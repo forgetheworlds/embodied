@@ -1,0 +1,27 @@
+# The shared remote carries code and the README only.
+# Everything below stays on this machine.
+
+# Local-only: agent context
+AGENTS.md
+CLAUDE.md
+
+# Local-only: the design record, its own git repo, never pushed
+design/
+
+# Local-only: Webots, the clones, bench worlds, result files (~3.8 GB)
+work/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# macOS and local noise
+.DS_Store
+*.log
