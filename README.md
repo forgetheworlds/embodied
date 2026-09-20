@@ -1,107 +1,52 @@
 # embodied
 
-A benchmark for the **onboard stack** of an agent flying a simulated drone. The agent is what is tested;
-the simulator is not.
+Building a drone system that can handle unfamiliar objectives in unfamiliar places: gather information, navigate, reason about observations, revise its approach, and report a supported result. The long-term goal is judgment comparable to a capable human pilot, within the aircraft's sensing, energy, and control limits.
 
-The subject is an avatar: a drone body plus the subsystems an agent acts through — estimator, inner loop,
-outer loop, perception and agency. One run produces one report card: a task outcome plus a number for each
-subsystem, all taken from the same episode log, so the numbers describe one flight rather than five
-separate experiments.
+**Status: repository foundation and simulation research. The integrated drone system is not implemented.** No supported flight command, drone test suite, or generalization result exists yet.
 
-**Status: designed, not built.** No implementation yet. The design rests on a verified evidence base.
+## The problem
 
----
+Finding a river, following it downstream, locating a cabin, and searching the surrounding area requires more than waypoints. The system must discover relevant places, choose useful viewpoints, remember observations, handle changed instructions and failures, manage resources, and decide whether its evidence is sufficient. These examples describe the intended judgment, not a fixed task menu.
 
-## Why this is not just another drone project
+## Intended system
 
-Most agent benchmarks measure whether a task passed. That tells you nothing about *why*. This one measures
-the parts, so a failure points at a subsystem instead of at "the agent".
+The working design connects a flight platform, perception and belief, spatial and episodic memory, a mission executive, and an independent evaluator/recorder. Higher-level reasoning cannot bypass control or safety. An action request is not proof of arrival; a model label is not identity proof; and a citation is not proof that its source supports the claim.
 
-Three decisions shape everything downstream:
+The exact control implementation, scored sensors, and first integrated experiment remain design decisions. Reusable skills and conventional components are valid tools; an original control law remains a recorded research requirement under review.
 
-- **The agent commands four propeller speeds and three gimbal angles.** There is no flight controller
-  underneath it, so every loop from attitude upward is the agent's. The camera is deliberately not
-  stabilised — steadying it is a decision the agent can make or fail to make.
-- **Disturbance is on by default**, with a still-air run as the control. A loop that only works in still air
-  is not a loop yet.
-- **Results are report cards against a floor and a ceiling** — the shipped example controller sets the
-  floor, two truth-fed oracles set the ceiling. Without a ceiling you cannot tell a good number from a
-  mediocre one.
+## What has been accomplished
 
-## What is notable about how it was built
+Local research exercised Webots camera/control interfaces and recorded a shipped-controller flight. It exposed issues with motor-command conventions, camera transforms, timing measurements, and earlier implementation plans. These local artifacts are not a reproducible public release or evidence of integrated autonomy.
 
-The simulator claims are not assertions. A 74-claim ledger records, for each one, its evidence class, the
-source, the exact quoted span, the date it was fetched, and what would prove it wrong. A separate
-verification pass then tried to falsify the load-bearing claims and re-ran the benchmark independently
-rather than trusting the notes: **33 confirmed, 7 corrected, 0 killed outright, 1 unverifiable.**
+The repository foundation now separates current agent context from archived planning, preserves design history on a dedicated branch, and provides setup and integrity checks. No drone capability is claimed from these checks.
 
-All four claims the project started from needed correcting. That is the point of checking.
+## Check this checkout
 
-The decisions live in `docs/adr/` — 14 of them, each recording the options **rejected** and what the choice
-**costs**, not only what was chosen. `docs/OPEN-QUESTIONS.md` records what is still undecided, with the
-constraints attached, so nothing is decided twice or against evidence.
+Foundation scripts require Python 3.9+ and Git 2.31+, with no third-party Python packages, model calls, or network access:
 
----
+```sh
+python3 scripts/check_repository.py
+```
 
-## Why Webots
+The public check does not require Atomic, Webots, private design documents, or cloud credentials.
 
-The shipped DJI Mavic 2 Pro model already has most of what is needed, and one of its example controllers
-flew it for us.
+For local agent development, make the local `design` branch available, then run:
 
-- The model exposes a camera, GPS, gyro, inertial unit, compass, four propeller motors and three gimbal
-  motors, all drivable from Python.
-- The shipped patrol controller climbed to 15.7 m and held 14.99 m while following waypoints for 407
-  seconds of simulated time.
-- A Supervisor process on a second node read the drone's true position for the whole flight while the drone
-  itself had no privileged access.
-- Camera frames reached an outside Python program which Webots did not launch.
+```sh
+python3 scripts/setup_agent.py
+python3 scripts/check_repository.py --agent-context
+```
 
-Four costs come with it:
+The installer mounts the design branch at `design/` and installs a small ignored `AGENTS.md`. It refuses to overwrite different instructions unless `--replace` is supplied; replacement first saves a backup. It does not fetch branches, install dependencies, start Atomic, or run workflows. A main-only public checkout can skip agent setup.
 
-- **No shipped controller reads a camera.** The Python one enables it and never looks, so there is no
-  perception example to copy — the perception task starts from nothing.
-- **ArduPilot works, but on its own terms.** It is pinned to Webots 2023a in source, and it takes over as
-  the flight controller, so the agent would talk MAVLink while images arrive on a different socket.
-- **PX4 has no Webots support.** The request was closed as stale, and the documentation never mentions it.
-- **A Supervisor cannot read another robot's camera**, which constrains how ground truth is produced. This
-  is an open design question, not a detail.
+Start Atomic from the code checkout. Its normal context loading reads `AGENTS.md`, which routes to a bounded startup packet. Dynamic workflows are authored for an approved slice using installed Atomic documentation. Workflow execution and model costs are separate from repository validation.
 
-## The four tasks
+## Repository boundaries
 
-| Task | What it tests | Baseline |
-|---|---|---|
-| **Hold and reject** | Hold a point for 60 s while the referee pushes and twists the drone | the shipped controller's altitude hold |
-| **Waypoint chain** | Fly a chain of five waypoints | the shipped controller's patrol route |
-| **Visual acquisition** | Find a marked object and point the camera at it | **none** — nothing shipped reads a camera |
-| **Navigate then inspect** | Fly to a waypoint, then find and report the object near it | navigation from the shipped controller, inspection from nothing |
+`main` contains code, related tests/configuration/scenario assets, and this README. The `design` branch contains current docs and the historical archive, mounted locally at `design/`. Runtime state and large experiments stay in ignored `.atomic/` and `work/`. Do not merge the design branch wholesale into main. Publishing main does not require publishing private planning history.
 
-Not every task exercises every subsystem, so the report card carries a `not exercised` entry rather than
-scoring a subsystem that was never called on. A zero there would report a failure that never happened.
+## Reproduction and reporting
 
----
+Every future released experiment must include pinned dependencies and assets or retrieval instructions, permitted sensors and priors, model identities, scenarios and seeds, exact run/scoring commands, expected artifacts, and measured limitations. The supported no-cloud baseline must run from a clean code checkout without private design documents.
 
-## What is not in this repository
-
-The design record is maintained privately and is **not** here: the architecture document, the decision
-records, the evidence ledger and the raw research output all live outside this repository. This README is
-the public face; the reasoning behind the code stays with the author.
-
-What that means for a reader: claims below are traceable in principle but not verifiable from this
-repository alone. That is a deliberate choice, not an oversight.
-
-## What is not here yet
-
-- **No implementation.** The build order starts with settling the substrate, then the forked model, then
-  measuring the camera cost curve which sets the loop rates, then the referee, logging and scoring before
-  any agent code, then the agent, then its ablations.
-- **Three questions need a real run** before the design closes: how camera cost changes with frame rate,
-  whether the forked model flies like the shipped one, and what the perception task scores with no agent.
-- **Bars come after measurement.** There is no pass or fail in the first run; a threshold written before any
-  measurement only encodes a guess.
-
-## Caveats on the numbers
-
-Frame rates were measured on an Apple M3 laptop rather than a controlled benchmark machine, and the same
-configuration varied between runs — 216 to 798 fps, real-time factor 1.73 to 6.38, with host load reaching
-12.88 on 8 cores. Absolute numbers do not transfer; ratios do. How idle the host must be is still an open
-question, so treat every rate here as an indicator and every ratio as the finding.
+Report mission success, false claims, uncertainty, interventions, safety violations, resource use, and failures. Compare credible baselines on held-out layouts, appearances, and goal compositions. Add images and synchronized video when real artifacts exist. Simulation success alone will not be described as physical flightworthiness or human-level performance.

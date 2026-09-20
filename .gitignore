@@ -5,7 +5,7 @@
 AGENTS.md
 CLAUDE.md
 
-# Local-only: the design record, its own git repo, never pushed
+# Local design branch worktree; never merge into main wholesale
 design/
 
 # Local-only: Webots, the clones, bench worlds, result files (~3.8 GB)
@@ -25,3 +25,8 @@ dist/
 # macOS and local noise
 .DS_Store
 *.log
+
+# Local agent state
+.atomic/
+.Codex/
+.codex/
