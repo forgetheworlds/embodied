@@ -1,6 +1,6 @@
 # embodied
 
-Building a drone system that can handle unfamiliar objectives in unfamiliar places: gather information, navigate, reason about observations, revise its approach, and report a supported result. The long-term goal is judgment comparable to a capable human pilot, within the aircraft's sensing, energy, and control limits.
+Building a continuously involved cloud multimodal drone pilot that can handle unfamiliar objectives in unfamiliar places: gather information, navigate, reason about observations, revise its approach, and report a supported result. The long-term goal is judgment comparable to a capable human pilot, within the aircraft's sensing, energy, and control limits.
 
 **Status: repository foundation and simulation research. The integrated drone system is not implemented.** No supported flight command, drone test suite, or generalization result exists yet.
 
@@ -10,9 +10,9 @@ Finding a river, following it downstream, locating a cabin, and searching the su
 
 ## Intended system
 
-The working design connects a flight platform, perception and belief, spatial and episodic memory, a mission executive, and an independent evaluator/recorder. Higher-level reasoning cannot bypass control or safety. An action request is not proof of arrival; a model label is not identity proof; and a citation is not proof that its source supports the claim.
+The working design has three concurrent layers: a cloud multimodal pilot selecting and revising grounded visual objectives throughout motion; local perception, spatial memory, and one coordinated obstacle-aware planner; and ArduPilot tracking and stabilization. An independent evaluator and recorder measure the system. Higher-level reasoning cannot bypass control or safety. An action request is not proof of arrival; a model label is not identity proof; and a citation is not proof that its source supports the claim.
 
-The exact control implementation, scored sensors, and first integrated experiment remain design decisions. Reusable skills and conventional components are valid tools; an original control law remains a recorded research requirement under review.
+Build 1 reuses ArduPilot and conventional local planning. It does not implement a new low-level controller. The first integrated target is an indoor rooms-and-doorways search/inspection mission. Simulator compatibility, calibrated RGB/depth, sensor-derived indoor localization, cloud latency and navigation quality still need experimental validation.
 
 ## What has been accomplished
 
@@ -44,6 +44,10 @@ Start Atomic from the code checkout. Its normal context loading reads `AGENTS.md
 ## Repository boundaries
 
 `main` contains code, related tests/configuration/scenario assets, and this README. The `design` branch contains current docs and the historical archive, mounted locally at `design/`. Runtime state and large experiments stay in ignored `.atomic/` and `work/`. Do not merge the design branch wholesale into main. Publishing main does not require publishing private planning history.
+
+## Evaluation direction
+
+The custom bench will compare a continuously refreshed cloud pilot, a one-shot planner, and a competent conventional policy while holding local sensing, navigation and control constant. It will include held-out layouts, blocked openings, ambiguous and absent targets, stale responses, and connection loss. Pose-assisted diagnostic runs and sensor-derived navigation runs remain separate. Existing external benchmarks may supply diagnostic tasks, assets or protocols; adapted tasks will not be reported as reproducing published scores. No benchmark result is available yet.
 
 ## Reproduction and reporting
 
