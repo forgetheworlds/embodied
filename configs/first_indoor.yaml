@@ -1,0 +1,80 @@
+# P00 compatibility gate: one Webots/ArduPilot candidate, probed from end to end.
+#
+# Every path is relative to the repository root, and every value that is genuinely a
+# number (a baseline, a rate, a timeout, a budget) is configuration rather than a
+# constant in code. Nothing here is a control gain or a measured latency.
+#
+# Two keys go beyond the plan's sketch and are called out because they are criteria
+# rather than plumbing:
+#   sensors.stereo.identical_channel_fraction_limit - the declared threshold for
+#     calling a frame colour, which the grayscale check compares against.
+#   scenario.estimator_params - the EKF-active set that run B layers on top of the
+#     pinned set, so the estimator item has a configuration in which it means
+#     something.
+
+project:
+  stage: P00
+  name: first-indoor
+
+platform:
+  ardupilot_root: work/ardupilot
+  ardupilot_commit: af8525911b49a4c2a3bdc83bc5ed57e1d0098134
+  sitl_binary: work/ardupilot/build/sitl/bin/arducopter
+  webots_home: work/Webots.app
+  webots_version: R2025a
+  webots_mode: realtime
+  sim_model: webots-python
+  vehicle: ArduCopter
+  sitl_home: "-35.363261,149.165230,584,353"
+  endpoints:
+    sitl: "tcp:127.0.0.1:5760"
+    fdm_port: 9002
+    controller_port: 9010
+
+scenario:
+  world: scenarios/compat/worlds/compat_stereo.wbt
+  params:
+    - scenarios/compat/params/compat_base.parm
+  estimator_params:
+    - scenarios/compat/params/compat_ekf.parm
+
+sensors:
+  stereo:
+    left: "camera left"
+    right: "camera right"
+    width: 640
+    height: 480
+    baseline_m: 0.10
+    sampling_period_ms: 100
+    encoding: rgb8
+    identical_channel_fraction_limit: 0.99
+  imu:
+    accelerometer: accelerometer
+    gyro: gyro
+    inertial_unit: "inertial unit"
+    gps: gps
+    sampling_period_ms: 10
+  calibration: scenarios/compat/calibration.json
+
+probe:
+  hover_altitude_m: 1.5
+  # Waypoints are local-NED offsets from the takeoff point; z is added to the hover
+  # altitude, so 0.0 means "level with where it took off".
+  waypoints_local_ned:
+    - [2.0, 0.0, 0.0]
+    - [2.0, 1.0, 0.0]
+  hold_per_waypoint_s: 8
+  stream_loss_window_s: 6
+  estimator_fault:
+    kind: position_step
+    magnitude_m: 30.0
+    hold_s: 6
+  timebase_samples: 40
+  timebase_spread_limit_ms: 60
+  step_timeout_s:
+    startup: 90
+    ready: 60
+    flight: 120
+  budget_wall_clock_s: 600
+
+output: work/runs/p00-compat

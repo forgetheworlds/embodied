@@ -1,0 +1,11 @@
+# EKF-active parameter set: run B of the P00 compatibility probe.
+#
+# The pinned set (compat_base.parm, copied unchanged from the ArduPilot Webots_Python
+# example at af852591) sets AHRS_EKF_TYPE 10, which selects the simulator's own state
+# as the estimator. This file adds only what is needed to make EKF3 the estimator, so
+# the estimator-health item has a configuration in which it means something. Parameter
+# files layer in order, so every value this file does not name still comes from the
+# pinned set.
+AHRS_EKF_TYPE 3
+EK3_ENABLE 1
+EK2_ENABLE 0

@@ -1,0 +1,7 @@
+{"mavpackettype": "HEARTBEAT", "custom_mode": 4, "base_mode": 209, "system_status": 4, "type": 2, "autopilot": 3}
+{"mavpackettype": "ATTITUDE", "time_boot_ms": 123456, "roll": 0.012, "pitch": -0.02, "yaw": 0.31}
+{"mavpackettype": "LOCAL_POSITION_NED", "time_boot_ms": 123456, "x": 2.0, "y": 1.0, "z": -1.5, "vx": 0.02, "vy": -0.01, "vz": 0.0}
+{"mavpackettype": "SERVO_OUTPUT_RAW", "time_boot_ms": 123456, "servo1_raw": 1500, "servo2_raw": 1500, "servo3_raw": 1500, "servo4_raw": 1500, "servo5_raw": 1000, "servo6_raw": 1000, "servo7_raw": 1000, "servo8_raw": 1000}
+{"mavpackettype": "EKF_STATUS_REPORT", "flags": 1, "velocity_variance": 0.11, "pos_horiz_variance": 0.42, "pos_vert_variance": 0.3}
+{"mavpackettype": "AUTOPILOT_VERSION", "time_boot_ms": 123456, "flight_sw_version": 262144, "flight_custom_version": [1, 2, 3, 4, 5, 6, 7, 8], "vendor_id": 3, "product_id": 1}
+{"mavpackettype": "STATUSTEXT", "severity": 6, "text": "guided mode entered"}

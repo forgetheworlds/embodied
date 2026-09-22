@@ -1,0 +1,200 @@
+# VRML_SIM R2025a utf8
+# Iris quadrotor for the P00 compatibility scene.
+#
+# Derived from ArduPilot `libraries/SITL/examples/Webots_Python/protos/Iris.proto`
+# at af8525911b49a4c2a3bdc83bc5ed57e1d0098134. The geometry, masses and motor
+# ordering are unchanged; upstream states that the motor and propeller constants
+# were determined empirically rather than from the real airframe, and that has not
+# been re-derived here.
+#
+# Changes for P00, each one required by the compatibility gate:
+#   1. the four inertial devices are named, so a record can say which device in
+#      which frame produced a value instead of assuming the default names;
+#   2. a stereo pair is added: two Camera nodes named "camera left" and
+#      "camera right", symmetrical about the fore-aft axis (y = +0.05 and
+#      y = -0.05, a 0.10 m baseline) with identical resolution, field of view and
+#      placement in height, so the two eyes can be read in one step and compared.
+# The camera device frame is the body frame: a Webots camera's optical axis is its
+# local +x, its local +y points left and its local +z points up. The image row and
+# column axes therefore do not coincide with a right-down-forward optical frame;
+# converting to one is P01-C work, and the declared calibration says so.
+
+PROTO Iris [
+  field  SFVec3f     translation     0 0 0
+  field  SFRotation  rotation        0 0 1 0
+  field  SFString    name            "Iris"  # Is `Robot.name`.
+  field  SFString    controller      "void"  # Is `Robot.controller`.
+  field  MFString    controllerArgs  []      # Is `Robot.controllerArgs`.
+  field  SFString    customData      ""      # Is `Robot.customData`.
+  field  SFBool      supervisor      FALSE   # Is `Robot.supervisor`.
+  field  SFBool      synchronization TRUE    # Is `Robot.synchronization`.
+  field  MFNode      extensionSlot   []      # Extends the robot with new nodes in the extension slot.
+]
+{
+  Robot {
+    translation IS translation
+    rotation IS rotation
+    controller IS controller
+    controllerArgs IS controllerArgs
+    customData IS customData
+    supervisor IS supervisor
+    synchronization IS synchronization
+    name IS name
+    children [
+      Group {
+        children IS extensionSlot
+      }
+      DEF IRIS_MESH Shape {
+        appearance PBRAppearance {
+          baseColor 0.05 0.05 0.05
+          roughness 1.000000
+          metalness 0.2
+        }
+        geometry Mesh {
+          url "meshes/iris.dae"
+        }
+        castShadows FALSE
+      }
+      Propeller {
+        shaftAxis 0 0 1
+        centerOfThrust 0.130000 -0.220000 0.023000
+        thrustConstants 0.0012 0
+        torqueConstants 5.0e-04 0
+        device RotationalMotor {
+          name "m1_motor"
+          maxVelocity 100
+          maxTorque 30
+          multiplier 1
+        }
+        slowHelix Solid {
+          translation 0.130000 -0.220000 0.023000
+          children [
+            Shape {
+              appearance DEF PROP_BLUE PBRAppearance {
+                baseColor 0 0 0.75
+                metalness 0.3
+              }
+              geometry DEF CCW_PROP Mesh {
+                url [
+                  "meshes/iris_prop_ccw.dae"
+                ]
+              }
+            }
+          ]
+        }
+      }
+      Propeller {
+        shaftAxis 0 0 1
+        centerOfThrust -0.130000 0.200000 0.023000
+        thrustConstants 0.0012 0
+        torqueConstants 5.0e-04 0
+        device RotationalMotor {
+          name "m2_motor"
+          maxVelocity 100
+          maxTorque 30
+          multiplier 1
+        }
+        slowHelix Solid {
+          translation -0.130000 0.200000 0.023000
+          children [
+            Shape {
+              appearance DEF PROP_BLACK PBRAppearance {
+                baseColor 0 0 0
+                metalness 0.3
+              }
+              geometry USE CCW_PROP
+            }
+          ]
+        }
+      }
+      Propeller {
+        shaftAxis 0 0 1
+        centerOfThrust 00.130000 0.220000 0.023000
+        thrustConstants -0.0012 0
+        torqueConstants 5.0e-04 0
+        device RotationalMotor {
+          name "m3_motor"
+          maxVelocity 100
+          maxTorque 30
+          multiplier -1
+        }
+        slowHelix Solid {
+          translation 0.130000 0.220000 0.023000
+          children [
+            Shape {
+              appearance USE PROP_BLUE
+              geometry DEF CW_PROP Mesh {
+                url [
+                  "meshes/iris_prop_cw.dae"
+                ]
+              }
+            }
+          ]
+        }
+      }
+      Propeller {
+        shaftAxis 0 0 1
+        centerOfThrust -0.130000 -0.200000 0.023000
+        thrustConstants -0.0012 0
+        torqueConstants 5.0e-04 0
+        device RotationalMotor {
+          name "m4_motor"
+          maxVelocity 100
+          maxTorque 30
+          multiplier -1
+        }
+        slowHelix Solid {
+          translation -0.130000 -0.200000 0.023000
+          children [
+            Shape {
+              appearance USE PROP_BLACK
+              geometry USE CW_PROP
+            }
+          ]
+        }
+      }
+      Accelerometer {
+        name "accelerometer"
+      }
+      GPS {
+        name "gps"
+      }
+      Gyro {
+        name "gyro"
+      }
+      InertialUnit {
+        name "inertial unit"
+      }
+      Camera {
+        name "camera left"
+        translation 0.050000 0.050000 0.050000
+        width 640
+        height 480
+        fieldOfView 1.047200
+        near 0.010000
+        far 0.000000
+      }
+      Camera {
+        name "camera right"
+        translation 0.050000 -0.050000 0.050000
+        width 640
+        height 480
+        fieldOfView 1.047200
+        near 0.010000
+        far 0.000000
+      }
+    ]
+    boundingObject Box {
+       size 0.470000 0.470000 0.110000
+    }
+    physics Physics {
+      density -1
+      mass 1.500000
+      centerOfMass [ 0.000000 0.000000 0.000000 ]
+      inertiaMatrix [
+        2.912500e-02 2.912500e-02 5.522500e-02
+        0.000000e+00 0.000000e+00 0.000000e+00
+      ]
+    }
+  }
+}
