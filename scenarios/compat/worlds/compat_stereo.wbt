@@ -22,6 +22,8 @@
 #   4. plain nodes instead of stock protos, so nothing is fetched at load time.
 #
 # EMBODIED_WORLD_ZERO world origin at floor level, x north, y west, z up (ENU), matching the documented frame of the pinned scene
+EXTERNPROTO "../protos/Iris.proto"
+
 WorldInfo {
   title "P00 compatibility: stereo Iris"
   basicTimeStep 2
@@ -47,6 +49,7 @@ DirectionalLight {
   intensity 1.2
 }
 Solid {
+  name "floor"
   translation 0 0 -0.02
   children [
     Shape {
@@ -66,6 +69,7 @@ Solid {
 # The colour witness: a saturated red panel the left and right cameras both see at
 # start. Its declared channel order is what the colour check compares against.
 Solid {
+  name "colour_witness"
   translation 3.0 0.0 0.75
   children [
     Shape {
@@ -86,6 +90,7 @@ Solid {
 # Two neutral side walls: something for the stereo pair to look at that is not the
 # witness, so a frame is never judged on one object alone.
 Solid {
+  name "wall_north"
   translation 2.0 2.2 0.9
   children [
     Shape {
@@ -103,6 +108,7 @@ Solid {
   }
 }
 Solid {
+  name "wall_south"
   translation 2.0 -2.2 0.9
   rotation 0 0 1 0
   children [

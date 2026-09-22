@@ -27,6 +27,7 @@ import select
 import socket
 import sys
 import time
+import traceback
 
 SHARED_MODULE_ERROR = None
 
@@ -300,17 +301,42 @@ def main():
         return 1
     print("Connected to ardupilot SITL", flush=True)
 
+    controls = first_controls
+
+    try:
+        run_loop(devices, link, channel, injections, status, args, controls, first_controls)
+    except Exception:
+        # A controller that dies silently looks exactly like a simulator that never
+        # started, so the reason is printed where the platform probe can read it.
+        traceback.print_exc()
+        print(
+            f"Controller: stopped after an exception (interpreter {sys.executable})",
+            flush=True,
+        )
+        raise
+    finally:
+        devices.stop_motors()
+        channel.close()
+        link.close()
+        print("Controller: stopped", flush=True)
+    return 0
+
+
+def run_loop(devices, link, channel, injections, status, args, controls, first_controls):
+    """The simulation loop: flight state out, motor commands in, records beside."""
     camera_period_ms = max(int(args.camera_period_ms), devices.timestep_ms)
     imu_period_ms = max(int(args.imu_period_ms), devices.timestep_ms)
     next_camera_ms = 0
     next_imu_ms = 0
     pair_counter = 0
-    controls = first_controls
     last_flight_state = None
-
     while True:
         if not devices.step():
-            break
+            print(
+                f"Controller: the simulation closed at {devices.simulator_time_s():.3f}s",
+                flush=True,
+            )
+            return
         elapsed_ms = int(devices.simulator_time_s() * 1000.0)
 
         if channel.accept() and not channel.status_sent:
@@ -405,11 +431,6 @@ def main():
             channel.send(
                 SHARED.Kind.STATUS, devices.simulator_time_s(), SHARED.encode_status_payload(status)
             )
-
-    devices.stop_motors()
-    channel.close()
-    link.close()
-    return 0
 
 
 if __name__ == "__main__":

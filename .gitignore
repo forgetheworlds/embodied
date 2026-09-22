@@ -30,3 +30,6 @@ dist/
 .atomic/
 .Codex/
 .codex/
+
+# Webots writes a project file beside a world it opens
+scenarios/compat/worlds/.compat_stereo.wbproj
