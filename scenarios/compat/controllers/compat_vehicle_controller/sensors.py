@@ -4,9 +4,14 @@ The controller's job is to be a transparent transport: read the named devices, h
 their values on in a declared frame with a capture stamp, and drive the motors with
 exactly what SITL asked for. Nothing here decides anything about a mission, and
 nothing here averages or reorders a camera channel.
+
+The propeller conversion is imported from the shared module so the simulator side
+and the adapter state it once. That import is safe here because the controller
+resolves the shared module, including the ``EMBODIED_SRC`` fallback, before it
+imports this file.
 """
 
-import math
+from embodied.platform.webots_ardupilot import propeller_velocity
 
 
 class VehicleDevices:
@@ -93,23 +98,19 @@ class VehicleDevices:
             "position_xyz": enu_to_ned(self.gps.getValues()),
         }
 
-    def set_motor_commands(self, fractions, *, uses_propellers=True, velocity_cap=math.inf):
-        """Drive the motors from SITL's per-channel fractions.
+    def set_motor_commands(self, fractions):
+        """Drive the motors from the fractions SITL sends.
 
-        SITL's values are a fraction of full throttle. A propeller's thrust is
-        quadratic in angular velocity while ArduPilot's linear throttle model expects
-        a linear relation, so the square root of the magnitude is what makes the two
-        agree; this matches the pinned parameter file's MOT_THST_EXPO 0. A negative
-        value means the channel is unused and is left alone.
+        A fraction below zero means SITL is not using that channel, so the motor is
+        left alone. Everything else is a fraction of full throttle, which this scene's
+        propellers convert into an angular velocity through the shared conversion.
         """
         for motor, fraction in zip(self.motors, fractions):
             if fraction < 0:
                 continue
-            if uses_propellers:
-                command = math.copysign(math.sqrt(abs(fraction)), fraction)
-            else:
-                command = fraction
-            motor.setVelocity(min(command * motor.getMaxVelocity(), velocity_cap))
+            motor.setVelocity(
+                propeller_velocity(fraction, max_velocity=motor.getMaxVelocity())
+            )
 
     def stop_motors(self):
         for motor in self.motors:

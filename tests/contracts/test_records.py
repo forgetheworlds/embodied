@@ -8,7 +8,7 @@ stable enough to hash.
 
 import dataclasses
 import json
-from pathlib import Path
+import os
 import subprocess
 import sys
 
@@ -530,14 +530,17 @@ def test_records_are_frozen_and_hashable():
 
 
 def test_the_module_imports_without_the_runtime_stack(tmp_path):
-    """Later stages must be able to load records without numpy, YAML or MAVLink."""
-    source_root = Path(R.__file__).resolve().parents[2]
+    """Later stages must be able to load records without numpy, YAML or MAVLink.
+
+    The check runs in a subprocess whose interpreter is the one that ran this test,
+    with the three modules blocked on its import path. Nothing is put on PYTHONPATH
+    except the blocker itself: the package is the installed one, the same code the
+    tests and the command use.
+    """
     blocker = tmp_path / "sitecustomize.py"
     blocker.write_text(
         "import sys\n"
         "class Blocker:\n"
-        "    def find_module(self, name, path=None):\n"
-        "        return self if name.split('.')[0] in {'numpy', 'yaml', 'pymavlink'} else None\n"
         "    def find_spec(self, name, path=None, target=None):\n"
         "        if name.split('.')[0] in {'numpy', 'yaml', 'pymavlink'}:\n"
         "            raise ImportError(name + ' is blocked for this test')\n"
@@ -549,16 +552,18 @@ def test_the_module_imports_without_the_runtime_stack(tmp_path):
         [
             sys.executable,
             "-c",
+            "import sys;"
             "from embodied.contracts import records;"
-            "print(records.RECORDS_REVISION, len(records.IMPLEMENTED_RECORDS))",
+            "print(records.RECORDS_REVISION, len(records.IMPLEMENTED_RECORDS), sys.executable)",
         ],
         capture_output=True,
         text=True,
         env={
-            "PYTHONPATH": f"{source_root}{__import__('os').pathsep}{tmp_path}",
-            "PATH": __import__("os").environ.get("PATH", ""),
+            "PYTHONPATH": str(tmp_path),
+            "PATH": os.environ.get("PATH", ""),
         },
         cwd=str(tmp_path),
     )
     assert completed.returncode == 0, completed.stderr
     assert R.RECORDS_REVISION in completed.stdout
+    assert sys.executable in completed.stdout

@@ -103,6 +103,9 @@ class CommandSpec:
     name: str
     help_text: str
     stage_id: str
+    # The stem of the default output directory, which CLI-PLAN names per command
+    # ("work/runs/p00-compat-...") rather than per stage.
+    run_prefix: str
     handler: CommandHandler
     add_arguments: ArgumentDeclaration | None
 
@@ -121,6 +124,7 @@ def register_command(
     *,
     help_text: str,
     stage_id: str,
+    run_prefix: str,
     add_arguments: ArgumentDeclaration | None = None,
 ) -> None:
     """Register one command. Later stages call this; they never edit the parser."""
@@ -130,6 +134,7 @@ def register_command(
         name=name,
         help_text=help_text,
         stage_id=stage_id,
+        run_prefix=run_prefix,
         handler=handler,
         add_arguments=add_arguments,
     )
@@ -334,10 +339,10 @@ def repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def default_output_directory(stage_id: str) -> Path:
-    """A fresh directory under the ignored ``work/runs`` tree, named for the stage."""
+def default_output_directory(run_prefix: str) -> Path:
+    """A fresh directory under the ignored ``work/runs`` tree, named for the run."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return repository_root() / "work" / "runs" / f"{stage_id}-{stamp}-{secrets.token_hex(2)}"
+    return repository_root() / "work" / "runs" / f"{run_prefix}-{stamp}-{secrets.token_hex(2)}"
 
 
 def code_revision(root: Path) -> str:
@@ -450,7 +455,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"embodied: {error}", file=sys.stderr)
         return EXIT_CODES[CommandStatus.INVALID]
 
-    output = Path(args.output) if args.output is not None else default_output_directory(spec.stage_id)
+    output = (
+        Path(args.output)
+        if args.output is not None
+        else default_output_directory(spec.run_prefix)
+    )
     if (output / RECEIPT_FILENAME).exists():
         print(
             f"embodied: {output / RECEIPT_FILENAME} already exists; "

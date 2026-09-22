@@ -18,11 +18,12 @@ SITL or a real autopilot:
 * :class:`SensorGateway` carries the controller's sensor records to this process
   and injection commands back to the controller.
 
-Two wire formats live here rather than in two places. The Webots controller
-imports :func:`pack_controls` and :func:`unpack_fdm` for its UDP exchange with
-SITL, whose layout is fixed by the pinned ArduPilot model, and it imports the
-``EMB1`` framing and :func:`bgra_to_rgb8` for the sensor stream. Both formats are
-versioned, and both have a round-trip test.
+Three formats live here rather than in two places. The Webots controller imports
+:func:`pack_fdm` and :func:`unpack_controls` for its UDP exchange with SITL, whose
+layout is fixed by the pinned ArduPilot model. It imports the ``EMB1`` framing,
+:func:`bgra_to_rgb8` and :class:`OutboundStream` for the sensor stream back to this
+process. Each format has its own test, and the socket layouts are checked against
+the pinned C structures rather than against themselves.
 
 Only the standard library is imported at module import time; numpy, pymavlink and
 YAML are imported inside the functions that need them, so the Webots controller
@@ -37,6 +38,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import struct
@@ -100,14 +102,12 @@ class FramingError(Exception):
 # (libraries/SITL/SIM_Webots_Python.cpp): a 16-float servo packet the simulator
 # receives, and a 16-double flight-state packet it sends back. The struct formats
 # carry no byte-order prefix because the firmware packs host order and both ends
-# run on this machine; changing that would break the exchange silently.
+# run on this machine; changing that would break the exchange silently. The sizes
+# are 64 and 128 bytes, and the test pins them against the C structures.
 CONTROL_FORMAT = "f" * 16
 CONTROL_SIZE = struct.calcsize(CONTROL_FORMAT)
 FDM_FORMAT = "d" * (1 + 3 + 3 + 3 + 3 + 3)
 FDM_SIZE = struct.calcsize(FDM_FORMAT)
-SERVO_MIN_PULSE_US = 1000
-SERVO_MAX_PULSE_US = 2000
-UNUSED_SERVO = -1.0
 
 
 @dataclass(frozen=True)
@@ -135,28 +135,14 @@ def enu_to_ned(values: Sequence[float]) -> tuple[float, float, float]:
     return (float(values[0]), -float(values[1]), -float(values[2]))
 
 
-def pack_controls(servo_values: Sequence[float]) -> bytes:
-    """Pack raw SITL servo values into the simulator's control packet.
-
-    SITL sends pulse widths around 1000-2000 microseconds while the simulator's
-    motors take a fraction of full speed, so the pinned bridge subtracts the
-    minimum and divides by the range. A negative value means "this channel is not
-    used" and is passed through rather than scaled.
-    """
-    if len(servo_values) != 16:
-        raise FramingError(f"a control packet carries 16 channels, got {len(servo_values)}")
-    scaled = []
-    for value in servo_values:
-        number = float(value)
-        if number < 0:
-            scaled.append(UNUSED_SERVO)
-        else:
-            scaled.append((number - SERVO_MIN_PULSE_US) / (SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US))
-    return struct.pack(CONTROL_FORMAT, *scaled)
-
-
 def unpack_controls(packet: bytes) -> tuple[float, ...]:
-    """Unpack a control packet from SITL into motor fractions."""
+    """Read SITL's control packet into one fraction per channel.
+
+    SITL sends ``(pulse_width - 1000) / 1000`` for each of its sixteen channels, so
+    a value is a fraction of full throttle and a negative one marks a channel the
+    autopilot is not using. Reading is the only direction this project needs: the
+    motor values are the simulator model's business, and nothing here builds one.
+    """
     if len(packet) != CONTROL_SIZE:
         raise FramingError(f"control packet is {len(packet)} bytes, expected {CONTROL_SIZE}")
     return struct.unpack(CONTROL_FORMAT, packet)
@@ -175,35 +161,17 @@ def pack_fdm(state: FlightState) -> bytes:
     )
 
 
-def unpack_fdm(packet: bytes) -> FlightState:
-    """Unpack the flight-state packet SITL expects."""
-    if len(packet) != FDM_SIZE:
-        raise FramingError(f"flight-state packet is {len(packet)} bytes, expected {FDM_SIZE}")
-    values = struct.unpack(FDM_FORMAT, packet)
-    return FlightState(
-        timestamp_s=values[0],
-        gyro_rpy=(values[1], values[2], values[3]),
-        accel_xyz=(values[4], values[5], values[6]),
-        attitude_rpy=(values[7], values[8], values[9]),
-        velocity_xyz=(values[10], values[11], values[12]),
-        position_xyz=(values[13], values[14], values[15]),
-    )
+def propeller_velocity(fraction: float, *, max_velocity: float) -> float:
+    """The angular velocity one motor should take for a throttle fraction.
 
-
-def motor_command(
-    fraction: float, *, uses_propellers: bool = True, velocity_cap: float = math.inf
-) -> float:
-    """Turn one motor fraction into the velocity the simulator's motor should take.
-
-    A Webots propeller's thrust is quadratic in angular velocity while ArduPilot's
-    ``MOT_THST_EXPO 0`` model is linear in throttle. Taking the square root of the
-    magnitude makes the two agree, which is the pinned example's convention and why
-    the pinned parameter file sets that exponential to zero.
+    A propeller's thrust is quadratic in its angular velocity, while ArduPilot's
+    throttle model with ``MOT_THST_EXPO 0`` is linear in the fraction it sends. The
+    square root of the magnitude is what makes the two agree, which is why the pinned
+    parameter file sets that exponential to zero. The Webots controller calls this
+    rather than repeating the conversion on its own side.
     """
-    if not uses_propellers:
-        return min(fraction, velocity_cap)
     linearized = math.copysign(math.sqrt(abs(fraction)), fraction)
-    return min(linearized, velocity_cap)
+    return linearized * max_velocity
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +300,69 @@ class FrameReader:
         message, consumed = read_message(bytes(self._buffer))
         del self._buffer[:consumed]
         return message
+
+
+# The controller's outgoing queue bound. A 640x480 rgb8 pair is about 1.8 MB and the
+# cameras produce ten a second, so a reader that pauses for a few hundred milliseconds
+# leaves a queue of several megabytes behind. This bound covers that pause; beyond it
+# the newest frame is dropped and counted rather than the stream being corrupted.
+MAX_QUEUED_STREAM_BYTES = 8 << 20
+
+
+class OutboundStream:
+    """Whole frames queued for a non-blocking socket, with a bound and a drop count.
+
+    The controller writes into this and then flushes; the reader may be slower than
+    the cameras, and a socket that is not ready raises rather than waiting, because
+    waiting would stall the simulation itself. Two rules keep the reader's view
+    honest. A frame is queued whole, and a frame that has already begun to go out is
+    never discarded: half a frame leaves the reader with bytes it cannot
+    resynchronise, which is worse than a frame it never sees. When the queue is over
+    its bound the newest frame is dropped and counted, so a slow reader receives
+    whole frames at a lower rate and the run can report what was lost.
+    """
+
+    def __init__(self, *, max_queued_bytes: int = MAX_QUEUED_STREAM_BYTES) -> None:
+        self.max_queued_bytes = int(max_queued_bytes)
+        self._queued = bytearray()
+        self.dropped_frames = 0
+
+    @property
+    def queued_bytes(self) -> int:
+        return len(self._queued)
+
+    def queue(self, frame: bytes) -> bool:
+        """Queue one whole frame. False means it was dropped instead of queued."""
+        if len(frame) > self.max_queued_bytes:
+            raise FramingError(
+                f"a {len(frame)}-byte frame does not fit in a {self.max_queued_bytes}-byte "
+                "stream queue, so it could never be sent"
+            )
+        if len(self._queued) + len(frame) > self.max_queued_bytes:
+            self.dropped_frames += 1
+            return False
+        self._queued += frame
+        return True
+
+    def flush(self, sock: socket.socket) -> None:
+        """Send what the socket will take now, keeping the rest for the next call.
+
+        A refused send is not an error: the socket buffer is full and the reader has
+        not caught up. Anything else is a real fault and is raised for the caller to
+        handle, because a stream that has failed silently is a stream that lies.
+        """
+        while self._queued:
+            try:
+                sent = sock.send(self._queued)
+            except (BlockingIOError, InterruptedError):
+                return
+            if sent <= 0:
+                return
+            del self._queued[:sent]
+
+    def reset(self) -> None:
+        """Forget queued bytes when the reader is gone. The drop count stays."""
+        self._queued.clear()
 
 
 PAIR_PAYLOAD_FORMAT = ">QIIIHHB"
@@ -470,18 +501,30 @@ def encode_imu_payload(
 
 
 def decode_imu_payload(payload: bytes) -> ImuPayload:
-    if len(payload) < IMU_PAYLOAD_SIZE + 9:
+    """Read one inertial sample. A payload that ends early is refused, never padded.
+
+    The fixed part holds the stamp and nine values; each device then contributes a
+    one-byte name length followed by its name, and the units tag has the same shape.
+    Every length byte is checked before it is read and every field before it is
+    sliced, so a truncated payload raises instead of running off the end of the
+    buffer, where a short frame could look like a complete one.
+    """
+    if len(payload) < IMU_PAYLOAD_SIZE + 4:
         raise FramingError("inertial payload is shorter than its header")
     values = struct.unpack(IMU_PAYLOAD_FORMAT, payload[:IMU_PAYLOAD_SIZE])
     offset = IMU_PAYLOAD_SIZE
     names = []
     for _ in range(3):
+        if len(payload) <= offset:
+            raise FramingError("inertial payload ends before a device name")
         length = payload[offset]
         offset += 1
         if len(payload) < offset + length:
             raise FramingError("inertial payload ends inside a device name")
         names.append(payload[offset : offset + length].decode("utf-8"))
         offset += length
+    if len(payload) <= offset:
+        raise FramingError("inertial payload ends before its units tag")
     units_len = payload[offset]
     offset += 1
     if len(payload) < offset + units_len:
@@ -1232,6 +1275,11 @@ def decode_telemetry(
     for message in messages:
         latest["messages_seen"] += 1
         kind = message.get("mavpackettype")
+        # The autopilot's own boot clock travels on almost every message. Reading it
+        # wherever it appears is what lets the timebase join sample a rate rather than
+        # wait for AUTOPILOT_VERSION, which answers once when it is asked.
+        if message.get("time_boot_ms") is not None:
+            latest["boot_time_ms"] = message["time_boot_ms"]
         if kind == "HEARTBEAT":
             latest["heartbeats"] += 1
             latest["custom_mode"] = message.get("custom_mode")
@@ -1291,7 +1339,6 @@ def decode_telemetry(
                     "uid",
                 )
             }
-            latest["boot_time_ms"] = message.get("time_boot_ms")
 
     return TelemetrySample(
         received_stamp=stamp,
@@ -1384,13 +1431,17 @@ def join_timebase(samples: Sequence[tuple[float, float]], spread_limit_ms: float
 MAV_CMD_COMPONENT_ARM_DISARM = 400
 MAV_CMD_NAV_TAKEOFF = 22
 MAV_CMD_SET_MESSAGE_INTERVAL = 511
+# MAV_CMD_REQUEST_MESSAGE asks for one message now. AUTOPILOT_VERSION is a
+# request-and-answer message rather than a streamed one, so it is asked for once.
+MAV_CMD_REQUEST_MESSAGE = 512
 MAV_FRAME_LOCAL_NED = 1
 MAV_FRAME_BODY_NED = 8
 
-# Message identifiers whose arrival interval this adapter requests.
+# Message identifiers this adapter asks the autopilot for.
 MSG_ID_ATTITUDE = 30
 MSG_ID_LOCAL_POSITION_NED = 32
 MSG_ID_SERVO_OUTPUT_RAW = 36
+MSG_ID_AUTOPILOT_VERSION = 148
 MSG_ID_EKF_STATUS_REPORT = 193
 
 # The only message types this program may send. Motion travels as a guided
@@ -1547,6 +1598,24 @@ class PymavlinkSession:
             )
         )
 
+    def request_message(self, message_id: int) -> None:
+        """Ask for one message now, for messages the autopilot only answers on request."""
+        self._send(
+            self._connection.mav.command_long_encode(
+                self.target_system,
+                self.target_component,
+                MAV_CMD_REQUEST_MESSAGE,
+                0,
+                message_id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        )
+
     def set_mode(self, mode_name: str) -> None:
         """Request one copter mode by name, by command rather than by assumed numbering."""
         mapping = {name: mode for mode, name in COPTER_MODES.items()}
@@ -1655,8 +1724,11 @@ class PymavlinkSession:
 class TcpSensorGateway:
     """The sensor stream client: one loopback connection carries records both ways."""
 
-    def __init__(self, monotonic_ns: Callable[[], int] = time.monotonic_ns) -> None:
-        self._monotonic_ns = monotonic_ns
+    def __init__(self, stamp: Callable[[], ClockStamp]) -> None:
+        # The caller supplies the stamp rather than this class inventing a host and
+        # clock identity of its own: a receipt time is only comparable with the
+        # capture time it is subtracted from when both name the same clock domain.
+        self._stamp = stamp
         self._socket: socket.socket | None = None
         self._reader = FrameReader()
         self._sequence = 0
@@ -1704,9 +1776,7 @@ class TcpSensorGateway:
         message = self._reader.next_message()
         if message is None:
             return None
-        received = ClockStamp(
-            host_id=socket.gethostname(), clock_id="monotonic", monotonic_ns=self._monotonic_ns()
-        )
+        received = self._stamp()
         record = SensorRecord(
             kind=message.kind,
             sim_time_s=message.sim_time_s,
@@ -1955,9 +2025,44 @@ class ShutdownEvidence:
     log_tails: dict[str, list[str]]
 
 
+@dataclass(frozen=True)
+class ControlEvent:
+    """One observed change in who is flying the aircraft, read from telemetry.
+
+    The autopilot leaves Guided flight on its own when something fails; this adapter
+    records that and stops publishing rather than continuing to send targets into a
+    mode that is not following them. The change is an observation, not a decision.
+    """
+
+    at: ClockStamp
+    from_mode: str | None
+    to_mode: str | None
+    armed_before: bool | None
+    armed_after: bool | None
+    system_status: int | None
+    statustexts: tuple[str, ...]
+    guidance_held: bool
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "at_monotonic_ns": self.at.monotonic_ns,
+            "from_mode": self.from_mode,
+            "to_mode": self.to_mode,
+            "armed_before": self.armed_before,
+            "armed_after": self.armed_after,
+            "system_status": self.system_status,
+            "statustexts": list(self.statustexts),
+            "guidance_held": self.guidance_held,
+        }
+
+
 def mask_for_target(target: MotionTarget) -> int:
-    """The type mask that matches a target: a field the mask ignores must be absent."""
-    mask = TYPE_MASK_FORCE | TYPE_MASK_ACCELERATION
+    """The type mask that matches a target: a field the mask ignores must be absent.
+
+    A set bit means "ignore this field", so each field the target omits gets its bit
+    set. Force is always ignored: this project never commands a force target.
+    """
+    mask = TYPE_MASK_FORCE
     if target.position_ned is None:
         mask |= TYPE_MASK_POSITION
     if target.velocity_ned is None:
@@ -2015,8 +2120,11 @@ class WebotsArduPilot:
         self._pending_records: list[SensorRecord] = []
         self._statustexts: list[str] = []
         self._sequence = 0
-        self._injection_index = 0
         self._mavlink_lines = 0
+        # Mode changes and refused publications are evidence: what the aircraft did
+        # belongs in the run's record even when it is not what was asked for.
+        self.control_events: list[ControlEvent] = []
+        self.refusals: list[dict[str, Any]] = []
         self.navigation_epoch = "nav-1"
 
     # -- lifecycle ---------------------------------------------------------
@@ -2038,6 +2146,9 @@ class WebotsArduPilot:
         self._children = {"webots": simulator, "sitl": sitl}
         self._gateway.open("127.0.0.1", self.settings.endpoints.controller_port, 30.0)
         connection = self._session.connect(self.settings.mavlink_endpoint, 30.0)
+        # AUTOPILOT_VERSION answers once, on request, and it is the only statement of
+        # which firmware is being exercised.
+        self._session.request_message(MSG_ID_AUTOPILOT_VERSION)
         self.evidence.write_json(
             "connection.json",
             {"autopilot": connection, "sitl_argv": list(sitl.argv), "webots_argv": list(simulator.argv)},
@@ -2138,10 +2249,41 @@ class WebotsArduPilot:
         for document in messages:
             self._record_mavlink(document)
         sample = decode_telemetry(messages, stamp=self._stamp(), previous=self._telemetry)
+        previous = self._telemetry
         self._telemetry = sample
         if sample.statustexts:
             self._statustexts = list(sample.statustexts)
+        if previous is not None and (
+            sample.mode_name != previous.mode_name or sample.armed != previous.armed
+        ):
+            self.control_events.append(
+                ControlEvent(
+                    at=sample.received_stamp,
+                    from_mode=previous.mode_name,
+                    to_mode=sample.mode_name,
+                    armed_before=previous.armed,
+                    armed_after=sample.armed,
+                    system_status=sample.system_status,
+                    statustexts=tuple(sample.statustexts[-5:]),
+                    guidance_held=self.guidance_held,
+                )
+            )
         return sample
+
+    @property
+    def guidance_held(self) -> bool:
+        """Whether the last telemetry showed the autopilot flying under Guided control.
+
+        False covers every other state, including "no telemetry yet", which is why
+        publishing is refused rather than attempted while it is False.
+        """
+        sample = self._telemetry
+        return bool(sample is not None and sample.in_guided_mode and sample.armed)
+
+    @property
+    def latest_telemetry(self) -> TelemetrySample | None:
+        """The most recent sample, without draining the stream again."""
+        return self._telemetry
 
     def sensor_record(self, timeout_s: float) -> SensorRecord | None:
         """The next sensor record, or None when the stream stays silent for the timeout."""
@@ -2242,8 +2384,34 @@ class WebotsArduPilot:
         )
         return evidence
 
-    def send_local_ned(self, target: LocalNedTarget) -> SetpointPublication:
-        """Publish one guided local-NED setpoint and record that it was published."""
+    def send_local_ned(self, target: LocalNedTarget) -> SetpointPublication | None:
+        """Publish one guided local-NED setpoint, and record that it was published.
+
+        Returns None when the last telemetry did not show the autopilot in Guided
+        flight. A setpoint sent in any other mode is a target nothing is following,
+        so it is not sent: the refusal is recorded with the mode and status that
+        caused it, and the caller reports what the aircraft was actually doing
+        instead of what it was told to do.
+        """
+        if not self.guidance_held:
+            sample = self._telemetry
+            refusal = {
+                "at_monotonic_ns": int(self._monotonic_ns()),
+                "requested_target_ned": list(target.position_ned)
+                if target.position_ned is not None
+                else None,
+                "observed_mode": None if sample is None else sample.mode_name,
+                "observed_armed": None if sample is None else sample.armed,
+                "reason": (
+                    "no telemetry has arrived, so the aircraft's mode is unknown and this "
+                    "adapter does not command blind"
+                    if sample is None
+                    else "the autopilot is not in armed Guided flight"
+                ),
+            }
+            self.refusals.append(refusal)
+            self.evidence.append_jsonl("refused-publications.jsonl", refusal)
+            return None
         motion = MotionTarget(
             position_ned=target.position_ned,
             velocity_ned=target.velocity_ned,
@@ -2419,8 +2587,13 @@ def build_observation(
     metadata["left_ppm"] = left_path
     metadata["right_ppm"] = right_path
     writer.append_jsonl("pairs.jsonl", metadata)
-    host_id = str(controller_status.get("host_id") or "undeclared-controller")
-    clock_id = str(controller_status.get("clock_id") or "undeclared")
+    host_id = controller_status.get("host_id")
+    clock_id = controller_status.get("clock_id")
+    if not host_id or not clock_id:
+        raise FramingError(
+            "the controller did not declare its host and clock, so its capture stamp "
+            "cannot be placed in a clock domain and cannot be compared with the receipt"
+        )
     observation = Observation(
         episode_id=label,
         record_id=f"{label}-obs-{sequence:05d}",
@@ -2429,7 +2602,7 @@ def build_observation(
         ),
         sequence=sequence,
         capture_stamp=ClockStamp(
-            host_id=host_id, clock_id=clock_id, monotonic_ns=int(pair.capture_host_ns)
+            host_id=str(host_id), clock_id=str(clock_id), monotonic_ns=int(pair.capture_host_ns)
         ),
         receipt_stamp=ClockStamp(
             host_id=record.received_stamp.host_id,
@@ -2552,7 +2725,11 @@ class CompatibilityProbe:
         self.output_dir = Path(output_dir)
         self._runner_factory = runner_factory or SubprocessRunner
         self._session_factory = session_factory or PymavlinkSession
-        self._gateway_factory = gateway_factory or TcpSensorGateway
+        # The gateway stamps each arriving record, so it is built with this run's clock
+        # identity rather than inventing one of its own.
+        self._gateway_factory = gateway_factory or (
+            lambda: TcpSensorGateway(stamp=self._stamp)
+        )
         self._monotonic_ns = monotonic_ns
         self._monotonic = monotonic
         self._sleep = sleep
@@ -2560,6 +2737,10 @@ class CompatibilityProbe:
         self._calibration: Any = None
         self._artifacts: list[str] = []
         self._prerequisites: tuple[Prerequisite, ...] = ()
+
+    def _stamp(self) -> ClockStamp:
+        """One reading of this host's monotonic clock, in this run's clock domain."""
+        return self.settings.capture_stamp(int(self._monotonic_ns()))
 
     # -- orchestration -----------------------------------------------------
 
@@ -2723,7 +2904,7 @@ class CompatibilityProbe:
                 "home": self.settings.sitl_home,
                 "argv": [str(part) for part in self.settings.sitl_argv(extra_params)],
                 "parameter_files": [str(name) for name in (*self.settings.params, *extra_params)],
-                "firmware": (adapter._telemetry.autopilot_version if adapter._telemetry else None),
+                "firmware": firmware_identity(adapter.latest_telemetry),
                 "mavlink_messages_logged": adapter.mavlink_message_count,
             },
             "ports": {
@@ -2735,6 +2916,7 @@ class CompatibilityProbe:
             "assets": {
                 "world": str(self.settings.world),
                 "world_sha256": _file_sha256(self.settings.world),
+                "protos": scenario_proto_assets(self.settings.world),
                 "parameter_sha256": {
                     str(name): _file_sha256(name)
                     for name in (*self.settings.params, *extra_params)
@@ -2798,9 +2980,6 @@ class CompatibilityProbe:
             reasons.append("no MAVLink heartbeat arrived")
         if not firmware:
             reasons.append("AUTOPILOT_VERSION did not arrive, so the firmware identity is unknown")
-        import_error = readiness.controller_status.get("embodied_import_error")
-        if import_error:
-            reasons.append(f"the controller could not import the shared framing: {import_error}")
         declared = readiness.controller_status.get("devices") or {}
         expected = {
             "left": self.settings.stereo.left,
@@ -3008,8 +3187,18 @@ class CompatibilityProbe:
         *,
         label: str,
     ) -> None:
-        """Take whatever the sensor stream has waiting, without blocking the flight."""
-        for _ in range(8):
+        """Take whatever the sensor stream has waiting, without blocking the flight.
+
+        The cameras produce a pair and the inertial devices sample far faster than the
+        probe's own cadence, so this drains until the stream is momentarily empty or a
+        short window closes. Reading a fixed number of records instead would leave a
+        backlog that grows for the whole run, and a backlog is stale data by the time
+        it is read.
+        """
+        drain_until = self._monotonic() + SENSOR_DRAIN_WINDOW_S
+        for _ in range(MAX_DRAINED_RECORDS):
+            if self._monotonic() >= drain_until:
+                return
             record = adapter.sensor_record(0.02)
             if record is None:
                 return
@@ -3106,13 +3295,15 @@ class CompatibilityProbe:
             )
             before = self._sample_once(adapter, writer, log, label=label)
             publication = None
+            publications_here = 0
+            refusals_here: list[dict[str, Any]] = []
             hold_until = self._monotonic() + self.settings.hold_per_waypoint_s
             while self._monotonic() < hold_until:
                 self._check_budget()
                 # Keep the stream alive while holding. A guided target has a life of
                 # its own inside the autopilot, so one target per waypoint would hold
                 # nothing; the deadline below is how long this sample stays valid.
-                publication = adapter.send_local_ned(
+                sent = adapter.send_local_ned(
                     LocalNedTarget(
                         position_ned=target,
                         velocity_ned=(0.0, 0.0, 0.0),
@@ -3121,7 +3312,20 @@ class CompatibilityProbe:
                         certificate_ref=None,
                     )
                 )
-                log.publications.append(publication)
+                if sent is None:
+                    # The autopilot stopped flying Guided, so continuing to publish
+                    # would be assuming control it has not granted. The hold ends here
+                    # and what the aircraft did instead is measured below.
+                    refusals_here.append(adapter.refusals[-1])
+                    reasons.append(
+                        f"Guided flight was lost while holding {list(target)}: "
+                        f"{adapter.refusals[-1]['reason']}, observed mode "
+                        f"{adapter.refusals[-1]['observed_mode']!r}"
+                    )
+                    break
+                publication = sent
+                publications_here += 1
+                log.publications.append(sent)
                 self._sample_once(adapter, writer, log, label=label)
                 self._sleep(0.2)
             after = self._sample_once(adapter, writer, log, label=label)
@@ -3132,18 +3336,23 @@ class CompatibilityProbe:
             if start is not None and end is not None:
                 displacement = (end[0] - start[0], end[1] - start[1], end[2] - start[2])
                 residual_m = math.dist(end, target)
+            published = None if publication is None else publication.setpoint
             record = {
                 "waypoint": list(waypoint),
                 "target_ned": list(target),
-                "setpoint_sequence": publication.setpoint.command_sequence,
-                "setpoint_type_mask": publication.setpoint.type_mask,
-                "setpoint_frame": publication.setpoint.frame.value,
-                "published_at_monotonic_ns": publication.published_stamp.monotonic_ns,
-                "deadline_s": publication.setpoint.deadline_s,
+                "setpoint_sequence": None if published is None else published.command_sequence,
+                "setpoint_type_mask": None if published is None else published.type_mask,
+                "setpoint_frame": None if published is None else published.frame.value,
+                "publications": publications_here,
+                "published_at_monotonic_ns": (
+                    None if publication is None else publication.published_stamp.monotonic_ns
+                ),
+                "deadline_s": None if published is None else published.deadline_s,
                 "position_before_ned": list(start) if start is not None else None,
                 "position_after_ned": list(end) if end is not None else None,
                 "displacement_ned": list(displacement) if displacement is not None else None,
                 "tracking_residual_m": residual_m,
+                "refusals": refusals_here,
                 "statustexts": list(after.statustexts[-5:]),
             }
             log.waypoints.append(record)
@@ -3189,6 +3398,8 @@ class CompatibilityProbe:
                 "statustexts": list(flight.statustexts),
                 "waypoints": log.waypoints,
                 "publications": len(log.publications),
+                "refused_publications": len(adapter.refusals),
+                "control_events": [event.document() for event in adapter.control_events],
                 "adoption": "publication is recorded; adoption is judged from the telemetry above",
             },
             reason="; ".join(reasons) if reasons else None,
@@ -3326,6 +3537,13 @@ class CompatibilityProbe:
             "max_pair_interval_s": max(intervals) if intervals else None,
             "stale_after_s": self.settings.stereo_stale_after_s,
             "witness": witness,
+            "controller_stream": (adapter.controller_status or {}).get("stream"),
+            "stamp_semantics": (
+                "capture is the controller's own monotonic reading at the step in which "
+                "both eyes were read, receipt is this process's monotonic reading when the "
+                "bytes arrived, and sim_time_s is that step's simulation time; per-camera "
+                "exposure offsets are not modelled"
+            ),
             "depth_source": None,
             "depth_note": "P00 uses no depth device; stereo depth belongs to P01-C",
         }
@@ -3505,8 +3723,9 @@ class CompatibilityProbe:
             self._sleep(0.2)
         resumed: list[dict[str, Any]] = []
         regained = False
+        resume_refused: dict[str, Any] | None = None
         if target is not None:
-            adapter.send_local_ned(
+            resent = adapter.send_local_ned(
                 LocalNedTarget(
                     position_ned=tuple(target),
                     velocity_ned=(0.0, 0.0, 0.0),
@@ -3515,13 +3734,19 @@ class CompatibilityProbe:
                     certificate_ref=None,
                 )
             )
+            if resent is None:
+                # Publishing again is only safe if the autopilot is again flying the
+                # targets. When it is not, the refusal itself is the observation.
+                resume_refused = adapter.refusals[-1]
             resume_until = self._monotonic() + 2.0
             while self._monotonic() < resume_until:
                 self._check_budget()
                 sample = self._sample_once(adapter, writer, log, label=adapter.label)
                 resumed.append(sample.document())
                 self._sleep(0.2)
-            regained = bool(resumed and resumed[-1]["mode_name"] == "GUIDED" and resumed[-1]["armed"])
+            regained = bool(
+                resumed and resumed[-1]["mode_name"] == "GUIDED" and resumed[-1]["armed"]
+            )
         if len(window_samples) < 2:
             reasons.append(
                 "fewer than two telemetry samples arrived during the stream-loss window, so no "
@@ -3543,6 +3768,8 @@ class CompatibilityProbe:
             "samples_in_window": window_samples,
             "samples_after_resume": resumed,
             "control_regained": regained,
+            "resume_refused": resume_refused,
+            "control_events": [event.document() for event in adapter.control_events],
             "observed_not_designed": (
                 "what the autopilot did during the gap is reported from its own telemetry; this "
                 "run does not claim that any behaviour was safe or intended"
@@ -3673,6 +3900,14 @@ GRAVITY_TOLERANCE = 1.0
 # when the EKF flags change at all.
 EKF_VARIANCE_GROWTH = 1.2
 
+# One pass over the sensor stream reads until it is momentarily empty or this window
+# closes, up to a record count that also bounds the pass when the clock is a fake.
+# The cameras and the inertial devices produce about 110 records a second, and the
+# probe's own cadence is a few samples a second, so a fixed small count per pass
+# would leave a backlog that grows for the whole run.
+SENSOR_DRAIN_WINDOW_S = 0.05
+MAX_DRAINED_RECORDS = 64
+
 
 def imu_gaps(samples: Sequence[ImuPayload]) -> list[float]:
     """Seconds between consecutive inertial samples, on the capture clock."""
@@ -3715,6 +3950,72 @@ def _file_sha256(path: Path) -> str | None:
     except OSError:
         return None
     return digest.hexdigest()
+
+
+def firmware_identity(sample: TelemetrySample | None) -> dict[str, Any] | None:
+    """What the autopilot reported about itself, with its version blobs written as hex.
+
+    AUTOPILOT_VERSION carries the custom firmware version as the eight bytes of the
+    build's git hash and the board's unique id as sixteen. They arrive as byte lists,
+    so they are written as hex: a reader comparing this run with the firmware it was
+    made from should not have to guess the byte order of a list of small integers.
+    """
+    if sample is None or sample.autopilot_version is None:
+        return None
+    reported = dict(sample.autopilot_version)
+    for field in (
+        "flight_custom_version",
+        "middleware_custom_version",
+        "os_custom_version",
+        "uid",
+    ):
+        value = reported.get(field)
+        if isinstance(value, (bytes, bytearray, list)) and value:
+            reported[field] = bytes(value).hex()
+    return reported
+
+
+def scenario_proto_assets(world: Path) -> list[dict[str, Any]]:
+    """Every proto and mesh the world reaches, with its path and hash.
+
+    The scene is copied from a pinned upstream example, so the manifest records what
+    was actually loaded rather than what the configuration intended. The world names
+    its protos with EXTERNPROTO and each proto names its meshes in a url field; both
+    are read out of the files, because an asset that is never hashed is an asset
+    nobody can compare with the revision it came from.
+    """
+    try:
+        world_text = world.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    assets: list[dict[str, Any]] = []
+    for line in world_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("EXTERNPROTO"):
+            continue
+        reference = stripped.split('"')
+        if len(reference) < 2 or _is_remote_reference(reference[1]):
+            continue
+        proto = (world.parent / reference[1]).resolve()
+        assets.append({"role": "proto", "path": str(proto), "sha256": _file_sha256(proto)})
+        try:
+            proto_text = proto.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for reference_field in re.findall(r"url\s*(\[[^\]]*\]|\"[^\"]*\")", proto_text):
+            for name in re.findall(r'"([^"]+)"', reference_field):
+                if _is_remote_reference(name):
+                    continue
+                mesh = (proto.parent / name).resolve()
+                assets.append(
+                    {"role": "mesh", "path": str(mesh), "sha256": _file_sha256(mesh)}
+                )
+    return assets
+
+
+def _is_remote_reference(reference: str) -> bool:
+    """Whether an asset reference would be fetched over the network rather than read."""
+    return reference.startswith(("http://", "https://", "webots://"))
 
 
 def build_compatibility_probe(settings: PlatformSettings, output_dir: Path) -> CompatibilityProbe:
@@ -3847,6 +4148,7 @@ register_command(
         "Start one pinned Webots/ArduPilot candidate, probe sensor, command and failure "
         "behaviour, and retain a receipt with the raw evidence."
     ),
-    stage_id="p00-compat",
+    stage_id="P00",
+    run_prefix="p00-compat",
     add_arguments=_add_compat_arguments,
 )

@@ -8,6 +8,7 @@ under test rather than the simulator's behaviour.
 
 from pathlib import Path
 import json
+import re
 import socket
 import struct
 import subprocess
@@ -16,7 +17,7 @@ import threading
 import time
 
 import pytest
-
+import yaml
 from embodied import cli
 from embodied.contracts import records as R
 from embodied.platform import webots_ardupilot as W
@@ -115,6 +116,11 @@ class FakeGateway:
                 "cameras": {"left": 100, "right": 100},
                 "camera_size": [64, 48],
                 "imu_period_ms": 10,
+                "stream": {
+                    "frames_produced": self.pair_counter,
+                    "frames_dropped": 0,
+                    "reader_connected": True,
+                },
                 "scene": {"witness_colour_rgb": [217, 13, 13], "witness_note": "test panel"},
             },
         )
@@ -219,6 +225,7 @@ class ScriptedMavlinkSession:
         dead_servos=False,
         refuse_guided=False,
         guided_timeout_s=0.6,
+        failsafe_after_setpoints=None,
         boot_jitter_s=0.0,
         gateway_holder=None,
     ):
@@ -228,11 +235,15 @@ class ScriptedMavlinkSession:
         self.dead_servos = dead_servos
         self.refuse_guided = refuse_guided
         self.guided_timeout_s = guided_timeout_s
+        # A count of publications after which the autopilot leaves Guided on its own,
+        # the way a failsafe would: the mode change is the aircraft's, not the test's.
+        self.failsafe_after_setpoints = failsafe_after_setpoints
         self.boot_jitter_s = boot_jitter_s
         self.gateway_holder = gateway_holder if gateway_holder is not None else {}
         self.sent = []
         self.commands = []
         self.intervals = []
+        self.requested_messages = []
         self.closed = False
         self.armed = False
         self.mode = "STABILIZE"
@@ -256,11 +267,19 @@ class ScriptedMavlinkSession:
     def request_message_interval(self, message_id, hz):
         self.intervals.append((message_id, hz))
 
+    def request_message(self, message_id):
+        self.requested_messages.append(message_id)
+
     def send_setpoint(self, setpoint):
         self.sent.append(setpoint)
         self.target = setpoint.target.position_ned
         self.last_setpoint_at = self.clock.monotonic()
         if self.refuse_guided:
+            self.mode = "LOITER"
+        elif (
+            self.failsafe_after_setpoints is not None
+            and len(self.sent) >= self.failsafe_after_setpoints
+        ):
             self.mode = "LOITER"
         else:
             self.mode = "GUIDED"
@@ -647,18 +666,21 @@ def test_inertial_and_json_payloads_round_trip():
 # ---------------------------------------------------------------------------
 
 
-def test_control_packet_scales_pulse_widths_and_passes_unused_channels():
-    fractions = W.unpack_controls(W.pack_controls([1000.0] * 8 + [2000.0] * 7 + [-1]))
-    assert fractions[:8] == (0.0,) * 8
-    assert all(value == pytest.approx(1.0) for value in fractions[8:15])
-    assert fractions[15] == -1.0
+def test_the_control_packet_layout_matches_the_pinned_model():
+    # SIM_Webots_Python.cpp reads sixteen floats, which is 64 bytes with no padding.
+    # SITL fills them with (pulse_width - 1000) / 1000, so the test builds that packet
+    # itself rather than asking the module to encode what the module then decodes.
+    assert W.CONTROL_SIZE == 64
+    packet = struct.pack("f" * 16, 0.0, 0.5, 1.0, *([-1.0] * 13))
+    assert W.unpack_controls(packet) == (0.0, 0.5, 1.0, *([-1.0] * 13))
     with pytest.raises(W.FramingError):
-        W.pack_controls([1000.0] * 15)
-    with pytest.raises(W.FramingError):
-        W.unpack_controls(b"\x00" * 8)
+        W.unpack_controls(packet[:-4])
 
 
-def test_flight_state_round_trips_through_the_pinned_layout():
+def test_the_flight_state_packet_layout_matches_the_pinned_model():
+    # struct fdm_packet: one timestamp, then gyro, acceleration, attitude, velocity and
+    # position, each three doubles. 16 doubles is 128 bytes with no padding.
+    assert W.FDM_SIZE == 128
     state = W.FlightState(
         timestamp_s=3.5,
         gyro_rpy=(0.1, 0.2, 0.3),
@@ -667,11 +689,16 @@ def test_flight_state_round_trips_through_the_pinned_layout():
         velocity_xyz=(4.0, 5.0, 6.0),
         position_xyz=(7.0, 8.0, 9.0),
     )
-    packet = W.pack_fdm(state)
-    assert len(packet) == W.FDM_SIZE == 128
-    assert W.unpack_fdm(packet) == state
-    with pytest.raises(W.FramingError):
-        W.unpack_fdm(packet[:-8])
+    expected = struct.pack(
+        "d" * 16,
+        3.5,
+        0.1, 0.2, 0.3,
+        1.0, 2.0, 3.0,
+        0.4, 0.5, 0.6,
+        4.0, 5.0, 6.0,
+        7.0, 8.0, 9.0,
+    )
+    assert W.pack_fdm(state) == expected
 
 
 def test_enu_to_ned_maps_all_six_signed_axes():
@@ -688,12 +715,12 @@ def test_enu_to_ned_maps_all_six_signed_axes():
 
 
 def test_propeller_thrust_is_linearized_before_it_reaches_the_motor():
-    assert W.motor_command(1.0) == pytest.approx(1.0)
-    assert W.motor_command(0.25) == pytest.approx(0.5)
-    assert W.motor_command(-0.25) == pytest.approx(-0.5)
-    assert W.motor_command(0.25, uses_propellers=False) == pytest.approx(0.25)
-    assert W.motor_command(1.0, velocity_cap=0.5) == pytest.approx(0.5)
-
+    # A propeller's thrust is quadratic in angular velocity, so a quarter of full
+    # throttle is half of the motor's maximum velocity, not a quarter of it.
+    assert W.propeller_velocity(1.0, max_velocity=100.0) == pytest.approx(100.0)
+    assert W.propeller_velocity(0.25, max_velocity=100.0) == pytest.approx(50.0)
+    assert W.propeller_velocity(-0.25, max_velocity=100.0) == pytest.approx(-50.0)
+    assert W.propeller_velocity(0.0, max_velocity=100.0) == pytest.approx(0.0)
 
 # ---------------------------------------------------------------------------
 # Frame measurement and colour
@@ -742,6 +769,13 @@ def test_colour_witness_reports_the_dominant_channel_and_its_location():
 # ---------------------------------------------------------------------------
 
 
+def loopback_stamp():
+    """The receipt stamp the gateway is given here, in one named clock domain."""
+    return W.ClockStamp(
+        host_id="test-host", clock_id="monotonic", monotonic_ns=time.monotonic_ns()
+    )
+
+
 def serve_messages(payloads, port, stop):
     """Send framed messages to one client, then hold the connection open."""
 
@@ -787,7 +821,7 @@ def test_gateway_assembles_a_pair_from_the_wire():
     )
     stop = threading.Event()
     serve_messages([status_message + pair_message], port, stop)
-    gateway = W.TcpSensorGateway()
+    gateway = W.TcpSensorGateway(stamp=loopback_stamp)
     try:
         gateway.open("127.0.0.1", port, 5.0)
         status = gateway.read_record(5.0)
@@ -823,13 +857,130 @@ def test_gateway_returns_nothing_when_a_message_stops_mid_frame():
     )
     stop = threading.Event()
     serve_messages([pair_message[: len(pair_message) // 2]], port, stop)
-    gateway = W.TcpSensorGateway()
+    gateway = W.TcpSensorGateway(stamp=loopback_stamp)
     try:
         gateway.open("127.0.0.1", port, 5.0)
         assert gateway.read_record(0.4) is None
     finally:
         stop.set()
         gateway.close()
+
+
+# ---------------------------------------------------------------------------
+# The controller's outgoing queue
+# ---------------------------------------------------------------------------
+
+
+def test_the_outgoing_queue_drops_whole_frames_and_counts_them():
+    stream = W.OutboundStream(max_queued_bytes=10)
+    assert stream.queue(b"12345") is True
+    assert stream.queue(b"67890") is True
+    assert stream.queue(b"abcde") is False  # over the bound: dropped, not truncated
+    assert stream.dropped_frames == 1
+    assert stream.queued_bytes == 10
+    with pytest.raises(W.FramingError):
+        stream.queue(b"x" * 11)  # a frame that could never fit at all is refused
+
+
+def test_a_frame_already_going_out_is_never_discarded_when_the_reader_pauses():
+    """The failure this exists to prevent: a large frame on a non-blocking socket.
+
+    A camera frame is about 1.8 MB and does not fit in one socket buffer. Truncating
+    the part that has gone out would leave the reader with bytes it cannot
+    resynchronise, so flushing keeps what is left and the reader eventually receives
+    the frame whole.
+    """
+    port = free_port()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
+    server.listen(1)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    accepted, _ = server.accept()
+    accepted.setblocking(False)
+    client.settimeout(5.0)
+    stream = W.OutboundStream(max_queued_bytes=16 << 20)
+    frame = W.pack_message(
+        W.Kind.PAIR, sim_time_s=1.0, sequence=1, payload=b"p" * (8 << 20)
+    )
+    try:
+        assert stream.queue(frame) is True
+        stream.flush(accepted)
+        assert stream.queued_bytes > 0, "the socket took a whole 8 MB frame at once"
+        received = bytearray()
+        while len(received) < len(frame):
+            received += client.recv(1 << 20)
+            stream.flush(accepted)
+        assert bytes(received) == frame
+        assert stream.queued_bytes == 0
+    finally:
+        client.close()
+        accepted.close()
+        server.close()
+
+
+# ---------------------------------------------------------------------------
+# Telemetry and clock joining
+# ---------------------------------------------------------------------------
+
+
+def test_the_boot_clock_is_read_from_whichever_message_carries_it():
+    # AUTOPILOT_VERSION answers once when asked, so a join that depended on it alone
+    # would have almost no samples. The boot clock travels on the streamed messages.
+    messages = [
+        {
+            "mavpackettype": "HEARTBEAT",
+            "custom_mode": 4,
+            "base_mode": 209,
+            "system_status": 4,
+        },
+        {
+            "mavpackettype": "ATTITUDE",
+            "time_boot_ms": 4242,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+        },
+    ]
+    sample = W.decode_telemetry(
+        messages, stamp=W.ClockStamp(host_id="h", clock_id="c", monotonic_ns=1)
+    )
+    assert sample.boot_time_ms == 4242
+    assert sample.autopilot_version is None
+
+
+def test_the_firmware_identity_writes_its_version_blobs_as_hex():
+    messages = [
+        {
+            "mavpackettype": "AUTOPILOT_VERSION",
+            "flight_sw_version": 262144,
+            "flight_custom_version": [1, 2, 3, 4, 5, 6, 7, 8],
+            "uid": [0, 1, 255],
+            "vendor_id": 3,
+        }
+    ]
+    sample = W.decode_telemetry(
+        messages, stamp=W.ClockStamp(host_id="h", clock_id="c", monotonic_ns=1)
+    )
+    identity = W.firmware_identity(sample)
+    assert identity["flight_custom_version"] == "0102030405060708"
+    assert identity["uid"] == "0001ff"
+    assert identity["vendor_id"] == 3
+    assert W.firmware_identity(None) is None
+
+
+def test_the_scene_assets_are_read_from_the_world_and_hashed():
+    assets = W.scenario_proto_assets(SCENE / "worlds" / "compat_stereo.wbt")
+    protos = [asset for asset in assets if asset["role"] == "proto"]
+    meshes = [asset for asset in assets if asset["role"] == "mesh"]
+    assert [Path(asset["path"]).name for asset in protos] == ["Iris.proto"]
+    assert {Path(asset["path"]).name for asset in meshes} == {
+        "iris.dae",
+        "iris_prop_ccw.dae",
+        "iris_prop_cw.dae",
+    }
+    assert all(asset["sha256"] for asset in assets)
+    assert W.scenario_proto_assets(Path("/nonexistent/absent.wbt")) == []
 
 
 # ---------------------------------------------------------------------------
@@ -941,11 +1092,23 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert (tmp_path / "out" / observation_document["right_payload"]).is_file()
 
     # The manifest states what ran, not what it concluded.
-    assert result.manifest["run_a"]["autopilot"]["firmware"]["vendor_id"] == 3
+    firmware = result.manifest["run_a"]["autopilot"]["firmware"]
+    assert firmware["vendor_id"] == 3
+    assert firmware["flight_custom_version"] == "0102030405060708"
     assert result.manifest["run_a"]["webots"]["version"] == "R2025a"
     assert result.manifest["run_a"]["sensors"]["stereo"]["baseline_m"] == 0.1
     assert result.manifest["run_a"]["ports"]["controller_port"] > 0
     assert result.manifest["run_b"]["autopilot"]["parameter_files"][1].endswith("compat_ekf.parm")
+
+    # The scene's own files are named and hashed, so a run can be compared with the
+    # revision of the world and the proto that produced it.
+    protos = result.manifest["run_a"]["assets"]["protos"]
+    assert any(Path(asset["path"]).name == "Iris.proto" for asset in protos)
+    assert len([asset for asset in protos if asset["role"] == "mesh"]) == 3
+    assert all(asset["sha256"] for asset in protos)
+
+    # The firmware identity answers one request, not a stream.
+    assert all(W.MSG_ID_AUTOPILOT_VERSION in session.requested_messages for session in sessions)
 
     # Both runs stopped both children, and recorded their exit codes.
     assert runner.terminated == ["webots", "sitl", "webots", "sitl"]
@@ -1057,6 +1220,39 @@ def test_stream_loss_reports_what_the_telemetry_showed(tmp_path):
     modes = {sample["mode_name"] for sample in loss.evidence["samples_in_window"]}
     assert "LOITER" in modes  # observed in telemetry, not asserted as safe behaviour
     assert "reported from its own telemetry" in loss.evidence["observed_not_designed"]
+    # The autopilot left Guided on its own, so publishing after the gap was refused
+    # with the mode that caused the refusal rather than sent anyway.
+    assert loss.evidence["resume_refused"] is not None
+    assert loss.evidence["resume_refused"]["observed_mode"] == "LOITER"
+
+
+def test_publication_resumes_when_the_autopilot_stays_in_guided(tmp_path):
+    result, _, _, sessions, _ = run_probe(tmp_path, session_kwargs={"guided_timeout_s": 600.0})
+    loss = check(result, "7_setpoint_stream_loss")
+    assert loss.status == "pass"
+    assert loss.evidence["resume_refused"] is None
+    assert loss.evidence["control_regained"] is True
+    # The only recorded changes leave the aircraft under Guided control: taking control
+    # at the start of the run, and nothing that took it away again.
+    assert all(event["guidance_held"] for event in loss.evidence["control_events"])
+    assert any(session.sent for session in sessions)
+
+
+def test_a_mode_change_stops_the_adapter_assuming_control(tmp_path):
+    result, _, _, sessions, _ = run_probe(
+        tmp_path, session_kwargs={"failsafe_after_setpoints": 2}
+    )
+    motion = check(result, "3_guided_local_ned_motion")
+    assert motion.status == "fail"
+    assert "Guided flight was lost" in motion.reason
+    assert motion.evidence["refused_publications"] >= 1
+    events = motion.evidence["control_events"]
+    assert any(event["to_mode"] == "LOITER" and event["guidance_held"] is False for event in events)
+    # Publication stopped at the change: exactly the two setpoints published before the
+    # autopilot left Guided, and nothing afterwards.
+    assert len(sessions[0].sent) == 2
+    loss = check(result, "7_setpoint_stream_loss")
+    assert loss.evidence["resume_refused"] is not None
 
 
 def test_a_step_that_cannot_produce_evidence_still_stops_both_children(tmp_path):
@@ -1203,7 +1399,7 @@ def test_a_passing_probe_is_exit_zero_with_a_pass_gate(tmp_path, monkeypatch):
     receipt = json.loads((output / "receipt.json").read_text())
     assert receipt["status"] == "complete"
     assert receipt["gate_status"] == "pass"
-    assert receipt["stage_id"] == "p00-compat"
+    assert receipt["stage_id"] == "P00"
     assert receipt["receipt_version"] == cli.RECEIPT_VERSION
     assert receipt["config_hash"] and len(receipt["config_hash"]) == 64
     assert receipt["code_revision"]
@@ -1270,6 +1466,77 @@ def test_an_existing_receipt_is_never_overwritten(tmp_path, monkeypatch):
     assert json.loads((output / "receipt.json").read_text()) == {"status": "complete"}
 
 
+def test_configuration_problems_name_the_key_they_came_from(tmp_path):
+    document = yaml.safe_load(write_scene(tmp_path).read_text(encoding="utf-8"))
+    del document["probe"]["budget_wall_clock_s"]
+    missing = tmp_path / "missing.yaml"
+    missing.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(cli.ConfigError) as absent:
+        cli.load_config(missing)
+    assert "probe.budget_wall_clock_s" in str(absent.value)
+
+    document = yaml.safe_load(write_scene(tmp_path).read_text(encoding="utf-8"))
+    document["sensors"]["stereo"]["width"] = "wide"
+    wrong_type = tmp_path / "wrong-type.yaml"
+    wrong_type.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(cli.ConfigError) as typed:
+        cli.load_config(wrong_type)
+    assert "sensors.stereo.width" in str(typed.value)
+
+
+def test_a_settings_value_that_cannot_describe_a_run_is_refused(tmp_path):
+    config_path = write_scene(tmp_path)
+    document = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    document["sensors"]["stereo"]["encoding"] = "gray8"
+    path = tmp_path / "gray.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(cli.ConfigError) as refusal:
+        settings_for(path, tmp_path)
+    assert "rgb8" in str(refusal.value)
+
+
+def test_the_default_output_directory_is_a_fresh_run_directory():
+    first = cli.default_output_directory("p00-compat")
+    second = cli.default_output_directory("p00-compat")
+    assert first != second
+    assert first.parent == cli.repository_root() / "work" / "runs"
+    assert re.fullmatch(r"p00-compat-\d{8}T\d{6}Z-[0-9a-f]{4}", first.name)
+
+
+def test_a_receipt_is_written_for_every_status(tmp_path):
+    spec = cli.CommandSpec(
+        name="compat",
+        help_text="a registered command",
+        stage_id="P00",
+        run_prefix="p00-compat",
+        handler=lambda args, output: None,
+        add_arguments=None,
+    )
+    for status in cli.CommandStatus:
+        output = tmp_path / status.value
+        cli.write_artifacts(
+            output,
+            cli.CommandOutcome(
+                status=status,
+                gate_status=cli.GateStatus.NOT_APPLICABLE,
+                sensor_mode=R.SensorMode.SIMULATOR_INTERFACE,
+            ),
+            spec=spec,
+            argv=["python", "-m", "embodied", "compat"],
+            config_hash_value=None,
+            started_monotonic_s=1.0,
+            started_at_utc="2026-01-01T00:00:00+00:00",
+        )
+        receipt = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+        assert receipt["status"] == status.value
+        assert receipt["gate_status"] == "not_applicable"
+        # P00 flies no physical episode and runs no paired trial, whatever the status.
+        assert receipt["episode_id"] is None
+        assert receipt["trial_group_id"] is None
+        assert receipt["sensor_mode"] == "simulator-interface"
+        assert [entry["path"] for entry in receipt["artifacts"]] == ["manifest.json"]
+
+
 def test_usage_problems_and_the_pending_status_map_to_the_declared_codes(capsys):
     assert cli.main([]) == 1
     assert cli.main(["compat", "--nonsense"]) == 1
@@ -1292,6 +1559,10 @@ def test_usage_problems_and_the_pending_status_map_to_the_declared_codes(capsys)
 def test_registering_the_same_command_twice_is_refused():
     with pytest.raises(cli.CommandError):
         cli.register_command(
-            "compat", lambda settings, output: None, help_text="duplicate", stage_id="P00"
+            "compat",
+            lambda settings, output: None,
+            help_text="duplicate",
+            stage_id="P00",
+            run_prefix="p00-compat",
         )
     assert "compat" in cli.COMMAND_REGISTRY

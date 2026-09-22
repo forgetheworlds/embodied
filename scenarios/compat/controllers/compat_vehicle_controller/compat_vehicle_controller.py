@@ -84,7 +84,6 @@ def parse_args():
     parser.add_argument("--inertial-unit", default="inertial unit")
     parser.add_argument("--gps", default="gps")
     parser.add_argument("--imu-period-ms", type=int, default=10)
-    parser.add_argument("--motor-velocity-cap", type=float, default=float("inf"))
     parser.add_argument("--status-interval", type=int, default=500)
     args = parser.parse_args()
     args.motors = [name.strip() for name in args.motors.split(",") if name.strip()]
@@ -140,7 +139,10 @@ class ObservationChannel:
 
     Records are dropped while nobody is connected rather than queued without bound:
     the platform probe is the only reader, and a queue that grew while it was absent
-    would be a memory leak with a flight attached.
+    would be a memory leak with a flight attached. Once a reader is connected the
+    camera frames are large enough that the reader can fall behind, so the queue has
+    a bound and a drop count rather than a blocking write: blocking would stop the
+    simulation, and an unbounded queue would turn a slow reader into a stale stream.
     """
 
     def __init__(self, port):
@@ -151,6 +153,7 @@ class ObservationChannel:
         self.server.setblocking(False)
         self.client = None
         self.buffer = bytearray()
+        self.outgoing = SHARED.OutboundStream()
         self.sequence = 0
         self.status_sent = False
 
@@ -161,19 +164,40 @@ class ObservationChannel:
                 client, _ = self.server.accept()
                 client.setblocking(False)
                 self.client = client
+                self.outgoing.reset()
                 print("Controller: analysis process connected", flush=True)
         return self.client is not None
 
     def send(self, kind, sim_time_s, payload):
+        """Frame one message and queue it, dropping it when the reader is behind."""
         if self.client is None:
             return
         self.sequence += 1
         framed = SHARED.pack_message(
             kind, sim_time_s=sim_time_s, sequence=self.sequence, payload=payload
         )
+        if not self.outgoing.queue(framed):
+            return
+        self._flush()
+
+    def describe(self):
+        """What this channel has done, for the status the probe records."""
+        return {
+            "frames_produced": self.sequence,
+            "frames_dropped": self.outgoing.dropped_frames,
+            "queued_bytes": self.outgoing.queued_bytes,
+            "max_queued_bytes": self.outgoing.max_queued_bytes,
+            "reader_connected": self.client is not None,
+        }
+
+    def _flush(self):
+        """Write what the socket will take, and stop the stream if it has failed."""
         try:
-            self.client.sendall(framed)
-        except OSError:
+            self.outgoing.flush(self.client)
+        except OSError as error:
+            print(f"Controller: the analysis connection failed: {error}", flush=True)
+            self.outgoing.reset()
+            self.client.close()
             self.client = None
 
     def poll_commands(self):
@@ -187,6 +211,8 @@ class ObservationChannel:
                 return commands
             try:
                 chunk = self.client.recv(1 << 16)
+            except (BlockingIOError, InterruptedError):
+                return commands
             except OSError:
                 self.client = None
                 return commands
@@ -240,8 +266,12 @@ class Injections:
         return {"applied": False, "state": {}, "reason": f"unknown fault {kind!r}"}
 
 
-def status_document(args, devices, robot):
-    """What the controller reports about itself before any measurement is judged."""
+def status_document(args, devices, robot, channel):
+    """What the controller reports about itself before any measurement is judged.
+
+    The stream counters are here because a reader that falls behind is a fact about
+    the run: a dropped frame is reported rather than silently missing.
+    """
     scene = {}
     raw_custom_data = robot.getCustomData()
     if raw_custom_data:
@@ -276,8 +306,15 @@ def status_document(args, devices, robot):
         "camera_size": list(devices.camera_size()),
         "imu_period_ms": args.imu_period_ms,
         "scene": scene,
+        "stream": channel.describe(),
         "injection_state": {},
     }
+
+
+def send_status(channel, status, sim_time_s):
+    """Refresh the stream counters and send the status to the analysis process."""
+    status["stream"] = channel.describe()
+    channel.send(SHARED.Kind.STATUS, sim_time_s, SHARED.encode_status_payload(status))
 
 
 def main():
@@ -287,7 +324,7 @@ def main():
     link = SitlLink(args.sitl_address, args.sitl_port)
     channel = ObservationChannel(args.controller_port)
     injections = Injections()
-    status = status_document(args, devices, robot)
+    status = status_document(args, devices, robot, channel)
 
     print(f"Controller: interpreter {sys.executable}", flush=True)
     print(f"Controller: shared framing from {SHARED.__file__}", flush=True)
@@ -340,9 +377,7 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
         elapsed_ms = int(devices.simulator_time_s() * 1000.0)
 
         if channel.accept() and not channel.status_sent:
-            channel.send(
-                SHARED.Kind.STATUS, devices.simulator_time_s(), SHARED.encode_status_payload(status)
-            )
+            send_status(channel, status, devices.simulator_time_s())
             channel.status_sent = True
 
         state = devices.read_flight_state(SHARED.enu_to_ned)
@@ -363,9 +398,7 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
         incoming = link.receive_controls()
         if incoming is not None:
             controls = incoming
-        devices.set_motor_commands(
-            SHARED.unpack_controls(controls), velocity_cap=args.motor_velocity_cap
-        )
+        devices.set_motor_commands(SHARED.unpack_controls(controls))
 
         if elapsed_ms >= next_camera_ms:
             next_camera_ms = elapsed_ms + camera_period_ms
@@ -428,9 +461,7 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
             )
 
         if channel.sequence and channel.sequence % args.status_interval == 0:
-            channel.send(
-                SHARED.Kind.STATUS, devices.simulator_time_s(), SHARED.encode_status_payload(status)
-            )
+            send_status(channel, status, devices.simulator_time_s())
 
 
 if __name__ == "__main__":
