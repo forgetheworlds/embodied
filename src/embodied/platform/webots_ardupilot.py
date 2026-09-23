@@ -3654,10 +3654,15 @@ class CompatibilityProbe:
                 "spread_ms": simulator_join.spread_ms,
                 "joined": simulator_join.joined,
                 "reason": simulator_join.reason,
+                "device_clock": "Webots simulation time carried on each sensor record",
                 "note": (
-                    "recorded, not required: this spread reflects real scheduling jitter in "
-                    "the simulator process, and a loose fit here does not hide a record whose "
-                    "capture and receipt stamps are in one clock domain"
+                    "recorded, not required, and read together with host_to_autopilot: the "
+                    "autopilot's boot clock advances with *simulated* time — the "
+                    "flight-state packet carries that time and ArduPilot's clock follows "
+                    "it — so both joins describe the same clock by different routes. A wide "
+                    "spread here is the simulator advancing in bursts rather than in step "
+                    "with the host clock, which is a measurement about the simulator and "
+                    "not a record whose capture and receipt stamps are in different domains"
                 ),
             },
             "cross_domain_rule": (
