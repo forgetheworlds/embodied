@@ -689,6 +689,8 @@ class PlatformSettings:
     waypoints_local_ned: tuple[tuple[float, float, float], ...]
     hold_per_waypoint_s: float
     stream_loss_window_s: float
+    settle_s: float
+    at_rest_window_s: float
     estimator_fault: EstimatorFault
     timebase_samples: int
     timebase_spread_limit_ms: float
@@ -812,6 +814,8 @@ class PlatformSettings:
             ),
             hold_per_waypoint_s=float(probe["hold_per_waypoint_s"]),
             stream_loss_window_s=float(probe["stream_loss_window_s"]),
+            settle_s=float(probe["settle_s"]),
+            at_rest_window_s=float(probe["at_rest_window_s"]),
             estimator_fault=EstimatorFault(
                 kind=fault["kind"],
                 magnitude_m=float(fault["magnitude_m"]),
@@ -856,6 +860,10 @@ class PlatformSettings:
             )
         if self.hover_altitude_m <= 0.0:
             raise ConfigError("probe.hover_altitude_m must be positive")
+        if self.settle_s <= 0.0:
+            raise ConfigError("probe.settle_s must be positive: the scene needs time to settle")
+        if self.at_rest_window_s <= 0.0:
+            raise ConfigError("probe.at_rest_window_s must be positive")
         if not self.waypoints_local_ned:
             raise ConfigError("probe.waypoints_local_ned must name at least one waypoint")
         if self.timebase_samples < 2:
@@ -882,7 +890,11 @@ class PlatformSettings:
         """The exact SITL command line for the pinned vehicle and ports.
 
         Parameter files are layered in order, so a second run that adds an
-        EKF-active set keeps every pinned value it does not name.
+        EKF-active set keeps every pinned value it does not name. ``--wipe`` makes each
+        run start from those files: SITL keeps its parameters in an ``eeprom.bin`` in
+        the autopilot checkout and rewrites it as it runs, so without the wipe run B
+        would begin from whatever run A had saved and neither receipt would describe
+        the configuration it claims to.
         """
         argv = [
             str(self.sitl_binary),
@@ -894,6 +906,7 @@ class PlatformSettings:
             str(self.sim_port_in),
             "--sim-port-out",
             str(self.sim_port_out),
+            "--wipe",
             "--home",
             self.sitl_home,
         ]
@@ -1220,6 +1233,19 @@ class TelemetrySample:
         }
 
 
+def _triple(message: dict[str, Any], *fields: str) -> tuple[float, float, float] | None:
+    """Three related numbers from one message, or None when the message omits any.
+
+    A vector with a missing component is not a measurement: carrying it forward as
+    ``(x, y, None)`` would put a hole in the middle of a record every later reader
+    treats as a number.
+    """
+    values = tuple(message.get(field) for field in fields)
+    if any(value is None for value in values):
+        return None
+    return (float(values[0]), float(values[1]), float(values[2]))
+
+
 def decode_telemetry(
     messages: Iterable[dict[str, Any]],
     *,
@@ -1288,22 +1314,10 @@ def decode_telemetry(
             latest["armed"] = None if base_mode is None else bool(base_mode & 128)
             latest["system_status"] = message.get("system_status")
         elif kind == "ATTITUDE":
-            latest["attitude_rpy"] = (
-                message.get("roll"),
-                message.get("pitch"),
-                message.get("yaw"),
-            )
+            latest["attitude_rpy"] = _triple(message, "roll", "pitch", "yaw")
         elif kind == "LOCAL_POSITION_NED":
-            latest["local_position_ned"] = (
-                message.get("x"),
-                message.get("y"),
-                message.get("z"),
-            )
-            latest["velocity_ned"] = (
-                message.get("vx"),
-                message.get("vy"),
-                message.get("vz"),
-            )
+            latest["local_position_ned"] = _triple(message, "x", "y", "z")
+            latest["velocity_ned"] = _triple(message, "vx", "vy", "vz")
         elif kind == "SERVO_OUTPUT_RAW":
             latest["servo_outputs"] = tuple(
                 UNKNOWN_SERVO_RAW if message.get(f"servo{index}_raw") is None
@@ -1423,6 +1437,15 @@ def join_timebase(samples: Sequence[tuple[float, float]], spread_limit_ms: float
         joined=joined,
         reason=reason,
     )
+
+
+# The autopilot's own view of itself, from MAV_STATE: it reports BOOT while it
+# initialises, STANDBY when it is landed and ready for commands, ACTIVE while flying,
+# and CRITICAL after a failsafe. Only the middle two mean "this vehicle can be given
+# a target", which is what readiness has to establish before any item measures it.
+MAV_STATE_STANDBY = 4
+MAV_STATE_ACTIVE = 5
+READY_SYSTEM_STATUSES = (MAV_STATE_STANDBY, MAV_STATE_ACTIVE)
 
 
 # The MAVLink identifiers this adapter uses, named so the code reads as intent
@@ -2076,6 +2099,43 @@ def mask_for_target(target: MotionTarget) -> int:
     return mask
 
 
+# How long an arming and mode request is given before the autopilot's answer is read.
+# The autopilot needs a moment, and it reports its pre-arm checks continuously, so the
+# grace is measured from the attempt rather than from the first refusal text. After it,
+# a vehicle that has not reached armed Guided flight has answered the request: either
+# its mode is not Guided or its pre-arm checks refuse, and polling it for the whole
+# flight timeout produces no more evidence than that first answer did.
+CONTROL_GRANT_GRACE_S = 3.0
+
+# How long to let an arming request be answered before reading the result. The
+# autopilot needs a moment, and the sensor stream is read throughout the wait.
+ARM_SETTLE_S = 1.0
+
+def autopilot_is_ready(sample: TelemetrySample) -> bool:
+    """Whether the autopilot has finished booting and is streaming its own clock.
+
+    A heartbeat arrives while the vehicle is still initialising, so status and a
+    streamed message carrying the boot clock are what show it is up. The boot clock is
+    the cheapest proof that its telemetry loop is running, which is what every later
+    item reads.
+    """
+    return (
+        sample.heartbeats > 0
+        and sample.system_status in READY_SYSTEM_STATUSES
+        and sample.boot_time_ms is not None
+    )
+
+
+def autopilot_state_summary(sample: TelemetrySample) -> str:
+    """Why the autopilot is not ready yet, in the words the receipt can carry."""
+    return (
+        f"system_status={sample.system_status} "
+        f"(ready states {list(READY_SYSTEM_STATUSES)}), "
+        f"mode={sample.mode_name!r}, boot_time_ms={sample.boot_time_ms}, "
+        f"heartbeats={sample.heartbeats}"
+    )
+
+
 class WebotsArduPilot:
     """One Webots/ArduPilot candidate vehicle, as a single object with a small surface.
 
@@ -2165,13 +2225,16 @@ class WebotsArduPilot:
             argv={"webots": simulator.argv, "sitl": sitl.argv},
             webots_version=self.settings.webots_version,
         )
-    def wait_ready(self, timeout_s: float) -> ReadinessEvidence:
-        """Wait until the controller is streaming and the autopilot is answering.
 
-        Readiness is three separate facts: the controller declared its status, a
-        heartbeat arrived, and the sensor stream is producing records. A process
-        that is alive but silent is not ready, and a heartbeat alone does not mean
-        the camera or the inertial devices are advancing.
+    def wait_ready(self, timeout_s: float) -> ReadinessEvidence:
+        """Wait until the simulator is streaming and the autopilot can be commanded.
+
+        Readiness is four separate facts: the controller declared its status, the
+        sensor stream produced a pair and an inertial sample, and the autopilot has
+        finished booting. ArduPilot answers a heartbeat seconds before it can be given
+        a target — it is still in MAV_STATE_BOOT, its telemetry loop is not streaming
+        and it cannot arm — and every later item reads that telemetry, so waiting for
+        the vehicle rather than for a pulse is what keeps those items meaningful.
         """
         started = self._monotonic()
         deadline = started + timeout_s
@@ -2195,7 +2258,12 @@ class WebotsArduPilot:
                     imu_seen = True
                     parked.append(record)
             sample = self.telemetry()
-            if status_seen and pair_seen and imu_seen and sample.heartbeats > 0:
+            if (
+                status_seen
+                and pair_seen
+                and imu_seen
+                and autopilot_is_ready(sample)
+            ):
                 self._pending_records = parked + self._pending_records
                 return ReadinessEvidence(
                     controller_status=self.controller_status,
@@ -2209,7 +2277,7 @@ class WebotsArduPilot:
             f"the simulator did not become ready within {timeout_s:.0f}s: "
             f"status={'yes' if status_seen else 'no'}, "
             f"pair={'yes' if pair_seen else 'no'}, imu={'yes' if imu_seen else 'no'}, "
-            f"heartbeats={self.telemetry().heartbeats}"
+            f"autopilot={autopilot_state_summary(self.telemetry())}"
         )
 
     def _die_if_child_exited(self) -> None:
@@ -2297,46 +2365,25 @@ class WebotsArduPilot:
             self.controller_status = record.status
         return record
 
-    def calibrate_timebase(self, samples: int) -> TimebaseJoin:
-        """Measure the relation between this host's clock and the autopilot's boot clock.
-
-        The device clock is read from telemetry (``time_boot_ms``); the host clock is
-        read at receipt. Nothing here assumes the two are the same clock, and the
-        residual spread decides whether they can be used together at all.
-        """
-        pairs: list[tuple[float, float]] = []
-        deadline = self._monotonic() + self.settings.step_timeout_s.ready
-        while len(pairs) < samples and self._monotonic() < deadline:
-            sample = self.telemetry()
-            if sample.boot_time_ms is not None:
-                pairs.append(
-                    (sample.received_stamp.monotonic_ns / 1e9, sample.boot_time_ms / 1000.0)
-                )
-            self._sleep(0.02)
-        join = join_timebase(pairs, self.settings.timebase_spread_limit_ms)
-        self.evidence.write_json(
-            "timebase.json",
-            {
-                "samples": join.samples,
-                "offset_s": join.offset_s,
-                "drift_ppm": join.drift_ppm,
-                "spread_ms": join.spread_ms,
-                "joined": join.joined,
-                "reason": join.reason,
-                "host_id": self.settings.host_id,
-                "clock_id": self.settings.clock_id,
-                "autopilot_clock": "time_boot_ms from the autopilot's own boot",
-            },
-        )
-        return join
 
     # -- command -----------------------------------------------------------
 
-    def arm_and_guided(self, timeout_s: float) -> FlightStateEvidence:
+
+    def arm_and_guided(
+        self, timeout_s: float, *, drain: Callable[[], None] | None = None
+    ) -> FlightStateEvidence:
         """Request Guided mode, arm, and take off to the configured altitude.
 
         A refusal is evidence: the mode and the arming state are read back from
-        telemetry, and any STATUSTEXT the autopilot gave is retained with them.
+        telemetry, and any STATUSTEXT the autopilot gave is retained with them. A
+        vehicle that refuses to arm will keep refusing for the whole window, so the
+        first refusal after the attempt is what ends the wait; polling a check that has
+        already failed for two minutes produces no further evidence.
+
+        ``drain`` is the caller's loop over the sensor stream. This wait is measured in
+        seconds, and the cameras and inertial devices keep producing throughout it, so
+        without it the controller's queue fills and frames are dropped before anything
+        reads them.
         """
         for message_id, hz in (
             (MSG_ID_ATTITUDE, 20.0),
@@ -2345,9 +2392,17 @@ class WebotsArduPilot:
             (MSG_ID_EKF_STATUS_REPORT, 2.0),
         ):
             self._session.request_message_interval(message_id, hz)
+        attempt_at = self._monotonic()
         self._session.set_mode("GUIDED")
         self._session.arm()
-        self._sleep(1.0)
+        # Give the autopilot a moment to answer the arming request, reading the sensor
+        # stream while it does: this wait is a second of frames the controller would
+        # otherwise queue and then drop.
+        settle_until = attempt_at + ARM_SETTLE_S
+        while self._monotonic() < settle_until:
+            if drain is not None:
+                drain()
+            self._sleep(0.1)
         sample = self.telemetry()
         if sample.armed:
             self._session.takeoff(self.settings.hover_altitude_m)
@@ -2358,8 +2413,19 @@ class WebotsArduPilot:
             position = sample.local_position_ned
             if position is not None:
                 altitude = -position[2]
-                if sample.in_guided_mode and sample.armed and altitude >= 0.5 * self.settings.hover_altitude_m:
+                if (
+                    sample.in_guided_mode
+                    and sample.armed
+                    and altitude >= 0.5 * self.settings.hover_altitude_m
+                ):
                     break
+            if (
+                self._monotonic() - attempt_at >= CONTROL_GRANT_GRACE_S
+                and not (sample.in_guided_mode and sample.armed)
+            ):
+                break
+            if drain is not None:
+                drain()
             self._sleep(0.2)
         evidence = FlightStateEvidence(
             commanded_mode="GUIDED",
@@ -2695,9 +2761,24 @@ class _FlightLog:
         self.pair_metadata: list[dict[str, Any]] = []
         self.observations: list[Observation] = []
         self.imu: list[ImuPayload] = []
+        self.at_rest_sim_times: list[float] = []
         self.waypoints: list[dict[str, Any]] = []
         self.sim_time_pairs: list[tuple[float, float]] = []
         self.servo_table: list[tuple[int, ...]] = []
+
+
+def window_reached(
+    sim_times: Sequence[float], start_sim_time: float | None, window_s: float
+) -> bool:
+    """Whether a measurement window measured in simulation time has run its course.
+
+    Simulation time arrives as a float, so a window that ends exactly on a sampling
+    boundary can miss it by a rounding step. Without the tolerance the window would
+    never close and the probe would sit there until its wall-clock ceiling.
+    """
+    if start_sim_time is None or not sim_times:
+        return False
+    return sim_times[-1] - start_sim_time >= window_s - TIME_COMPARISON_TOLERANCE_S
 
 
 class CompatibilityProbe:
@@ -2831,13 +2912,13 @@ class CompatibilityProbe:
                 return tuple(checks), manifest, tuple(notes)
 
             log = _FlightLog()
-            at_rest_imu = self._collect_imu(adapter, writer, log, seconds=2.0)
-            checks.append(self._item_frames_and_timebases(adapter, writer, log))
+            at_rest_imu, pre_settle = self._collect_imu(adapter, writer, log, label=label)
+            checks.append(self._item_frames_and_timebases(adapter, writer, log, label=label))
             motion_check = self._item_guided_motion(adapter, writer, log)
             checks.append(motion_check)
             checks.append(self._item_actuator_mapping(adapter, writer, log))
             checks.append(self._item_stereo_pairs(adapter, writer, log, label=label))
-            checks.append(self._item_imu_stream(adapter, writer, at_rest_imu, log))
+            checks.append(self._item_imu_stream(adapter, writer, at_rest_imu, pre_settle, log))
             checks.append(self._item_stream_loss(adapter, writer, log))
             if estimator_run:
                 checks.append(self._item_estimator_health(adapter, writer))
@@ -3004,15 +3085,54 @@ class CompatibilityProbe:
 
     # -- checklist item 2 --------------------------------------------------
 
+    def _sample_autopilot_clock(
+        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+    ) -> list[tuple[float, float]]:
+        """Pair host receipt times with the autopilot's own clock, once per message batch.
+
+        The sensor stream is read on every pass as well. The cameras and the inertial
+        devices produce about ten times as fast as this loop samples the autopilot, so a
+        loop that ignored the stream would fill the controller's queue and its frames
+        would be dropped before any of them reached the stereo evidence.
+        """
+        pairs: list[tuple[float, float]] = []
+        deadline = self._monotonic() + self.settings.step_timeout_s.ready
+        while len(pairs) < self.settings.timebase_samples and self._monotonic() < deadline:
+            self._check_budget()
+            sample = adapter.telemetry()
+            if sample.boot_time_ms is not None:
+                pairs.append(
+                    (sample.received_stamp.monotonic_ns / 1e9, sample.boot_time_ms / 1000.0)
+                )
+            self._read_records(adapter, writer, log, label=label)
+            self._sleep(0.02)
+        return pairs
+
     def _item_frames_and_timebases(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog
+        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
     ) -> ProbeCheck:
-        join = adapter.calibrate_timebase(self.settings.timebase_samples)
+        pairs = self._sample_autopilot_clock(adapter, writer, log, label=label)
+        join = join_timebase(pairs, self.settings.timebase_spread_limit_ms)
         # A second, separate comparison: the host clock against the simulator's own
         # clock. Simulated physics may run faster, slower or stop, so the two are
         # related by measurement and never assumed equal.
         simulator_join = join_timebase(
             log.sim_time_pairs, spread_limit_ms=self.settings.timebase_spread_limit_ms
+        )
+        self._record_artifacts(
+            self._write_json(
+                f"{label}/timebase.json",
+                {
+                    "samples": join.samples,
+                    "offset_s": join.offset_s,
+                    "drift_ppm": join.drift_ppm,
+                    "spread_ms": join.spread_ms,
+                    "joined": join.joined,
+                    "reason": join.reason,
+                    "device_clock": "telemetry time_boot_ms",
+                    "host_clock": f"{self.settings.host_id}/{self.settings.clock_id}",
+                },
+            )
         )
         world_zero = self._world_zero_point()
         document = {
@@ -3141,109 +3261,136 @@ class CompatibilityProbe:
                     found.append({"file": path.name, "line": stripped})
         return found
 
+
+
+
     def _collect_imu(
         self,
         adapter: WebotsArduPilot,
         writer: EvidenceWriter,
         log: _FlightLog,
         *,
-        seconds: float,
-    ) -> list[ImuPayload]:
-        """Collect inertial samples for a bounded window, and record them."""
-        samples: list[ImuPayload] = []
-        deadline = self._monotonic() + seconds
+        label: str,
+    ) -> tuple[list[ImuPayload], int]:
+        """Measure the inertial devices at rest, once the scene has settled.
+
+        The window is measured in simulation time, because that is the time the scene
+        settles in: a freshly loaded airframe is pushed out of the floor and its
+        accelerometer converges over about a second of simulated time, so a window
+        measured on the wall clock would average the transient into the measurement.
+        Samples before the settle time are counted and left out, and the raw material
+        keeps them, tagged with the window they arrived in.
+        """
+        settled: list[ImuPayload] = []
+        pre_settle = 0
+        window_start_sim = None
+        deadline = self._monotonic() + AT_REST_WALL_CLOCK_LIMIT_S
         while self._monotonic() < deadline:
             self._check_budget()
-            record = adapter.sensor_record(0.1)
-            if record is not None and record.sim_time_s >= 0.0:
+            for record in self._read_records(adapter, writer, log, label=label):
+                if record.imu is None:
+                    continue
+                settle_time = self.settings.settle_s
+                if record.sim_time_s < settle_time:
+                    pre_settle += 1
+                    self._write_imu_sample(writer, "settling", record)
+                    continue
+                if window_start_sim is None:
+                    window_start_sim = record.sim_time_s
+                settled.append(record.imu)
+                self._write_imu_sample(writer, "at_rest", record)
+                log.at_rest_sim_times.append(record.sim_time_s)
+            if window_reached(
+                log.at_rest_sim_times, window_start_sim, self.settings.at_rest_window_s
+            ):
+                return settled, pre_settle
+            self._sleep(0.02)
+        return settled, pre_settle
+
+    def _read_records(
+        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+    ) -> list[SensorRecord]:
+        """Take whatever the sensor stream has waiting, and file each record.
+
+        The cameras and the inertial devices produce about 110 records a second while
+        the probe's own cadence is a few samples a second, so this drains until the
+        stream is momentarily empty or a short window closes. Reading a fixed small
+        number instead would leave a backlog that grows for the whole run, and the
+        controller drops frames when that backlog reaches its bound.
+        """
+        drained: list[SensorRecord] = []
+        drain_until = self._monotonic() + SENSOR_DRAIN_WINDOW_S
+        for _ in range(MAX_DRAINED_RECORDS):
+            if self._monotonic() >= drain_until:
+                return drained
+            record = adapter.sensor_record(0.02)
+            if record is None:
+                return drained
+            drained.append(record)
+            if record.sim_time_s >= 0.0:
                 log.sim_time_pairs.append(
                     (record.received_stamp.monotonic_ns / 1e9, record.sim_time_s)
                 )
-            if record is not None and record.imu is not None:
-                samples.append(record.imu)
-                writer.append_jsonl(
-                    "imu.jsonl",
-                    {
-                        "phase": "at_rest",
-                        "sim_time_s": record.sim_time_s,
-                        "capture_monotonic_ns": record.imu.capture_host_ns,
-                        "receipt_monotonic_ns": record.received_stamp.monotonic_ns,
-                        "accelerometer": list(record.imu.accelerometer),
-                        "gyro": list(record.imu.gyro),
-                        "inertial_unit_rpy": list(record.imu.inertial_unit_rpy),
-                        "device_names": list(record.imu.device_names),
-                        "units": record.imu.units,
-                    },
+            if record.pair is not None:
+                self._file_pair(
+                    record, writer, log, label=label, controller_status=adapter.controller_status
                 )
-                self._record_artifacts(str((writer.directory / "imu.jsonl").relative_to(self.output_dir)))
-            self._sleep(0.05)
-        return samples
+            elif record.imu is not None:
+                log.imu.append(record.imu)
+                self._write_imu_sample(writer, "flight", record)
+        return drained
 
-    def _drain_sensors(
+    def _file_pair(
         self,
-        adapter: WebotsArduPilot,
+        record: SensorRecord,
         writer: EvidenceWriter,
         log: _FlightLog,
         *,
         label: str,
+        controller_status: dict[str, Any],
     ) -> None:
-        """Take whatever the sensor stream has waiting, without blocking the flight.
+        """Turn one arriving pair into an observation, or record why it could not be."""
+        sequence = len(log.pair_metadata) + 1
+        store = len(log.observations) < PAIRS_STORED_PER_RUN
+        try:
+            description = build_observation(
+                record,
+                settings=self.settings,
+                calibration=self._calibration,
+                label=label,
+                sequence=sequence,
+                controller_status=controller_status,
+                writer=writer,
+                store_payload=store,
+            )
+        except RecordError as error:
+            log.pair_metadata.append({"sequence": sequence, "record_error": str(error)})
+            return
+        log.pair_metadata.append(description.metadata)
+        if description.observation is not None:
+            log.observations.append(description.observation)
 
-        The cameras produce a pair and the inertial devices sample far faster than the
-        probe's own cadence, so this drains until the stream is momentarily empty or a
-        short window closes. Reading a fixed number of records instead would leave a
-        backlog that grows for the whole run, and a backlog is stale data by the time
-        it is read.
-        """
-        drain_until = self._monotonic() + SENSOR_DRAIN_WINDOW_S
-        for _ in range(MAX_DRAINED_RECORDS):
-            if self._monotonic() >= drain_until:
-                return
-            record = adapter.sensor_record(0.02)
-            if record is None:
-                return
-            if record.pair is not None:
-                sequence = len(log.pair_metadata) + 1
-                store = len(log.observations) < PAIRS_STORED_PER_RUN
-                try:
-                    description = build_observation(
-                        record,
-                        settings=self.settings,
-                        calibration=self._calibration,
-                        label=label,
-                        sequence=sequence,
-                        controller_status=adapter.controller_status,
-                        writer=writer,
-                        store_payload=store,
-                    )
-                except RecordError as error:
-                    log.pair_metadata.append(
-                        {"sequence": sequence, "record_error": str(error)}
-                    )
-                    continue
-                log.pair_metadata.append(description.metadata)
-                if description.observation is not None:
-                    log.observations.append(description.observation)
-                if record.sim_time_s >= 0.0:
-                    log.sim_time_pairs.append(
-                        (record.received_stamp.monotonic_ns / 1e9, record.sim_time_s)
-                    )
-            elif record.imu is not None:
-                log.imu.append(record.imu)
-                writer.append_jsonl(
-                    "imu.jsonl",
-                    {
-                        "phase": "flight",
-                        "sim_time_s": record.sim_time_s,
-                        "capture_monotonic_ns": record.imu.capture_host_ns,
-                        "receipt_monotonic_ns": record.received_stamp.monotonic_ns,
-                        "accelerometer": list(record.imu.accelerometer),
-                        "gyro": list(record.imu.gyro),
-                        "inertial_unit_rpy": list(record.imu.inertial_unit_rpy),
-                        "device_names": list(record.imu.device_names),
-                        "units": record.imu.units,
-                    },
-                )
+    def _write_imu_sample(self, writer: EvidenceWriter, phase: str, record: SensorRecord) -> None:
+        """One inertial sample, tagged with the window it arrived in."""
+        sample = record.imu
+        assert sample is not None
+        writer.append_jsonl(
+            "imu.jsonl",
+            {
+                "phase": phase,
+                "sim_time_s": record.sim_time_s,
+                "capture_monotonic_ns": sample.capture_host_ns,
+                "receipt_monotonic_ns": record.received_stamp.monotonic_ns,
+                "accelerometer": list(sample.accelerometer),
+                "gyro": list(sample.gyro),
+                "inertial_unit_rpy": list(sample.inertial_unit_rpy),
+                "device_names": list(sample.device_names),
+                "units": sample.units,
+            },
+        )
+        self._record_artifacts(
+            str((writer.directory / "imu.jsonl").relative_to(self.output_dir))
+        )
 
     def _sample_once(
         self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
@@ -3252,7 +3399,7 @@ class CompatibilityProbe:
         log.telemetry.append(sample)
         if sample.servo_outputs is not None:
             log.servo_table.append(sample.servo_outputs)
-        self._drain_sensors(adapter, writer, log, label=label)
+        self._read_records(adapter, writer, log, label=label)
         return sample
 
     # -- checklist item 3 --------------------------------------------------
@@ -3261,7 +3408,10 @@ class CompatibilityProbe:
         self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog
     ) -> ProbeCheck:
         label = adapter.label
-        flight = adapter.arm_and_guided(self.settings.step_timeout_s.flight)
+        flight = adapter.arm_and_guided(
+            self.settings.step_timeout_s.flight,
+            drain=lambda: self._read_records(adapter, writer, log, label=label),
+        )
         reasons: list[str] = []
         if flight.refused:
             detail = "; ".join(flight.statustexts[-3:]) or "no STATUSTEXT was given"
@@ -3571,6 +3721,7 @@ class CompatibilityProbe:
         adapter: WebotsArduPilot,
         writer: EvidenceWriter,
         at_rest: Sequence[ImuPayload],
+        pre_settle: int,
         log: _FlightLog,
     ) -> ProbeCheck:
         reasons: list[str] = []
@@ -3590,6 +3741,23 @@ class CompatibilityProbe:
                     f"expects {names[role]!r}"
                 )
         units = samples[0].units if samples else None
+        if not at_rest:
+            reasons.append(
+                f"no inertial sample arrived after the {self.settings.settle_s:.1f}s the scene "
+                "needs to settle, so the at-rest measurement has nothing to report"
+            )
+        # A value that is not a number is not a measurement: averaging one into the
+        # window would turn the whole window into a number that means nothing.
+        non_finite = [
+            index
+            for index, sample in enumerate(at_rest)
+            if not all(math.isfinite(value) for value in sample.accelerometer + sample.gyro)
+        ]
+        if non_finite:
+            reasons.append(
+                f"{len(non_finite)} of {len(at_rest)} inertial samples inside the settled "
+                "window report a value that is not a number"
+            )
         # Gaps are measured inside each window in which the probe was reading the
         # stream. The pause between two windows is the reader being busy, not the
         # stream stalling, and the evidence says which windows were measured.
@@ -3605,7 +3773,8 @@ class CompatibilityProbe:
                 f"the inertial stream stalled for {largest_gap:.2f}s inside a sampling "
                 f"window, beyond the declared {self.settings.imu_stale_after_s:.2f}s"
             )
-        at_rest_mean = axis_mean_and_spread([sample.accelerometer for sample in at_rest])
+        measured = [sample for index, sample in enumerate(at_rest) if index not in non_finite]
+        at_rest_mean = axis_mean_and_spread([sample.accelerometer for sample in measured])
         gravity_expected = GRAVITY_NED_Z
         gravity_ok = None
         if at_rest_mean["mean"] is not None:
@@ -3619,9 +3788,19 @@ class CompatibilityProbe:
         cross_check = self._imu_cross_check(adapter, writer, samples, log)
         if cross_check["joined"] is False:
             reasons.append(cross_check["reason"])
+        window_start = log.at_rest_sim_times[0] if log.at_rest_sim_times else None
         document = {
             "samples": len(samples),
             "at_rest_samples": len(at_rest),
+            "at_rest_window_sim_time_s": (
+                None
+                if window_start is None
+                else round(log.at_rest_sim_times[-1] - window_start, 3)
+            ),
+            "at_rest_window_start_sim_time_s": window_start,
+            "settle_s": self.settings.settle_s,
+            "pre_settle_samples_discarded": pre_settle,
+            "non_finite_samples": len(non_finite),
             "device_names": list(device_names),
             "units": units,
             "largest_gap_s": largest_gap,
@@ -3873,6 +4052,7 @@ class CompatibilityProbe:
 # Probe constants
 # ---------------------------------------------------------------------------
 
+
 # A motion check needs thresholds. They are declared here rather than hidden in a
 # comparison, and they are deliberately loose: this gate asks whether a commanded
 # axis produces motion in that direction, not whether the controller tracks it well.
@@ -3907,6 +4087,15 @@ EKF_VARIANCE_GROWTH = 1.2
 # would leave a backlog that grows for the whole run.
 SENSOR_DRAIN_WINDOW_S = 0.05
 MAX_DRAINED_RECORDS = 64
+
+# A wall-clock ceiling on the at-rest measurement. The window itself is measured in
+# simulation time; this only stops the probe from waiting forever if the simulation
+# stops advancing, which is a finding rather than a reason to hang.
+AT_REST_WALL_CLOCK_LIMIT_S = 60.0
+
+# Simulation time is compared with this tolerance when a window's end is decided. It
+# is far below a sampling period and far above the rounding noise on a second.
+TIME_COMPARISON_TOLERANCE_S = 1e-6
 
 
 def imu_gaps(samples: Sequence[ImuPayload]) -> list[float]:

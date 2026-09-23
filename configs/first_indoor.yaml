@@ -33,8 +33,12 @@ platform:
 
 scenario:
   world: scenarios/compat/worlds/compat_stereo.wbt
+  # Layered in order. compat_base.parm is the pinned example's set, copied unchanged;
+  # compat_arming.parm holds what a simulated airframe needs before ArduPilot's
+  # pre-arm checks pass; compat_ekf.parm is run B's EKF-active set.
   params:
     - scenarios/compat/params/compat_base.parm
+    - scenarios/compat/params/compat_arming.parm
   estimator_params:
     - scenarios/compat/params/compat_ekf.parm
 
@@ -56,6 +60,10 @@ sensors:
     sampling_period_ms: 10
   calibration: scenarios/compat/calibration.json
 
+# The two measurement windows are configuration because they are properties of this
+# scene rather than of the adapter: the freshly loaded airframe is pushed out of the
+# floor and its accelerometer converges over about a second of simulated time, and a
+# window measured in simulated time is comparable between the realtime and fast modes.
 probe:
   hover_altitude_m: 1.5
   # Waypoints are local-NED offsets from the takeoff point; z is added to the hover
@@ -65,6 +73,8 @@ probe:
     - [2.0, 1.0, 0.0]
   hold_per_waypoint_s: 8
   stream_loss_window_s: 6
+  settle_s: 1.5
+  at_rest_window_s: 2.0
   estimator_fault:
     kind: position_step
     magnitude_m: 30.0

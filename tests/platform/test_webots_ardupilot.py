@@ -224,6 +224,7 @@ class ScriptedMavlinkSession:
         direction=1.0,
         dead_servos=False,
         refuse_guided=False,
+        refuse_arming=False,
         guided_timeout_s=0.6,
         failsafe_after_setpoints=None,
         boot_jitter_s=0.0,
@@ -234,6 +235,7 @@ class ScriptedMavlinkSession:
         self.direction = direction
         self.dead_servos = dead_servos
         self.refuse_guided = refuse_guided
+        self.refuse_arming = refuse_arming
         self.guided_timeout_s = guided_timeout_s
         # A count of publications after which the autopilot leaves Guided on its own,
         # the way a failsafe would: the mode change is the aircraft's, not the test's.
@@ -293,7 +295,8 @@ class ScriptedMavlinkSession:
 
     def arm(self):
         self.commands.append(("arm",))
-        self.armed = True
+        if not self.refuse_arming:
+            self.armed = True
 
     def takeoff(self, altitude_m):
         self.commands.append(("takeoff", altitude_m))
@@ -323,6 +326,11 @@ class ScriptedMavlinkSession:
             self.ekf_variance = 0.5
             self.flags = 1
         servo = 1000 if (self.dead_servos or not guided) else 1500
+        statustext = "guided" if guided else "EKF failsafe check"
+        if self.refuse_arming and not self.armed:
+            # What an autopilot says when its pre-arm check fails: the text is the
+            # evidence that the refusal is the aircraft's decision, not the test's.
+            statustext = "PreArm: 3D Accel calibration needed"
         return [
             {
                 "mavpackettype": "HEARTBEAT",
@@ -365,7 +373,7 @@ class ScriptedMavlinkSession:
                 "vendor_id": 3,
                 "product_id": 1,
             },
-            {"mavpackettype": "STATUSTEXT", "text": "guided" if guided else "EKF failsafe check"},
+            {"mavpackettype": "STATUSTEXT", "text": statustext},
         ]
 
     def close(self):
@@ -380,10 +388,12 @@ class ScriptedMavlinkSession:
         dy = self.target[1] - self.position[1]
         dz = self.target[2] - self.position[2]
         step = 0.15 * self.direction
+
         def approach(delta):
             if abs(delta) <= abs(step):
                 return delta
             return step if delta > 0 else -step
+
         self.position = (
             self.position[0] + approach(dx),
             self.position[1] + approach(dy),
@@ -468,7 +478,10 @@ def write_scene(tmp_path, **overrides):
         },
         "scenario": {
             "world": str(SCENE / "worlds" / "compat_stereo.wbt"),
-            "params": [str(SCENE / "params" / "compat_base.parm")],
+            "params": [
+                str(SCENE / "params" / "compat_base.parm"),
+                str(SCENE / "params" / "compat_arming.parm"),
+            ],
             "estimator_params": [str(SCENE / "params" / "compat_ekf.parm")],
         },
         "sensors": {
@@ -496,6 +509,10 @@ def write_scene(tmp_path, **overrides):
             "waypoints_local_ned": [[2.0, 0.0, 0.0], [2.0, 1.0, 0.0]],
             "hold_per_waypoint_s": 2.0,
             "stream_loss_window_s": 3.0,
+            # Short windows: the fake clock advances 0.05 s per wait, so these still
+            # exercise the settle and measurement logic without thousands of records.
+            "settle_s": 0.1,
+            "at_rest_window_s": 0.2,
             "estimator_fault": {"kind": "position_step", "magnitude_m": 30.0, "hold_s": 2.0},
             "timebase_samples": 5,
             "timebase_spread_limit_ms": 60,
@@ -526,6 +543,7 @@ def run_probe(
     session_kwargs=None,
     runner=None,
     output_name="out",
+    config_overrides=None,
 ):
     """Run the whole checklist against scripted seams and return the result."""
     clock = clock or FakeClock()
@@ -544,7 +562,7 @@ def run_probe(
         return session
 
     runner = runner or FakeRunner()
-    config_path = write_scene(tmp_path)
+    config_path = write_scene(tmp_path, **(config_overrides or {}))
     settings = settings_for(config_path, tmp_path)
     probe = W.CompatibilityProbe(
         settings,
@@ -1098,7 +1116,9 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert result.manifest["run_a"]["webots"]["version"] == "R2025a"
     assert result.manifest["run_a"]["sensors"]["stereo"]["baseline_m"] == 0.1
     assert result.manifest["run_a"]["ports"]["controller_port"] > 0
-    assert result.manifest["run_b"]["autopilot"]["parameter_files"][1].endswith("compat_ekf.parm")
+    assert [
+        Path(name).name for name in result.manifest["run_b"]["autopilot"]["parameter_files"]
+    ] == ["compat_base.parm", "compat_arming.parm", "compat_ekf.parm"]
 
     # The scene's own files are named and hashed, so a run can be compared with the
     # revision of the world and the proto that produced it.
@@ -1310,6 +1330,86 @@ def test_prerequisites_are_reported_before_any_process_starts(tmp_path):
     assert "webots_application" in str(failure.value)
     assert "autopilot_commit" in str(failure.value)
     assert runner.spawned == []
+
+
+def test_the_probe_waits_for_a_booted_autopilot_not_just_a_heartbeat(tmp_path):
+    """A heartbeat arrives while ArduPilot is still initialising.
+    Measuring telemetry, arming and setpoints against a vehicle in MAV_STATE_BOOT
+    would report a broken transport for a vehicle that had simply not finished
+    booting, so readiness has to wait for the vehicle.
+    """
+
+    class StillBooting(ScriptedMavlinkSession):
+        def drain(self):
+            messages = super().drain()
+            for message in messages:
+                if message["mavpackettype"] == "HEARTBEAT":
+                    message["system_status"] = 2  # MAV_STATE_BOOT
+            return messages
+
+    clock = FakeClock()
+    config_path = write_scene(
+        tmp_path, probe={"step_timeout_s": {"startup": 1.0, "ready": 30, "flight": 60}}
+    )
+    settings = settings_for(config_path, tmp_path)
+    probe = W.CompatibilityProbe(
+        settings,
+        output_dir=tmp_path / "out",
+        runner_factory=FakeRunner,
+        session_factory=lambda: StillBooting(clock),
+        gateway_factory=lambda: FakeGateway(clock),
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    with pytest.raises(W.ProbeFailure) as failure:
+        probe.run()
+    assert "system_status=2" in str(failure.value)
+    assert "boot_time_ms" in str(failure.value)
+
+
+def test_the_at_rest_measurement_waits_for_the_scene_to_settle(tmp_path):
+    result, _, _, _, _ = run_probe(
+        tmp_path, config_overrides={"probe": {"settle_s": 0.5, "at_rest_window_s": 0.4}}
+    )
+    imu = check(result, "6_imu_stream")
+    assert imu.status == "pass", imu.reason
+    assert imu.evidence["settle_s"] == 0.5
+    assert imu.evidence["pre_settle_samples_discarded"] > 0
+    assert imu.evidence["at_rest_window_start_sim_time_s"] >= 0.5
+    assert imu.evidence["at_rest_window_sim_time_s"] >= 0.4
+    assert imu.evidence["non_finite_samples"] == 0
+
+
+def test_an_arming_refusal_ends_the_wait_instead_of_polling_it(tmp_path):
+    clock = FakeClock()
+    started = clock.monotonic()
+    result, _, _, _, _ = run_probe(
+        tmp_path,
+        clock=clock,
+        session_kwargs={"refuse_guided": True},
+        config_overrides={
+            "probe": {"step_timeout_s": {"startup": 30, "ready": 30, "flight": 600}}
+        },
+    )
+    motion = check(result, "3_guided_local_ned_motion")
+    assert motion.status == "fail"
+    # The flight timeout is 600 s of the fake clock; a refused check keeps refusing,
+    # so the wait has to end long before it.
+    assert clock.monotonic() - started < 60.0
+
+
+def test_the_launch_commands_carry_the_wipe_and_the_parameter_layers(tmp_path):
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+    argv = settings.sitl_argv(settings.estimator_params)
+    assert "--wipe" in argv
+    defaults = [argv[index + 1] for index, item in enumerate(argv) if item == "--defaults"]
+    assert [Path(name).name for name in defaults] == [
+        "compat_base.parm",
+        "compat_arming.parm",
+        "compat_ekf.parm",
+    ]
+
 
 
 # ---------------------------------------------------------------------------

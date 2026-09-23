@@ -46,6 +46,8 @@ probe:
     - [2.0, 0.0, 0.0]
   hold_per_waypoint_s: 8
   stream_loss_window_s: 6
+  settle_s: 1.5
+  at_rest_window_s: 2.0
   estimator_fault:
     kind: position_step
     magnitude_m: 30.0

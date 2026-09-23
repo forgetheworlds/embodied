@@ -239,6 +239,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "waypoints_local_ned": [[float]],
         "hold_per_waypoint_s": float,
         "stream_loss_window_s": float,
+        # How much simulated time the scene needs to settle, and how much simulated
+        # time the at-rest measurement covers once it has.
+        "settle_s": float,
+        "at_rest_window_s": float,
         "estimator_fault": {"kind": str, "magnitude_m": float, "hold_s": float},
         "timebase_samples": int,
         "timebase_spread_limit_ms": float,
