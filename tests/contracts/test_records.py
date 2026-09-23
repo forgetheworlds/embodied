@@ -559,9 +559,12 @@ def test_the_module_imports_without_the_runtime_stack(tmp_path):
     The check runs in a subprocess whose interpreter is the one that ran this test,
     with the three modules blocked on its import path. Nothing is put on PYTHONPATH
     except the blocker itself: the package is the installed one, the same code the
-    tests and the command use.
+    tests and the command use. The blocker is imported by name rather than shipped
+    as ``sitecustomize.py``: a ``sitecustomize`` on PYTHONPATH shadows the
+    interpreter's own, and Homebrew's is what adds pip's site-packages (where the
+    editable ``embodied`` lives) to ``sys.path``.
     """
-    blocker = tmp_path / "sitecustomize.py"
+    blocker = tmp_path / "runtime_blocker.py"
     blocker.write_text(
         "import sys\n"
         "class Blocker:\n"
@@ -576,6 +579,7 @@ def test_the_module_imports_without_the_runtime_stack(tmp_path):
         [
             sys.executable,
             "-c",
+            "import runtime_blocker;"
             "import sys;"
             "from embodied.contracts import records;"
             "print(records.RECORDS_REVISION, len(records.IMPLEMENTED_RECORDS), sys.executable)",
