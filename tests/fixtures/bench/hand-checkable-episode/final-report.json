@@ -1,0 +1,105 @@
+{
+  "claims": [
+    {
+      "kind": "observation",
+      "observed": "found",
+      "predicate": "found",
+      "stamp": {
+        "clock_id": "monotonic",
+        "host_id": "synthetic-bench-0",
+        "monotonic_ns": 5500000000
+      },
+      "support_refs": [
+        "obs-2"
+      ],
+      "target": "red_kettle",
+      "uncertainty": 0.05,
+      "unmet_requirements": null
+    },
+    {
+      "kind": "observation",
+      "observed": "inspected",
+      "predicate": "inspected",
+      "stamp": {
+        "clock_id": "monotonic",
+        "host_id": "synthetic-bench-0",
+        "monotonic_ns": 5500000000
+      },
+      "support_refs": [
+        "obs-2"
+      ],
+      "target": "red_kettle",
+      "uncertainty": 0.05,
+      "unmet_requirements": null
+    },
+    {
+      "kind": "observation",
+      "observed": "returned",
+      "predicate": "returned",
+      "stamp": {
+        "clock_id": "monotonic",
+        "host_id": "synthetic-bench-0",
+        "monotonic_ns": 5500000000
+      },
+      "support_refs": [
+        "obs-4"
+      ],
+      "target": "start",
+      "uncertainty": 0.1,
+      "unmet_requirements": null
+    },
+    {
+      "kind": "observation",
+      "observed": "found",
+      "predicate": "found",
+      "stamp": {
+        "clock_id": "monotonic",
+        "host_id": "synthetic-bench-0",
+        "monotonic_ns": 5500000000
+      },
+      "support_refs": [
+        "obs-3"
+      ],
+      "target": "toolbox",
+      "uncertainty": 0.2,
+      "unmet_requirements": null
+    },
+    {
+      "kind": "observation",
+      "observed": "found",
+      "predicate": "found",
+      "stamp": {
+        "clock_id": "monotonic",
+        "host_id": "synthetic-bench-0",
+        "monotonic_ns": 5500000000
+      },
+      "support_refs": [
+        "obs-3"
+      ],
+      "target": "red_kettle",
+      "uncertainty": 0.2,
+      "unmet_requirements": null
+    },
+    {
+      "kind": "observation",
+      "observed": 3,
+      "predicate": "count",
+      "stamp": {
+        "clock_id": "monotonic",
+        "host_id": "synthetic-bench-0",
+        "monotonic_ns": 5500000000
+      },
+      "support_refs": [
+        "obs-2"
+      ],
+      "target": "red_kettle",
+      "uncertainty": 0.1,
+      "unmet_requirements": null
+    }
+  ],
+  "evidence_snapshot_ids": [],
+  "mission_revision": 0,
+  "physical_return_status": "returned",
+  "termination_reason": "returned_and_reported",
+  "unmet_requirements": []
+}
