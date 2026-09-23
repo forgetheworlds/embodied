@@ -1361,8 +1361,10 @@ def test_motion_is_published_as_a_guided_setpoint_and_never_as_a_motor_command(t
     for setpoint in published:
         assert setpoint.frame is R.Frame.ODOM
         assert setpoint.type_mask == R.TYPE_MASK_POSITION_VELOCITY
-        assert setpoint.type_mask & R.TYPE_MASK_FORCE  # force is always ignored
+        # No force target is claimed, so its bit stays clear.
+        assert not setpoint.type_mask & R.TYPE_MASK_FORCE_SET
         assert setpoint.target.position_ned is not None
+        assert setpoint.target.velocity_ned is not None
     commands = [command for session in sessions for command in session.commands]
     assert {command[0] for command in commands} <= {"set_mode", "arm", "takeoff"}
     assert ("set_mode", "GUIDED") in commands
@@ -1588,6 +1590,55 @@ def test_the_ready_system_states_are_mavlink_s_own():
         dialect.MAV_STATE_STANDBY,
         dialect.MAV_STATE_ACTIVE,
     )
+
+
+def test_the_published_setpoint_is_a_position_and_velocity_target_the_autopilot_accepts(
+    tmp_path,
+):
+    """The mask is MAVLink's own, and the autopilot reads it in field groups.
+
+    Pinned against the dialect, because the numbers are the dialect's, and against the
+    way the receiving end reads them: the autopilot treats a group as ignored when *any*
+    bit in that group is set, so a mask naming part of a group is not a partial
+    instruction — it is a different one. A setpoint that carries a position and a
+    velocity therefore has to clear both of those groups, and a mask that threw a
+    carried field away would be refused when the record is built.
+    """
+    from pymavlink.dialects.v20 import ardupilotmega as dialect
+
+    position_group = (
+        dialect.POSITION_TARGET_TYPEMASK_X_IGNORE
+        | dialect.POSITION_TARGET_TYPEMASK_Y_IGNORE
+        | dialect.POSITION_TARGET_TYPEMASK_Z_IGNORE
+    )
+    velocity_group = (
+        dialect.POSITION_TARGET_TYPEMASK_VX_IGNORE
+        | dialect.POSITION_TARGET_TYPEMASK_VY_IGNORE
+        | dialect.POSITION_TARGET_TYPEMASK_VZ_IGNORE
+    )
+    acceleration_group = (
+        dialect.POSITION_TARGET_TYPEMASK_AX_IGNORE
+        | dialect.POSITION_TARGET_TYPEMASK_AY_IGNORE
+        | dialect.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+    )
+    assert R.TYPE_MASK_POSITION_IGNORE == position_group
+    assert R.TYPE_MASK_VELOCITY_IGNORE == velocity_group
+    assert R.TYPE_MASK_ACCELERATION_IGNORE == acceleration_group
+    assert R.TYPE_MASK_FORCE_SET == dialect.POSITION_TARGET_TYPEMASK_FORCE_SET
+    assert R.TYPE_MASK_YAW_IGNORE == dialect.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+    assert R.TYPE_MASK_YAW_RATE_IGNORE == dialect.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+
+    _, _, _, sessions, _ = run_probe(tmp_path)
+    published = [setpoint for session in sessions for setpoint in session.sent]
+    assert published, "no setpoint was published"
+    for setpoint in published:
+        mask = setpoint.type_mask
+        assert not mask & position_group, "the autopilot would ignore the position target"
+        assert not mask & velocity_group, "the autopilot would ignore the velocity target"
+        assert mask & acceleration_group == acceleration_group
+        assert mask & dialect.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+        assert mask & dialect.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+        assert not mask & dialect.POSITION_TARGET_TYPEMASK_FORCE_SET
 
 
 def test_the_probe_waits_for_a_booted_autopilot_not_just_a_heartbeat(tmp_path):

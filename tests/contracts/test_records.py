@@ -386,9 +386,18 @@ def test_motion_setpoint_rejects_an_empty_mask_an_unknown_frame_and_a_contradict
         dataclasses.replace(motion_setpoint(), frame="world")
     with pytest.raises(R.RecordError):
         dataclasses.replace(motion_setpoint(), frame=R.Frame.MAP)
-    # The mask says velocity is ignored while the target carries one.
+    # The mask ignores velocity while the target carries one.
     with pytest.raises(R.RecordError):
-        dataclasses.replace(motion_setpoint(), type_mask=R.TYPE_MASK_ALL & ~R.TYPE_MASK_ACCELERATION)
+        dataclasses.replace(
+            motion_setpoint(),
+            type_mask=R.TYPE_MASK_ALL & ~R.TYPE_MASK_VELOCITY_IGNORE,
+        )
+    # The mask says heading is used while the target carries none.
+    with pytest.raises(R.RecordError):
+        dataclasses.replace(
+            motion_setpoint(),
+            type_mask=R.TYPE_MASK_POSITION_VELOCITY & ~R.TYPE_MASK_YAW_IGNORE,
+        )
     with pytest.raises(R.RecordError):
         dataclasses.replace(
             motion_setpoint(),
@@ -402,13 +411,28 @@ def test_motion_setpoint_rejects_an_empty_mask_an_unknown_frame_and_a_contradict
         )
 
 
-def test_type_mask_never_requests_force():
-    # A set bit means "ignore this field", and this project never commands force, so
-    # the force bit is always set and a mask without it is rejected.
-    assert R.TYPE_MASK_POSITION_VELOCITY & R.TYPE_MASK_FORCE
+def test_type_mask_names_complete_field_groups_and_never_a_force_target():
+    """The mask is read in groups by the autopilot, so only whole groups are accepted.
+
+    A bit that ignores one position axis is read as ignoring the position target
+    entirely, which is not what a mask with one axis set appears to say. The force bit
+    means the opposite of the others — it claims a force target — and this system never
+    sends one.
+    """
+    # 4 is z_ignore alone: part of the position group, and so not a mask at all.
     with pytest.raises(R.RecordError):
         dataclasses.replace(
-            motion_setpoint(), type_mask=R.TYPE_MASK_POSITION_VELOCITY & ~R.TYPE_MASK_FORCE
+            motion_setpoint(), type_mask=(R.TYPE_MASK_POSITION_VELOCITY | 4)
+        )
+    with pytest.raises(R.RecordError):
+        dataclasses.replace(
+            motion_setpoint(), type_mask=(R.TYPE_MASK_POSITION_VELOCITY | 8)
+        )
+    assert R.TYPE_MASK_POSITION_VELOCITY & ~R.TYPE_MASK_ALL == 0
+    with pytest.raises(R.RecordError):
+        dataclasses.replace(
+            motion_setpoint(),
+            type_mask=(R.TYPE_MASK_POSITION_VELOCITY | R.TYPE_MASK_FORCE_SET),
         )
 
 

@@ -68,12 +68,11 @@ from embodied.contracts.records import (
     SensorMode,
     RecordError,
     SetpointSource,
-    TYPE_MASK_ACCELERATION,
-    TYPE_MASK_FORCE,
-    TYPE_MASK_POSITION,
-    TYPE_MASK_VELOCITY,
-    TYPE_MASK_YAW,
-    TYPE_MASK_YAW_RATE,
+    TYPE_MASK_ACCELERATION_IGNORE,
+    TYPE_MASK_POSITION_IGNORE,
+    TYPE_MASK_VELOCITY_IGNORE,
+    TYPE_MASK_YAW_IGNORE,
+    TYPE_MASK_YAW_RATE_IGNORE,
 )
 
 
@@ -1946,7 +1945,11 @@ class PymavlinkSession:
         )
 
     def send_setpoint(self, setpoint: MotionSetpoint) -> None:
-        """Publish one guided local-NED target, using exactly the fields the mask selects."""
+        """Publish one guided local-NED target, using exactly the fields the mask selects.
+
+        The mask goes out unchanged: the record's bits are MAVLink's own, so there is no
+        translation step in which a field group could lose its meaning on the way.
+        """
         target = setpoint.target
         position = target.position_ned or (0.0, 0.0, 0.0)
         velocity = target.velocity_ned or (0.0, 0.0, 0.0)
@@ -2346,20 +2349,22 @@ class ControlEvent:
 def mask_for_target(target: MotionTarget) -> int:
     """The type mask that matches a target: a field the mask ignores must be absent.
 
-    A set bit means "ignore this field", so each field the target omits gets its bit
-    set. Force is always ignored: this project never commands a force target.
+    A set bit means "ignore this field", and the bits are MAVLink's own, so this mask is
+    what the autopilot reads. Each ignored field contributes a whole group, because the
+    autopilot reads the groups whole: setting one position axis would throw away the
+    position target entirely rather than hold one axis. Force is never claimed.
     """
-    mask = TYPE_MASK_FORCE
+    mask = 0
     if target.position_ned is None:
-        mask |= TYPE_MASK_POSITION
+        mask |= TYPE_MASK_POSITION_IGNORE
     if target.velocity_ned is None:
-        mask |= TYPE_MASK_VELOCITY
+        mask |= TYPE_MASK_VELOCITY_IGNORE
     if target.acceleration_ned is None:
-        mask |= TYPE_MASK_ACCELERATION
+        mask |= TYPE_MASK_ACCELERATION_IGNORE
     if target.yaw_rad is None:
-        mask |= TYPE_MASK_YAW
+        mask |= TYPE_MASK_YAW_IGNORE
     if target.yaw_rate_rad_s is None:
-        mask |= TYPE_MASK_YAW_RATE
+        mask |= TYPE_MASK_YAW_RATE_IGNORE
     return mask
 
 

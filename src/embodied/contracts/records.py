@@ -231,26 +231,35 @@ class SensorMode(str, Enum):
     SIMULATOR_INTERFACE = "simulator-interface"
 
 
-# MAVLink position-target type-mask bits, named so a setpoint can state which
-# fields it asked the autopilot to use. A set bit means "ignore this field".
-TYPE_MASK_POSITION = 1
-TYPE_MASK_VELOCITY = 2
-TYPE_MASK_ACCELERATION = 4
-TYPE_MASK_FORCE = 8
-TYPE_MASK_YAW = 16
-TYPE_MASK_YAW_RATE = 32
+# MAVLink position-target type-mask bits, taken from the message the autopilot reads
+# rather than invented here (MAVLink POSITION_TARGET_TYPEMASK, the dialect the pinned
+# firmware speaks). A set bit means "ignore this field"; the bit numbers are the
+# dialect's, so the mask a record carries is the mask that goes on the wire.
+#
+# The autopilot reads these bits in *groups*: setting one axis of a group ignores the
+# whole group, so a mask with part of a group set asks for something the sender did
+# not write. The constants are therefore the groups themselves — x|y|z, vx|vy|vz,
+# ax|ay|az — and a mask is only ever built out of whole groups.
+TYPE_MASK_POSITION_IGNORE = 1 | 2 | 4  # x | y | z
+TYPE_MASK_VELOCITY_IGNORE = 8 | 16 | 32  # vx | vy | vz
+TYPE_MASK_ACCELERATION_IGNORE = 64 | 128 | 256  # ax | ay | az
+# Not an ignore bit: FORCE_SET tells the autopilot this message is a force target.
+# This system never commands a force target, so the bit stays clear in every mask.
+TYPE_MASK_FORCE_SET = 512
+TYPE_MASK_YAW_IGNORE = 1024
+TYPE_MASK_YAW_RATE_IGNORE = 2048
 TYPE_MASK_ALL = (
-    TYPE_MASK_POSITION
-    | TYPE_MASK_VELOCITY
-    | TYPE_MASK_ACCELERATION
-    | TYPE_MASK_FORCE
-    | TYPE_MASK_YAW
-    | TYPE_MASK_YAW_RATE
+    TYPE_MASK_POSITION_IGNORE
+    | TYPE_MASK_VELOCITY_IGNORE
+    | TYPE_MASK_ACCELERATION_IGNORE
+    | TYPE_MASK_FORCE_SET
+    | TYPE_MASK_YAW_IGNORE
+    | TYPE_MASK_YAW_RATE_IGNORE
 )
-# Position and velocity enabled: acceleration, force and both heading fields are
-# ignored. This is the mask the compatibility probe publishes.
+# Position and velocity enabled: acceleration and both heading fields are ignored, and
+# no force target is claimed. This is the mask the compatibility probe publishes.
 TYPE_MASK_POSITION_VELOCITY = (
-    TYPE_MASK_ACCELERATION | TYPE_MASK_FORCE | TYPE_MASK_YAW | TYPE_MASK_YAW_RATE
+    TYPE_MASK_ACCELERATION_IGNORE | TYPE_MASK_YAW_IGNORE | TYPE_MASK_YAW_RATE_IGNORE
 )
 
 
@@ -882,11 +891,29 @@ class MotionSetpoint:
         self._check_mask_matches_target()
 
     def _check_mask_matches_target(self) -> None:
-        """Every field the mask tells the autopilot to ignore must be absent."""
+        """Every field group the mask tells the autopilot to ignore must be absent.
+
+        Two rules, both from the receiving end. The autopilot reads a field group as a
+        unit — one position axis set ignores all three — so a mask must name whole
+        groups or it will be understood as something other than what it says. And every
+        field a record's target carries has to be one the mask activates.
+        """
+        for group, name in (
+            (TYPE_MASK_POSITION_IGNORE, "position"),
+            (TYPE_MASK_VELOCITY_IGNORE, "velocity"),
+            (TYPE_MASK_ACCELERATION_IGNORE, "acceleration"),
+        ):
+            if (self.type_mask & group) not in (0, group):
+                raise RecordError(
+                    f"type_mask sets part of the {name} group; the autopilot ignores a "
+                    "field group whole, so a mask names complete groups"
+                )
         for bit, value, name in (
-            (TYPE_MASK_POSITION, self.target.position_ned, "position"),
-            (TYPE_MASK_VELOCITY, self.target.velocity_ned, "velocity"),
-            (TYPE_MASK_ACCELERATION, self.target.acceleration_ned, "acceleration"),
+            (TYPE_MASK_POSITION_IGNORE, self.target.position_ned, "position"),
+            (TYPE_MASK_VELOCITY_IGNORE, self.target.velocity_ned, "velocity"),
+            (TYPE_MASK_ACCELERATION_IGNORE, self.target.acceleration_ned, "acceleration"),
+            (TYPE_MASK_YAW_IGNORE, self.target.yaw_rad, "yaw"),
+            (TYPE_MASK_YAW_RATE_IGNORE, self.target.yaw_rate_rad_s, "yaw_rate"),
         ):
             if bool(self.type_mask & bit) == (value is not None):
                 verb = "ignored" if self.type_mask & bit else "used"
@@ -894,10 +921,9 @@ class MotionSetpoint:
                     f"type_mask says {name} is {verb} but the target "
                     f"{'carries' if value is not None else 'omits'} it"
                 )
-        if not self.type_mask & TYPE_MASK_FORCE:
+        if self.type_mask & TYPE_MASK_FORCE_SET:
             raise RecordError(
-                "this system never requests a force target, so the force field is always "
-                "ignored and its mask bit is always set"
+                "this system never commands a force target, so its mask bit stays clear"
             )
 
 
