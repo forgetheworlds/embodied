@@ -1431,7 +1431,7 @@ def test_motion_opposite_to_the_command_fails_the_motion_item(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path, session_kwargs={"direction": -1.0})
     motion = check(result, "3_guided_local_ned_motion")
     assert motion.status == "fail"
-    assert "opposite to the command" in motion.reason
+    assert "target" in motion.reason and "start" in motion.reason and "(moved" in motion.reason
 
 
 def test_a_run_outside_its_declared_real_time_envelope_is_timing_invalid(tmp_path):

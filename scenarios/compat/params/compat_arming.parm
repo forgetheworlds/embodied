@@ -66,6 +66,19 @@ ATC_RAT_PIT_P   0.25
 ATC_RAT_RLL_I   0.25
 ATC_RAT_PIT_I   0.25
 
+# The rate-loop damping terms, paired the way the file the proportional and integral
+# gains above came from pairs them. The pinned iris.parm publishes
+# ATC_RAT_RLL/PIT_D 0.0003 beside its own P = 0.05 (D/P 0.0060); airsim-quadX.parm
+# publishes D = 0.003 beside the P = 0.25 and I = 0.25 this file already adopts
+# (D/P 0.0120). Flying that file's P and I with the pin's D left this airframe's
+# damping ratio at 0.0012 — 10x below the source of its own P and I, and 22x below
+# ArduPilot's default for this frame class (D 0.0036 against P 0.135,
+# AC_AttitudeControl_Multi.h). 0.003 sits inside the documented range 0.0 0.05
+# (increment 0.001) and within one increment of that default: it is the pairing the
+# source file publishes, not a tuned number.
+ATC_RAT_RLL_D   0.003
+ATC_RAT_PIT_D   0.003
+
 # The scheduler loop rate a 500 Hz sensor interface supports. Derived, not tuned:
 # ArduPilot requires the gyro rate to be at least 1.8 times this value.
 SCHED_LOOP_RATE 250
