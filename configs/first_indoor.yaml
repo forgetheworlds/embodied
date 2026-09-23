@@ -4,13 +4,19 @@
 # number (a baseline, a rate, a timeout, a budget) is configuration rather than a
 # constant in code. Nothing here is a control gain or a measured latency.
 #
-# Two keys go beyond the plan's sketch and are called out because they are criteria
-# rather than plumbing:
+# Three keys are criteria rather than plumbing and are called out because a reviewer has
+# to be able to tell a declared engineering parameter from a value taken out of a
+# document:
 #   sensors.stereo.identical_channel_fraction_limit - the declared threshold for
 #     calling a frame colour, which the grayscale check compares against.
-#   scenario.estimator_params - the EKF-active set that run B layers on top of the
-#     pinned set, so the estimator item has a configuration in which it means
-#     something.
+#   scenario.estimator_params - the EKF-active set that makes the estimator item mean
+#     something. Both runs apply it: the pinned example's simulator AHRS (AHRS_EKF_TYPE
+#     10) was measured to diverge under a valid local-NED position target while this set
+#     holds the same targets to centimetres, so the pinned set is recorded as evidence
+#     rather than flown, and run A is not the pinned upstream configuration.
+#   probe.realtime_ratio_envelope - the real-time envelope specification section 14.4
+#     asks a run to declare. The specification names no value; this is this stage's
+#     declared engineering parameter, justified where it is set below.
 
 project:
   stage: P00
@@ -35,7 +41,9 @@ scenario:
   world: scenarios/compat/worlds/compat_stereo.wbt
   # Layered in order. compat_base.parm is the pinned example's set, copied unchanged;
   # compat_arming.parm holds what a simulated airframe needs before ArduPilot's
-  # pre-arm checks pass; compat_ekf.parm is run B's EKF-active set.
+  # pre-arm checks pass; compat_ekf.parm is the EKF-active set both runs apply, because
+  # the pinned set's simulator AHRS does not hold a guided local-NED target on this
+  # candidate (measured; see the note at the top of this file).
   params:
     - scenarios/compat/params/compat_base.parm
     - scenarios/compat/params/compat_arming.parm
@@ -84,11 +92,21 @@ probe:
     magnitude_m: 30.0
     hold_s: 6
   timebase_samples: 40
-  timebase_spread_limit_ms: 60
+  # How often the simulator's rate is recorded, in host seconds, and the envelope it has
+  # to stay inside. Specification section 14.4 asks for a declared real-time-ratio
+  # envelope recorded in windows rather than as a run average, and for a timing-invalid
+  # result when the host cannot sustain the load; it names no number. The declared
+  # envelope is 0.5-1.5 simulated seconds per wall second: the scene asks Webots for
+  # realtime mode, and a window outside that range means the recorded simulator times no
+  # longer describe the environment the scene declares. This candidate measures 0.77-0.96
+  # per 5 s window with a whole-run ratio near 0.83, so the envelope catches a simulator
+  # that stalls or fast-forwards rather than describing normal operation.
+  realtime_window_s: 5.0
+  realtime_ratio_envelope: [0.5, 1.5]
   # How often the timebase item reads the autopilot's clock. A message can only be
   # stamped when it is read off the socket, so this is the resolution of that
-  # measurement: the join's residual scatter cannot come out smaller than this, and a
-  # slower loop would report its own latency as scatter between the two clocks.
+  # measurement: the joined relation's residual scatter cannot come out smaller than
+  # this, and a slower loop would report its own latency as scatter between two clocks.
   timebase_poll_s: 0.005
   step_timeout_s:
     startup: 90

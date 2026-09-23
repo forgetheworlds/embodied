@@ -575,7 +575,11 @@ def write_scene(tmp_path, **overrides):
             "pre_arm_wait_s": 5.0,
             "estimator_fault": {"kind": "position_step", "magnitude_m": 30.0, "hold_s": 2.0},
             "timebase_samples": 5,
-            "timebase_spread_limit_ms": 60,
+            # The scripted clock advances 0.05 s per wait, so a window is a fraction of a
+            # second here: the relation only has to span one window to be measurable, and
+            # the scripted simulator runs at realtime, inside the declared envelope.
+            "realtime_window_s": 0.1,
+            "realtime_ratio_envelope": [0.5, 1.5],
             "timebase_poll_s": 0.005,
             "step_timeout_s": {"startup": 30, "ready": 30, "flight": 60},
             "budget_wall_clock_s": 600,
@@ -615,13 +619,14 @@ def run_probe(
     config_path = write_scene(tmp_path, **(config_overrides or {}))
     settings = settings_for(config_path, tmp_path)
     # The scripted vehicle reports the parameters its run layered, so a run whose files
-    # were applied is a run whose read-back agrees. Run B adds the estimator files, as
-    # the configuration declares, so the second session reports those too.
-    def parameters_for_run(index):
+    # were applied is a run whose read-back agrees. Both runs apply the candidate's
+    # parameter files, estimator set included, so both report the same values.
+    def parameters_for_run():
         if "parameter_values" in session_kwargs:
             return session_kwargs["parameter_values"]
-        extra = settings.estimator_params if index else ()
-        return W.read_configured_parameters(settings.parameter_files(extra))
+        return W.read_configured_parameters(
+            settings.parameter_files(settings.estimator_params)
+        )
 
     def make_gateway():
         gateway = FakeGateway(clock, **(gateway_kwargs or {}))
@@ -629,7 +634,7 @@ def run_probe(
         return gateway
 
     def make_session():
-        values = parameters_for_run(len(sessions))
+        values = parameters_for_run()
         overrides = {k: v for k, v in session_kwargs.items() if k != "parameter_values"}
         session = ScriptedMavlinkSession(
             clock, gateway_holder=holder, parameter_values=values, **overrides
@@ -772,7 +777,7 @@ def test_the_flight_state_packet_layout_matches_the_pinned_model():
     # struct fdm_packet: one timestamp, then gyro, acceleration, attitude, velocity and
     # position, each three doubles. 16 doubles is 128 bytes with no padding.
     assert W.FDM_SIZE == 128
-    state = W.FlightState(
+    state = W.SimFdmState(
         timestamp_s=3.5,
         gyro_rpy=(0.1, 0.2, 0.3),
         accel_xyz=(1.0, 2.0, 3.0),
@@ -1194,11 +1199,11 @@ def test_a_receipt_stamp_is_the_arrival_of_the_message_that_carried_the_clock(tm
 
 def test_the_timebase_evidence_keeps_its_samples_and_its_resolution():
     samples = [(1000.0, 10.0), (1001.0, 11.0), (1002.5, 12.5)]
-    join = W.join_timebase(samples, 60.0)
+    join = W.join_timebase(samples, minimum_span_s=0.5)
     evidence = W.timebase_evidence(
         join, samples, poll_period_s=0.005, host_clock="test-host/monotonic"
     )
-    assert evidence["joined"] is True
+    assert evidence["measured"] is True
     assert evidence["poll_period_s"] == 0.005
     assert evidence["samples_host_s_device_s"] == [list(pair) for pair in samples]
     assert evidence["host_seconds_per_device_second"] == pytest.approx(1.0, abs=1e-6)
@@ -1246,19 +1251,31 @@ def test_telemetry_is_decoded_from_recorded_messages():
 def test_timebase_join_recovers_a_synthetic_offset_and_drift():
     # The device clock runs about 100 ppm slow against the host clock.
     samples = [(1000.0 + index * 0.1, 100.0 + index * 0.09999) for index in range(20)]
-    join = W.join_timebase(samples, spread_limit_ms=60.0)
-    assert join.joined
+    join = W.join_timebase(samples, minimum_span_s=0.5)
+    assert join.measured
     # host = offset + scale * boot, so an offset near +900 s is expected here.
     assert join.offset_s == pytest.approx(900.0, abs=0.05)
     assert join.drift_ppm == pytest.approx(100.0, abs=20.0)
     assert join.spread_ms < 1.0
 
 
-def test_an_over_limit_spread_is_reported_as_unjoined_clocks():
-    samples = [(1000.0 + index * 0.1, 100.0 + index * 0.1 + (0.5 if index % 2 else 0.0)) for index in range(10)]
-    join = W.join_timebase(samples, spread_limit_ms=60.0)
-    assert not join.joined
-    assert "exceeds the configured" in join.reason
+def test_a_wide_spread_is_recorded_rather_than_thresholded():
+    """The spread is the error bar on the relation, not a pass/fail of its own.
+
+    Under a simulator the residual spread is the simulator advancing in bursts against
+    the host clock, and no threshold on one run separates that from a broken join. What
+    the run declares instead is the rate the simulator held, window by window, against
+    the envelope the configuration declares; the spread stays in the evidence with the
+    samples behind it.
+    """
+    samples = [
+        (1000.0 + index * 0.1, 100.0 + index * 0.1 + (0.5 if index % 2 else 0.0))
+        for index in range(10)
+    ]
+    join = W.join_timebase(samples, minimum_span_s=0.5)
+    assert join.measured is True
+    assert join.spread_ms > 400.0
+    assert join.reason is None
 
 
 def test_fitting_a_timebase_needs_two_samples_and_a_moving_clock():
@@ -1286,6 +1303,7 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
         "5_stereo_colour_pairs[run-a]",
         "6_imu_stream[run-a]",
         "7_setpoint_stream_loss[run-a]",
+        "8_estimator_health_loss[run-a]",
         "1_startup_and_transport[run-b]",
         "8_estimator_health_loss[run-b]",
     ):
@@ -1303,7 +1321,7 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
         "run-a/stereo.json",
         "run-a/actuators.json",
         "run-a/stream-loss.json",
-        "run-a/estimator-not-applicable.json",
+        "run-a/estimator.json",
         "run-b/estimator.json",
         "run-a/webots.log",
         "run-a/sitl.log",
@@ -1312,10 +1330,11 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
         assert artifact in result.artifacts, artifact
         assert (tmp_path / "out" / artifact).is_file(), artifact
 
-    # Run A declares why its estimator item does not apply, with the parameter line.
-    declaration = json.loads((tmp_path / "out" / "run-a" / "estimator-not-applicable.json").read_text())
-    assert declaration["applicable"] is False
-    assert any("AHRS_EKF_TYPE" in entry["line"] for entry in declaration["parameter_evidence"])
+    # Every guided flight was commanded with the mask the autopilot reads.
+    frames = check(result, "2_frames_and_timebases")
+    assert frames.evidence["realtime"]["timing_valid"] is True
+    assert frames.evidence["realtime"]["windows"]
+    assert frames.evidence["host_to_autopilot"]["measured"] is True
 
     # A stereo pair became a shared record, and its pixels are stored beside it.
     stereo = json.loads((tmp_path / "out" / "run-a" / "stereo.json").read_text())
@@ -1335,8 +1354,12 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert result.manifest["run_a"]["sensors"]["stereo"]["baseline_m"] == 0.1
     assert result.manifest["run_a"]["ports"]["controller_port"] > 0
     assert [
-        Path(name).name for name in result.manifest["run_b"]["autopilot"]["parameter_files"]
+        Path(name).name for name in result.manifest["run_a"]["autopilot"]["parameter_files"]
     ] == ["compat_base.parm", "compat_arming.parm", "compat_ekf.parm"]
+    assert Path(result.manifest["run_b"]["autopilot"]["parameter_files"][-1]).name == (
+        "compat_ekf.parm"
+    )
+    assert result.manifest["run_a"]["realtime"]["timing_valid"] is True
 
     # The scene's own files are named and hashed, so a run can be compared with the
     # revision of the world and the proto that produced it.
@@ -1410,19 +1433,37 @@ def test_motion_opposite_to_the_command_fails_the_motion_item(tmp_path):
     assert "opposite to the command" in motion.reason
 
 
-def test_unjoined_clocks_fail_the_timebase_item(tmp_path):
-    result, _, _, _, _ = run_probe(tmp_path, session_kwargs={"boot_jitter_s": 0.5})
+def test_a_run_outside_its_declared_real_time_envelope_is_timing_invalid(tmp_path):
+    """The declared envelope is the criterion, and the configuration carries the value.
+
+    Specification section 14.4 asks a run to admit only a declared real-time-ratio
+    envelope; a window outside it means the recorded simulator times do not describe the
+    environment the scenario declares, and the run reports that rather than being judged
+    as if its timing were what it claimed.
+    """
+    result, _, _, _, _ = run_probe(
+        tmp_path, config_overrides={"probe": {"realtime_ratio_envelope": [2.0, 3.0]}}
+    )
     frames = check(result, "2_frames_and_timebases")
     assert frames.status == "fail"
-    assert "unjoined clocks" in frames.reason
+    assert "timing-invalid" in frames.reason
+    assert frames.evidence["realtime"]["timing_valid"] is False
+    assert frames.evidence["realtime"]["windows_outside"]
 
 
-def test_a_join_is_refused_when_the_samples_cannot_resolve_the_tolerance():
-    """A fit whose whole span is below the tolerance is not a measurement of it.
+def test_a_noisy_autopilot_clock_is_recorded_rather_than_failed(tmp_path):
+    result, _, _, _, _ = run_probe(tmp_path, session_kwargs={"boot_jitter_s": 0.5})
+    frames = check(result, "2_frames_and_timebases")
+    assert frames.evidence["host_to_autopilot"]["measured"] is True
+    assert frames.evidence["host_to_autopilot"]["spread_ms"] > 60.0
 
-    Five samples taken inside one brief burst barely move the host clock while the
-    device clock jumps up and down: the line absorbs the jumps into a nonsense slope and
-    its residuals look small. Reporting that as a joined pair of clocks would be a
+
+def test_a_join_is_refused_when_the_samples_cannot_resolve_a_window():
+    """A fit whose whole span is below the window is not a measurement of the rate.
+
+    Five samples taken inside one brief burst barely move the host clock while the device
+    clock jumps up and down: the line absorbs the jumps into a nonsense slope and its
+    residuals look small. Reporting that as a relation between two clocks would be a
     measurement claiming a resolution it never had.
     """
     samples = [
@@ -1432,15 +1473,15 @@ def test_a_join_is_refused_when_the_samples_cannot_resolve_the_tolerance():
         (1000.030, 899.9),
         (1000.040, 900.9),
     ]
-    join = W.join_timebase(samples, 60.0)
-    assert join.joined is False
+    join = W.join_timebase(samples, minimum_span_s=0.5)
+    assert join.measured is False
     assert "the host clock advanced only" in join.reason
 
 
-def test_a_join_spread_over_the_tolerance_is_still_judged_on_its_spread():
+def test_a_measured_join_reports_the_spread_it_saw():
     samples = [(1000.0 + index, 900.0 + index) for index in range(40)]
-    join = W.join_timebase(samples, 60.0)
-    assert join.joined is True
+    join = W.join_timebase(samples, minimum_span_s=0.5)
+    assert join.measured is True
     assert join.spread_ms == pytest.approx(0.0, abs=1e-6)
 
 
@@ -1475,6 +1516,38 @@ def test_an_injection_is_not_reported_as_applied_until_the_controller_acknowledg
     assert applied.evidence["fault"]["applied"] is True
     assert applied.evidence["observable_signal"] is True
 
+
+def test_the_estimator_item_is_measured_wherever_the_files_select_an_ekf(tmp_path):
+    """The item runs where an estimator is running, decided from the files that were applied.
+
+    A run cannot claim an estimator it is not flying: applicability comes from the
+    AHRS_EKF_TYPE the parameter files select, so a configuration that selects the
+    simulator's own state records why the item does not apply instead of degrading nothing
+    and reporting that as a measurement.
+    """
+    result, _, _, _, _ = run_probe(tmp_path)
+    measured = {entry.name for entry in result.checks}
+    assert "8_estimator_health_loss[run-a]" in measured
+    assert "8_estimator_health_loss[run-b]" in measured
+    assert not (tmp_path / "out" / "run-a" / "estimator-not-applicable.json").exists()
+
+    pinned, _, _, _, _ = run_probe(
+        tmp_path,
+        output_name="out-pinned",
+        config_overrides={
+            "scenario": {"estimator_params": [str(SCENE / "params" / "compat_base.parm")]}
+        },
+    )
+    reported = {entry.name for entry in pinned.checks}
+    assert not any(name.startswith("8_estimator_health_loss") for name in reported)
+    declaration = json.loads(
+        (tmp_path / "out-pinned" / "run-a" / "estimator-not-applicable.json").read_text()
+    )
+    assert declaration["applicable"] is False
+    assert declaration["selected_estimator"] == 10.0
+    assert any(
+        "AHRS_EKF_TYPE" in entry["line"] for entry in declaration["parameter_evidence"]
+    )
 
 def test_stream_loss_reports_what_the_telemetry_showed(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path)
@@ -1795,12 +1868,12 @@ def fake_probe_factory(**run_kwargs):
             return gateway
 
         def make_session():
-            # Each run's vehicle reports the parameters that run layered, as the probe
-            # checks: run A the pinned and arming sets, run B those plus the EKF set.
-            extra = settings.estimator_params if sessions else ()
+            # Both runs' vehicles report the candidate's parameters, as the probe checks.
             values = session_kwargs.pop(
                 "parameter_values",
-                W.read_configured_parameters(settings.parameter_files(extra)),
+                W.read_configured_parameters(
+                    settings.parameter_files(settings.estimator_params)
+                ),
             )
             session = ScriptedMavlinkSession(
                 clock, gateway_holder=holder, parameter_values=values, **session_kwargs

@@ -247,7 +247,11 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "pre_arm_wait_s": float,
         "estimator_fault": {"kind": str, "magnitude_m": float, "hold_s": float},
         "timebase_samples": int,
-        "timebase_spread_limit_ms": float,
+        # The window the simulator's rate is recorded in, and the envelope it has to stay
+        # inside: both are declared engineering parameters of this stage, carried in the
+        # configuration rather than hidden in the check.
+        "realtime_window_s": float,
+        "realtime_ratio_envelope": [float],
         "timebase_poll_s": float,
         "step_timeout_s": {"startup": float, "ready": float, "flight": float},
         "budget_wall_clock_s": float,
