@@ -2089,10 +2089,10 @@ class FlightStateEvidence:
     altitude_m: float | None
     statustexts: tuple[str, ...]
     refused: bool
-    # Whether the vehicle's own pre-arm checks went quiet before the attempt, and which
-    # ones were still outstanding if they did not.
-    pre_arm_clear: bool
-    pre_arm_outstanding: tuple[str, ...]
+    # How many times control was requested, and every refusal the autopilot gave: the
+    # list of what it said was missing, kept verbatim.
+    control_attempts: int
+    refusals: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -2160,11 +2160,14 @@ def mask_for_target(target: MotionTarget) -> int:
 # flight timeout produces no more evidence than that first answer did.
 CONTROL_GRANT_GRACE_S = 3.0
 
-# How long the autopilot must stop reporting pre-arm failures before the probe asks it to
-# arm. ArduPilot repeats a failing pre-arm check and stops repeating it when the check
-# clears, so quiet means clear. Some checks clear only with time: a simulated GPS needs a
-# fix, the EKF needs a home, and the IMU consistency check needs a quiet window.
-PRE_ARM_QUIET_S = 10.0
+# How long the probe waits between control attempts while the autopilot is refusing.
+#
+# Readiness cannot be judged from the autopilot's pre-arm texts: ArduPilot repeats a
+# failing check at its own rate and stops repeating it whether it has cleared or not, so
+# the only honest way to see a vehicle become ready is to ask for control and read the
+# answer. A simulated vehicle needs tens of seconds of simulated time for a GPS fix, a
+# home position and a quiet IMU window, so the request is repeated rather than sent once.
+CONTROL_RETRY_S = 5.0
 
 # How long to let an arming request be answered before reading the result. The
 # autopilot needs a moment, and the sensor stream is read throughout the wait.
@@ -2463,34 +2466,70 @@ class WebotsArduPilot:
         """The most recent sample, without draining the stream again."""
         return self._telemetry
 
-    def wait_for_pre_arm_clear(
-        self, timeout_s: float, *, drain: Callable[[], None] | None = None
-    ) -> tuple[bool, tuple[str, ...]]:
-        """Wait until the autopilot stops reporting pre-arm failures, or the wait ends.
+    def request_control(
+        self,
+        timeout_s: float,
+        *,
+        drain: Callable[[], None] | None = None,
+    ) -> tuple[FlightStateEvidence, ClockStamp]:
+        """Ask for Guided mode and arming until the vehicle accepts or the wait ends.
 
-        ArduPilot reports its pre-arm checks by text while disarmed, and some of them
-        clear only with time: a simulated GPS needs a fix, the EKF needs a home, and the
-        IMU consistency check needs a quiet window. Arming the moment the first heartbeat
-        arrives asks a question the vehicle is not ready to answer, and the refusal that
-        comes back describes the boot rather than the transport.
+        A simulated vehicle needs tens of seconds of simulated time before ArduPilot's
+        pre-arm checks pass — a GPS fix, a home position, a quiet window for the IMU
+        consistency check — and its refusals cannot be read as a list of what is still
+        missing, because it repeats a failing check at its own rate and stops repeating
+        it whether it cleared or not. So the request is repeated and every answer is
+        kept: the refusal that finally explains the stop is evidence, and the attempt
+        count says how long the vehicle was given.
 
-        Returns whether the checks went quiet, and the texts that were outstanding if
-        they did not.
+        Returns what the autopilot reported about itself, and when the last request was
+        made.
         """
         deadline = self._monotonic() + timeout_s
-        outstanding: dict[str, float] = {}
-        while self._monotonic() < deadline:
+        refusals: dict[str, str] = {}
+        attempts = 0
+        attempt_at = self._monotonic()
+        sample = self.telemetry()
+        while True:
+            attempts += 1
+            attempt_at = self._monotonic()
+            self._session.set_mode("GUIDED")
+            self._session.arm()
+            # Give the autopilot a moment to answer, reading the sensor stream while it
+            # does: this wait is a second of frames the controller would otherwise queue
+            # and then drop.
+            settle_until = self._monotonic() + ARM_SETTLE_S
+            while self._monotonic() < settle_until:
+                if drain is not None:
+                    drain()
+                self._sleep(0.1)
             sample = self.telemetry()
-            if drain is not None:
-                drain()
             for text in sample.statustexts:
                 if text.startswith("PreArm:") or text.startswith("Arm:"):
-                    outstanding[text] = self._monotonic()
-            last = max(outstanding.values(), default=None)
-            if last is None or self._monotonic() - last >= PRE_ARM_QUIET_S:
-                return True, ()
-            self._sleep(0.5)
-        return False, tuple(sorted(outstanding))
+                    refusals[text] = text
+            if sample.armed or self._monotonic() >= deadline:
+                break
+            retry_until = self._monotonic() + CONTROL_RETRY_S
+            while self._monotonic() < retry_until and self._monotonic() < deadline:
+                if drain is not None:
+                    drain()
+                self._sleep(0.5)
+        evidence = FlightStateEvidence(
+            commanded_mode="GUIDED",
+            mode_reached=sample.in_guided_mode,
+            armed=bool(sample.armed),
+            takeoff_commanded_m=self.settings.hover_altitude_m,
+            altitude_m=None,
+            statustexts=tuple(self._statustexts),
+            refused=not (sample.in_guided_mode and sample.armed),
+            control_attempts=attempts,
+            refusals=tuple(sorted(refusals)),
+        )
+        return evidence, ClockStamp(
+            host_id=self.settings.host_id,
+            clock_id=self.settings.clock_id,
+            monotonic_ns=int(attempt_at * 1e9),
+        )
 
     def sensor_record(self, timeout_s: float) -> SensorRecord | None:
         """The next sensor record, or None when the stream stays silent for the timeout."""
@@ -2510,72 +2549,51 @@ class WebotsArduPilot:
     def arm_and_guided(
         self, timeout_s: float, *, drain: Callable[[], None] | None = None
     ) -> FlightStateEvidence:
-        """Request Guided mode, arm, and take off to the configured altitude.
+        """Ask for Guided flight, and take off once the autopilot grants it.
 
         A refusal is evidence: the mode and the arming state are read back from
-        telemetry, and any STATUSTEXT the autopilot gave is retained with them. A
-        vehicle that refuses to arm will keep refusing for the whole window, so the
-        first refusal after the attempt is what ends the wait; polling a check that has
-        already failed for two minutes produces no further evidence.
+        telemetry, and every refusal the autopilot gave is kept with them. Control is
+        requested repeatedly for the configured wait, because a simulated vehicle needs
+        simulated time before its pre-arm checks pass.
 
-        ``drain`` is the caller's loop over the sensor stream. This wait is measured in
-        seconds, and the cameras and inertial devices keep producing throughout it, so
-        without it the controller's queue fills and frames are dropped before anything
-        reads them.
-
-        The pre-arm wait comes first: a vehicle that has just booted is still being asked
-        for a GPS fix, a home and a quiet IMU window, and arming before those clear
-        records the boot rather than the transport.
+        ``drain`` is the caller's loop over the sensor stream, which keeps producing
+        throughout this wait.
         """
-        pre_arm_clear, outstanding = self.wait_for_pre_arm_clear(
+        evidence, attempt_at = self.request_control(
             self.settings.pre_arm_wait_s, drain=drain
         )
-        attempt_at = self._monotonic()
-        self._session.set_mode("GUIDED")
-        self._session.arm()
-        # Give the autopilot a moment to answer the arming request, reading the sensor
-        # stream while it does: this wait is a second of frames the controller would
-        # otherwise queue and then drop.
-        settle_until = attempt_at + ARM_SETTLE_S
-        while self._monotonic() < settle_until:
-            if drain is not None:
-                drain()
-            self._sleep(0.1)
-        sample = self.telemetry()
-        if sample.armed:
-            self._session.takeoff(self.settings.hover_altitude_m)
-        deadline = self._monotonic() + timeout_s
         altitude = None
-        while self._monotonic() < deadline:
-            sample = self.telemetry()
-            position = sample.local_position_ned
-            if position is not None:
-                altitude = -position[2]
+        if evidence.armed:
+            self._session.takeoff(self.settings.hover_altitude_m)
+            takeoff_at = self._monotonic()
+            deadline = takeoff_at + timeout_s
+            while self._monotonic() < deadline:
+                sample = self.telemetry()
+                position = sample.local_position_ned
+                if position is not None:
+                    altitude = -position[2]
+                    if (
+                        sample.in_guided_mode
+                        and sample.armed
+                        and altitude >= 0.5 * self.settings.hover_altitude_m
+                    ):
+                        break
                 if (
-                    sample.in_guided_mode
-                    and sample.armed
-                    and altitude >= 0.5 * self.settings.hover_altitude_m
+                    self._monotonic() - takeoff_at >= CONTROL_GRANT_GRACE_S
+                    and not (sample.in_guided_mode and sample.armed)
                 ):
+                    # A mode that has not become Guided will not become Guided by waiting.
                     break
-            if (
-                self._monotonic() - attempt_at >= CONTROL_GRANT_GRACE_S
-                and not (sample.in_guided_mode and sample.armed)
-            ):
-                break
-            if drain is not None:
-                drain()
-            self._sleep(0.2)
-        evidence = FlightStateEvidence(
-            commanded_mode="GUIDED",
-            mode_reached=sample.in_guided_mode,
-            armed=bool(sample.armed),
-            takeoff_commanded_m=self.settings.hover_altitude_m,
-            altitude_m=altitude,
-            statustexts=tuple(self._statustexts),
-            refused=not (sample.in_guided_mode and sample.armed),
-            pre_arm_clear=pre_arm_clear,
-            pre_arm_outstanding=outstanding,
-        )
+                if drain is not None:
+                    drain()
+                self._sleep(0.2)
+            evidence = replace(
+                evidence,
+                mode_reached=sample.in_guided_mode,
+                armed=bool(sample.armed),
+                altitude_m=altitude,
+                refused=not (sample.in_guided_mode and sample.armed),
+            )
         self.evidence.write_json(
             "flight-state.json",
             {
@@ -2584,11 +2602,12 @@ class WebotsArduPilot:
                 "armed": evidence.armed,
                 "takeoff_commanded_m": evidence.takeoff_commanded_m,
                 "altitude_m": evidence.altitude_m,
-                "refused": evidence.refused,
-                "pre_arm_clear": evidence.pre_arm_clear,
-                "pre_arm_outstanding": list(evidence.pre_arm_outstanding),
+                "control_attempts": evidence.control_attempts,
+                "refusals": list(evidence.refusals),
                 "pre_arm_wait_s": self.settings.pre_arm_wait_s,
+                "control_requested_at_monotonic_ns": attempt_at.monotonic_ns,
                 "statustexts": list(evidence.statustexts),
+                "refused": evidence.refused,
             },
         )
         return evidence

@@ -247,9 +247,10 @@ class ScriptedMavlinkSession:
         # The parameters this scripted vehicle reports about itself, as an autopilot
         # answers a parameter request: the value that is running, not the value intended.
         self.parameter_values = dict(parameter_values or {})
-        # A failing pre-arm check clears after this many batches, as a simulated GPS,
-        # home position and IMU consistency check do.
+        # How many control requests the pre-arm checks refuse before they clear, as a
+        # simulated GPS, home position and IMU consistency check do.
         self.pre_arm_failures = pre_arm_failures
+        self.pre_arm_text = pre_arm_failures > 0
         self.pending_parameters = []
         self.sent = []
         self.commands = []
@@ -315,8 +316,16 @@ class ScriptedMavlinkSession:
 
     def arm(self):
         self.commands.append(("arm",))
-        if not self.refuse_arming:
-            self.armed = True
+        if self.refuse_arming:
+            return
+        if self.pre_arm_failures > 0:
+            # The vehicle refuses while its pre-arm checks fail, however often it is asked,
+            # and stops reporting them once they clear: what the probe has to observe
+            # rather than guess at.
+            self.pre_arm_failures -= 1
+            self.pre_arm_text = self.pre_arm_failures > 0
+            return
+        self.armed = True
 
     def takeoff(self, altitude_m):
         self.commands.append(("takeoff", altitude_m))
@@ -354,9 +363,7 @@ class ScriptedMavlinkSession:
             self.flags = 1
         servo = 1000 if (self.dead_servos or not guided) else 1500
         statustext = "guided" if guided else "EKF failsafe check"
-        if not self.armed and (
-            self.refuse_arming or self.drains <= self.pre_arm_failures
-        ):
+        if not self.armed and (self.refuse_arming or self.pre_arm_text):
             # What an autopilot says while its pre-arm checks fail: the text is the
             # evidence that the refusal is the aircraft's decision, not the test's.
             statustext = "PreArm: 3D Accel calibration needed"
@@ -1474,24 +1481,25 @@ def test_the_launch_commands_carry_the_wipe_and_the_parameter_layers(tmp_path):
     ]
 
 
-def test_the_probe_waits_for_the_autopilot_s_pre_arm_checks_to_clear(tmp_path):
+def test_the_probe_requests_control_again_while_the_vehicle_refuses(tmp_path):
     """A vehicle that has just booted is still waiting for its GPS, home and IMU.
 
-    Arming the moment the first heartbeat arrives records the boot rather than the
-    transport, so the probe waits for the checks to go quiet first, and records both
-    the wait and anything that was still outstanding.
+    Its refusals are not a list of what is missing — ArduPilot stops repeating a check
+    whether it cleared or not — so the probe asks again and reads each answer.
     """
     result, _, _, _, _ = run_probe(
         tmp_path,
-        session_kwargs={"pre_arm_failures": 40},
+        session_kwargs={"pre_arm_failures": 2},
         config_overrides={"probe": {"pre_arm_wait_s": 60.0}},
     )
     motion = check(result, "3_guided_local_ned_motion")
     assert motion.status == "pass", motion.reason
     assert motion.evidence["control_events"]
     flight = json.loads((tmp_path / "out" / "run-a" / "flight-state.json").read_text())
-    assert flight["pre_arm_clear"] is True
-    assert flight["pre_arm_outstanding"] == []
+    assert flight["armed"] is True
+    # The first request was refused and the probe asked again once the checks cleared.
+    assert flight["control_attempts"] > 1
+    assert "PreArm: 3D Accel calibration needed" in flight["refusals"]
     assert flight["pre_arm_wait_s"] == 60.0
 
 
@@ -1505,8 +1513,9 @@ def test_a_vehicle_whose_pre_arm_checks_never_clear_is_recorded_as_refusing(tmp_
     assert motion.status == "fail"
     assert "did not enter Guided flight" in motion.reason
     flight = json.loads((tmp_path / "out" / "run-a" / "flight-state.json").read_text())
-    assert flight["pre_arm_clear"] is False
-    assert "PreArm: 3D Accel calibration needed" in flight["pre_arm_outstanding"]
+    assert flight["armed"] is False
+    assert flight["control_attempts"] > 1
+    assert "PreArm: 3D Accel calibration needed" in flight["refusals"]
 
 
 
