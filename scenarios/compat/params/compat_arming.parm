@@ -24,6 +24,13 @@
 #       value ArduPilot's own simulator parameter set uses for both of them on a quad X
 #       (Tools/autotest/default_params/airsim-quadX.parm at the same commit), so it comes
 #       from upstream rather than from here. This is the one control gain in this file.
+#   "Arm: Gyro 0 rate 500Hz < loop rate*1.8 540Hz"
+#       ArduPilot requires the gyro sample rate to be at least 1.8 times the scheduler
+#       loop rate. The Webots scene steps at the pinned 2 ms, so the flight-state packet
+#       the autopilot reads as its gyro is sampled at 500 Hz, and the pinned loop rate of
+#       300 Hz therefore demands 540 Hz. 250 Hz is the highest round rate that a 500 Hz
+#       sensor supports (250 x 1.8 = 450). The value is derived from the scene's own time
+#       step, not chosen for control behaviour, and every receipt records it.
 #
 # Nothing here touches the estimator, the transport, the sensor path or the frame layout.
 # The vehicle reports these values back to the probe, so each receipt states the
@@ -47,3 +54,7 @@ ACRO_BAL_PITCH  0
 
 ATC_RAT_RLL_I   0.25
 ATC_RAT_PIT_I   0.25
+
+# The scheduler loop rate a 500 Hz sensor interface supports. Derived, not tuned:
+# ArduPilot requires the gyro rate to be at least 1.8 times this value.
+SCHED_LOOP_RATE 250
