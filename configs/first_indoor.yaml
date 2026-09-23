@@ -85,6 +85,11 @@ probe:
     hold_s: 6
   timebase_samples: 40
   timebase_spread_limit_ms: 60
+  # How often the timebase item reads the autopilot's clock. A message can only be
+  # stamped when it is read off the socket, so this is the resolution of that
+  # measurement: the join's residual scatter cannot come out smaller than this, and a
+  # slower loop would report its own latency as scatter between the two clocks.
+  timebase_poll_s: 0.005
   step_timeout_s:
     startup: 90
     ready: 60

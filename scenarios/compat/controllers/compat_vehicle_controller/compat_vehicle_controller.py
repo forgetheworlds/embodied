@@ -169,14 +169,26 @@ class ObservationChannel:
         return self.client is not None
 
     def send(self, kind, sim_time_s, payload):
-        """Frame one message and queue it, dropping it when the reader is behind."""
+        """Frame one message and queue it, in the order it was produced.
+
+        Status and injection acknowledgements are queued as control frames: they answer
+        the analysis process, so a backlog of camera frames defers them but never
+        discards them. Everything else is bulk and is dropped from the newest end when
+        the reader falls behind. Both kinds leave in the order they were queued, because
+        the reader resynchronises on frame boundaries and a reordered frame is a stream
+        it cannot parse.
+        """
         if self.client is None:
             return
         self.sequence += 1
         framed = SHARED.pack_message(
             kind, sim_time_s=sim_time_s, sequence=self.sequence, payload=payload
         )
-        if not self.outgoing.queue(framed):
+        control = kind in (SHARED.Kind.STATUS, SHARED.Kind.FAULT_ACK)
+        queued = (
+            self.outgoing.queue_control(framed) if control else self.outgoing.queue(framed)
+        )
+        if not queued:
             return
         self._flush()
 
@@ -184,10 +196,8 @@ class ObservationChannel:
         """What this channel has done, for the status the probe records."""
         return {
             "frames_produced": self.sequence,
-            "frames_dropped": self.outgoing.dropped_frames,
-            "queued_bytes": self.outgoing.queued_bytes,
-            "max_queued_bytes": self.outgoing.max_queued_bytes,
             "reader_connected": self.client is not None,
+            **self.outgoing.describe(),
         }
 
     def _flush(self):

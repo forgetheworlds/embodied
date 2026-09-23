@@ -248,6 +248,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "estimator_fault": {"kind": str, "magnitude_m": float, "hold_s": float},
         "timebase_samples": int,
         "timebase_spread_limit_ms": float,
+        "timebase_poll_s": float,
         "step_timeout_s": {"startup": float, "ready": float, "flight": float},
         "budget_wall_clock_s": float,
     },

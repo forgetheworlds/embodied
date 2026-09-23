@@ -76,7 +76,16 @@ class FakeRunner:
 
 
 class FakeGateway:
-    """A controller that streams status, stereo pairs and inertial samples on demand."""
+    """A controller that streams status, stereo pairs and inertial samples on demand.
+
+    It produces records at a rate in the tests' own time base and returns nothing once
+    the reader has caught up, because that is what the real stream does and what the
+    probe's drain relies on: a pass over the sensor stream ends when the stream is
+    momentarily empty, so a fake that could always produce another record would never
+    let a pass finish.
+    """
+
+    RECORDS_PER_SECOND = 110.0
 
     def __init__(self, clock, *, pair_bytes=None, colourless=False, acknowledge=True, motors=("m1_motor", "m2_motor", "m3_motor", "m4_motor")):
         self.clock = clock
@@ -91,6 +100,8 @@ class FakeGateway:
         self.sequence = 0
         self.pair_counter = 0
         self.closed = False
+        self._produced_until = None
+        self._budget = 0.0
 
     def _status(self):
         return W.SensorRecord(
@@ -175,11 +186,23 @@ class FakeGateway:
         return None
 
     def read_record(self, timeout_s):
+        """One record produced since the last read, or nothing when it has caught up."""
         if self.queue:
             return self.queue.pop(0)
         if not self.status_sent:
             self.status_sent = True
             return self._status()
+        now = self.clock.monotonic()
+        if self._produced_until is None:
+            # The first read happens the moment the reader connects, with no time behind
+            # it: nothing has been produced yet, which is what the real stream reports.
+            self._produced_until = now
+            return None
+        self._budget += (now - self._produced_until) * self.RECORDS_PER_SECOND
+        self._produced_until = now
+        if self._budget < 1.0:
+            return None
+        self._budget -= 1.0
         self.sequence += 1
         return self._pair() if self.sequence % 2 else self._imu()
 
@@ -553,6 +576,7 @@ def write_scene(tmp_path, **overrides):
             "estimator_fault": {"kind": "position_step", "magnitude_m": 30.0, "hold_s": 2.0},
             "timebase_samples": 5,
             "timebase_spread_limit_ms": 60,
+            "timebase_poll_s": 0.005,
             "step_timeout_s": {"startup": 30, "ready": 30, "flight": 60},
             "budget_wall_clock_s": 600,
         },
@@ -949,6 +973,85 @@ def test_the_outgoing_queue_drops_whole_frames_and_counts_them():
         stream.queue(b"x" * 11)  # a frame that could never fit at all is refused
 
 
+def test_a_control_frame_is_not_lost_behind_a_full_bulk_queue():
+    """The failure this exists to prevent: an acknowledgement dropped by pixels.
+
+    The analysis process waits for the controller's answer to an injection, and that
+    answer travels on the same connection as the camera stream. A full queue of frames
+    must not be able to discard it, because a lost acknowledgement cannot be told apart
+    from a command that was never applied.
+    """
+    stream = W.OutboundStream(max_queued_bytes=10, max_control_bytes=10)
+    assert stream.queue(b"1234567890") is True
+    assert stream.queue_control(b"ack") is True
+    assert stream.control_queued_bytes == 3
+    assert stream.dropped_control_frames == 0
+    assert stream.describe()["dropped_control_frames"] == 0
+
+
+def test_a_full_queue_drops_pixels_to_carry_a_control_frame():
+    stream = W.OutboundStream(max_queued_bytes=10, max_control_bytes=10)
+    assert stream.queue(b"1234567890") is True
+    assert stream.queue(b"more") is False, "the bulk frame does not fit"
+    assert stream.dropped_frames == 1
+    # Room for the answer is made by evicting pixels, not by refusing the answer.
+    assert stream.queue_control(b"ack") is True
+    assert stream.dropped_frames == 2
+    assert stream.dropped_control_frames == 0
+    assert stream.queued_bytes == 3
+
+
+def test_a_control_frame_never_overtakes_a_frame_that_is_half_sent():
+    """A reordered frame is a stream the reader cannot parse.
+
+    A camera frame is larger than the socket buffer, so part of it is regularly left
+    queued between flushes. A control frame queued at that moment must wait for the
+    rest of the frame in front of it: sending it first would put its bytes inside the
+    frame the reader is still assembling, and every frame after that would be read at
+    the wrong offset.
+    """
+    port = free_port()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
+    server.listen(1)
+    client = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    accepted, _ = server.accept()
+    accepted.setblocking(False)
+    client.settimeout(5.0)
+    stream = W.OutboundStream(max_queued_bytes=16 << 20)
+    bulk = W.pack_message(W.Kind.PAIR, sim_time_s=1.0, sequence=1, payload=b"p" * (8 << 20))
+    control = W.pack_message(W.Kind.FAULT_ACK, sim_time_s=2.0, sequence=2, payload=b"ack")
+    try:
+        assert stream.queue(bulk) is True
+        stream.flush(accepted)
+        # The bulk frame is larger than the socket buffer, so it is now half sent.
+        assert 0 < stream.queued_bytes < len(bulk)
+        assert stream.queue_control(control) is True
+        received = bytearray()
+        expected = len(bulk) + len(control)
+        while len(received) < expected:
+            chunk = client.recv(1 << 20)
+            assert chunk, "the connection closed before the whole stream arrived"
+            received += chunk
+            stream.flush(accepted)
+        assert bytes(received) == bulk + control, "the frames must leave in order"
+        assert stream.queued_bytes == 0
+    finally:
+        client.close()
+        accepted.close()
+        server.close()
+
+
+def test_control_frames_are_counted_when_their_own_bound_is_full():
+    stream = W.OutboundStream(max_queued_bytes=100, max_control_bytes=5)
+    assert stream.queue_control(b"ack") is True
+    assert stream.queue_control(b"ack") is True
+    # The oldest control frame is the one evicted, so the reader gets the newest.
+    assert stream.dropped_control_frames == 1
+    assert stream.control_queued_bytes == 3
+
+
 def test_a_frame_already_going_out_is_never_discarded_when_the_reader_pauses():
     """The failure this exists to prevent: a large frame on a non-blocking socket.
 
@@ -1034,6 +1137,72 @@ def test_the_firmware_identity_writes_its_version_blobs_as_hex():
     assert identity["uid"] == "0001ff"
     assert identity["vendor_id"] == 3
     assert W.firmware_identity(None) is None
+
+
+def test_a_receipt_stamp_is_the_arrival_of_the_message_that_carried_the_clock(tmp_path):
+    """A batch's folded time is not the same fact as a message's arrival time.
+
+    The timebase join pairs the autopilot's clock with the host time that message
+    arrived. Stamping the sample when the whole batch had been read and logged would
+    fold this program's own polling period into the join, and the run would report a
+    scatter between two clocks that is really the latency of reading them.
+    """
+    clock = FakeClock()
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+
+    class Session:
+        def drain(self):
+            return [
+                {
+                    "mavpackettype": "ATTITUDE",
+                    "time_boot_ms": 1000,
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    W.RECEIVED_AT_KEY: 5_000_000_000,
+                },
+                {
+                    "mavpackettype": "HEARTBEAT",
+                    "custom_mode": 4,
+                    "base_mode": 209,
+                    "system_status": 4,
+                    W.RECEIVED_AT_KEY: 5_090_000_000,
+                },
+            ]
+
+        def close(self):
+            return None
+
+    adapter = W.WebotsArduPilot(
+        settings,
+        runner=FakeRunner(),
+        session=Session(),
+        gateway=FakeGateway(clock),
+        evidence=W.EvidenceWriter(tmp_path / "out", "run-a"),
+        label="run-a",
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    sample = adapter.telemetry()
+    assert sample.boot_time_ms == 1000
+    assert sample.received_stamp.monotonic_ns == 5_000_000_000, (
+        "the stamp must be the arrival of the ATTITUDE that carries the clock, not the "
+        "later heartbeat in the same batch"
+    )
+
+
+def test_the_timebase_evidence_keeps_its_samples_and_its_resolution():
+    samples = [(1000.0, 10.0), (1001.0, 11.0), (1002.5, 12.5)]
+    join = W.join_timebase(samples, 60.0)
+    evidence = W.timebase_evidence(
+        join, samples, poll_period_s=0.005, host_clock="test-host/monotonic"
+    )
+    assert evidence["joined"] is True
+    assert evidence["poll_period_s"] == 0.005
+    assert evidence["samples_host_s_device_s"] == [list(pair) for pair in samples]
+    assert evidence["host_seconds_per_device_second"] == pytest.approx(1.0, abs=1e-6)
+    assert "poll period" in evidence["resolution_note"]
 
 
 def test_the_scene_assets_are_read_from_the_world_and_hashed():
@@ -1244,7 +1413,33 @@ def test_unjoined_clocks_fail_the_timebase_item(tmp_path):
     frames = check(result, "2_frames_and_timebases")
     assert frames.status == "fail"
     assert "unjoined clocks" in frames.reason
-    assert frames.evidence["host_to_autopilot"]["spread_ms"] > 60.0
+
+
+def test_a_join_is_refused_when_the_samples_cannot_resolve_the_tolerance():
+    """A fit whose whole span is below the tolerance is not a measurement of it.
+
+    Five samples taken inside one brief burst barely move the host clock while the
+    device clock jumps up and down: the line absorbs the jumps into a nonsense slope and
+    its residuals look small. Reporting that as a joined pair of clocks would be a
+    measurement claiming a resolution it never had.
+    """
+    samples = [
+        (1000.000, 900.9),
+        (1000.010, 899.9),
+        (1000.020, 900.9),
+        (1000.030, 899.9),
+        (1000.040, 900.9),
+    ]
+    join = W.join_timebase(samples, 60.0)
+    assert join.joined is False
+    assert "the host clock advanced only" in join.reason
+
+
+def test_a_join_spread_over_the_tolerance_is_still_judged_on_its_spread():
+    samples = [(1000.0 + index, 900.0 + index) for index in range(40)]
+    join = W.join_timebase(samples, 60.0)
+    assert join.joined is True
+    assert join.spread_ms == pytest.approx(0.0, abs=1e-6)
 
 
 def test_publication_is_recorded_and_adoption_is_left_to_telemetry(tmp_path):

@@ -308,40 +308,99 @@ class FrameReader:
 # the newest frame is dropped and counted rather than the stream being corrupted.
 MAX_QUEUED_STREAM_BYTES = 8 << 20
 
+# Control frames — the controller's status and its acknowledgement of an injection —
+# travel on the same connection but not in the same lane. They answer a command the
+# reader is waiting for, so a full queue of camera frames must not be able to swallow
+# one: a lost acknowledgement is indistinguishable from a command that was never
+# applied, and the reader would report a request it cannot confirm. The lane is small
+# because these frames are: a status is about a kilobyte and an acknowledgement less.
+MAX_QUEUED_CONTROL_BYTES = 256 << 10
+
 
 class OutboundStream:
-    """Whole frames queued for a non-blocking socket, with a bound and a drop count.
+    """Whole frames queued for a non-blocking socket, with bounds and drop counts.
 
     The controller writes into this and then flushes; the reader may be slower than
     the cameras, and a socket that is not ready raises rather than waiting, because
-    waiting would stall the simulation itself. Two rules keep the reader's view
-    honest. A frame is queued whole, and a frame that has already begun to go out is
-    never discarded: half a frame leaves the reader with bytes it cannot
-    resynchronise, which is worse than a frame it never sees. When the queue is over
-    its bound the newest frame is dropped and counted, so a slow reader receives
-    whole frames at a lower rate and the run can report what was lost.
+    waiting would stall the simulation itself.
+
+    Three rules keep the reader's view honest. Frames leave in the order they were
+    queued, whatever kind they are, and a frame that has already begun to go out is
+    never discarded: half a frame — or a frame whose second half was overtaken by
+    another frame — leaves the reader with bytes it cannot resynchronise, which is
+    worse than a frame it never sees. Because of that, admission is the only place a
+    frame can be lost.
+
+    Bulk frames and control frames are admitted differently. A bulk frame is refused
+    when the queue is over its bound, and the refusal is counted, so a slow reader
+    receives whole frames at a lower rate and the run can report what was lost. A
+    control frame — the status, or the answer to an injection — is not refused for
+    being preceded by pixels: it evicts the newest frames that have not begun to go
+    out, because a lost acknowledgement cannot be told apart from a command that was
+    never applied. The control frames have a bound of their own, and exceeding either
+    bound is counted, so nothing is dropped in silence.
     """
 
-    def __init__(self, *, max_queued_bytes: int = MAX_QUEUED_STREAM_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        max_queued_bytes: int = MAX_QUEUED_STREAM_BYTES,
+        max_control_bytes: int = MAX_QUEUED_CONTROL_BYTES,
+    ) -> None:
         self.max_queued_bytes = int(max_queued_bytes)
-        self._queued = bytearray()
+        self.max_control_bytes = int(max_control_bytes)
+        self._frames: list[bytes] = []
+        self._droppable: list[bool] = []
+        # How many bytes of the head frame have already gone out. The rest of that
+        # frame is sent before anything queued after it.
+        self._sent_from_head = 0
+        self._queued_bytes = 0
+        self._control_bytes = 0
         self.dropped_frames = 0
+        self.dropped_control_frames = 0
 
     @property
     def queued_bytes(self) -> int:
-        return len(self._queued)
+        return self._queued_bytes
+
+    @property
+    def control_queued_bytes(self) -> int:
+        return self._control_bytes
 
     def queue(self, frame: bytes) -> bool:
-        """Queue one whole frame. False means it was dropped instead of queued."""
+        """Queue one whole bulk frame. False means it was dropped instead of queued."""
         if len(frame) > self.max_queued_bytes:
             raise FramingError(
                 f"a {len(frame)}-byte frame does not fit in a {self.max_queued_bytes}-byte "
                 "stream queue, so it could never be sent"
             )
-        if len(self._queued) + len(frame) > self.max_queued_bytes:
+        if self._queued_bytes + len(frame) > self.max_queued_bytes:
             self.dropped_frames += 1
             return False
-        self._queued += frame
+        self._append(frame, droppable=True)
+        return True
+
+    def queue_control(self, frame: bytes) -> bool:
+        """Queue a frame the reader is waiting for, making room rather than waiting.
+
+        False means even an empty bulk queue could not carry it, or the control frames
+        already queued fill their own bound: both are counted, because a control frame
+        that was discarded is a fact about the run rather than something to hide.
+        """
+        if len(frame) > self.max_queued_bytes:
+            raise FramingError(
+                f"a {len(frame)}-byte control frame cannot be carried by a "
+                f"{self.max_queued_bytes}-byte queue"
+            )
+        while self._control_bytes + len(frame) > self.max_control_bytes:
+            if not self._evict(self._oldest_control_index):
+                self.dropped_control_frames += 1
+                return False
+        while self._queued_bytes + len(frame) > self.max_queued_bytes:
+            if not self._evict(self._newest_bulk_index):
+                self.dropped_control_frames += 1
+                return False
+        self._append(frame, droppable=False)
         return True
 
     def flush(self, sock: socket.socket) -> None:
@@ -351,18 +410,83 @@ class OutboundStream:
         not caught up. Anything else is a real fault and is raised for the caller to
         handle, because a stream that has failed silently is a stream that lies.
         """
-        while self._queued:
+        while self._frames:
+            frame = self._frames[0]
+            # A view, not a copy: the remainder of a large frame is sent from the bytes
+            # that are already in memory, however many flushes that takes.
+            remaining = memoryview(frame)[self._sent_from_head :]
             try:
-                sent = sock.send(self._queued)
+                sent = sock.send(remaining)
             except (BlockingIOError, InterruptedError):
                 return
             if sent <= 0:
                 return
-            del self._queued[:sent]
+            self._sent_from_head += sent
+            self._queued_bytes -= sent
+            if not self._droppable[0]:
+                self._control_bytes -= sent
+            if self._sent_from_head >= len(frame):
+                self._frames.pop(0)
+                self._droppable.pop(0)
+                self._sent_from_head = 0
+
+    def describe(self) -> dict[str, Any]:
+        """The queue's own state, for the status the analysis process records."""
+        return {
+            "queued_bytes": self.queued_bytes,
+            "control_queued_bytes": self.control_queued_bytes,
+            "max_queued_bytes": self.max_queued_bytes,
+            "max_control_bytes": self.max_control_bytes,
+            "dropped_frames": self.dropped_frames,
+            "dropped_control_frames": self.dropped_control_frames,
+        }
 
     def reset(self) -> None:
-        """Forget queued bytes when the reader is gone. The drop count stays."""
-        self._queued.clear()
+        """Forget queued bytes when the reader is gone. The drop counts stay."""
+        self._frames.clear()
+        self._droppable.clear()
+        self._sent_from_head = 0
+        self._queued_bytes = 0
+        self._control_bytes = 0
+
+    # -- internals ---------------------------------------------------------
+
+    def _append(self, frame: bytes, *, droppable: bool) -> None:
+        self._frames.append(frame)
+        self._droppable.append(droppable)
+        self._queued_bytes += len(frame)
+        if not droppable:
+            self._control_bytes += len(frame)
+
+    @property
+    def _oldest_control_index(self) -> int | None:
+        for index, droppable in enumerate(self._droppable):
+            if not droppable and not (index == 0 and self._sent_from_head):
+                return index
+        return None
+
+    @property
+    def _newest_bulk_index(self) -> int | None:
+        for index in range(len(self._frames) - 1, -1, -1):
+            if self._droppable[index] and not (index == 0 and self._sent_from_head):
+                return index
+        return None
+
+    def _evict(self, choose: int | None) -> bool:
+        """Drop one whole frame that has not begun to go out."""
+        if choose is None:
+            return False
+        frame = self._frames.pop(choose)
+        droppable = self._droppable.pop(choose)
+        self._queued_bytes -= len(frame)
+        if droppable:
+            self.dropped_frames += 1
+        else:
+            self._control_bytes -= len(frame)
+            self.dropped_control_frames += 1
+        if choose == 0:
+            self._sent_from_head = 0
+        return True
 
 
 PAIR_PAYLOAD_FORMAT = ">QIIIHHB"
@@ -695,6 +819,10 @@ class PlatformSettings:
     estimator_fault: EstimatorFault
     timebase_samples: int
     timebase_spread_limit_ms: float
+    # The resolution of the timebase measurement: how often the sampling loop reads the
+    # autopilot's clock. A message can only be stamped when it is read, so this bounds
+    # how much of the loop's own latency can appear as scatter between the two clocks.
+    timebase_poll_s: float
     step_timeout_s: StepTimeouts
     budget_wall_clock_s: float
     output: str
@@ -825,6 +953,7 @@ class PlatformSettings:
             ),
             timebase_samples=int(probe["timebase_samples"]),
             timebase_spread_limit_ms=float(probe["timebase_spread_limit_ms"]),
+            timebase_poll_s=float(probe["timebase_poll_s"]),
             step_timeout_s=StepTimeouts(
                 startup=float(timeouts["startup"]),
                 ready=float(timeouts["ready"]),
@@ -872,6 +1001,8 @@ class PlatformSettings:
             raise ConfigError("probe.waypoints_local_ned must name at least one waypoint")
         if self.timebase_samples < 2:
             raise ConfigError("probe.timebase_samples must be at least 2 to fit a line")
+        if self.timebase_poll_s <= 0.0:
+            raise ConfigError("probe.timebase_poll_s must be positive")
         if self.estimator_fault.magnitude_m <= 0.0 or self.estimator_fault.hold_s <= 0.0:
             raise ConfigError("probe.estimator_fault magnitude and hold must be positive")
         if self.budget_wall_clock_s <= 0.0:
@@ -1436,7 +1567,13 @@ def fit_timebase(samples: Sequence[tuple[float, float]]) -> tuple[float, float, 
 
 
 def join_timebase(samples: Sequence[tuple[float, float]], spread_limit_ms: float) -> TimebaseJoin:
-    """Join two clocks, or report that they cannot be joined inside the limit."""
+    """Join two clocks, or report that they cannot be joined inside the limit.
+
+    A join is only meaningful when the samples span more than the tolerance being
+    checked. A line fitted to a host clock that barely moved while the device clock
+    jumped up and down is not a relation between two clocks, and its residuals can look
+    small while saying nothing, so the span is checked before the spread is believed.
+    """
     try:
         offset, drift_ppm, spread_ms = fit_timebase(samples)
     except ProbeFailure as error:
@@ -1447,6 +1584,22 @@ def join_timebase(samples: Sequence[tuple[float, float]], spread_limit_ms: float
             spread_ms=None,
             joined=False,
             reason=str(error),
+        )
+    host_span_ms = 1000.0 * (
+        max(host for host, _ in samples) - min(host for host, _ in samples)
+    )
+    if host_span_ms < spread_limit_ms:
+        return TimebaseJoin(
+            samples=len(samples),
+            offset_s=offset,
+            drift_ppm=drift_ppm,
+            spread_ms=spread_ms,
+            joined=False,
+            reason=(
+                f"the host clock advanced only {host_span_ms:.1f} ms across the samples, "
+                f"less than the {spread_limit_ms:.1f} ms the join is checked against, so "
+                "the fit cannot resolve the tolerance it is being asked about"
+            ),
         )
     joined = spread_ms <= spread_limit_ms
     reason = None
@@ -1463,6 +1616,48 @@ def join_timebase(samples: Sequence[tuple[float, float]], spread_limit_ms: float
         joined=joined,
         reason=reason,
     )
+
+
+def timebase_evidence(
+    join: TimebaseJoin,
+    samples: Sequence[tuple[float, float]],
+    *,
+    poll_period_s: float,
+    host_clock: str,
+) -> dict[str, Any]:
+    """What the join measured, how finely it could measure it, and on which samples.
+
+    The raw pairs are kept beside the fit so a reader can re-derive the numbers rather
+    than take them on trust, and the poll period is kept with them because it is the
+    resolution of the measurement: a message cannot be stamped before it is read, so a
+    slowly polling loop reports its own latency as scatter between the two clocks.
+
+    ``drift_ppm`` is reported as a rate, not as crystal drift. Under a simulator the
+    autopilot's boot clock advances with *simulated* time — Webots advances the step,
+    the flight-state packet carries that time, and ArduPilot's clock follows it — so
+    the fitted scale is the simulator's rate against the host clock, and a simulation
+    that cannot hold realtime shows up here as a rate, not as a hardware defect.
+    """
+    return {
+        "samples": join.samples,
+        "offset_s": join.offset_s,
+        "host_seconds_per_device_second": (
+            None if join.drift_ppm is None else 1.0 + join.drift_ppm / 1e6
+        ),
+        "drift_ppm": join.drift_ppm,
+        "spread_ms": join.spread_ms,
+        "joined": join.joined,
+        "reason": join.reason,
+        "device_clock": "telemetry time_boot_ms",
+        "host_clock": host_clock,
+        "poll_period_s": poll_period_s,
+        "resolution_note": (
+            "each sample pairs the host time a message was read off the socket with the "
+            "autopilot clock that message carried; the loop's poll period bounds how "
+            "much later than its arrival a message can be stamped"
+        ),
+        "samples_host_s_device_s": [[host_s, device_s] for host_s, device_s in samples],
+    }
 
 
 # The autopilot's own view of itself, from MAV_STATE: it reports BOOT (1) while it
@@ -1498,6 +1693,14 @@ MSG_ID_LOCAL_POSITION_NED = 32
 MSG_ID_SERVO_OUTPUT_RAW = 36
 MSG_ID_AUTOPILOT_VERSION = 148
 MSG_ID_EKF_STATUS_REPORT = 193
+
+# Every message this program reads carries the host time at which it was read off the
+# socket, under this key. The stamp belongs to the message, not to the batch it was
+# folded into: the timebase join pairs an autopilot clock reading with the arrival of
+# the message that carried it, and a stamp taken after a whole batch was parsed and
+# logged would charge the join for this program's own polling period. The key is
+# recorded in mavlink.jsonl so the join's samples can be re-derived from the evidence.
+RECEIVED_AT_KEY = "received_monotonic_ns"
 
 # The only message types this program may send. Motion travels as a guided
 # setpoint; everything else is a procedure such as a mode request or an interval
@@ -1776,13 +1979,21 @@ class PymavlinkSession:
         )
 
     def drain(self) -> list[dict[str, Any]]:
+        """Read what has arrived, stamping each message as it is read.
+
+        The socket is read until it is momentarily empty: the messages that are waiting
+        are the ones that arrived since the last call, and stopping early would leave a
+        backlog that grows for the whole run.
+        """
         messages: list[dict[str, Any]] = []
         while len(messages) < 2000:
             message = self._connection.recv_match(blocking=False)
             if message is None:
                 break
+            received_ns = time.monotonic_ns()
             document = message.to_dict()
             document.setdefault("mavpackettype", message.get_type())
+            document[RECEIVED_AT_KEY] = received_ns
             messages.append(document)
         return messages
 
@@ -2269,13 +2480,24 @@ class WebotsArduPilot:
         ):
             self._session.request_message_interval(message_id, hz)
 
-    def read_parameters(self, names: Sequence[str], timeout_s: float) -> dict[str, float]:
+    def read_parameters(
+        self,
+        names: Sequence[str],
+        timeout_s: float,
+        *,
+        drain: Callable[[], None] | None = None,
+    ) -> dict[str, float]:
         """Ask the autopilot for the named parameters and wait for its answers.
 
         The requests go out in small batches because ArduPilot drops a parameter request
         outright when its pending queue is full, and a burst of thirty of them fills it:
         the tail of the list is silently lost, which looks exactly like a parameter the
         vehicle does not have.
+
+        ``drain`` is the caller's loop over the sensor stream. It matters here as much as
+        anywhere else: the cameras keep producing while the parameter answers are
+        collected, and this wait is long enough — a second and more of round trips — for
+        an unread stream to fill the controller's queue and lose frames behind it.
         """
         reported: dict[str, float] = {}
         deadline = self._monotonic() + timeout_s
@@ -2285,6 +2507,8 @@ class WebotsArduPilot:
             for name in batch:
                 self._session.request_parameter(name)
             while self._monotonic() < deadline:
+                if drain is not None:
+                    drain()
                 sample = self.telemetry()
                 reported.update(sample.parameters)
                 if all(name in reported for name in batch):
@@ -2298,7 +2522,7 @@ class WebotsArduPilot:
         return self.settings.parameter_files(self._extra_params)
 
     def start(self) -> StartupEvidence:
-        """Start Webots and SITL, then open the sensor and MAVLink channels."""
+        """Start Webots and SITL, then open the MAVLink session and the sensor stream."""
         simulator = self._runner.spawn(
             "webots",
             self.settings.simulator_argv(),
@@ -2312,8 +2536,13 @@ class WebotsArduPilot:
             cwd=self.settings.ardupilot_root,
         )
         self._children = {"webots": simulator, "sitl": sitl}
-        self._gateway.open("127.0.0.1", self.settings.endpoints.controller_port, 30.0)
         connection = self._session.connect(self.settings.mavlink_endpoint, 30.0)
+        # The sensor stream is opened last, when this process is ready to read it. The
+        # controller sends frames only to a connected reader, so opening it before the
+        # autopilot session is up would start a stream nobody was reading: the reader
+        # would be behind from its first byte and the controller would drop whatever its
+        # queue could not hold.
+        self._gateway.open("127.0.0.1", self.settings.endpoints.controller_port, 30.0)
         # AUTOPILOT_VERSION answers once, on request, and it is the only statement of
         # which firmware is being exercised.
         self._session.request_message(MSG_ID_AUTOPILOT_VERSION)
@@ -2429,7 +2658,9 @@ class WebotsArduPilot:
         messages = self._session.drain()
         for document in messages:
             self._record_mavlink(document)
-        sample = decode_telemetry(messages, stamp=self._stamp(), previous=self._telemetry)
+        sample = decode_telemetry(
+            messages, stamp=self._arrival_stamp(messages), previous=self._telemetry
+        )
         previous = self._telemetry
         self._telemetry = sample
         if sample.statustexts:
@@ -2450,6 +2681,25 @@ class WebotsArduPilot:
                 )
             )
         return sample
+
+    def _arrival_stamp(self, messages: Sequence[dict[str, Any]]) -> ClockStamp:
+        """The host time the message carrying the autopilot's clock was read.
+
+        A sample's receipt stamp is the arrival of the message whose ``time_boot_ms``
+        the sample reports, not the moment the batch was folded: those two differ by
+        however long this program spent between reading the message and finishing with
+        the batch, and that difference is the probe's own latency, not the clock
+        relation the timebase item is measuring. When a batch carries no autopilot clock
+        reading at all — a heartbeat-only batch, say — the sample keeps the batch stamp,
+        because then there is no message whose arrival it is describing.
+        """
+        for document in reversed(messages):
+            if document.get("time_boot_ms") is None:
+                continue
+            arrival_ns = document.get(RECEIVED_AT_KEY)
+            if arrival_ns is not None:
+                return self.settings.capture_stamp(int(arrival_ns))
+        return self._stamp()
 
     @property
     def guidance_held(self) -> bool:
@@ -2948,6 +3198,28 @@ def window_reached(
     return sim_times[-1] - start_sim_time >= window_s - TIME_COMPARISON_TOLERANCE_S
 
 
+def new_reader_stats() -> dict[str, Any]:
+    """A fresh account of how the probe read the sensor stream.
+
+    Both ends of the stream are counted, because a hole in the frames says something
+    different depending on which end produced it: the controller counts what it dropped,
+    and this counts how long it went between reads and whether a read ever stopped with
+    records still queued.
+    """
+    return {
+        "drains": 0,
+        "drains_with_records": 0,
+        "drains_stopped_early": 0,
+        "records": 0,
+        "max_drain_s": 0.0,
+        "max_gap_between_drains_s": 0.0,
+        "controller_frames_produced": None,
+        "controller_frames_dropped": None,
+        "controller_queued_bytes": None,
+        "last_drain_at": None,
+    }
+
+
 class CompatibilityProbe:
     """The live compatibility checklist, driven through replaceable seams.
 
@@ -2985,6 +3257,11 @@ class CompatibilityProbe:
         self._calibration: Any = None
         self._artifacts: list[str] = []
         self._prerequisites: tuple[Prerequisite, ...] = ()
+        self._reader_stats = new_reader_stats()
+
+    def reader_stats(self) -> dict[str, Any]:
+        """What this process's own reading of the sensor stream looked like."""
+        return {key: value for key, value in self._reader_stats.items() if key != "last_drain_at"}
 
     def _stamp(self) -> ClockStamp:
         """One reading of this host's monotonic clock, in this run's clock domain."""
@@ -3072,13 +3349,17 @@ class CompatibilityProbe:
         checks: list[ProbeCheck] = []
         notes: list[str] = []
         try:
-            startup_check = self._item_startup(adapter, writer, label)
+            # The flight log exists before the first item, so the startup item's waits can
+            # read the sensor stream too: every record it files is evidence the later
+            # items judge, and a wait that ignored the stream would both lose frames and
+            # leave a hole in the material the stereo and inertial items are reading.
+            log = _FlightLog()
+            startup_check = self._item_startup(adapter, writer, log, label)
             checks.append(startup_check)
             if startup_check.status == "fail":
                 manifest = self._run_manifest(label, adapter, writer, extra_params)
                 return tuple(checks), manifest, tuple(notes)
 
-            log = _FlightLog()
             at_rest_imu, pre_settle = self._collect_imu(adapter, writer, log, label=label)
             checks.append(self._item_frames_and_timebases(adapter, writer, log, label=label))
             motion_check = self._item_guided_motion(adapter, writer, log)
@@ -3088,7 +3369,7 @@ class CompatibilityProbe:
             checks.append(self._item_imu_stream(adapter, writer, at_rest_imu, pre_settle, log))
             checks.append(self._item_stream_loss(adapter, writer, log))
             if estimator_run:
-                checks.append(self._item_estimator_health(adapter, writer))
+                checks.append(self._item_estimator_health(adapter, writer, log))
             if not estimator_run:
                 notes.append(
                     "run A: the estimator item is not applicable because AHRS_EKF_TYPE 10 "
@@ -3194,12 +3475,13 @@ class CompatibilityProbe:
                 },
             },
             "controller": adapter.controller_status,
+            "reader": self.reader_stats(),
         }
 
     # -- checklist item 1 --------------------------------------------------
 
     def _item_startup(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, label: str
+        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, label: str
     ) -> ProbeCheck:
         startup = adapter.start()
         readiness = adapter.wait_ready(self.settings.step_timeout_s.startup)
@@ -3209,7 +3491,13 @@ class CompatibilityProbe:
         # that never reached it leaves the vehicle on firmware defaults while every file
         # in the receipt still looks right, so the two are compared here.
         configured = read_configured_parameters(adapter.parameter_files())
-        reported = adapter.read_parameters(tuple(sorted(configured)), PARAMETER_READ_TIMEOUT_S)
+        reported = adapter.read_parameters(
+            tuple(sorted(configured)),
+            PARAMETER_READ_TIMEOUT_S,
+            drain=lambda: self._read_records(
+                adapter, writer, log, label=label, imu_phase="startup"
+            ),
+        )
         mismatches = [
             f"{name}: files say {configured[name]:g}, autopilot reports {reported[name]:g}"
             for name in sorted(configured)
@@ -3283,24 +3571,40 @@ class CompatibilityProbe:
     def _sample_autopilot_clock(
         self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
     ) -> list[tuple[float, float]]:
-        """Pair host receipt times with the autopilot's own clock, once per message batch.
+        """Pair host receipt times with the autopilot's own clock.
 
-        The sensor stream is read on every pass as well. The cameras and the inertial
-        devices produce about ten times as fast as this loop samples the autopilot, so a
-        loop that ignored the stream would fill the controller's queue and its frames
-        would be dropped before any of them reached the stereo evidence.
+        The resolution of this measurement is how often the autopilot's clock is read: a
+        message cannot be stamped earlier than the moment it is read off the socket, so a
+        loop that polled slowly would report its own latency as the scatter between the
+        two clocks. The poll period is configuration (``probe.timebase_poll_s``) rather
+        than a constant, and it is recorded beside the samples it produced.
+
+        The sensor stream is read on every pass as well, and the clock is sampled before
+        and after each pass rather than only once per pass: the cameras produce about
+        18 MB a second, so a pass takes longer than the poll period, and a clock read
+        only once per pass would be sampled at the pass rate while claiming the
+        configured resolution. Sampling around the pass also keeps every sample at a
+        moment when the stream has just been emptied, which is when the reader is not
+        behind and a message is stamped closest to the moment it actually arrived.
         """
         pairs: list[tuple[float, float]] = []
         deadline = self._monotonic() + self.settings.step_timeout_s.ready
-        while len(pairs) < self.settings.timebase_samples and self._monotonic() < deadline:
-            self._check_budget()
+
+        def take_sample() -> None:
+            if len(pairs) >= self.settings.timebase_samples:
+                return
             sample = adapter.telemetry()
             if sample.boot_time_ms is not None:
                 pairs.append(
                     (sample.received_stamp.monotonic_ns / 1e9, sample.boot_time_ms / 1000.0)
                 )
+
+        while len(pairs) < self.settings.timebase_samples and self._monotonic() < deadline:
+            self._check_budget()
+            take_sample()
             self._read_records(adapter, writer, log, label=label)
-            self._sleep(0.02)
+            take_sample()
+            self._sleep(self.settings.timebase_poll_s)
         return pairs
 
     def _item_frames_and_timebases(
@@ -3314,21 +3618,13 @@ class CompatibilityProbe:
         simulator_join = join_timebase(
             log.sim_time_pairs, spread_limit_ms=self.settings.timebase_spread_limit_ms
         )
-        self._record_artifacts(
-            self._write_json(
-                f"{label}/timebase.json",
-                {
-                    "samples": join.samples,
-                    "offset_s": join.offset_s,
-                    "drift_ppm": join.drift_ppm,
-                    "spread_ms": join.spread_ms,
-                    "joined": join.joined,
-                    "reason": join.reason,
-                    "device_clock": "telemetry time_boot_ms",
-                    "host_clock": f"{self.settings.host_id}/{self.settings.clock_id}",
-                },
-            )
+        timebase = timebase_evidence(
+            join,
+            pairs,
+            poll_period_s=self.settings.timebase_poll_s,
+            host_clock=f"{self.settings.host_id}/{self.settings.clock_id}",
         )
+        self._record_artifacts(self._write_json(f"{label}/timebase.json", timebase))
         world_zero = self._world_zero_point()
         document = {
             "frames": {
@@ -3350,16 +3646,7 @@ class CompatibilityProbe:
                     "source": "the configured --home and the origin SITL reports",
                 },
             },
-            "host_to_autopilot": {
-                "samples": join.samples,
-                "offset_s": join.offset_s,
-                "drift_ppm": join.drift_ppm,
-                "spread_ms": join.spread_ms,
-                "joined": join.joined,
-                "reason": join.reason,
-                "device_clock": "telemetry time_boot_ms",
-                "host_clock": f"{self.settings.host_id}/{self.settings.clock_id}",
-            },
+            "host_to_autopilot": timebase,
             "host_to_simulator": {
                 "samples": simulator_join.samples,
                 "offset_s": simulator_join.offset_s,
@@ -3516,24 +3803,40 @@ class CompatibilityProbe:
         return settled, pre_settle
 
     def _read_records(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+        self,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        *,
+        label: str,
+        imu_phase: str = "flight",
     ) -> list[SensorRecord]:
-        """Take whatever the sensor stream has waiting, and file each record.
+        """Take everything the sensor stream has waiting, and file each record.
 
-        The cameras and the inertial devices produce about 110 records a second while
-        the probe's own cadence is a few samples a second, so this drains until the
-        stream is momentarily empty or a short window closes. Reading a fixed small
-        number instead would leave a backlog that grows for the whole run, and the
-        controller drops frames when that backlog reaches its bound.
+        The loop drains until the stream is momentarily empty. That is not a detail: the
+        cameras produce about 18 MB of pixels a second, the controller's queue holds
+        about four pairs, and a reader that stopped after a fixed window while the queue
+        was still full would leave a backlog that never cleared — the controller then
+        drops pairs, and the stream the analysis sees has holes in it that no transport
+        actually produced. The elapsed bound below is a safety valve for a pathological
+        pile-up, not the intended exit: a healthy drain ends when the stream is empty.
+
+        ``imu_phase`` names the window an inertial sample arrived in, so a wait outside
+        the flight phase does not have to leave its samples unrecorded. Samples from a
+        phase other than ``flight`` are written to the evidence but kept out of the
+        measurement set, which is the flight-phase and at-rest samples only.
         """
         drained: list[SensorRecord] = []
-        drain_until = self._monotonic() + SENSOR_DRAIN_WINDOW_S
+        started = self._monotonic()
+        stopped_early = False
+        drain_until = started + SENSOR_DRAIN_LIMIT_S
         for _ in range(MAX_DRAINED_RECORDS):
             if self._monotonic() >= drain_until:
-                return drained
-            record = adapter.sensor_record(0.02)
+                stopped_early = True
+                break
+            record = adapter.sensor_record(SENSOR_READ_TIMEOUT_S)
             if record is None:
-                return drained
+                break
             drained.append(record)
             if record.sim_time_s >= 0.0:
                 log.sim_time_pairs.append(
@@ -3544,9 +3847,50 @@ class CompatibilityProbe:
                     record, writer, log, label=label, controller_status=adapter.controller_status
                 )
             elif record.imu is not None:
-                log.imu.append(record.imu)
-                self._write_imu_sample(writer, "flight", record)
+                if imu_phase == "flight":
+                    log.imu.append(record.imu)
+                self._write_imu_sample(writer, imu_phase, record)
+        self._note_drain(
+            started=started,
+            drained=len(drained),
+            stopped_early=stopped_early,
+            controller_status=adapter.controller_status,
+        )
         return drained
+
+    def _note_drain(
+        self,
+        *,
+        started: float,
+        drained: int,
+        stopped_early: bool,
+        controller_status: dict[str, Any] | None,
+    ) -> None:
+        """Keep a running account of how this process read the stream.
+
+        The reader's own cadence is part of the result: a stream that stalled because
+        the analysis process was busy says something different from one that stalled
+        inside the controller, and only the account of both ends can tell them apart.
+        The totals go into the transport evidence rather than into a file of their own.
+        """
+        stats = self._reader_stats
+        stats["drains"] += 1
+        stats["records"] += drained
+        if drained:
+            stats["drains_with_records"] += 1
+        if stopped_early:
+            stats["drains_stopped_early"] += 1
+        stats["max_drain_s"] = max(stats["max_drain_s"], self._monotonic() - started)
+        previous = stats.get("last_drain_at")
+        if previous is not None:
+            stats["max_gap_between_drains_s"] = max(
+                stats["max_gap_between_drains_s"], started - previous
+            )
+        stats["last_drain_at"] = started
+        stream = (controller_status or {}).get("stream") or {}
+        stats["controller_frames_dropped"] = stream.get("frames_dropped")
+        stats["controller_frames_produced"] = stream.get("frames_produced")
+        stats["controller_queued_bytes"] = stream.get("queued_bytes")
 
     def _file_pair(
         self,
@@ -3889,10 +4233,30 @@ class CompatibilityProbe:
         intervals = [
             later - earlier for earlier, later in zip(capture_times, capture_times[1:])
         ]
-        if len(metadata) >= 2 and intervals and max(intervals) > self.settings.stereo_stale_after_s:
+        # Where the longest silence was, not just how long: a hole while the simulator is
+        # still bringing its cameras up says something different from one in the middle of
+        # a flight, and a reader of the receipt can only tell them apart if the gap is
+        # located in the run's own time bases.
+        longest = None
+        if intervals:
+            worst = max(range(len(intervals)), key=lambda index: intervals[index])
+            longest = {
+                "seconds": intervals[worst],
+                "from_sim_time_s": metadata[worst].get("sim_time_s"),
+                "to_sim_time_s": metadata[worst + 1].get("sim_time_s"),
+                "from_capture_monotonic_ns": metadata[worst].get("capture_monotonic_ns"),
+                "pairs_before": worst + 1,
+                "pairs_after": len(metadata) - worst - 1,
+            }
+        if (
+            len(metadata) >= 2
+            and longest is not None
+            and longest["seconds"] > self.settings.stereo_stale_after_s
+        ):
             reasons.append(
-                f"the stereo stream stalled for {max(intervals):.2f}s, beyond the declared "
-                f"{self.settings.stereo_stale_after_s:.2f}s"
+                f"the stereo stream stalled for {longest['seconds']:.2f}s, beyond the declared "
+                f"{self.settings.stereo_stale_after_s:.2f}s, between simulated "
+                f"{longest['from_sim_time_s']}s and {longest['to_sim_time_s']}s"
             )
         if len(metadata) < 2:
             reasons.append(f"only {len(metadata)} stereo pair(s) arrived during the run")
@@ -3915,10 +4279,12 @@ class CompatibilityProbe:
             "encoding": self.settings.stereo.encoding,
             "width": self.settings.stereo.width,
             "height": self.settings.stereo.height,
-            "max_pair_interval_s": max(intervals) if intervals else None,
+            "max_pair_interval_s": longest["seconds"] if longest else None,
+            "max_pair_interval": longest,
             "stale_after_s": self.settings.stereo_stale_after_s,
             "witness": witness,
             "controller_stream": (adapter.controller_status or {}).get("stream"),
+            "reader": self.reader_stats(),
             "stamp_semantics": (
                 "capture is the controller's own monotonic reading at the step in which "
                 "both eyes were read, receipt is this process's monotonic reading when the "
@@ -4196,8 +4562,20 @@ class CompatibilityProbe:
 
     # -- checklist item 8 --------------------------------------------------
 
-    def _item_estimator_health(self, adapter: WebotsArduPilot, writer: EvidenceWriter) -> ProbeCheck:
+    def _item_estimator_health(
+        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog
+    ) -> ProbeCheck:
+        """Inject a declared estimator fault while airborne, then remove it.
+
+        The sensor stream is read throughout, for the same reason every other item
+        reads it: the cameras keep producing while this item measures telemetry, and an
+        item that stopped reading for the length of a fault would leave the controller's
+        queue full — and the controller answers a command through that same queue, so a
+        starved reader can lose the acknowledgement it is waiting for.
+        """
         reasons: list[str] = []
+        label = adapter.label
+        self._read_records(adapter, writer, log, label=label)
         before = adapter.telemetry()
         injection = Injection.publish(
             0,
@@ -4215,6 +4593,7 @@ class CompatibilityProbe:
         while self._monotonic() < hold_until:
             self._check_budget()
             during.append(adapter.telemetry().document())
+            self._read_records(adapter, writer, log, label=label)
             self._sleep(0.2)
         removal = adapter.inject(Injection.clear(1, kind=self.settings.estimator_fault.kind))
         if not removal.applied:
@@ -4224,6 +4603,7 @@ class CompatibilityProbe:
         while self._monotonic() < recover_until:
             self._check_budget()
             after.append(adapter.telemetry().document())
+            self._read_records(adapter, writer, log, label=label)
             self._sleep(0.2)
         variances = [
             entry["ekf_pos_horiz_variance"]
@@ -4328,13 +4708,15 @@ GRAVITY_TOLERANCE = 1.0
 # when the EKF flags change at all.
 EKF_VARIANCE_GROWTH = 1.2
 
-# One pass over the sensor stream reads until it is momentarily empty or this window
-# closes, up to a record count that also bounds the pass when the clock is a fake.
-# The cameras and the inertial devices produce about 110 records a second, and the
-# probe's own cadence is a few samples a second, so a fixed small count per pass
-# would leave a backlog that grows for the whole run.
-SENSOR_DRAIN_WINDOW_S = 0.05
-MAX_DRAINED_RECORDS = 64
+# One pass over the sensor stream ends when the stream is momentarily empty. These are
+# the two bounds on that loop, and neither is its normal exit: an individual read waits
+# this long for the next record, and a pass gives up after this much elapsed time so a
+# pile-up cannot starve the rest of the checklist. The cameras alone produce about 18 MB
+# of pixels a second, so a pass that stopped while records were still queued would leave
+# a backlog that never cleared and the controller would drop frames behind it.
+SENSOR_READ_TIMEOUT_S = 0.02
+SENSOR_DRAIN_LIMIT_S = 2.0
+MAX_DRAINED_RECORDS = 4096
 
 # A wall-clock ceiling on the at-rest measurement. The window itself is measured in
 # simulation time; this only stops the probe from waiting forever if the simulation
