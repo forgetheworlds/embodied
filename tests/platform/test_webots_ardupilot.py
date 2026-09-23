@@ -229,6 +229,7 @@ class ScriptedMavlinkSession:
         failsafe_after_setpoints=None,
         boot_jitter_s=0.0,
         gateway_holder=None,
+        parameter_values=None,
     ):
         self.clock = clock
         self.moves = moves
@@ -242,10 +243,15 @@ class ScriptedMavlinkSession:
         self.failsafe_after_setpoints = failsafe_after_setpoints
         self.boot_jitter_s = boot_jitter_s
         self.gateway_holder = gateway_holder if gateway_holder is not None else {}
+        # The parameters this scripted vehicle reports about itself, as an autopilot
+        # answers a parameter request: the value that is running, not the value intended.
+        self.parameter_values = dict(parameter_values or {})
+        self.pending_parameters = []
         self.sent = []
         self.commands = []
         self.intervals = []
         self.requested_messages = []
+        self.requested_parameters = []
         self.closed = False
         self.armed = False
         self.mode = "STABILIZE"
@@ -271,6 +277,16 @@ class ScriptedMavlinkSession:
 
     def request_message(self, message_id):
         self.requested_messages.append(message_id)
+
+    def request_parameter(self, name):
+        self.requested_parameters.append(name)
+        self.pending_parameters.append(
+            {
+                "mavpackettype": "PARAM_VALUE",
+                "param_id": name,
+                "param_value": self.parameter_values.get(name, 0.0),
+            }
+        )
 
     def send_setpoint(self, setpoint):
         self.sent.append(setpoint)
@@ -306,9 +322,16 @@ class ScriptedMavlinkSession:
             self.mode = "GUIDED"
         self.target = (0.0, 0.0, -altitude_m)
 
+    # -- inbound --
+
     def drain(self):
         self._advance()
         self.drains += 1
+        parameters, self.pending_parameters = self.pending_parameters, []
+        return parameters + self._telemetry_batch()
+
+    def _telemetry_batch(self):
+        """One batch of streamed messages, as the autopilot would send them."""
         # An alternating offset stands in for a device clock that is not steady.
         jitter = self.boot_jitter_s * (1 if self.drains % 2 else -1)
         boot_ms = int((self.clock.monotonic() - 100.0 + jitter) * 1000)
@@ -336,7 +359,7 @@ class ScriptedMavlinkSession:
                 "mavpackettype": "HEARTBEAT",
                 "custom_mode": W.COPTER_MODES and (4 if guided else 5),
                 "base_mode": armed_flag | 81,
-                "system_status": 4,
+                "system_status": W.MAV_STATE_STANDBY,
             },
             {
                 "mavpackettype": "ATTITUDE",
@@ -550,6 +573,17 @@ def run_probe(
     session_kwargs = dict(session_kwargs or {})
     holder = {}
     sessions = []
+    runner = runner or FakeRunner()
+    config_path = write_scene(tmp_path, **(config_overrides or {}))
+    settings = settings_for(config_path, tmp_path)
+    # The scripted vehicle reports the parameters its run layered, so a run whose files
+    # were applied is a run whose read-back agrees. Run B adds the estimator files, as
+    # the configuration declares, so the second session reports those too.
+    def parameters_for_run(index):
+        if "parameter_values" in session_kwargs:
+            return session_kwargs["parameter_values"]
+        extra = settings.estimator_params if index else ()
+        return W.read_configured_parameters(settings.parameter_files(extra))
 
     def make_gateway():
         gateway = FakeGateway(clock, **(gateway_kwargs or {}))
@@ -557,13 +591,14 @@ def run_probe(
         return gateway
 
     def make_session():
-        session = ScriptedMavlinkSession(clock, gateway_holder=holder, **session_kwargs)
+        values = parameters_for_run(len(sessions))
+        overrides = {k: v for k, v in session_kwargs.items() if k != "parameter_values"}
+        session = ScriptedMavlinkSession(
+            clock, gateway_holder=holder, parameter_values=values, **overrides
+        )
         sessions.append(session)
         return session
 
-    runner = runner or FakeRunner()
-    config_path = write_scene(tmp_path, **(config_overrides or {}))
-    settings = settings_for(config_path, tmp_path)
     probe = W.CompatibilityProbe(
         settings,
         output_dir=tmp_path / output_name,
@@ -1332,8 +1367,23 @@ def test_prerequisites_are_reported_before_any_process_starts(tmp_path):
     assert runner.spawned == []
 
 
+def test_the_ready_system_states_are_mavlink_s_own():
+    """The numbers that decide readiness come from the dialect, not from memory.
+
+    Reading MAV_STATE's order wrong would exclude a landed, ready vehicle from
+    readiness and stop every run before it measured anything.
+    """
+    from pymavlink.dialects.v20 import ardupilotmega as dialect
+
+    assert W.READY_SYSTEM_STATUSES == (
+        dialect.MAV_STATE_STANDBY,
+        dialect.MAV_STATE_ACTIVE,
+    )
+
+
 def test_the_probe_waits_for_a_booted_autopilot_not_just_a_heartbeat(tmp_path):
     """A heartbeat arrives while ArduPilot is still initialising.
+
     Measuring telemetry, arming and setpoints against a vehicle in MAV_STATE_BOOT
     would report a broken transport for a vehicle that had simply not finished
     booting, so readiness has to wait for the vehicle.
@@ -1344,7 +1394,7 @@ def test_the_probe_waits_for_a_booted_autopilot_not_just_a_heartbeat(tmp_path):
             messages = super().drain()
             for message in messages:
                 if message["mavpackettype"] == "HEARTBEAT":
-                    message["system_status"] = 2  # MAV_STATE_BOOT
+                    message["system_status"] = 1  # MAV_STATE_BOOT
             return messages
 
     clock = FakeClock()
@@ -1364,7 +1414,7 @@ def test_the_probe_waits_for_a_booted_autopilot_not_just_a_heartbeat(tmp_path):
     )
     with pytest.raises(W.ProbeFailure) as failure:
         probe.run()
-    assert "system_status=2" in str(failure.value)
+    assert "system_status=1" in str(failure.value)
     assert "boot_time_ms" in str(failure.value)
 
 
@@ -1400,18 +1450,33 @@ def test_an_arming_refusal_ends_the_wait_instead_of_polling_it(tmp_path):
 
 
 def test_the_launch_commands_carry_the_wipe_and_the_parameter_layers(tmp_path):
+    """One --defaults argument, comma separated: a repeated flag replaces the earlier one.
+
+    Passing the files as separate flags silently applies only the last of them, and the
+    vehicle then runs on firmware defaults while the receipt still names every file.
+    """
     settings = settings_for(write_scene(tmp_path), tmp_path)
     argv = settings.sitl_argv(settings.estimator_params)
     assert "--wipe" in argv
-    defaults = [argv[index + 1] for index, item in enumerate(argv) if item == "--defaults"]
-    assert [Path(name).name for name in defaults] == [
+    assert argv.count("--defaults") == 1
+    layer = argv[argv.index("--defaults") + 1]
+    assert [Path(name).name for name in layer.split(",")] == [
         "compat_base.parm",
         "compat_arming.parm",
         "compat_ekf.parm",
     ]
 
 
-
+def test_a_vehicle_running_different_parameters_fails_the_startup_item(tmp_path):
+    """The read-back is the check that a parameter file was actually applied."""
+    result, _, _, _, _ = run_probe(
+        tmp_path, session_kwargs={"parameter_values": {"FRAME_CLASS": 0.0}}
+    )
+    startup = check(result, "1_startup_and_transport")
+    assert startup.status == "fail"
+    assert "not running the configured parameters" in startup.reason
+    assert "FRAME_CLASS" in startup.reason
+    assert startup.evidence["parameters"]["reported_by_autopilot"]["FRAME_CLASS"] == 0.0
 # ---------------------------------------------------------------------------
 # The command: configuration, prerequisites, receipt and exit codes
 # ---------------------------------------------------------------------------
@@ -1423,6 +1488,8 @@ def fake_probe_factory(**run_kwargs):
     def factory(settings, output_dir):
         clock = FakeClock()
         holder = {}
+        sessions = []
+        session_kwargs = dict(run_kwargs.get("session_kwargs", {}))
 
         def make_gateway():
             gateway = FakeGateway(clock, **run_kwargs.get("gateway_kwargs", {}))
@@ -1430,9 +1497,18 @@ def fake_probe_factory(**run_kwargs):
             return gateway
 
         def make_session():
-            return ScriptedMavlinkSession(
-                clock, gateway_holder=holder, **run_kwargs.get("session_kwargs", {})
+            # Each run's vehicle reports the parameters that run layered, as the probe
+            # checks: run A the pinned and arming sets, run B those plus the EKF set.
+            extra = settings.estimator_params if sessions else ()
+            values = session_kwargs.pop(
+                "parameter_values",
+                W.read_configured_parameters(settings.parameter_files(extra)),
             )
+            session = ScriptedMavlinkSession(
+                clock, gateway_holder=holder, parameter_values=values, **session_kwargs
+            )
+            sessions.append(session)
+            return session
 
         return W.CompatibilityProbe(
             settings,

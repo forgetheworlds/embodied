@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument("--inertial-unit", default="inertial unit")
     parser.add_argument("--gps", default="gps")
     parser.add_argument("--imu-period-ms", type=int, default=10)
-    parser.add_argument("--status-interval", type=int, default=500)
+    parser.add_argument("--status-interval", type=int, default=100)
     args = parser.parse_args()
     args.motors = [name.strip() for name in args.motors.split(",") if name.strip()]
     return args

@@ -886,15 +886,24 @@ class PlatformSettings:
             str(self.world),
         )
 
+    def parameter_files(self, extra_params: Sequence[Path] = ()) -> tuple[Path, ...]:
+        """Every parameter file one run layers, in the order it layers them."""
+        return (*self.params, *extra_params)
+
     def sitl_argv(self, extra_params: Sequence[Path] = ()) -> tuple[str, ...]:
         """The exact SITL command line for the pinned vehicle and ports.
 
-        Parameter files are layered in order, so a second run that adds an
-        EKF-active set keeps every pinned value it does not name. ``--wipe`` makes each
-        run start from those files: SITL keeps its parameters in an ``eeprom.bin`` in
-        the autopilot checkout and rewrites it as it runs, so without the wipe run B
-        would begin from whatever run A had saved and neither receipt would describe
-        the configuration it claims to.
+        The parameter files go into ONE ``--defaults`` argument, comma separated, in
+        layering order: SITL keeps a single defaults path and a repeated flag replaces
+        the earlier one, so passing them separately silently applies only the last file
+        and the vehicle runs on firmware defaults while the receipt claims the files.
+        AP_Param reads the list left to right with later files overriding earlier ones,
+        which is the layering this configuration declares.
+
+        ``--wipe`` makes each run start from those files: SITL keeps its parameters in
+        an ``eeprom.bin`` in the autopilot checkout and rewrites it as it runs, so
+        without the wipe run B would begin from whatever run A had saved and neither
+        receipt would describe the configuration it claims to.
         """
         argv = [
             str(self.sitl_binary),
@@ -909,9 +918,9 @@ class PlatformSettings:
             "--wipe",
             "--home",
             self.sitl_home,
+            "--defaults",
+            ",".join(str(name) for name in self.parameter_files(extra_params)),
         ]
-        for name in (*self.params, *extra_params):
-            argv += ["--defaults", str(name)]
         return tuple(argv)
 
     def controller_environment(self) -> dict[str, str]:
@@ -1207,6 +1216,9 @@ class TelemetrySample:
     boot_time_ms: int | None
     home_position: tuple[float, float, float] | None
     autopilot_version: dict[str, Any] | None
+    # Parameters the autopilot has reported about itself, by name. This is the only
+    # statement of the configuration that is actually running.
+    parameters: dict[str, float]
 
     @property
     def in_guided_mode(self) -> bool:
@@ -1245,7 +1257,6 @@ def _triple(message: dict[str, Any], *fields: str) -> tuple[float, float, float]
         return None
     return (float(values[0]), float(values[1]), float(values[2]))
 
-
 def decode_telemetry(
     messages: Iterable[dict[str, Any]],
     *,
@@ -1274,6 +1285,7 @@ def decode_telemetry(
         "boot_time_ms": None,
         "home_position": None,
         "autopilot_version": None,
+        "parameters": {},
         "messages_seen": 0,
     }
     if previous is not None:
@@ -1295,6 +1307,7 @@ def decode_telemetry(
                 "boot_time_ms": previous.boot_time_ms,
                 "home_position": previous.home_position,
                 "autopilot_version": previous.autopilot_version,
+                "parameters": dict(previous.parameters),
             }
         )
 
@@ -1313,6 +1326,14 @@ def decode_telemetry(
             base_mode = message.get("base_mode")
             latest["armed"] = None if base_mode is None else bool(base_mode & 128)
             latest["system_status"] = message.get("system_status")
+        elif kind == "PARAM_VALUE":
+            # A parameter the autopilot reports about itself: the only statement of the
+            # configuration that is actually running, as opposed to the files that were
+            # meant to be applied.
+            name = message.get("param_id")
+            value = message.get("param_value")
+            if name and value is not None:
+                latest["parameters"][str(name).rstrip("\x00")] = float(value)
         elif kind == "ATTITUDE":
             latest["attitude_rpy"] = _triple(message, "roll", "pitch", "yaw")
         elif kind == "LOCAL_POSITION_NED":
@@ -1373,6 +1394,7 @@ def decode_telemetry(
         boot_time_ms=latest["boot_time_ms"],
         home_position=latest["home_position"],
         autopilot_version=latest["autopilot_version"],
+        parameters=dict(latest["parameters"]),
     )
 
 
@@ -1439,12 +1461,14 @@ def join_timebase(samples: Sequence[tuple[float, float]], spread_limit_ms: float
     )
 
 
-# The autopilot's own view of itself, from MAV_STATE: it reports BOOT while it
-# initialises, STANDBY when it is landed and ready for commands, ACTIVE while flying,
-# and CRITICAL after a failsafe. Only the middle two mean "this vehicle can be given
-# a target", which is what readiness has to establish before any item measures it.
-MAV_STATE_STANDBY = 4
-MAV_STATE_ACTIVE = 5
+# The autopilot's own view of itself, from MAV_STATE: it reports BOOT (1) while it
+# initialises, CALIBRATING (2), STANDBY (3) when it is landed and ready for commands,
+# ACTIVE (4) while flying, and CRITICAL (5) after a failsafe. Only the middle two mean
+# "this vehicle can be given a target", which is what readiness has to establish before
+# any item measures it. The values are MAVLink's own; the test pins them against the
+# dialect so a misremembered number cannot quietly exclude a ready vehicle.
+MAV_STATE_STANDBY = 3
+MAV_STATE_ACTIVE = 4
 READY_SYSTEM_STATUSES = (MAV_STATE_STANDBY, MAV_STATE_ACTIVE)
 
 
@@ -1459,6 +1483,10 @@ MAV_CMD_SET_MESSAGE_INTERVAL = 511
 MAV_CMD_REQUEST_MESSAGE = 512
 MAV_FRAME_LOCAL_NED = 1
 MAV_FRAME_BODY_NED = 8
+
+# The timebase join reads the autopilot's own clock from each message it receives, so
+# the message rate is that join's resolution. Attitude is what the join samples.
+ATTITUDE_STREAM_HZ = 50.0
 
 # Message identifiers this adapter asks the autopilot for.
 MSG_ID_ATTITUDE = 30
@@ -1475,6 +1503,7 @@ ALLOWED_OUTBOUND_TYPES = frozenset(
         "SET_POSITION_TARGET_LOCAL_NED",
         "COMMAND_LONG",
         "SET_MESSAGE_INTERVAL",
+        "PARAM_REQUEST_READ",
         "HEARTBEAT",
     }
 )
@@ -1657,6 +1686,17 @@ class PymavlinkSession:
                 0,
                 0,
                 0,
+            )
+        )
+
+    def request_parameter(self, name: str) -> None:
+        """Ask what value the autopilot is running for one parameter."""
+        self._send(
+            self._connection.mav.param_request_read_send(
+                self.target_system,
+                self.target_component,
+                name.encode("ascii"),
+                -1,
             )
         )
 
@@ -2189,6 +2229,48 @@ class WebotsArduPilot:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def request_telemetry_streams(self) -> None:
+        """Ask the autopilot for the telemetry every item reads, at the requested rates.
+
+        Attitude is asked for at 50 Hz because the timebase join pairs the autopilot's
+        own clock with this host's: the clock reading arrives with each message, so a
+        20 Hz stream quantises the join by 50 ms and no measured spread could be tighter
+        than that. The other rates follow the probe's own cadence; all of them are far
+        below the autopilot's loop rate.
+        """
+        for message_id, hz in (
+            (MSG_ID_ATTITUDE, ATTITUDE_STREAM_HZ),
+            (MSG_ID_LOCAL_POSITION_NED, 10.0),
+            (MSG_ID_SERVO_OUTPUT_RAW, 5.0),
+            (MSG_ID_EKF_STATUS_REPORT, 2.0),
+        ):
+            self._session.request_message_interval(message_id, hz)
+
+    def read_parameters(self, names: Sequence[str], timeout_s: float) -> dict[str, float]:
+        """Ask the autopilot for the named parameters and wait for its answers.
+
+        This is how a run learns the configuration that is actually loaded rather than
+        the one the parameter files were meant to produce: SITL applies a single
+        ``--defaults`` list, and a mistake there leaves the vehicle on firmware defaults
+        while every file in the receipt still looks right.
+        """
+        missing = set(names)
+        reported: dict[str, float] = {}
+        for name in names:
+            self._session.request_parameter(name)
+        deadline = self._monotonic() + timeout_s
+        while missing and self._monotonic() < deadline:
+            sample = self.telemetry()
+            reported.update(sample.parameters)
+            missing = {name for name in names if name not in reported}
+            if missing:
+                self._sleep(0.05)
+        return reported
+
+    def parameter_files(self) -> tuple[Path, ...]:
+        """Every parameter file this run layers, in layering order."""
+        return self.settings.parameter_files(self._extra_params)
+
     def start(self) -> StartupEvidence:
         """Start Webots and SITL, then open the sensor and MAVLink channels."""
         simulator = self._runner.spawn(
@@ -2209,6 +2291,11 @@ class WebotsArduPilot:
         # AUTOPILOT_VERSION answers once, on request, and it is the only statement of
         # which firmware is being exercised.
         self._session.request_message(MSG_ID_AUTOPILOT_VERSION)
+        # The streams every later item reads are asked for here, at the connection that
+        # carries telemetry, rather than later: a heartbeat arrives while the vehicle is
+        # still booting, and readiness has to be able to see that its telemetry loop is
+        # running before anything is measured against it.
+        self.request_telemetry_streams()
         self.evidence.write_json(
             "connection.json",
             {"autopilot": connection, "sitl_argv": list(sitl.argv), "webots_argv": list(simulator.argv)},
@@ -2385,13 +2472,6 @@ class WebotsArduPilot:
         without it the controller's queue fills and frames are dropped before anything
         reads them.
         """
-        for message_id, hz in (
-            (MSG_ID_ATTITUDE, 20.0),
-            (MSG_ID_LOCAL_POSITION_NED, 10.0),
-            (MSG_ID_SERVO_OUTPUT_RAW, 5.0),
-            (MSG_ID_EKF_STATUS_REPORT, 2.0),
-        ):
-            self._session.request_message_interval(message_id, hz)
         attempt_at = self._monotonic()
         self._session.set_mode("GUIDED")
         self._session.arm()
@@ -2635,6 +2715,11 @@ def build_observation(
         "height": pair.height,
         "left_sha256": hashlib_sha256(pair.left_bytes),
         "right_sha256": hashlib_sha256(pair.right_bytes),
+        # A camera that is enabled but has not yet produced an image returns an empty
+        # buffer. Recorded rather than judged, so the item can tell an empty frame from
+        # a frame whose channels were averaged away.
+        "left_empty": not any(pair.left_bytes),
+        "right_empty": not any(pair.right_bytes),
         "left_quality": describe_quality(left_quality),
         "right_quality": describe_quality(right_quality),
         "witness": witness,
@@ -3038,6 +3123,18 @@ class CompatibilityProbe:
         readiness = adapter.wait_ready(self.settings.step_timeout_s.startup)
         sample = readiness.telemetry
         firmware = sample.autopilot_version or {}
+        # What the autopilot is actually running, asked for by name. A parameter file
+        # that never reached it leaves the vehicle on firmware defaults while every file
+        # in the receipt still looks right, so the two are compared here.
+        configured = read_configured_parameters(adapter.parameter_files())
+        reported = adapter.read_parameters(tuple(sorted(configured)), PARAMETER_READ_TIMEOUT_S)
+        mismatches = [
+            f"{name}: files say {configured[name]:g}, autopilot reports {reported[name]:g}"
+            for name in sorted(configured)
+            if name in reported
+            and not values_agree(configured[name], reported[name])
+        ]
+        unanswered = sorted(name for name in configured if name not in reported)
         document = {
             "label": label,
             "webots_version": startup.webots_version,
@@ -3047,6 +3144,12 @@ class CompatibilityProbe:
             "firmware": firmware,
             "controller_status": readiness.controller_status,
             "waited_s": readiness.waited_s,
+            "parameters": {
+                "configured": configured,
+                "reported_by_autopilot": reported,
+                "mismatches": mismatches,
+                "unanswered": unanswered,
+            },
             "log_head": {
                 "webots": writer.tail_lines(writer.directory / "webots.log"),
                 "sitl": writer.tail_lines(writer.directory / "sitl.log"),
@@ -3061,6 +3164,16 @@ class CompatibilityProbe:
             reasons.append("no MAVLink heartbeat arrived")
         if not firmware:
             reasons.append("AUTOPILOT_VERSION did not arrive, so the firmware identity is unknown")
+        if unanswered:
+            reasons.append(
+                "the autopilot did not report "
+                f"{', '.join(unanswered)}, so the run cannot say what it was flying"
+            )
+        if mismatches:
+            reasons.append(
+                "the autopilot is not running the configured parameters: "
+                + "; ".join(mismatches)
+            )
         declared = readiness.controller_status.get("devices") or {}
         expected = {
             "left": self.settings.stereo.left,
@@ -3188,10 +3301,17 @@ class CompatibilityProbe:
         reasons: list[str] = []
         if not join.joined:
             reasons.append(f"unjoined clocks: {join.reason}")
-        if simulator_join.joined is False and simulator_join.reason is not None and (
-            "at least two" in simulator_join.reason or "did not advance" in simulator_join.reason
+        if (
+            simulator_join.joined is False
+            and simulator_join.reason is not None
+            and (
+                "at least two" in simulator_join.reason
+                or "did not advance" in simulator_join.reason
+            )
         ):
-            reasons.append(f"the host and simulator clocks cannot be related: {simulator_join.reason}")
+            reasons.append(
+                f"the host and simulator clocks cannot be related: {simulator_join.reason}"
+            )
         if join.samples < self.settings.timebase_samples:
             reasons.append(
                 f"only {join.samples} of {self.settings.timebase_samples} timebase samples "
@@ -3287,6 +3407,12 @@ class CompatibilityProbe:
         deadline = self._monotonic() + AT_REST_WALL_CLOCK_LIMIT_S
         while self._monotonic() < deadline:
             self._check_budget()
+            # Telemetry is read here too, so the at-rest window has both sensors at the
+            # same local time and the inertial cross-check has something to join to.
+            sample = adapter.telemetry()
+            log.telemetry.append(sample)
+            if sample.servo_outputs is not None:
+                log.servo_table.append(sample.servo_outputs)
             for record in self._read_records(adapter, writer, log, label=label):
                 if record.imu is None:
                     continue
@@ -3572,6 +3698,13 @@ class CompatibilityProbe:
         if best is None:
             # No sample at all is a different finding from a sample showing nothing.
             reasons.append("SERVO_OUTPUT_RAW never arrived, so actuation was never observed")
+        elif not log.publications:
+            # An output that never left idle while nothing was commanded is not evidence
+            # of an unmapped actuator, so it is reported as what it is.
+            reasons.append(
+                "no setpoint was published during this run, so the servo outputs cannot be "
+                "attributed to a command"
+            )
         elif active == 0:
             reasons.append(
                 "unmapped actuation: every servo output stayed at the idle pulse while the "
@@ -3587,6 +3720,7 @@ class CompatibilityProbe:
             "motor_names": motors,
             "channel_outputs": list(best) if best is not None else None,
             "active_channels": active,
+            "publications": len(log.publications),
             "idle_pulse_us": PWM_IDLE_RAW,
             "requirement": "each configured motor channel must leave the idle pulse in flight",
         }
@@ -3618,11 +3752,22 @@ class CompatibilityProbe:
                     f"pair {entry['pair_id']}: the left counter is {entry['left_frame_id']} and "
                     f"the right is {entry['right_frame_id']}, so the eyes were not read in one step"
                 )
-        colourless = [
+        # A camera that is enabled but has not yet produced an image returns an empty
+        # buffer. That frame is not evidence about colour either way, so it is counted
+        # and excluded rather than judged.
+        empty = [entry for entry in metadata if entry.get("left_empty")]
+        frames_with_content = [
             entry
             for entry in metadata
-            if entry.get("left_quality")
-            and not entry["left_quality"]["is_colour"]
+            if entry.get("left_quality") and not entry.get("left_empty")
+        ]
+        if metadata and not frames_with_content:
+            reasons.append(
+                f"none of the {len(metadata)} pairs carried any pixels, so the cameras never "
+                "produced an image"
+            )
+        colourless = [
+            entry for entry in frames_with_content if not entry["left_quality"]["is_colour"]
         ]
         if colourless:
             first = colourless[0]
@@ -3634,15 +3779,17 @@ class CompatibilityProbe:
             )
         witness = None
         declaration = (adapter.controller_status.get("scene") or {}).get("witness_colour_rgb")
-        if metadata and not declaration:
+        if frames_with_content and not declaration:
             reasons.append(
                 "the scene did not declare a known-colour object, so channel order cannot be "
                 "checked against a witness"
             )
-        elif metadata:
-            witness = metadata[0].get("witness")
+        elif frames_with_content:
+            # The witness is judged on the first pair that carried an image, for the same
+            # reason: an empty buffer says nothing about channel order.
+            witness = frames_with_content[0].get("witness")
             if witness is None:
-                reasons.append("the colour witness was not measured in the first stored pair")
+                reasons.append("the colour witness was not measured in the first usable pair")
             elif witness["matched_pixels"] == 0:
                 reasons.append(
                     "the scene's known-colour object was not found in the frame, so the colour "
@@ -3673,6 +3820,8 @@ class CompatibilityProbe:
             )
         document = {
             "pairs_captured": len(metadata),
+            "pairs_with_content": len(frames_with_content),
+            "pairs_before_first_image": len(empty),
             "pairs_stored": len(stored),
             "storage_bound": PAIRS_STORED_PER_RUN,
             "storage_note": (
@@ -4025,6 +4174,7 @@ class CompatibilityProbe:
                 "hold_s": self.settings.estimator_fault.hold_s,
                 "requested": injection.injection_id,
                 "applied": receipt.applied,
+
                 "acknowledged_state": receipt.acknowledged_state,
                 "removed": removal.applied,
             },
@@ -4069,6 +4219,19 @@ AXIS_AGREEMENT_MARGIN_M = 0.25
 # never leaves it is not being driven.
 PWM_IDLE_RAW = 1000
 
+# How long the autopilot is given to answer for the parameters the run declares, and
+# how close two readings of the same parameter must be. ArduPilot stores parameters as
+# 32-bit floats, so a value written as 0.0003 comes back a few ulps away.
+PARAMETER_READ_TIMEOUT_S = 20.0
+PARAMETER_VALUE_TOLERANCE = 1e-6
+
+
+def values_agree(configured: float, reported: float) -> bool:
+    """Whether two readings of one parameter are the same value."""
+    difference = abs(configured - reported)
+    return difference <= PARAMETER_VALUE_TOLERANCE * max(1.0, abs(configured))
+
+
 # At rest in a north-east-down frame the accelerometer measures gravity on the
 # down axis. The tolerance is generous on purpose: this check is about sign and
 # frame, not about calibration.
@@ -4096,6 +4259,34 @@ AT_REST_WALL_CLOCK_LIMIT_S = 60.0
 # Simulation time is compared with this tolerance when a window's end is decided. It
 # is far below a sampling period and far above the rounding noise on a second.
 TIME_COMPARISON_TOLERANCE_S = 1e-6
+
+
+def read_configured_parameters(paths: Sequence[Path]) -> dict[str, float]:
+    """The parameter values the configured files declare, in layering order.
+
+    Later files override earlier ones, which is how SITL reads a comma-separated
+    ``--defaults`` list, so this is the configuration the run intends to load. Reading
+    it back from the autopilot and comparing the two is what turns "the files say so"
+    into evidence.
+    """
+    configured: dict[str, float] = {}
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.split("#", 1)[0].strip()
+            if not stripped:
+                continue
+            fields = stripped.split()
+            if len(fields) < 2:
+                continue
+            try:
+                configured[fields[0]] = float(fields[1])
+            except ValueError:
+                continue
+    return configured
 
 
 def imu_gaps(samples: Sequence[ImuPayload]) -> list[float]:
