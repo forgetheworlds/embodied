@@ -102,9 +102,9 @@ probe:
   # result when the host cannot sustain the load; it names no number. The declared
   # envelope is 0.5-1.5 simulated seconds per wall second: the scene asks Webots for
   # realtime mode, and a window outside that range means the recorded simulator times no
-  # longer describe the environment the scene declares. This candidate measures 0.77-0.96
-  # per 5 s window with a whole-run ratio near 0.83, so the envelope catches a simulator
-  # that stalls or fast-forwards rather than describing normal operation.
+  # longer describe the environment the scene declares. Measured windows live per run in
+  # the accept-* receipts, superseding any figure once quoted here; the envelope exists to
+  # catch a simulator that stalls or fast-forwards, not to describe normal operation.
   realtime_window_s: 5.0
   realtime_ratio_envelope: [0.5, 1.5]
   # How often the timebase item reads the autopilot's clock. A message can only be
