@@ -1,5 +1,5 @@
 # Arming parameters for the simulated airframe: the third layer of the P00 parameter
-# set, applied after the pinned file and before run B's estimator file.
+# set, applied after the pinned file and before the EKF-active file both runs apply.
 #
 # The pinned set (compat_base.parm, copied unchanged from the ArduPilot Webots_Python
 # example at af852591) cannot arm a simulated vehicle on its own, and ArduPilot says so
@@ -22,8 +22,17 @@
 #       corresponding feed-forward gain is zero, and the pinned set zeroes both rate
 #       integral gains, so the firmware rejects the configuration outright. 0.25 is the
 #       value ArduPilot's own simulator parameter set uses for both of them on a quad X
-#       (Tools/autotest/default_params/airsim-quadX.parm at the same commit), so it comes
-#       from upstream rather than from here. This is the one control gain in this file.
+#       (Tools/autotest/default_params/airsim-quadX.parm at the same commit).
+#
+#       That set pairs each rate integral with the same proportional gain (both 0.25).
+#       Taking the integral alone left this airframe with an integral five times its
+#       proportional term, which is not a controller anyone chose: measured in
+#       work/runs/p00-compat/accept-4, both runs of the probe's guided hold saturated the
+#       motors (1947-1949 us against a 1000 us idle) while the collective throttle swung
+#       between 1150 and 1708 us around the 1419 us hover the stable run held, and the
+#       airframe then pitched over and was disarmed by ArduPilot's crash detector. The
+#       proportional gains below restore the pairing that file uses; they are the same
+#       two upstream numbers, from the same file, as the integrals above.
 #   "Arm: Gyro 0 rate 500Hz < loop rate*1.8 540Hz"
 #       ArduPilot requires the gyro sample rate to be at least 1.8 times the scheduler
 #       loop rate. The Webots scene steps at the pinned 2 ms, so the flight-state packet
@@ -52,6 +61,8 @@ INS_ACC2SCAL_Z  1.001
 ACRO_BAL_ROLL   0
 ACRO_BAL_PITCH  0
 
+ATC_RAT_RLL_P   0.25
+ATC_RAT_PIT_P   0.25
 ATC_RAT_RLL_I   0.25
 ATC_RAT_PIT_I   0.25
 
