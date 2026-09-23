@@ -1690,9 +1690,13 @@ class PymavlinkSession:
         )
 
     def request_parameter(self, name: str) -> None:
-        """Ask what value the autopilot is running for one parameter."""
+        """Ask what value the autopilot is running for one parameter.
+
+        ``*_encode`` rather than ``*_send``: the send form returns nothing, and this
+        adapter refuses to put an unchecked message on the wire.
+        """
         self._send(
-            self._connection.mav.param_request_read_send(
+            self._connection.mav.param_request_read_encode(
                 self.target_system,
                 self.target_component,
                 name.encode("ascii"),
@@ -2249,23 +2253,26 @@ class WebotsArduPilot:
     def read_parameters(self, names: Sequence[str], timeout_s: float) -> dict[str, float]:
         """Ask the autopilot for the named parameters and wait for its answers.
 
-        This is how a run learns the configuration that is actually loaded rather than
-        the one the parameter files were meant to produce: SITL applies a single
-        ``--defaults`` list, and a mistake there leaves the vehicle on firmware defaults
-        while every file in the receipt still looks right.
+        The requests go out in small batches because ArduPilot drops a parameter request
+        outright when its pending queue is full, and a burst of thirty of them fills it:
+        the tail of the list is silently lost, which looks exactly like a parameter the
+        vehicle does not have.
         """
-        missing = set(names)
         reported: dict[str, float] = {}
-        for name in names:
-            self._session.request_parameter(name)
         deadline = self._monotonic() + timeout_s
-        while missing and self._monotonic() < deadline:
-            sample = self.telemetry()
-            reported.update(sample.parameters)
-            missing = {name for name in names if name not in reported}
-            if missing:
+        pending = list(names)
+        while pending and self._monotonic() < deadline:
+            batch, pending = pending[:PARAMETER_READ_BATCH], pending[PARAMETER_READ_BATCH:]
+            for name in batch:
+                self._session.request_parameter(name)
+            while self._monotonic() < deadline:
+                sample = self.telemetry()
+                reported.update(sample.parameters)
+                if all(name in reported for name in batch):
+                    break
                 self._sleep(0.05)
         return reported
+
 
     def parameter_files(self) -> tuple[Path, ...]:
         """Every parameter file this run layers, in layering order."""
@@ -4222,7 +4229,10 @@ PWM_IDLE_RAW = 1000
 # How long the autopilot is given to answer for the parameters the run declares, and
 # how close two readings of the same parameter must be. ArduPilot stores parameters as
 # 32-bit floats, so a value written as 0.0003 comes back a few ulps away.
-PARAMETER_READ_TIMEOUT_S = 20.0
+PARAMETER_READ_TIMEOUT_S = 60.0
+# ArduPilot drops a parameter request when its pending queue is full, so the requests go
+# out a few at a time and each batch is waited for before the next is sent.
+PARAMETER_READ_BATCH = 4
 PARAMETER_VALUE_TOLERANCE = 1e-6
 
 
