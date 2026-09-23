@@ -1,25 +1,33 @@
-# Arming parameters for the simulated airframe: the third and last layer of the P00
-# parameter set.
+# Arming parameters for the simulated airframe: the third layer of the P00 parameter
+# set, applied after the pinned file and before run B's estimator file.
 #
-# The pinned set (compat_base.parm, copied unchanged from the ArduPilot
-# Webots_Python example at af852591) cannot arm a simulated vehicle on its own, and
-# ArduPilot says so in its own words: "3D Accel calibration needed" and "Check
-# ACRO_BAL_ROLL/PITCH". Neither is a transport defect, and neither may be worked
-# around by pretending the vehicle flew.
+# The pinned set (compat_base.parm, copied unchanged from the ArduPilot Webots_Python
+# example at af852591) cannot arm a simulated vehicle on its own, and ArduPilot says so
+# in its own words at the arm attempt:
 #
-#   INS_ACC*OFFS / INS_ACC*SCAL   ArduPilot treats an accelerometer whose offsets are
-#     exactly zero as uncalibrated, and a simulator's ideal accelerometer reports
-#     zero offsets. These are the small non-zero values ArduPilot's own SITL autotest
-#     parameter set uses, with the comment "we need small INS_ACC offsets so INS is
-#     recognised as being calibrated" (Tools/autotest/default_params/copter.parm at
-#     the same commit). The values are a recognition flag, not a measurement, and the
-#     receipt records them through this file's hash.
-#   ACRO_BAL_ROLL/PITCH   ArduPilot requires these to be no larger than the ACRO
-#     angle gains. The pinned set lowers ATC_ANG_RLL_P/PIT_P to 0.5 while the
-#     ACRO balance terms keep their default of 1.0, so the check fails. Zero disables
-#     the acro balance feature, which a Guided compatibility probe never uses.
+#   "PreArm: 3D Accel calibration needed"
+#       ArduPilot treats an accelerometer whose offsets are exactly zero as
+#       uncalibrated, and a simulator's ideal accelerometer reports zero offsets. The
+#       small non-zero values below are the ones ArduPilot's own SITL autotest set uses,
+#       with the comment "we need small INS_ACC offsets so INS is recognised as being
+#       calibrated" (Tools/autotest/default_params/copter.parm at the same commit). They
+#       are a recognition flag, not a measurement.
+#   "PreArm: Check ACRO_BAL_ROLL/PITCH"
+#       ArduPilot requires the ACRO balance terms to be no larger than the ACRO angle
+#       gains. The pinned set lowers ATC_ANG_RLL_P and ATC_ANG_PIT_P to 0.5 while the
+#       balance terms keep their default of 1.0. Zero disables a feature this stage
+#       never uses.
+#   "Arm: Bad parameter: ATC_RAT_RLL_I must be > 0"
+#       ArduPilot's attitude-controller check requires a positive integral gain when the
+#       corresponding feed-forward gain is zero, and the pinned set zeroes both rate
+#       integral gains, so the firmware rejects the configuration outright. 0.25 is the
+#       value ArduPilot's own simulator parameter set uses for both of them on a quad X
+#       (Tools/autotest/default_params/airsim-quadX.parm at the same commit), so it comes
+#       from upstream rather than from here. This is the one control gain in this file.
 #
-# Nothing here touches the estimator, the transport, or any control gain.
+# Nothing here touches the estimator, the transport, the sensor path or the frame layout.
+# The vehicle reports these values back to the probe, so each receipt states the
+# configuration that actually ran rather than the one these files intended.
 
 INS_ACCOFFS_X   0.001
 INS_ACCOFFS_Y   0.001
@@ -36,3 +44,6 @@ INS_ACC2SCAL_Z  1.001
 
 ACRO_BAL_ROLL   0
 ACRO_BAL_PITCH  0
+
+ATC_RAT_RLL_I   0.25
+ATC_RAT_PIT_I   0.25
