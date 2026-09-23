@@ -1431,7 +1431,17 @@ def test_motion_opposite_to_the_command_fails_the_motion_item(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path, session_kwargs={"direction": -1.0})
     motion = check(result, "3_guided_local_ned_motion")
     assert motion.status == "fail"
-    assert "opposite to the command" in motion.reason
+    # The reason states the motion observed — target, start, end and the signed
+    # displacement per axis — rather than paraphrasing the criterion it failed,
+    # and every reported axis must have moved opposite its own target.
+    observed = re.findall(
+        r"axis \d+: target ([+-]?\d+\.\d{2}) m, start [+-]?\d+\.\d{2} m, "
+        r"end [+-]?\d+\.\d{2} m \(moved ([+-]?\d+\.\d{2}) m\)",
+        motion.reason,
+    )
+    assert observed, motion.reason
+    for target, moved in observed:
+        assert float(target) * float(moved) < 0.0
 
 
 def test_a_run_outside_its_declared_real_time_envelope_is_timing_invalid(tmp_path):

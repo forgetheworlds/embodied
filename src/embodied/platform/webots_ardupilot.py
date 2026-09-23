@@ -4280,8 +4280,10 @@ class CompatibilityProbe:
                 )
                 if abs(commanded) >= AXIS_AGREEMENT_COMMAND_M and moved_opposite:
                     reasons.append(
-                        f"axis {axis}: commanded {commanded:+.2f} m but the vehicle moved "
-                        f"{measured_axis:+.2f} m, opposite to the command"
+                        f"axis {axis}: target {commanded:+.2f} m, "
+                        f"start {entry['position_before_ned'][axis]:+.2f} m, "
+                        f"end {entry['position_after_ned'][axis]:+.2f} m "
+                        f"(moved {measured_axis:+.2f} m)"
                     )
         check = ProbeCheck(
             name=f"3_guided_local_ned_motion[{label}]",
