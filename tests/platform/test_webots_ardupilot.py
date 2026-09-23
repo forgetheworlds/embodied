@@ -6,6 +6,7 @@ are replaced with scripted components, so the probe's own sequence and judgement
 under test rather than the simulator's behaviour.
 """
 
+import ast
 from pathlib import Path
 import json
 import re
@@ -1548,6 +1549,34 @@ def test_the_estimator_item_is_measured_wherever_the_files_select_an_ekf(tmp_pat
     assert any(
         "AHRS_EKF_TYPE" in entry["line"] for entry in declaration["parameter_evidence"]
     )
+
+
+def test_the_scene_controller_only_uses_shared_names_the_adapter_exposes():
+    """The scene's controller reaches the adapter by name, from Webots' own interpreter.
+
+    Nothing here imports the controller — it needs Webots' ``controller`` module — so a
+    rename in the adapter is otherwise discovered by starting a whole live run, which is
+    how the ``SimFdmState`` rename broke one. The names it uses are read from its source
+    instead, so a rename that misses it fails a test rather than a run.
+    """
+    controller_dir = SCENE / "controllers" / "compat_vehicle_controller"
+    used: set[str] = set()
+    for path in sorted(controller_dir.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "SHARED"
+            ):
+                used.add(node.attr)
+        for name in re.findall(
+            r"from embodied\.platform\.webots_ardupilot import ([A-Za-z_][\w, ]*)", source
+        ):
+            used.update(part.strip() for part in name.split(",") if part.strip())
+    assert used, "the controller no longer reaches the shared module"
+    missing = sorted(name for name in used if not hasattr(W, name))
+    assert missing == [], f"the adapter does not expose {missing}"
 
 def test_stream_loss_reports_what_the_telemetry_showed(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path)

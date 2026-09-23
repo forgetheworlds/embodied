@@ -402,7 +402,7 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
         last_flight_state = state
 
         link.send_flight_state(
-            SHARED.pack_fdm(SHARED.FlightState(timestamp_s=devices.simulator_time_s(), **state))
+            SHARED.pack_fdm(SHARED.SimFdmState(timestamp_s=devices.simulator_time_s(), **state))
         )
 
         incoming = link.receive_controls()
