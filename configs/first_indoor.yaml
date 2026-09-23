@@ -9,12 +9,16 @@
 # document:
 #   sensors.stereo.identical_channel_fraction_limit - the declared threshold for
 #     calling a frame colour, which the grayscale check compares against.
-#   scenario.estimator_params - the EKF-active set that makes the estimator item mean
-#     something. Both runs apply it: the pinned example's simulator AHRS (AHRS_EKF_TYPE
-#     10) was measured to diverge under a valid local-NED position target while this set
-#     holds the same targets to centimetres, so the pinned set is recorded as evidence
-#     rather than flown, and run A is not the pinned upstream configuration.
-#   probe.realtime_ratio_envelope - the real-time envelope specification section 14.4
+#   scenario.estimator_params - the EKF-active set that both runs apply. The pinned
+#     example's simulator AHRS (AHRS_EKF_TYPE 10) was measured unable to track a local-NED
+#     target at all (accept-1: zero horizontal displacement, [0, 0, -16.95] and
+#     [0, 0, -17.42]), so the pinned set is recorded as evidence rather than flown, and run
+#     A is not the pinned upstream configuration. Honesty note 2026-09-23: an earlier
+#     version of this comment claimed the EKF set "holds the same targets to centimetres";
+#     that was true only of accept-2/accept-4 samples. At the reviewed revision (accept-5)
+#     the EKF set's closed-loop stability is the open question of the authorized airframe
+#     cycle; residuals and regimes live in the accept receipts, not here.
+#   probe.realtime_ratio_envelope - the real-time envelope specification section 21.2
 #     asks a run to declare. The specification names no value; this is this stage's
 #     declared engineering parameter, justified where it is set below.
 
@@ -93,8 +97,8 @@ probe:
     hold_s: 6
   timebase_samples: 40
   # How often the simulator's rate is recorded, in host seconds, and the envelope it has
-  # to stay inside. Specification section 14.4 asks for a declared real-time-ratio
-  # envelope recorded in windows rather than as a run average, and for a timing-invalid
+  #   to stay inside. Specification section 21.2 asks for a declared real-time-ratio
+  #   envelope recorded in windows rather than as a run average, and for a timing-invalid
   # result when the host cannot sustain the load; it names no number. The declared
   # envelope is 0.5-1.5 simulated seconds per wall second: the scene asks Webots for
   # realtime mode, and a window outside that range means the recorded simulator times no
