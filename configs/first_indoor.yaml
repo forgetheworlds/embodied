@@ -75,6 +75,10 @@ probe:
   stream_loss_window_s: 6
   settle_s: 1.5
   at_rest_window_s: 2.0
+  # How long to wait for the autopilot's own pre-arm checks to clear before asking it to
+  # arm: a simulated GPS needs a fix, the EKF needs a home, and the IMU consistency
+  # check needs a quiet window, all of which take simulated time.
+  pre_arm_wait_s: 60
   estimator_fault:
     kind: position_step
     magnitude_m: 30.0

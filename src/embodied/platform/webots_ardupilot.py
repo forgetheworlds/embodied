@@ -691,6 +691,7 @@ class PlatformSettings:
     stream_loss_window_s: float
     settle_s: float
     at_rest_window_s: float
+    pre_arm_wait_s: float
     estimator_fault: EstimatorFault
     timebase_samples: int
     timebase_spread_limit_ms: float
@@ -816,6 +817,7 @@ class PlatformSettings:
             stream_loss_window_s=float(probe["stream_loss_window_s"]),
             settle_s=float(probe["settle_s"]),
             at_rest_window_s=float(probe["at_rest_window_s"]),
+            pre_arm_wait_s=float(probe["pre_arm_wait_s"]),
             estimator_fault=EstimatorFault(
                 kind=fault["kind"],
                 magnitude_m=float(fault["magnitude_m"]),
@@ -864,6 +866,8 @@ class PlatformSettings:
             raise ConfigError("probe.settle_s must be positive: the scene needs time to settle")
         if self.at_rest_window_s <= 0.0:
             raise ConfigError("probe.at_rest_window_s must be positive")
+        if self.pre_arm_wait_s <= 0.0:
+            raise ConfigError("probe.pre_arm_wait_s must be positive")
         if not self.waypoints_local_ned:
             raise ConfigError("probe.waypoints_local_ned must name at least one waypoint")
         if self.timebase_samples < 2:
@@ -2032,7 +2036,6 @@ class EvidenceWriter:
 # The adapter
 # ---------------------------------------------------------------------------
 
-
 @dataclass(frozen=True)
 class LocalNedTarget:
     """One requested motion target in the local NED frame."""
@@ -2077,6 +2080,8 @@ class ReadinessEvidence:
 
 @dataclass(frozen=True)
 class FlightStateEvidence:
+    """What the autopilot was doing when it was asked for control, as it reported it."""
+
     commanded_mode: str
     mode_reached: bool
     armed: bool
@@ -2084,6 +2089,10 @@ class FlightStateEvidence:
     altitude_m: float | None
     statustexts: tuple[str, ...]
     refused: bool
+    # Whether the vehicle's own pre-arm checks went quiet before the attempt, and which
+    # ones were still outstanding if they did not.
+    pre_arm_clear: bool
+    pre_arm_outstanding: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -2151,9 +2160,16 @@ def mask_for_target(target: MotionTarget) -> int:
 # flight timeout produces no more evidence than that first answer did.
 CONTROL_GRANT_GRACE_S = 3.0
 
+# How long the autopilot must stop reporting pre-arm failures before the probe asks it to
+# arm. ArduPilot repeats a failing pre-arm check and stops repeating it when the check
+# clears, so quiet means clear. Some checks clear only with time: a simulated GPS needs a
+# fix, the EKF needs a home, and the IMU consistency check needs a quiet window.
+PRE_ARM_QUIET_S = 10.0
+
 # How long to let an arming request be answered before reading the result. The
 # autopilot needs a moment, and the sensor stream is read throughout the wait.
 ARM_SETTLE_S = 1.0
+
 
 def autopilot_is_ready(sample: TelemetrySample) -> bool:
     """Whether the autopilot has finished booting and is streaming its own clock.
@@ -2447,6 +2463,35 @@ class WebotsArduPilot:
         """The most recent sample, without draining the stream again."""
         return self._telemetry
 
+    def wait_for_pre_arm_clear(
+        self, timeout_s: float, *, drain: Callable[[], None] | None = None
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Wait until the autopilot stops reporting pre-arm failures, or the wait ends.
+
+        ArduPilot reports its pre-arm checks by text while disarmed, and some of them
+        clear only with time: a simulated GPS needs a fix, the EKF needs a home, and the
+        IMU consistency check needs a quiet window. Arming the moment the first heartbeat
+        arrives asks a question the vehicle is not ready to answer, and the refusal that
+        comes back describes the boot rather than the transport.
+
+        Returns whether the checks went quiet, and the texts that were outstanding if
+        they did not.
+        """
+        deadline = self._monotonic() + timeout_s
+        outstanding: dict[str, float] = {}
+        while self._monotonic() < deadline:
+            sample = self.telemetry()
+            if drain is not None:
+                drain()
+            for text in sample.statustexts:
+                if text.startswith("PreArm:") or text.startswith("Arm:"):
+                    outstanding[text] = self._monotonic()
+            last = max(outstanding.values(), default=None)
+            if last is None or self._monotonic() - last >= PRE_ARM_QUIET_S:
+                return True, ()
+            self._sleep(0.5)
+        return False, tuple(sorted(outstanding))
+
     def sensor_record(self, timeout_s: float) -> SensorRecord | None:
         """The next sensor record, or None when the stream stays silent for the timeout."""
         if self._pending_records:
@@ -2461,7 +2506,6 @@ class WebotsArduPilot:
 
 
     # -- command -----------------------------------------------------------
-
 
     def arm_and_guided(
         self, timeout_s: float, *, drain: Callable[[], None] | None = None
@@ -2478,7 +2522,14 @@ class WebotsArduPilot:
         seconds, and the cameras and inertial devices keep producing throughout it, so
         without it the controller's queue fills and frames are dropped before anything
         reads them.
+
+        The pre-arm wait comes first: a vehicle that has just booted is still being asked
+        for a GPS fix, a home and a quiet IMU window, and arming before those clear
+        records the boot rather than the transport.
         """
+        pre_arm_clear, outstanding = self.wait_for_pre_arm_clear(
+            self.settings.pre_arm_wait_s, drain=drain
+        )
         attempt_at = self._monotonic()
         self._session.set_mode("GUIDED")
         self._session.arm()
@@ -2522,6 +2573,8 @@ class WebotsArduPilot:
             altitude_m=altitude,
             statustexts=tuple(self._statustexts),
             refused=not (sample.in_guided_mode and sample.armed),
+            pre_arm_clear=pre_arm_clear,
+            pre_arm_outstanding=outstanding,
         )
         self.evidence.write_json(
             "flight-state.json",
@@ -2531,8 +2584,11 @@ class WebotsArduPilot:
                 "armed": evidence.armed,
                 "takeoff_commanded_m": evidence.takeoff_commanded_m,
                 "altitude_m": evidence.altitude_m,
-                "statustexts": list(evidence.statustexts),
                 "refused": evidence.refused,
+                "pre_arm_clear": evidence.pre_arm_clear,
+                "pre_arm_outstanding": list(evidence.pre_arm_outstanding),
+                "pre_arm_wait_s": self.settings.pre_arm_wait_s,
+                "statustexts": list(evidence.statustexts),
             },
         )
         return evidence

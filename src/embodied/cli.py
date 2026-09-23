@@ -239,10 +239,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "waypoints_local_ned": [[float]],
         "hold_per_waypoint_s": float,
         "stream_loss_window_s": float,
-        # How much simulated time the scene needs to settle, and how much simulated
-        # time the at-rest measurement covers once it has.
+        # Simulated time the scene needs to settle, simulated time the at-rest
+        # measurement covers once it has, and how long the probe waits for the
+        # autopilot's own pre-arm checks to clear before it asks the vehicle to arm.
         "settle_s": float,
         "at_rest_window_s": float,
+        "pre_arm_wait_s": float,
         "estimator_fault": {"kind": str, "magnitude_m": float, "hold_s": float},
         "timebase_samples": int,
         "timebase_spread_limit_ms": float,
