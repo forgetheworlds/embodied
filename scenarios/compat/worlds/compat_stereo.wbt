@@ -1,0 +1,159 @@
+#VRML_SIM R2025a utf8
+# P00 compatibility scene: one pinned Webots/ArduPilot candidate with a stereo rig.
+#
+# Provenance (recorded here because the code branch allows no other prose file):
+# derived from ArduPilot `libraries/SITL/examples/Webots_Python` at
+# af8525911b49a4c2a3bdc83bc5ed57e1d0098134 — worlds/iris_camera.wbt for the world
+# layout, protos/Iris.proto and protos/meshes/*.dae for the vehicle. The pinned
+# world declares its props through
+# `https://raw.githubusercontent.com/cyberbotics/webots/R2023a/...` EXTERNPROTO
+# URLs; those are dropped here, because remote resolution is a network dependency
+# and a live failure path. Only the local Iris proto is referenced, and the floor,
+# walls, light and colour witness are plain nodes.
+#
+# Changes against the pinned example, each one required by the compatibility gate:
+#   1. a stereo rig: two Camera nodes named "camera left" and "camera right",
+#      placed symmetrically about the body's fore-aft axis, half the declared
+#      baseline to each side, with identical resolution, field of view and period;
+#   2. named inertial devices, so a record can say which device, in which frame,
+#      produced a value;
+#   3. a saturated red panel, so the colour check has a witness whose expected
+#      channel order is known before the run rather than after it;
+#   4. plain nodes instead of stock protos, so nothing is fetched at load time.
+#
+# EMBODIED_WORLD_ZERO world origin at floor level, x north, y west, z up (ENU), matching the documented frame of the pinned scene
+EXTERNPROTO "../protos/Iris.proto"
+
+WorldInfo {
+  title "P00 compatibility: stereo Iris"
+  basicTimeStep 2
+  contactProperties [
+    ContactProperties {
+      material1 "default"
+      material2 "default"
+      coulombFriction [ 0 0 0 ]
+    }
+  ]
+}
+Viewpoint {
+  orientation 0.2 -0.9 -0.4 5.4
+  position -2.7 -1.0 2.2
+  follow "Iris"
+  followSmoothness 0.01
+}
+Background {
+  skyColor [ 0.6 0.7 0.85 ]
+}
+DirectionalLight {
+  direction 0.2 -0.4 -1
+  intensity 1.2
+}
+Solid {
+  name "floor"
+  translation 0 0 -0.02
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.55 0.55 0.58
+        roughness 0.9
+      }
+      geometry Plane {
+        size 14 14
+      }
+    }
+  ]
+  boundingObject Plane {
+    size 14 14
+  }
+}
+# The colour witness: a saturated red panel the left and right cameras both see at
+# start. Its declared channel order is what the colour check compares against.
+Solid {
+  name "colour_witness"
+  translation 3.0 0.0 0.75
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.05 0.05
+        metalness 0.0
+        roughness 0.6
+      }
+      geometry Box {
+        size 1.2 0.08 1.5
+      }
+    }
+  ]
+  boundingObject Box {
+    size 1.2 0.08 1.5
+  }
+}
+# Two neutral side walls: something for the stereo pair to look at that is not the
+# witness, so a frame is never judged on one object alone.
+Solid {
+  name "wall_north"
+  translation 2.0 2.2 0.9
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.75 0.75 0.7
+        roughness 0.9
+      }
+      geometry Box {
+        size 3.5 0.1 1.8
+      }
+    }
+  ]
+  boundingObject Box {
+    size 3.5 0.1 1.8
+  }
+}
+Solid {
+  name "wall_south"
+  translation 2.0 -2.2 0.9
+  rotation 0 0 1 0
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.2 0.35 0.7
+        roughness 0.9
+      }
+      geometry Box {
+        size 3.5 0.1 1.8
+      }
+    }
+  ]
+  boundingObject Box {
+    size 3.5 0.1 1.8
+  }
+}
+Iris {
+  translation 0 0 0.02
+  controller "compat_vehicle_controller"
+  controllerArgs [
+    "--sitl-address"
+    "127.0.0.1"
+    "--sitl-port"
+    "9002"
+    "--controller-port"
+    "9010"
+    "--motors"
+    "m1_motor, m2_motor, m3_motor, m4_motor"
+    "--camera-left"
+    "camera left"
+    "--camera-right"
+    "camera right"
+    "--camera-period-ms"
+    "100"
+    "--accelerometer"
+    "accelerometer"
+    "--gyro"
+    "gyro"
+    "--inertial-unit"
+    "inertial unit"
+    "--gps"
+    "gps"
+    "--imu-period-ms"
+    "10"
+  ]
+  customData "{\"witness_colour_rgb\": [217, 13, 13], \"witness_note\": \"red panel at x=3.0 on the room's centre line\", \"world_zero\": \"floor level, ENU\"}"
+}

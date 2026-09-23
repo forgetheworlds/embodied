@@ -1,0 +1,88 @@
+{
+  "T_body_camera_left": {
+    "child_frame": "camera_left",
+    "parent_frame": "body",
+    "quaternion_wxyz": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "translation_m": [
+      0.05,
+      0.05,
+      0.05
+    ]
+  },
+  "T_body_imu": {
+    "child_frame": "imu",
+    "parent_frame": "body",
+    "quaternion_wxyz": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "translation_m": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "T_camera_left_camera_right": {
+    "child_frame": "camera_right",
+    "parent_frame": "camera_left",
+    "quaternion_wxyz": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "translation_m": [
+      0.0,
+      -0.1,
+      0.0
+    ]
+  },
+  "baseline_m": 0.1,
+  "calibration_id": "compat-stereo-1",
+  "depth_convention": "no depth device in P00; metric depth and its validity are P01-C work",
+  "left_distortion": {
+    "coefficients": [
+      0.0
+    ],
+    "model": "none_declared"
+  },
+  "left_intrinsics": {
+    "focal_length_px": [
+      554.2562584220407,
+      554.2562584220407
+    ],
+    "principal_point_px": [
+      320.0,
+      240.0
+    ]
+  },
+  "pixel_convention": "top-left origin written as [column, row]; the column axis runs along the body's rightward (-y) axis and the row axis runs downward (-z), because a Webots camera's optical axis is its own +x",
+  "right_distortion": {
+    "coefficients": [
+      0.0
+    ],
+    "model": "none_declared"
+  },
+  "right_intrinsics": {
+    "focal_length_px": [
+      554.2562584220407,
+      554.2562584220407
+    ],
+    "principal_point_px": [
+      320.0,
+      240.0
+    ]
+  },
+  "source": "declared for the compat scene from the Webots world and proto; not measured",
+  "time_offset_error_s": null,
+  "time_offset_s": null,
+  "validated_limits": "declared from the scene file, not measured: intrinsics follow from the declared 1.0472 rad field of view and 640x480 images, distortion is assumed zero, and the rig geometry is the placement written in scenarios/compat/protos/Iris.proto. Validated operating limits and a measured calibration are P01-C work.",
+  "version": "1"
+}

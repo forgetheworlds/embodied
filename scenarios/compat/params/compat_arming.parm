@@ -1,0 +1,71 @@
+# Arming parameters for the simulated airframe: the third layer of the P00 parameter
+# set, applied after the pinned file and before the EKF-active file both runs apply.
+#
+# The pinned set (compat_base.parm, copied unchanged from the ArduPilot Webots_Python
+# example at af852591) cannot arm a simulated vehicle on its own, and ArduPilot says so
+# in its own words at the arm attempt:
+#
+#   "PreArm: 3D Accel calibration needed"
+#       ArduPilot treats an accelerometer whose offsets are exactly zero as
+#       uncalibrated, and a simulator's ideal accelerometer reports zero offsets. The
+#       small non-zero values below are the ones ArduPilot's own SITL autotest set uses,
+#       with the comment "we need small INS_ACC offsets so INS is recognised as being
+#       calibrated" (Tools/autotest/default_params/copter.parm at the same commit). They
+#       are a recognition flag, not a measurement.
+#   "PreArm: Check ACRO_BAL_ROLL/PITCH"
+#       ArduPilot requires the ACRO balance terms to be no larger than the ACRO angle
+#       gains. The pinned set lowers ATC_ANG_RLL_P and ATC_ANG_PIT_P to 0.5 while the
+#       balance terms keep their default of 1.0. Zero disables a feature this stage
+#       never uses.
+#   "Arm: Bad parameter: ATC_RAT_RLL_I must be > 0"
+#       ArduPilot's attitude-controller check requires a positive integral gain when the
+#       corresponding feed-forward gain is zero, and the pinned set zeroes both rate
+#       integral gains, so the firmware rejects the configuration outright. 0.25 is the
+#       value ArduPilot's own simulator parameter set uses for both of them on a quad X
+#       (Tools/autotest/default_params/airsim-quadX.parm at the same commit).
+#
+#       That set pairs each rate integral with the same proportional gain (both 0.25).
+#       Taking the integral alone left this airframe with an integral five times its
+#       proportional term, which is not a controller anyone chose: measured in
+#       work/runs/p00-compat/accept-4, both runs of the probe's guided hold saturated the
+#       motors (1947-1949 us against a 1000 us idle) while the collective throttle swung
+#       between 1150 and 1708 us around the 1419 us hover the stable run held, and the
+#       airframe then pitched over and was disarmed by ArduPilot's crash detector. The
+#       proportional gains below restore the pairing that file uses; they are the same
+#       two upstream numbers, from the same file, as the integrals above.
+#   "Arm: Gyro 0 rate 500Hz < loop rate*1.8 540Hz"
+#       ArduPilot requires the gyro sample rate to be at least 1.8 times the scheduler
+#       loop rate. The Webots scene steps at the pinned 2 ms, so the flight-state packet
+#       the autopilot reads as its gyro is sampled at 500 Hz, and the pinned loop rate of
+#       300 Hz therefore demands 540 Hz. 250 Hz is the highest round rate that a 500 Hz
+#       sensor supports (250 x 1.8 = 450). The value is derived from the scene's own time
+#       step, not chosen for control behaviour, and every receipt records it.
+#
+# Nothing here touches the estimator, the transport, the sensor path or the frame layout.
+# The vehicle reports these values back to the probe, so each receipt states the
+# configuration that actually ran rather than the one these files intended.
+
+INS_ACCOFFS_X   0.001
+INS_ACCOFFS_Y   0.001
+INS_ACCOFFS_Z   0.001
+INS_ACCSCAL_X   1.001
+INS_ACCSCAL_Y   1.001
+INS_ACCSCAL_Z   1.001
+INS_ACC2OFFS_X  0.001
+INS_ACC2OFFS_Y  0.001
+INS_ACC2OFFS_Z  0.001
+INS_ACC2SCAL_X  1.001
+INS_ACC2SCAL_Y  1.001
+INS_ACC2SCAL_Z  1.001
+
+ACRO_BAL_ROLL   0
+ACRO_BAL_PITCH  0
+
+ATC_RAT_RLL_P   0.25
+ATC_RAT_PIT_P   0.25
+ATC_RAT_RLL_I   0.25
+ATC_RAT_PIT_I   0.25
+
+# The scheduler loop rate a 500 Hz sensor interface supports. Derived, not tuned:
+# ArduPilot requires the gyro rate to be at least 1.8 times this value.
+SCHED_LOOP_RATE 250

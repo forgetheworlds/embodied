@@ -1,0 +1,9 @@
+# A configuration that is valid YAML but does not match the schema: the sensors
+# section is missing and an unknown top-level section is present.
+project:
+  stage: P00
+  name: malformed
+platform:
+  ardupilot_root: work/ardupilot
+surprise:
+  anything: true

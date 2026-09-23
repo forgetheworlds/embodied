@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools==81.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embodied"
+version = "0.1.0"
+description = "Continuous multimodal drone pilot: shared runtime records, simulator platform adapter and evaluation bench."
+readme = "README.md"
+requires-python = ">=3.11"
+# Exact pins. Every pin is the version this stage was developed and measured
+# against, so `python -m pip install -e '.[dev]'` cannot drift between two runs.
+dependencies = [
+    "numpy==2.4.4",
+    "PyYAML==6.0.3",
+    "pymavlink==2.4.49",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
