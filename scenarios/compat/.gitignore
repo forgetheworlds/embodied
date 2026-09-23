@@ -1,0 +1,4 @@
+# Webots writes a project file beside each world it opens. It is the simulator's own
+# state, not part of the scenario, so it is ignored here rather than in the repository
+# root: this stage's write lock is the scenario directory.
+.compat_stereo.wbproj
