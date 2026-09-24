@@ -4,13 +4,18 @@ Three things live here because every command must do them identically: the
 mapping from a run's outcome to a process exit code, the JSON receipt that records
 what happened, and the loader for the one configuration file a command reads.
 Command handlers live in the module that owns the work and register themselves
-here, so a later stage adds behaviour without editing a shared parser.
+here, so a later stage adds a command without editing the shared parser. A new
+command *module* is the one exception: its name must be appended to
+``COMMAND_MODULES`` below — one serialized line per module, granted as the
+"Dispatch wiring exception" recorded in APPROVAL-RECORD.
 
 Exit codes, from CLI-PLAN:
 
 * ``0`` the command produced a valid complete result. This says nothing about
   whether the drone succeeded: a completed losing episode is valid data.
-* ``1`` a command error, with diagnostics retained.
+* ``1`` a command error: a usage problem or an unwritable output is reported on
+  stderr with no receipt for the attempt, while a command that ran records its
+  reason in the receipt it writes.
 * ``2`` blocked by a missing prerequisite or budget.
 * ``3`` pending a mandatory adjudication.
 """
@@ -433,9 +438,7 @@ def write_artifacts(
         "started_at_utc": started_at_utc,
         "finished_at_utc": finished_at_utc,
         "started_at_monotonic_s": round(started_monotonic_s, 6),
-        "finished_at_monotonic_s": round(
-            started_monotonic_s + (time.monotonic() - started_monotonic_s), 6
-        ),
+        "finished_at_monotonic_s": round(time.monotonic(), 6),
     }
     receipt_path = output / RECEIPT_FILENAME
     receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")

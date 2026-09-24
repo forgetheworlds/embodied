@@ -340,14 +340,20 @@ def test_missing_information_stays_null_through_a_round_trip():
     assert restored.capture_pose_ref is None
     assert restored.depth_source is None
     assert restored.sim_time_s is None
-    assert "0" not in json.dumps(restored.sim_time_s)
 
 
-def test_no_field_falls_back_to_a_default_value():
+def test_no_field_may_be_omitted_from_any_record():
+    """Every field of every record is required: omitting one is refused, so no field
+    can fall back to a default value."""
     for name, builder in COMPLETE_EXAMPLES.items():
-        for field in dataclasses.fields(builder()):
-            assert field.default is dataclasses.MISSING, f"{name}.{field.name} has a default"
-            assert field.default_factory is dataclasses.MISSING, f"{name}.{field.name}"
+        record = builder()
+        present = {
+            field.name: getattr(record, field.name) for field in dataclasses.fields(record)
+        }
+        for omitted in present:
+            partial = {key: value for key, value in present.items() if key != omitted}
+            with pytest.raises(TypeError):
+                type(record)(**partial)
 
 
 def test_stamps_are_compared_only_inside_one_clock_domain():
@@ -526,9 +532,12 @@ def test_goals_are_bounded_and_unbounded_ones_are_rejected():
 
 
 def test_json_output_is_byte_stable_and_keys_are_sorted():
-    first = json.dumps(R.to_dict(final_report()), sort_keys=False)
-    second = json.dumps(R.to_dict(final_report()), sort_keys=False)
-    assert first == second
+    # The expected bytes are written out, not derived by encoding twice in one
+    # process: the encoder is pure, so re-running it here would certify itself.
+    known = json.dumps(R.to_dict(stamp(1.0)), sort_keys=False)
+    assert known == (
+        '{"clock_id": "monotonic", "host_id": "host-1", "monotonic_ns": 1000000000}'
+    )
     document = R.to_dict(observation())
     assert list(document) == sorted(document)
     assert list(document["capture_stamp"]) == sorted(document["capture_stamp"])

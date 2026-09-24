@@ -4986,7 +4986,7 @@ def axis_mean_and_spread(samples: Sequence[Sequence[float]]) -> dict[str, Any]:
 
 
 def write_record(record: Any) -> Any:
-    """The JSON document of one shared record, or the record itself when it has no codec."""
+    """The JSON document of one shared record, or ``None`` when it has no codec."""
     from embodied.contracts.records import to_dict
 
     try:

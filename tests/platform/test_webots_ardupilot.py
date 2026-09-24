@@ -28,6 +28,75 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "platform"
 SCENE = REPO_ROOT / "scenarios" / "compat"
 
 
+# The parameter values each fixture .parm file declares, transcribed by hand from
+# scenarios/compat/params. The startup read-back check compares the product
+# parser's reading of those files against what the vehicle reports running, so
+# both sides must not come from the same parser: a fake built on
+# W.read_configured_parameters would certify a parser regression with the
+# parser's own output.
+FIXTURE_PARAMETER_VALUES = {
+    "compat_base.parm": {
+        "FRAME_CLASS": 1.0,
+        "FRAME_TYPE": 1.0,
+        "ATC_ANG_PIT_P": 0.5,
+        "ATC_ANG_RLL_P": 0.5,
+        "ATC_ANG_YAW_P": 0.5,
+        "ATC_RAT_PIT_P": 0.05,
+        "ATC_RAT_RLL_P": 0.05,
+        "ATC_RAT_YAW_P": 0.02,
+        "ATC_RAT_PIT_I": 0.0,
+        "ATC_RAT_RLL_I": 0.0,
+        "ATC_RAT_PIT_D": 0.0003,
+        "ATC_RAT_RLL_D": 0.0003,
+        "ATC_RAT_YAW_D": 0.000001,
+        "AHRS_EKF_TYPE": 10.0,
+        "ARMING_SKIPCHK": 64.0,
+        "MOT_THST_EXPO": 0.0,
+        "SCHED_LOOP_RATE": 300.0,
+        "INS_GYR_CAL": 0.0,
+    },
+    "compat_arming.parm": {
+        "INS_ACCOFFS_X": 0.001,
+        "INS_ACCOFFS_Y": 0.001,
+        "INS_ACCOFFS_Z": 0.001,
+        "INS_ACCSCAL_X": 1.001,
+        "INS_ACCSCAL_Y": 1.001,
+        "INS_ACCSCAL_Z": 1.001,
+        "INS_ACC2OFFS_X": 0.001,
+        "INS_ACC2OFFS_Y": 0.001,
+        "INS_ACC2OFFS_Z": 0.001,
+        "INS_ACC2SCAL_X": 1.001,
+        "INS_ACC2SCAL_Y": 1.001,
+        "INS_ACC2SCAL_Z": 1.001,
+        "ACRO_BAL_ROLL": 0.0,
+        "ACRO_BAL_PITCH": 0.0,
+        "ATC_RAT_RLL_P": 0.25,
+        "ATC_RAT_PIT_P": 0.25,
+        "ATC_RAT_RLL_I": 0.25,
+        "ATC_RAT_PIT_I": 0.25,
+        "SCHED_LOOP_RATE": 250.0,
+    },
+    "compat_ekf.parm": {
+        "AHRS_EKF_TYPE": 3.0,
+        "EK3_ENABLE": 1.0,
+        "EK2_ENABLE": 0.0,
+    },
+}
+
+
+def scripted_parameter_values(settings):
+    """What a vehicle running this configuration's layered fixture files reports.
+
+    Layering follows the files' own rule — later files override earlier ones —
+    but every value comes from the transcription above, never from the product's
+    parser, so the probe's read-back check has an independent source to compare.
+    """
+    values = {}
+    for path in (*settings.params, *settings.estimator_params):
+        values.update(FIXTURE_PARAMETER_VALUES[path.name])
+    return values
+
+
 # ---------------------------------------------------------------------------
 # Doubles
 # ---------------------------------------------------------------------------
@@ -619,15 +688,16 @@ def run_probe(
     runner = runner or FakeRunner()
     config_path = write_scene(tmp_path, **(config_overrides or {}))
     settings = settings_for(config_path, tmp_path)
-    # The scripted vehicle reports the parameters its run layered, so a run whose files
-    # were applied is a run whose read-back agrees. Both runs apply the candidate's
-    # parameter files, estimator set included, so both report the same values.
+    # The scripted vehicle reports the values transcribed from the fixture .parm
+    # files, never the product parser's reading of them: the startup read-back
+    # compares the parser's report of the files against what the vehicle says it
+    # runs, and one parser on both sides could not fail on a parser regression.
+    # Both runs apply the candidate's parameter files, estimator set included, so
+    # both report the same values.
     def parameters_for_run():
         if "parameter_values" in session_kwargs:
             return session_kwargs["parameter_values"]
-        return W.read_configured_parameters(
-            settings.parameter_files(settings.estimator_params)
-        )
+        return scripted_parameter_values(settings)
 
     def make_gateway():
         gateway = FakeGateway(clock, **(gateway_kwargs or {}))
@@ -1431,17 +1501,19 @@ def test_motion_opposite_to_the_command_fails_the_motion_item(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path, session_kwargs={"direction": -1.0})
     motion = check(result, "3_guided_local_ned_motion")
     assert motion.status == "fail"
-    # The reason states the motion observed — target, start, end and the signed
-    # displacement per axis — rather than paraphrasing the criterion it failed,
-    # and every reported axis must have moved opposite its own target.
-    observed = re.findall(
-        r"axis \d+: target ([+-]?\d+\.\d{2}) m, start [+-]?\d+\.\d{2} m, "
-        r"end [+-]?\d+\.\d{2} m \(moved ([+-]?\d+\.\d{2}) m\)",
-        motion.reason,
-    )
-    assert observed, motion.reason
-    for target, moved in observed:
-        assert float(target) * float(moved) < 0.0
+    # The evidence carries each waypoint's commanded target beside the telemetry's
+    # displacement over the hold; in this direction scenario every commanded axis
+    # must have moved opposite its own target, read from those structured fields
+    # rather than from the reason's prose.
+    commanded = [
+        (target, moved)
+        for waypoint in motion.evidence["waypoints"]
+        for target, moved in zip(waypoint["target_ned"], waypoint["displacement_ned"])
+        if abs(target) >= W.AXIS_AGREEMENT_COMMAND_M
+    ]
+    assert commanded, motion.evidence["waypoints"]
+    for target, moved in commanded:
+        assert target * moved < 0.0, (target, moved, motion.reason)
 
 
 def test_a_run_outside_its_declared_real_time_envelope_is_timing_invalid(tmp_path):
@@ -1907,12 +1979,10 @@ def fake_probe_factory(**run_kwargs):
             return gateway
 
         def make_session():
-            # Both runs' vehicles report the candidate's parameters, as the probe checks.
+            # Both runs' vehicles report the fixture parameters transcribed above,
+            # as the probe checks.
             values = session_kwargs.pop(
-                "parameter_values",
-                W.read_configured_parameters(
-                    settings.parameter_files(settings.estimator_params)
-                ),
+                "parameter_values", scripted_parameter_values(settings)
             )
             session = ScriptedMavlinkSession(
                 clock, gateway_holder=holder, parameter_values=values, **session_kwargs

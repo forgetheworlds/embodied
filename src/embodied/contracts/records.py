@@ -83,6 +83,14 @@ def _non_negative_int(value: Any, name: str) -> int:
     return value
 
 
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RecordError(f"{name} must be an integer, got {type(value).__name__}")
+    if value <= 0:
+        raise RecordError(f"{name} must be positive, got {value}")
+    return value
+
+
 def _optional_number(value: Any, name: str) -> float | None:
     if value is None:
         return None
@@ -547,8 +555,8 @@ class Observation:
                 raise RecordError("the two halves of a pair are two separate payloads")
             _plain(self.pair_id, "pair_id")
         _plain(self.encoding, "encoding")
-        _positive(self.width, "width")
-        _positive(self.height, "height")
+        _positive_int(self.width, "width")
+        _positive_int(self.height, "height")
         _plain(self.calibration_id, "calibration_id")
         if self.capture_pose_ref is not None:
             _plain(self.capture_pose_ref, "capture_pose_ref")
@@ -1025,7 +1033,8 @@ def to_dict(record: Any) -> dict[str, Any]:
     if not dataclasses.is_dataclass(record) or isinstance(record, type):
         raise RecordError("to_dict takes one record instance")
     encoded = _encode(record)
-    assert isinstance(encoded, dict)
+    if not isinstance(encoded, dict):
+        raise RecordError("a record must encode to a JSON object")
     return encoded
 
 
