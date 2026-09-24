@@ -40,6 +40,7 @@ import os
 from pathlib import Path
 import re
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -1885,6 +1886,7 @@ class SubprocessRunner:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
         self._processes[name] = process
         return ChildProcess(name=name, argv=tuple(argv), pid=process.pid, log_path=log_path)
@@ -1894,17 +1896,41 @@ class SubprocessRunner:
         return None if process is None else process.poll()
 
     def terminate(self, child: ChildProcess, timeout_s: float = 10.0) -> int | None:
+        """Stop the child and everything it forked, bounded, and never raise.
+
+        The signal goes to the child's process group (it leads its own session,
+        see :meth:`spawn`), so a grandchild such as the simulator's vehicle
+        controller is covered too.  This runs in ``stop()``'s ``finally`` block,
+        so a child that outlives the bounded stop is reported as ``None`` — an
+        honest fact — instead of raising and destroying the run's evidence.
+        """
         process = self._processes.get(child.name)
         if process is None:
             return None
         if process.poll() is None:
-            process.terminate()
+            self._signal_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=timeout_s)
+                self._signal_group(process, signal.SIGKILL)
+                try:
+                    process.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    return None
         return process.returncode
+
+    @staticmethod
+    def _signal_group(process: subprocess.Popen, sig: int) -> None:
+        """Send ``sig`` to the child's process group, ignoring a child already gone."""
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except OSError:
+            # The child already exited (or is unreachable): fall back to the pid
+            # so the signal's intent is still attempted exactly once.
+            try:
+                process.send_signal(sig)
+            except OSError:
+                pass
 
     def tail(self, child: ChildProcess, lines: int = 200) -> list[str]:
         """The last lines of a child's output, bounded so a runaway log cannot fill memory."""

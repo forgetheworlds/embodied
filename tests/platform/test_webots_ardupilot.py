@@ -8,9 +8,11 @@ under test rather than the simulator's behaviour.
 
 import ast
 from pathlib import Path
+import os
 import json
 import re
 import socket
+import signal
 import struct
 import subprocess
 import sys
@@ -2142,3 +2144,79 @@ def test_registering_the_same_command_twice_is_refused():
             run_prefix="p00-compat",
         )
     assert "compat" in cli.COMMAND_REGISTRY
+
+
+# ---------------------------------------------------------------------------
+# The real subprocess runner: who owns a child's death
+# ---------------------------------------------------------------------------
+
+
+IGNORES_SIGTERM = r"""
+import signal, subprocess, sys, time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+grandchild = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+    ]
+)
+print("grandchild", grandchild.pid, flush=True)
+time.sleep(60)
+"""
+
+
+def _wait_until_gone(pid, timeout_s=5.0):
+    """Wait for a pid to stop answering, so a reaped-orphan race is not a flake."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"pid {pid} survived the bounded stop")
+        time.sleep(0.05)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are a POSIX facility")
+def test_the_real_runner_stops_a_sigterm_ignoring_child_and_the_process_group_it_forked(tmp_path):
+    """The stop owns the child's group, stays bounded, and never raises.
+
+    The suite replaces the runner everywhere else, so this is the real stop path:
+    the child here ignores SIGTERM exactly as the pinned SITL does, and it forks a
+    grandchild that ignores it too, exactly as the simulator forks its vehicle
+    controller. A pid-scoped stop would leave both alive and an unguarded wait
+    would raise out of ``stop()``'s ``finally`` — abandoning ``shutdown.json``,
+    which is how iteration 2's invocation lost its evidence.
+    """
+    runner = W.SubprocessRunner()
+    child = runner.spawn(
+        "stubborn",
+        [sys.executable, "-c", IGNORES_SIGTERM],
+        log_path=tmp_path / "stubborn.log",
+    )
+    # The child leads its own group, so signalling that group reaches its forks
+    # and can never reach the harness's group.
+    assert os.getpgid(child.pid) == child.pid
+
+    grandchild_pid = None
+    deadline = time.monotonic() + 10.0
+    while grandchild_pid is None and time.monotonic() < deadline:
+        for line in child.log_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("grandchild "):
+                grandchild_pid = int(line.split()[1])
+                break
+        else:
+            time.sleep(0.05)
+    assert grandchild_pid is not None, "the child never forked, so the test would prove nothing"
+
+    # SIGTERM is ignored: the stop must escalate inside its own bound and return
+    # the observed status instead of raising.
+    exit_code = runner.terminate(child, timeout_s=0.5)
+
+    assert exit_code == -signal.SIGKILL
+    assert runner.poll(child) is not None
+    _wait_until_gone(child.pid)
+    _wait_until_gone(grandchild_pid)
