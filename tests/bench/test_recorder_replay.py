@@ -10,7 +10,7 @@ with it.
 These tests also carry the negative side of the truth-isolation invariant:
 the agent projection refuses bench-private members, the agent stream rejects
 a foreign kind smuggled into it, and the agent-facing modules name no
-bench-private file or reader.
+bench-private file, no bench-side store and no reader for either.
 """
 
 import hashlib
@@ -305,10 +305,10 @@ def test_the_agent_stream_rejects_a_foreign_kind_smuggled_into_it(tmp_path):
 
 def test_the_agent_side_modules_name_no_private_file_or_reader():
     recorder_source = Path(recorder.__file__).read_text(encoding="utf-8")
-    for token in ("truth-events", "referee", "grader"):
+    for token in ("truth-events", "referee", "grader", ".truth", "truth_store"):
         assert token not in recorder_source, f"recorder.py names {token!r}"
     cli_source = Path(embodied.bench.cli.__file__).read_text(encoding="utf-8")
-    for token in ("truth-events", "referee"):
+    for token in ("truth-events", "referee", ".truth", "truth_store"):
         assert token not in cli_source, f"bench/cli.py names {token!r}"
     # The referee module is write-only: no function reads its stream.
     from embodied.bench import referee

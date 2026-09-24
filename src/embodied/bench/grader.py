@@ -3,7 +3,8 @@
 Two sources stay apart until here. The agent projection
 (:mod:`embodied.bench.recorder`) yields what the runtime recorded — events,
 report, referenced payloads — and it cannot reach anything else. The
-bench-side stream (written only by :mod:`embodied.bench.referee`) yields the
+bench-side store *outside* the episode directory (written only by
+:mod:`embodied.bench.referee`, resolved by its one path function) yields the
 scenario's hidden facts. The score compares every report claim against both,
 plus one more input the runtime never sees: the support annotation a reviewer
 writes per claim (``adjudication.json``), which the report's own confidence
@@ -40,7 +41,11 @@ from embodied.bench.events import (
     verify_stream_order,
 )
 from embodied.bench.recorder import AgentSurface, read_json, write_json
-from embodied.bench.referee import TRUTH_EVENTS_FILENAME
+from embodied.bench.referee import (
+    StoreMissing,
+    TRUTH_EVENTS_FILENAME,
+    truth_store_path,
+)
 
 ADJUDICATION_FILENAME = "adjudication.json"
 SCORE_FILENAME = "score.json"
@@ -352,23 +357,38 @@ class Score:
 
 
 def _bench_side_records(episode_dir: Path) -> tuple[dict, dict]:
-    """The hidden world declaration and the physical outcome, last wins."""
-    try:
-        events = read_event_lines(
-            episode_dir / TRUTH_EVENTS_FILENAME, TRUTH_EVENT_KINDS, "bench-side"
+    """The hidden world declaration and the physical outcome, last wins.
+
+    This is the only place in the package that opens the bench-side store,
+    and it reaches it through the referee's resolver so the store is always
+    the sibling directory outside the episode. A store that does not exist
+    is a missing prerequisite (:class:`StoreMissing`, exit 2); a store that
+    exists but is malformed, tampered with or incomplete stays a grading
+    error, because there something was written and then went wrong.
+    """
+    store = truth_store_path(episode_dir)
+    if not store.is_dir():
+        raise StoreMissing(
+            f"{store} is missing; the bench-side store lives outside the episode "
+            "directory and holds the hidden facts a score compares against"
         )
-    except EpisodeError:
+    stream_path = store / TRUTH_EVENTS_FILENAME
+    if not stream_path.is_file():
         raise GradeError(
-            f"{episode_dir} has no bench-side stream; an episode without hidden "
-            "facts cannot be scored"
-        ) from None
+            f"{store} exists but has no {TRUTH_EVENTS_FILENAME}; "
+            "an episode without hidden facts cannot be scored"
+        )
+    try:
+        events = read_event_lines(stream_path, TRUTH_EVENT_KINDS, "bench-side")
+    except EpisodeError as error:
+        raise GradeError(f"cannot read the bench-side stream: {error}") from None
     verify_stream_order(events)
     worlds = [event.payload for event in events if event.kind == _WORLD_KIND]
     outcomes = [event.payload for event in events if event.kind == _OUTCOME_KIND]
     if not worlds:
-        raise GradeError(f"{episode_dir} has no world-state record in its bench-side stream")
+        raise GradeError(f"{store} has no world-state record in its bench-side stream")
     if not outcomes:
-        raise GradeError(f"{episode_dir} has no physical-outcome record in its bench-side stream")
+        raise GradeError(f"{store} has no physical-outcome record in its bench-side stream")
     return worlds[-1], outcomes[-1]
 
 
@@ -376,10 +396,10 @@ def grade(episode_dir: Path, adjudication_path: Path | None = None) -> Score:
     """Score one episode offline and write ``score.json`` into it.
 
     Reads the agent projection for the report and the events, the bench-side
-    stream for hidden facts, and the adjudication for support — the only place
-    in the package where all three meet. The score document carries no
-    timestamps and no machine-specific paths, so re-scoring an unchanged
-    episode reproduces score.json byte for byte.
+    store outside the episode for hidden facts, and the adjudication for
+    support — the only place in the package where all three meet. The score
+    document carries no timestamps and no machine-specific paths, so
+    re-scoring an unchanged episode reproduces score.json byte for byte.
     """
     episode_dir = Path(episode_dir)
     surface = AgentSurface.open(episode_dir)

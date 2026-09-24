@@ -7,14 +7,17 @@ after their own name: the shared dispatcher adds it to this command, and the
 leaves re-declare it with a suppressed default so a leaf-level flag overrides
 without a parent-level default clobbering it back.
 
-This module never names a bench-private file. The score path delegates to the
-scorer module, which owns that surface; the replay path can only reach the
-agent projection, which refuses anything else.
+This module never names a bench-private file or the store that holds hidden
+facts. The score path delegates to the scorer module, which owns that
+surface; the replay path can only reach the agent projection, which refuses
+anything else.
 
 Exit codes follow the shared receipt (CLI-PLAN): record refuses an
-unregistered suite with status blocked (2); replay and a completed score exit
-0 even when the episode itself failed — a completed losing episode is valid
-data — and a score awaiting support adjudication exits 3.
+unregistered suite with status blocked (2); a score whose bench-side store is
+missing is a missing prerequisite, also blocked (2) with the store path
+named; replay and a completed score exit 0 even when the episode itself
+failed — a completed losing episode is valid data — and a score awaiting
+support adjudication exits 3.
 """
 
 from __future__ import annotations
@@ -180,6 +183,20 @@ def _score(args: argparse.Namespace, output: Path) -> CommandOutcome:
     episode = Path(args.episode)
     try:
         score = grader.grade(episode, args.adjudication)
+    except grader.StoreMissing as error:
+        # The bench-side store is a missing prerequisite, not a command
+        # mistake: report blocked with the store path named, and write no
+        # score — there are no hidden facts to grade against.
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(str(error),),
+            limitations=(
+                "an episode without its bench-side store cannot be scored; "
+                "no score was written",
+            ),
+            manifest={"episode": str(episode)},
+        )
     except (EpisodeError, EventError, grader.GradeError) as error:
         raise CommandError(f"score: {error}") from error
     output.mkdir(parents=True, exist_ok=True)
