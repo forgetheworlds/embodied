@@ -1,0 +1,34 @@
+{
+  "arm": null,
+  "artifacts": {
+    "agent-events.jsonl": "0009805e64c32924077f7ac0a47b2a88ce987646f397b6504d7b00e65623535b",
+    "final-report.json": "3c12124fb2f357e1ec8cabd8a92ec95c2342152fd9e882960cec842aaaffdc0c",
+    "payloads/obs-0-left.ppm": "4c79f5703beee0a02406f8ce5b95c58afac7ed85aeb24bbccb7b2bdad94f9a90",
+    "payloads/obs-0-right.ppm": "4c79f5703beee0a02406f8ce5b95c58afac7ed85aeb24bbccb7b2bdad94f9a90",
+    "payloads/obs-1-left.ppm": "e9f972a45f658f2870bf57cae5a3e110c82045915f3f246e2f8f1d3a46d9d766",
+    "payloads/obs-1-right.ppm": "e9f972a45f658f2870bf57cae5a3e110c82045915f3f246e2f8f1d3a46d9d766",
+    "payloads/obs-2-left.ppm": "876801c1e13f8e6b17a3da446b66fcf8f784a905735d01af63173929664928a5",
+    "payloads/obs-2-right.ppm": "876801c1e13f8e6b17a3da446b66fcf8f784a905735d01af63173929664928a5",
+    "payloads/obs-3-left.ppm": "66bfb92091074ffe10093e0fbfefcf7fbd1aae451b612454f4816822ac8bb314",
+    "payloads/obs-3-right.ppm": "66bfb92091074ffe10093e0fbfefcf7fbd1aae451b612454f4816822ac8bb314",
+    "payloads/obs-4-left.ppm": "4c79f5703beee0a02406f8ce5b95c58afac7ed85aeb24bbccb7b2bdad94f9a90",
+    "payloads/obs-4-right.ppm": "4c79f5703beee0a02406f8ce5b95c58afac7ed85aeb24bbccb7b2bdad94f9a90"
+  },
+  "code_revision": null,
+  "config_hash": null,
+  "episode_id": "hand-checkable-001",
+  "episode_kind": "synthetic-fixture",
+  "events_revision": "p02-events-1",
+  "manifest_revision": "p02-manifest-1",
+  "model_identity": null,
+  "permitted_projection": [
+    "manifest.json",
+    "agent-events.jsonl",
+    "final-report.json",
+    "payloads/"
+  ],
+  "records_revision": "p00-records-1",
+  "sensor_mode": null,
+  "suite": null,
+  "trial_group_id": null
+}

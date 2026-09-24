@@ -1,0 +1,55 @@
+{
+  "adjudication_version": "p02-adjudication-1",
+  "entries": [
+    {
+      "cited_evidence": [
+        "obs-2"
+      ],
+      "claim_index": 0,
+      "note": "obs-2 shows a single red object filling the centre of the frame",
+      "verdict": "supported"
+    },
+    {
+      "cited_evidence": [
+        "obs-2"
+      ],
+      "claim_index": 1,
+      "note": "obs-2 is the close view: the red object fills most of the frame",
+      "verdict": "supported"
+    },
+    {
+      "cited_evidence": [
+        "obs-4"
+      ],
+      "claim_index": 2,
+      "note": "obs-4 shows the launch mat band again, the same frame as the start view",
+      "verdict": "supported"
+    },
+    {
+      "cited_evidence": [
+        "obs-3"
+      ],
+      "claim_index": 3,
+      "note": "obs-3 shows only a shelf band and no toolbox; the citation cannot support a found claim",
+      "verdict": "unsupported"
+    },
+    {
+      "cited_evidence": [
+        "obs-3"
+      ],
+      "claim_index": 4,
+      "note": "obs-3 contains no red object; the citation is unrelated to the claim",
+      "verdict": "unsupported"
+    },
+    {
+      "cited_evidence": [
+        "obs-2"
+      ],
+      "claim_index": 5,
+      "note": "obs-2 shows one red object; the asserted count copies the instruction's requested three",
+      "verdict": "unsupported"
+    }
+  ],
+  "reviewer": "p02-fixture-author",
+  "rubric_revision": "hand-rubric-1"
+}

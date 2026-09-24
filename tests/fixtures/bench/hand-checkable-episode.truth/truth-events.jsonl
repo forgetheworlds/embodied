@@ -1,0 +1,2 @@
+{"kind":"world_state","payload":{"targets":{"red_kettle":{"present":true},"toolbox":{"present":false}},"world_counts":{"red_kettle":1,"toolbox":0}},"seq":0,"sim_time_s":null,"stamp":{"clock_id":"monotonic","host_id":"synthetic-bench-0","monotonic_ns":0}}
+{"kind":"physical_outcome","payload":{"inspected":{"red_kettle":true},"return_verified":true,"takeover":false,"violations":[]},"seq":1,"sim_time_s":null,"stamp":{"clock_id":"monotonic","host_id":"synthetic-bench-0","monotonic_ns":5600000000}}

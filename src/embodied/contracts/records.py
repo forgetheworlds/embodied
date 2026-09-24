@@ -969,7 +969,7 @@ class ReportClaim:
 
     predicate: str
     target: str
-    observed: int | float | bool | str
+    observed: int | float | str
     support_refs: tuple[str, ...]
     kind: ClaimKind
     stamp: ClockStamp
