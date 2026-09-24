@@ -69,7 +69,7 @@ sensors:
     gyro: gyro
     inertial_unit: "inertial unit"
     gps: gps
-    sampling_period_ms: 10
+    sampling_period_ms: 2
   calibration: scenarios/compat/calibration.json
 
 # The two measurement windows are configuration because they are properties of this

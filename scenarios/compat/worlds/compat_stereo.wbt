@@ -149,7 +149,7 @@ Iris {
     "--gps"
     "gps"
     "--imu-period-ms"
-    "10"
+    "2"
   ]
   customData "{\"witness_colour_rgb\": [217, 13, 13], \"witness_note\": \"red panel at x=3.0 on the room's centre line\", \"world_zero\": \"floor level, ENU\"}"
 }
