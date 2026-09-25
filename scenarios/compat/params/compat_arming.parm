@@ -91,3 +91,9 @@ SCHED_LOOP_RATE 250
 # 1.0 m/s has a 0.50 m stopping distance at the firmware's 1.0 m/s² default
 # vertical acceleration limit, versus 2.76 m from the measured 2.35 m/s.
 WP_SPD_UP       1.0
+
+# Iteration 11: the it10 green run-a had ~4 s of 1100 us armed idle before
+# takeoff, while failed run-b took off before reaching idle, ramped to 1726 us
+# and overshot to 2.77 m. Firmware MOT_IDLE_SEC holds GROUND_IDLE for this many
+# seconds after spin-up (AP_MotorsMulticopter.cpp:248-255,665-739; range 0-5).
+MOT_IDLE_SEC     4.0
