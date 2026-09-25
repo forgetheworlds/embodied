@@ -119,3 +119,138 @@ probe:
   budget_wall_clock_s: 600
 
 output: work/runs/p00-compat
+
+# ---------------------------------------------------------------------------
+# P01-C offline stereo calibration (stage definition p01c-calibration). Additive
+# section: every P00 key above is untouched. The declared values name the same
+# pinned rig as sensors.calibration's compat-stereo-1 declaration, re-versioned
+# because a changed calibration is a new version, never an edit.
+#
+# The bounds below were written here BEFORE the validation run over the accept-5
+# evidence and are never adjusted after seeing results (plan section 6). Where a
+# bound is this stage's declared engineering parameter rather than a plan-fixed
+# number, the justification stands next to it. Justification recorded once: a
+# 1 px disparity-quantization envelope gives sigma_z = z^2*sigma_d/(f*B) ~= 1.8 cm
+# at 2 m and 7.3 % of z at 4 m, so sub-pixel geometry bounds and the >= 10 % depth
+# bound sit above quantization noise and can only be failed by real geometry error.
+
+calibration:
+  calibration_id: first-indoor-stereo-1
+  version: "2"
+  records_revision: p00-records-1
+
+  # Evidence reuse (plan section 2): the P00 accept-5 colour pairs and the pinned
+  # scene declaration. No new simulator capture is justified for this stage.
+  evidence:
+    pair_dirs:
+      - work/runs/p00-compat/accept-5/run-a/pairs
+      - work/runs/p00-compat/accept-5/run-b/pairs
+    accept5_receipt: work/runs/p00-compat/accept-5/receipt.json
+    accept5_manifest: work/runs/p00-compat/accept-5/manifest.json
+    timebase_run_a: work/runs/p00-compat/accept-5/run-a/frames-and-timebases.json
+    timebase_run_b: work/runs/p00-compat/accept-5/run-b/frames-and-timebases.json
+    declared_calibration: scenarios/compat/calibration.json
+    declared_calibration_sha256: 0230799daa822f815ef8d0336c958e1fa8cde12ccc635755f1ba5d470fdd4b46
+    world: scenarios/compat/worlds/compat_stereo.wbt
+    world_sha256: 02a68d9b2e337a5f439f2359f3354f2d94e45914284442f747ac2a1859783e4d
+    proto: scenarios/compat/protos/Iris.proto
+    proto_sha256: 1eab7722a7e3da6aa4b131a556de31e7c54af2bd80400ccbdbf37ba6549c7a3c
+
+  # Referee geometry for the depth check, transcribed from the pinned world and
+  # proto (sha256 above). Referee truth from the scene declaration; it never
+  # feeds the calibration values themselves.
+  referee:
+    # All 24 stored accept-5 pairs carry sim times <= 2.5 s, before takeoff, and
+    # the 12 pairs within each run are byte-identical: the vehicle is at the
+    # declared static start for every stored capture. The capture-time pose used
+    # for the depth check is therefore the scene declaration's start pose. That
+    # is simulator-scene truth: DIAGNOSTIC provenance, never a scored
+    # sensor-derived pose and never pooled with one.
+    pose_source: static_start_declared
+    body_position_world_m: [0.0, 0.0, 0.02]
+    body_quaternion_world_wxyz: [1.0, 0.0, 0.0, 0.0]
+    surfaces:
+      # WorldInfo floor: Plane size 14x14 at translation (0, 0, -0.02).
+      - name: floor
+        plane_point_world_m: [0.0, 0.0, -0.02]
+        plane_normal_world: [0.0, 0.0, 1.0]
+        axis_bounds_world_m:
+          x: [-7.0, 7.0]
+          y: [-7.0, 7.0]
+      # Colour witness: Box 1.2 x 0.08 x 1.5 at (3.0, 0.0, 0.75); its camera-facing
+      # face is the plane x = 2.4.
+      - name: witness_front
+        plane_point_world_m: [2.4, 0.0, 0.75]
+        plane_normal_world: [1.0, 0.0, 0.0]
+        axis_bounds_world_m:
+          y: [-0.6, 0.6]
+          z: [0.0, 1.5]
+      # Side walls: Box 3.5 x 0.1 x 1.8 at (+/-2.2, 0.9 in z); inner faces at
+      # y = +/-2.15.
+      - name: wall_north_inner
+        plane_point_world_m: [2.0, 2.15, 0.9]
+        plane_normal_world: [0.0, -1.0, 0.0]
+        axis_bounds_world_m:
+          x: [0.25, 3.75]
+          z: [0.0, 1.8]
+      - name: wall_south_inner
+        plane_point_world_m: [2.0, -2.15, 0.9]
+        plane_normal_world: [0.0, 1.0, 0.0]
+        axis_bounds_world_m:
+          x: [0.25, 3.75]
+          z: [0.0, 1.8]
+
+  # Pre-registered gate bounds. B1 and B3 tolerances are plan-fixed (plan
+  # section 6); the sample floors are this stage's declared parameters.
+  bounds:
+    rectification_row_residual_median_px: 1.0
+    rectification_row_residual_p95_px: 2.0
+    # A 95th percentile across retained matches is a distribution statistic;
+    # below 20 retained matches it is ordering noise, so 20 is the floor for
+    # evaluating B1's percentiles on one pair.
+    min_retained_matches: 20
+    # Per-sample B3 bound, plan-fixed: |z_meas - z_declared| <= max of these.
+    depth_abs_tol_m: 0.15
+    depth_rel_tol: 0.10
+    depth_range_m: [0.5, 4.0]
+    # A per-surface pass/fail on a handful of matches is not a distribution:
+    # a surface must contribute at least this many compared samples before its
+    # accuracy fraction gates, and at least this fraction of them must sit
+    # inside the per-sample bound. Spec 5.2 concedes wrong matches near
+    # discontinuities, so 100 % is not the requirement; 95 % of a large set is.
+    min_compared_samples_per_surface: 1000
+    min_within_fraction: 0.95
+    # A declared surface is gate-eligible only if its in-window, unoccluded
+    # projection holds at least this many pixels outside the declared border
+    # margin; ineligible surfaces are recorded, never claimed. A gate-eligible
+    # surface that is not compared, or not within the fraction, blocks the run.
+    min_eligible_pixels_per_surface: 1000
+    # Declared image-border rejection margin (pixels), spec 5.2.
+    border_px: 8
+
+  # Declared matching machinery, spec 5.2. These are documented mechanisms, not
+  # calibrated safety probabilities.
+  features:
+    detector: ORB
+    nfeatures: 2000
+    scale_factor: 1.2
+    nlevels: 8
+    descriptor_ratio_threshold: 0.8
+  matcher:
+    algorithm: StereoSGBM
+    # The declared 0.5 m operating bound implies f*B/z_min = 110.9 px of
+    # disparity; 128 is the next multiple of 16 above it. Chosen from the
+    # declared range, not from the images.
+    num_disparities: 128
+    block_size: 5
+    uniqueness_ratio: 10
+    speckle_window_size: 200
+    speckle_range: 2
+    texture_threshold: 10
+    lr_tolerance_px: 1.0
+    # Declared disparity-quantization sigma for the uncertainty envelope
+    # sigma_z = z^2 * sigma_d / (f * B); an envelope, not a probability.
+    disparity_quantization_sigma_px: 1.0
+
+  # Where the offline derivation writes its artifacts (plan section 10).
+  output: work/runs/p01-calibration
