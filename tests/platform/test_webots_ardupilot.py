@@ -612,6 +612,7 @@ def run_probe(
     runner=None,
     output_name="out",
     config_overrides=None,
+    session_class=ScriptedMavlinkSession,
 ):
     """Run the whole checklist against scripted seams and return the result."""
     clock = clock or FakeClock()
@@ -639,7 +640,7 @@ def run_probe(
     def make_session():
         values = parameters_for_run()
         overrides = {k: v for k, v in session_kwargs.items() if k != "parameter_values"}
-        session = ScriptedMavlinkSession(
+        session = session_class(
             clock, gateway_holder=holder, parameter_values=values, **overrides
         )
         sessions.append(session)
@@ -1434,6 +1435,109 @@ def test_motion_opposite_to_the_command_fails_the_motion_item(tmp_path):
     motion = check(result, "3_guided_local_ned_motion")
     assert motion.status == "fail"
     assert "target" in motion.reason and "start" in motion.reason and "(moved" in motion.reason
+
+
+class OvershootThenDescend(ScriptedMavlinkSession):
+    """A climb that overshoots the commanded hover, then correct flight.
+
+    Iteration 5 run-b's start: takeoff is commanded to the 1.5 m hover, the climb
+    overshoots, and waypoint 1's start sample catches the vehicle 0.7 m above the
+    altitude it is about to be commanded to hold. Descending to that target is
+    then compliance with the command; the target coordinate's negative sign says
+    where the target sits, not which way the command asks the vehicle to move.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.climb_overshoot_m = 0.7
+        self.holding_overshoot = False
+
+    def takeoff(self, altitude_m):
+        super().takeoff(altitude_m)
+        self.position = (0.0, 0.0, -altitude_m - self.climb_overshoot_m)
+        self.holding_overshoot = True
+
+    def send_setpoint(self, setpoint):
+        super().send_setpoint(setpoint)
+        self.holding_overshoot = False
+
+    def _advance(self):
+        if self.holding_overshoot or not self.moves or self.target is None:
+            return
+        # Pinned, not drain-timed: run-b held both absolute targets to 2-5 cm, so
+        # the arithmetic under test wants start and end positions it can read
+        # exact values from whatever the drain cadence was.
+        self.position = self.target
+
+
+class ClimbingWhenToldToDescend(OvershootThenDescend):
+    """The same overshoot, then a vehicle that climbs away from its target.
+
+    The command is a descent (the vehicle sits above the target altitude) and
+    the motion is a climb: the rule must still bite when its direction
+    reference is the commanded step.
+    """
+
+    def _advance(self):
+        if self.holding_overshoot or not self.moves or self.target is None:
+            return
+        self.position = (
+            self.target[0],
+            self.target[1],
+            self.target[2] - 2 * self.climb_overshoot_m,
+        )
+
+
+def test_a_descent_to_the_commanded_altitude_is_not_opposite_motion(tmp_path):
+    """Iteration 5 run-b's waypoint record, scripted.
+
+    The climb overshoots, so waypoint 1's start sample sits 0.7 m above the
+    target altitude and the correct flight to it is a descent: displacement
+    +0.7 m on an axis whose commanded coordinate is -1.5 m. Judged against the
+    absolute coordinate that read as opposite motion; judged against the
+    commanded step it is exactly the motion that was asked for.
+    """
+    result, _, _, _, _ = run_probe(tmp_path, session_class=OvershootThenDescend)
+    for name in ("3_guided_local_ned_motion[run-a]", "3_guided_local_ned_motion[run-b]"):
+        motion = next(entry for entry in result.checks if entry.name == name)
+        assert motion.status == "pass", motion.reason
+        first = motion.evidence["waypoints"][0]
+        assert first["position_before_ned"][2] == pytest.approx(-2.2)
+        assert first["displacement_ned"][2] == pytest.approx(0.7)
+
+
+def test_a_climb_against_a_commanded_descent_still_fails_the_motion_item(tmp_path):
+    """The corrected rule still bites: opposite to the commanded step is flagged.
+
+    The command is a descent of 0.7 m and the vehicle climbs 0.7 m instead; the
+    finding names the commanded step, which is the reference it judged against.
+    """
+    result, _, _, _, _ = run_probe(tmp_path, session_class=ClimbingWhenToldToDescend)
+    motion = check(result, "3_guided_local_ned_motion")
+    assert motion.status == "fail"
+    assert "axis 2" in motion.reason
+    assert "commanded step +0.70" in motion.reason
+
+
+def test_a_mid_hold_loss_is_reported_as_the_loss_when_the_motion_followed_the_command(
+    tmp_path,
+):
+    """A lost flight is reported lost, whatever its measured motion said.
+
+    The autopilot leaves Guided mid-hold after two publications; until then the
+    vehicle moved toward the commanded target. The record carries the loss
+    alone: no axis-direction finding is invented for motion that followed the
+    command.
+    """
+    result, _, _, _, _ = run_probe(
+        tmp_path, session_kwargs={"failsafe_after_setpoints": 2}
+    )
+    motion = check(result, "3_guided_local_ned_motion")
+    assert motion.status == "fail"
+    assert "Guided flight was lost" in motion.reason
+    waypoints = motion.evidence["waypoints"]
+    assert waypoints and waypoints[0]["displacement_ned"] is not None
+    assert "axis" not in motion.reason
 
 
 def test_a_run_outside_its_declared_real_time_envelope_is_timing_invalid(tmp_path):

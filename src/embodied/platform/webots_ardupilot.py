@@ -4552,13 +4552,22 @@ class CompatibilityProbe:
             for axis, (commanded, measured_axis) in enumerate(
                 zip(entry["target_ned"], displacement)
             ):
+                # What a displacement can comply with is the step that was
+                # commanded, target minus start. The target coordinate's own sign
+                # says where the target sits, not which way the command asks the
+                # vehicle to move: judged against it, a correct descent (start
+                # above the target) reads as motion against the command.
+                commanded_step = (
+                    entry["target_ned"][axis] - entry["position_before_ned"][axis]
+                )
                 moved_opposite = (
-                    commanded * measured_axis < 0.0
+                    commanded_step * measured_axis < 0.0
                     and abs(measured_axis) > AXIS_AGREEMENT_MARGIN_M
                 )
-                if abs(commanded) >= AXIS_AGREEMENT_COMMAND_M and moved_opposite:
+                if abs(commanded_step) >= AXIS_AGREEMENT_COMMAND_M and moved_opposite:
                     reasons.append(
                         f"axis {axis}: target {commanded:+.2f} m, "
+                        f"commanded step {commanded_step:+.2f} m, "
                         f"start {entry['position_before_ned'][axis]:+.2f} m, "
                         f"end {entry['position_after_ned'][axis]:+.2f} m "
                         f"(moved {measured_axis:+.2f} m)"
