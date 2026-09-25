@@ -1935,6 +1935,43 @@ def test_the_launch_commands_carry_the_wipe_and_the_parameter_layers(tmp_path):
     ]
 
 
+def test_the_flown_yaw_pairing_is_the_firmware_stock_paired_with_the_flown_rate_loop():
+    """No control axis flies at a value its own firmware documents as out of range.
+
+    The pin's yaw gains survived every provenance restoration this stage made: the
+    roll/pitch rate pairing came from airsim-quadX.parm (which sets no yaw gains at
+    all) and the roll/pitch angle P returned to the firmware stock 4.5 in iteration
+    7, leaving yaw alone at ATC_ANG_YAW_P 0.5 and ATC_RAT_YAW_P 0.02. Iteration 7's
+    own flights then departed yaw-first (run-a's yaw crossed 0.15 rad 0.76 s before
+    pitch and 0.95 s before roll, with both runs sustaining 180-280 degrees/s yaw
+    spins into the tumble and run-b's EKF3 running an in-flight yaw realignment
+    seconds before the crash disarm), so the values below are pinned as literals
+    with their sources rather than left to the pin's vestigial context.
+    """
+    layered = W.read_configured_parameters(
+        [SCENE / "params" / name for name in
+         ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")]
+    )
+    # Angle P, all three axes, the firmware's own stock: AC_ATTITUDE_CONTROL_ANGLE_P
+    # 4.5f, "default angle P gain for roll, pitch and yaw", applied to roll, pitch
+    # and yaw at work/ardupilot af852591, libraries/AC_AttitudeControl/
+    # AC_AttitudeControl.h:15,51-53. The parameter's documented range is
+    # 3.000-12.000 (AC_AttitudeControl.cpp:62-85); the pin's 0.5 is below it.
+    assert layered["ATC_ANG_RLL_P"] == 4.5
+    assert layered["ATC_ANG_PIT_P"] == 4.5
+    assert layered["ATC_ANG_YAW_P"] == 4.5
+    # Yaw rate P at the firmware stock for this frame class:
+    # AC_ATC_MULTI_RATE_YAW_P 0.180f (AC_AttitudeControl_Multi.h:26). The pin's
+    # 0.02 is below the parameter's own documented range floor of 0.10
+    # (AC_AttitudeControl_Multi.cpp:208-213).
+    assert layered["ATC_RAT_YAW_P"] == 0.18
+    # The yaw integral is declared by no parameter file: the pin never set it, and
+    # the 0.02 iteration 7's autopilot reported is the firmware's own default --
+    # within one increment of the stock 0.018 (AC_AttitudeControl_Multi.h:29).
+    # Nothing to restore, so nothing is declared.
+    assert "ATC_RAT_YAW_I" not in layered
+
+
 def test_the_probe_requests_control_again_while_the_vehicle_refuses(tmp_path):
     """A vehicle that has just booted is still waiting for its GPS, home and IMU.
 

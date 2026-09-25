@@ -3,11 +3,11 @@ FRAME_TYPE       1          # X class
 
 ATC_ANG_PIT_P    4.5
 ATC_ANG_RLL_P    4.5
-ATC_ANG_YAW_P    0.5
+ATC_ANG_YAW_P    4.5
 
 ATC_RAT_PIT_P    0.05
 ATC_RAT_RLL_P    0.05
-ATC_RAT_YAW_P    0.02 
+ATC_RAT_YAW_P    0.18 
 
 ATC_RAT_PIT_I    0
 ATC_RAT_RLL_I    0
