@@ -891,9 +891,8 @@ def run_validation(config_path: Path, *, code_revision: str) -> int:
     # --- declared referee geometry from the static-start pose --------------
     body_position = tuple(float(v) for v in referee_cfg["body_position_world_m"])
     body_rotation = _quaternion_rotation(tuple(float(v) for v in referee_cfg["body_quaternion_world_wxyz"]))
-    camera_position = body_position + tuple(
-        calibration.T_body_camera_left.translation_m
-    )
+    camera_translation = calibration.T_body_camera_left.translation_m
+    camera_position = tuple(b + t for b, t in zip(body_position, camera_translation))
     camera_rotation = body_rotation @ _quaternion_rotation(
         calibration.T_body_camera_left.quaternion_wxyz
     )
