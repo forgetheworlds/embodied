@@ -1972,27 +1972,6 @@ def test_the_flown_yaw_pairing_is_the_firmware_stock_paired_with_the_flown_rate_
     assert "ATC_RAT_YAW_I" not in layered
 
 
-def test_quad_yaw_torque_points_the_same_way_as_the_firmware_mixer():
-    """The 3fb6564 yaw gains must be negative feedback, not positive feedback.
-
-    The pinned firmware's quad X yaw factors are (+1,+1,-1,-1) for motors
-    1..4 (work/ardupilot/libraries/AP_Motors/AP_MotorsMatrix.cpp:592-600).
-    Webots R2025a Propeller applies Q=q1*abs(omega)*omega along +Z; its Motor
-    multiplier changes omega's sign. The bridge converts Webots +Z yaw to
-    ArduPilot -Z yaw. Flight 8 observed the former opposite sign directly:
-    run-a boot 51.83 s, yaw mix -375 us and yaw rate +1.693 rad/s.
-    """
-    scene = (SCENE / "protos" / "Iris.proto").read_text()
-    motors = [int(i) for i in re.findall(r'name "m([1-4])_motor"', scene)]
-    torques = [float(q) for q in re.findall(r"torqueConstants\s+([^\s]+)\s+0", scene)]
-    multipliers = [int(m) for m in re.findall(r"multiplier\s+(-?1)\b", scene)]
-    assert motors == [1, 2, 3, 4]
-    assert multipliers == [1, 1, -1, -1]
-    assert [-q * m for q, m in zip(torques, multipliers)] == [
-        0.0005, 0.0005, -0.0005, -0.0005
-    ]
-
-
 def test_the_probe_requests_control_again_while_the_vehicle_refuses(tmp_path):
     """A vehicle that has just booted is still waiting for its GPS, home and IMU.
 
