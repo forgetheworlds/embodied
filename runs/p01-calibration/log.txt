@@ -1,0 +1,29 @@
+inputs: 24 stored pairs from 2 runs
+inputs: 1 unique (left, right) image pairs across 24 stored pairs
+pair run-a/12: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/13: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/14: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/15: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/16: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/17: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/18: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/20: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/22: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/23: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/24: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-a/25: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/12: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/13: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/14: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/15: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/16: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/17: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/20: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/22: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/23: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/24: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/25: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+pair run-b/26: retained=25 row_med=0.0 row_p95=0.0 valid_frac=0.4839
+gates: B1=pass B3=fail -> blocked
+failure: B3 floor: 39072/718176 within tolerance (5.4%) < declared 95%
+artifacts written under /Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p01-calibration

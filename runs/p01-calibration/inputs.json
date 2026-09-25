@@ -1,0 +1,211 @@
+{
+  "accept5_manifest": "work/runs/p00-compat/accept-5/manifest.json",
+  "accept5_receipt": "work/runs/p00-compat/accept-5/receipt.json",
+  "declared_calibration": {
+    "path": "scenarios/compat/calibration.json",
+    "sha256": "0230799daa822f815ef8d0336c958e1fa8cde12ccc635755f1ba5d470fdd4b46"
+  },
+  "finding": "24 stored pairs carry 1 unique (left, right) image pairs \u2014 the static pre-takeoff scene, stored 12 times per run and identical across run-a and run-b; the depth check's referee pose is the declared static start (DIAGNOSTIC provenance)",
+  "pairs": [
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00001-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "12",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00001-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00002-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "13",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00002-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00003-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "14",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00003-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00004-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "15",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00004-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00005-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "16",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00005-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00006-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "17",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00006-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00007-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "18",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00007-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00008-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "20",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00008-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00009-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "22",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00009-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00010-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "23",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00010-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00011-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "24",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00011-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00012-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "25",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-a/pairs/00012-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-a"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00001-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "12",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00001-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00002-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "13",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00002-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00003-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "14",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00003-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00004-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "15",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00004-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00005-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "16",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00005-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00006-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "17",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00006-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00007-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "20",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00007-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00008-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "22",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00008-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00009-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "23",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00009-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00010-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "24",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00010-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00011-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "25",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00011-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    },
+    {
+      "left": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00012-left.ppm",
+      "left_sha256": "8a674521e79a5262a2221a6447abf36f4861bc532e3e23e6b0b35b571413cc97",
+      "pair_id": "26",
+      "right": "/Users/muadhsambul/embodied/.atomic/worktrees/p01-sensors/work/runs/p00-compat/accept-5/run-b/pairs/00012-right.ppm",
+      "right_sha256": "50cd67514336117796497bad40df04489d2c7db7d16dd89c8bb485478fd007f5",
+      "run": "run-b"
+    }
+  ],
+  "proto": {
+    "path": "scenarios/compat/protos/Iris.proto",
+    "sha256": "1eab7722a7e3da6aa4b131a556de31e7c54af2bd80400ccbdbf37ba6549c7a3c"
+  },
+  "world": {
+    "path": "scenarios/compat/worlds/compat_stereo.wbt",
+    "sha256": "02a68d9b2e337a5f439f2359f3354f2d94e45914284442f747ac2a1859783e4d"
+  }
+}
