@@ -2,10 +2,13 @@
 # Iris quadrotor for the P00 compatibility scene.
 #
 # Derived from ArduPilot `libraries/SITL/examples/Webots_Python/protos/Iris.proto`
-# at af8525911b49a4c2a3bdc83bc5ed57e1d0098134. The geometry, masses and motor
-# ordering are unchanged; upstream states that the motor and propeller constants
-# were determined empirically rather than from the real airframe, and that has not
-# been re-derived here.
+# at af8525911b49a4c2a3bdc83bc5ed57e1d0098134. Geometry, mass, motor
+# ordering and propeller magnitudes remain upstream's empirically determined values.
+# The torque coefficient's sign is reversed below so that a positive ArduPilot
+# quad-X yaw mix (+m1/+m2, -m3/-m4) makes positive NED yaw: Webots applies
+# Q=q1*|omega|*omega about +Z, while the bridge negates yaw into NED. The
+# original sign made flight 8's increased yaw gain positive feedback (receipt:
+# work/runs/p00-airframe/accept-mission-08-2026-09-25T1622Z/).
 #
 # Changes for P00, each one required by the compatibility gate:
 #   1. the four inertial devices are named, so a record can say which device in
@@ -14,6 +17,8 @@
 #      "camera right", symmetrical about the fore-aft axis (y = +0.05 and
 #      y = -0.05, a 0.10 m baseline) with identical resolution, field of view and
 #      placement in height, so the two eyes can be read in one step and compared.
+#   3. correct the four propeller reaction-torque signs for the NED yaw mixer;
+#      thrust constants, motor multipliers and torque magnitudes are unchanged.
 # The camera device frame is the body frame: a Webots camera's optical axis is its
 # local +x, its local +y points left and its local +z points up. The image row and
 # column axes therefore do not coincide with a right-down-forward optical frame;
@@ -59,7 +64,7 @@ PROTO Iris [
         shaftAxis 0 0 1
         centerOfThrust 0.130000 -0.220000 0.023000
         thrustConstants 0.0012 0
-        torqueConstants 5.0e-04 0
+        torqueConstants -5.0e-04 0
         device RotationalMotor {
           name "m1_motor"
           maxVelocity 100
@@ -87,7 +92,7 @@ PROTO Iris [
         shaftAxis 0 0 1
         centerOfThrust -0.130000 0.200000 0.023000
         thrustConstants 0.0012 0
-        torqueConstants 5.0e-04 0
+        torqueConstants -5.0e-04 0
         device RotationalMotor {
           name "m2_motor"
           maxVelocity 100
@@ -111,7 +116,7 @@ PROTO Iris [
         shaftAxis 0 0 1
         centerOfThrust 00.130000 0.220000 0.023000
         thrustConstants -0.0012 0
-        torqueConstants 5.0e-04 0
+        torqueConstants -5.0e-04 0
         device RotationalMotor {
           name "m3_motor"
           maxVelocity 100
@@ -136,7 +141,7 @@ PROTO Iris [
         shaftAxis 0 0 1
         centerOfThrust -0.130000 -0.200000 0.023000
         thrustConstants -0.0012 0
-        torqueConstants 5.0e-04 0
+        torqueConstants -5.0e-04 0
         device RotationalMotor {
           name "m4_motor"
           maxVelocity 100
