@@ -713,8 +713,9 @@ def declared_depth_map(
         numerator = float(normal @ (point - origin))
         with np.errstate(divide="ignore", invalid="ignore"):
             t = numerator / denominator
-        hit = t > 0.0
-        hit_point = origin[None, None, :] + t[..., None] * dirs_world
+            hit = t > 0.0
+            # parallel rays give inf/nan t; the hit test drops them
+            hit_point = origin[None, None, :] + t[..., None] * dirs_world
         for axis, (lo, hi) in surface.axis_bounds_world_m.items():
             axis_index = {"x": 0, "y": 1, "z": 2}[axis]
             hit &= (hit_point[..., axis_index] >= lo) & (hit_point[..., axis_index] <= hi)
@@ -935,7 +936,7 @@ def run_validation(config_path: Path, *, code_revision: str) -> int:
             left_rgb,
             right_rgb,
             calibration,
-            matcher,
+            {**matcher, "border_px": bounds["border_px"], "depth_range_m": bounds["depth_range_m"]},
             pair_id=pair["pair_id"],
             capture_stamp=pair["capture"],
             receipt_stamp=pair["receipt"],
