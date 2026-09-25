@@ -193,6 +193,10 @@ class Kind(IntEnum):
     IMU = 3
     FAULT = 4
     FAULT_ACK = 5
+    # One simulator pose sample: the same truth the flight-state packet carries,
+    # streamed beside the inertial samples so this process can hand it to the
+    # autopilot's external-navigation path (VISION_POSITION_ESTIMATE).
+    POSE = 6
 
 
 @dataclass(frozen=True)
@@ -663,6 +667,54 @@ def decode_imu_payload(payload: bytes) -> ImuPayload:
         inertial_unit_rpy=(values[7], values[8], values[9]),
         device_names=(names[0], names[1], names[2]),
         units=units,
+    )
+
+
+POSE_PAYLOAD_FORMAT = ">Q6d"
+POSE_PAYLOAD_SIZE = struct.calcsize(POSE_PAYLOAD_FORMAT)
+
+
+@dataclass(frozen=True)
+class PosePayload:
+    """One simulator pose sample: the truth the flight-state packet carries.
+
+    The six values are the same position and attitude the flight-state packet hands
+    to SITL, already in ArduPilot's NED frame (the controller converts the Webots
+    devices with :func:`enu_to_ned` exactly as it does for the flight state), so the
+    sample is a repetition of that packet's position and attitude fields, not a
+    second reading of the scene.
+    """
+
+    capture_host_ns: int
+    position_xyz: tuple[float, float, float]
+    attitude_rpy: tuple[float, float, float]
+
+
+def encode_pose_payload(
+    *,
+    capture_host_ns: int,
+    position_xyz: Sequence[float],
+    attitude_rpy: Sequence[float],
+) -> bytes:
+    """Pack one pose sample with its capture stamp."""
+    if len(position_xyz) != 3 or len(attitude_rpy) != 3:
+        raise FramingError("a pose sample carries three position and three attitude values")
+    return struct.pack(
+        POSE_PAYLOAD_FORMAT, int(capture_host_ns), *position_xyz, *attitude_rpy
+    )
+
+
+def decode_pose_payload(payload: bytes) -> PosePayload:
+    """Read one pose sample. A payload that is not exactly one sample is refused."""
+    if len(payload) != POSE_PAYLOAD_SIZE:
+        raise FramingError(
+            f"pose payload is {len(payload)} bytes, expected {POSE_PAYLOAD_SIZE}"
+        )
+    values = struct.unpack(POSE_PAYLOAD_FORMAT, payload)
+    return PosePayload(
+        capture_host_ns=values[0],
+        position_xyz=(values[1], values[2], values[3]),
+        attitude_rpy=(values[4], values[5], values[6]),
     )
 
 
@@ -1323,6 +1375,7 @@ class SensorRecord:
     imu: ImuPayload | None = None
     status: dict[str, Any] | None = None
     fault_ack: dict[str, Any] | None = None
+    pose: PosePayload | None = None
 
 
 COPTER_MODES = {
@@ -1831,6 +1884,10 @@ RECEIVED_AT_KEY = "received_monotonic_ns"
 # The only message types this program may send. Motion travels as a guided
 # setpoint; everything else is a procedure such as a mode request or an interval
 # request. There is no motor, throttle, RC or attitude command in this set.
+# VISION_POSITION_ESTIMATE is the one sensor feed this program sends: the
+# simulator's own pose, handed to the autopilot's external-navigation path. It
+# commands nothing — ArduPilot decides what to fuse from it through the EK3_SRC1
+# source selection (libraries/AP_NavEKF/AP_NavEKF_Source.cpp at the pinned commit).
 ALLOWED_OUTBOUND_TYPES = frozenset(
     {
         "SET_POSITION_TARGET_LOCAL_NED",
@@ -1838,8 +1895,16 @@ ALLOWED_OUTBOUND_TYPES = frozenset(
         "SET_MESSAGE_INTERVAL",
         "PARAM_REQUEST_READ",
         "HEARTBEAT",
+        "VISION_POSITION_ESTIMATE",
     }
 )
+
+# How often the vision feed republishes the latest simulator pose. EKF3 rejects
+# external-navigation measurements closer together than 20 ms
+# (AP_NavEKF3.h:516, extNavIntervalMin_ms = 20, pinned commit af85259), so the
+# feed runs at 25 ms — comfortably inside what the filter accepts, and far below
+# the ~2 ms cadence the controller streams pose samples at.
+VISION_POSE_PERIOD_S = 0.025
 
 
 # ---------------------------------------------------------------------------
@@ -1960,6 +2025,12 @@ class PymavlinkSession:
         self._mavutil = None
         self.target_system = 0
         self.target_component = 0
+        # One lock around the wire: the vision feed sends from its own thread at a
+        # steady rate while the checklist's thread sends modes, parameters and
+        # setpoints between phases. pymavlink does not serialize concurrent sends,
+        # and interleaved partial frames are unreadable, so every sender passes
+        # through the same lock here.
+        self._send_lock = threading.Lock()
 
     def connect(self, endpoint: str, timeout_s: float) -> dict[str, Any]:
         try:
@@ -1989,7 +2060,39 @@ class PymavlinkSession:
                 f"refusing to send {message_type}: this project commands motion only "
                 "through supported MAVLink guided setpoints"
             )
-        self._connection.mav.send(message)
+        with self._send_lock:
+            self._connection.mav.send(message)
+
+    def send_vision_position_estimate(
+        self, *, usec: int, x: float, y: float, z: float, roll: float, pitch: float, yaw: float
+    ) -> None:
+        """Publish one simulator pose to the autopilot's external-navigation path.
+
+        The values are passed through unchanged: the pose sample arrives from the
+        controller already in ArduPilot's NED frame (the same :func:`enu_to_ned`
+        conversion the flight-state packet applies, webots_ardupilot.py:127-137 at
+        the pinned commit), and MAVLink vision messages are declared in that same
+        NED frame, so a conversion here would be a second opinion the stream never
+        asked for. ArduPilot receives it through GCS_MAVLINK's vision handler
+        (GCS_Common.cpp:4578), AP_VisualOdom turns the Euler angles into the
+        quaternion it forwards (AP_VisualOdom.cpp:212-215), and EKF3 fuses position
+        and yaw per EK3_SRC1 selection. The covariance is NaN, the MAVLink
+        "unknown" declaration: AP_VisualOdom then substitutes its own configured
+        noise (VISO_POS_NSE, VISO_YAW_M_NSE), which is the honest statement — the
+        simulator does not measure a covariance.
+        """
+        self._send(
+            self._connection.mav.vision_position_estimate_encode(
+                int(usec),
+                float(x),
+                float(y),
+                float(z),
+                float(roll),
+                float(pitch),
+                float(yaw),
+                [float("nan")] * 21,
+            )
+        )
 
     def request_message_interval(self, message_id: int, hz: float) -> None:
         self._send(
@@ -2231,6 +2334,8 @@ class TcpSensorGateway:
             record = replace(record, status=decode_status_payload(message.payload))
         elif message.kind is Kind.FAULT_ACK:
             record = replace(record, fault_ack=decode_fault_payload(message.payload))
+        elif message.kind is Kind.POSE:
+            record = replace(record, pose=decode_pose_payload(message.payload))
         return record
 
     def send_fault(self, injection: Injection) -> None:
@@ -2651,6 +2756,17 @@ class WebotsArduPilot:
         self.control_events: list[ControlEvent] = []
         self.refusals: list[dict[str, Any]] = []
         self.navigation_epoch = "nav-1"
+        # The simulator-interface pose feed. The reader stores the latest pose
+        # sample it reads; a dedicated thread republishes it to the autopilot's
+        # external-navigation path at VISION_POSE_PERIOD_S. The slot is a plain
+        # tuple reference — the reader replaces it atomically and the feed reads
+        # whole tuples — and the feed owns no state the checklist reads except the
+        # account stop() records.
+        self._latest_pose: tuple[float, tuple[float, float, float], tuple[float, float, float]] | None = None
+        self._vision_feed_thread: threading.Thread | None = None
+        self._vision_feed_stop = threading.Event()
+        self._vision_feed_error: BaseException | None = None
+        self._vision_feed_published = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -2738,6 +2854,9 @@ class WebotsArduPilot:
         # controller's frames are read as they arrive, whether or not this thread
         # is busy elsewhere.
         self._start_reader()
+        # The pose feed starts with the reader: both run for the adapter's lifetime,
+        # and the feed publishes only what the reader has actually received.
+        self._start_vision_feed()
         # AUTOPILOT_VERSION answers once, on request, and it is the only statement of
         # which firmware is being exercised.
         self._session.request_message(MSG_ID_AUTOPILOT_VERSION)
@@ -2831,10 +2950,21 @@ class WebotsArduPilot:
         Called from a finally block by the probe, so a failed step still leaves the
         two children terminated and their exit codes and last output recorded.
         """
-        # The reader stops first: it is the only reader either stream has, and it
+        # The vision feed stops first: it is the only other thread that sends on the
+        # MAVLink session, and it must not be touching a socket this method closes.
+        self._stop_vision_feed()
+        # The reader stops next: it is the only reader either stream has, and it
         # must not be touching a socket this method is about to close.
         self._stop_reader()
         self._gateway.close()
+        self.evidence.write_json(
+            "vision-pose-feed.json",
+            {
+                "published": self._vision_feed_published,
+                "period_s": VISION_POSE_PERIOD_S,
+                "error": None if self._vision_feed_error is None else repr(self._vision_feed_error),
+            },
+        )
         try:
             self._session.close()
         except Exception:  # noqa: BLE001 - cleanup must not raise over the real failure
@@ -3026,6 +3156,59 @@ class WebotsArduPilot:
         if thread is not None and thread.is_alive():
             thread.join(timeout=READER_JOIN_TIMEOUT_S)
 
+    # -- vision pose feed --------------------------------------------------
+
+    def _start_vision_feed(self) -> None:
+        """Start the thread that republishes the simulator pose to the autopilot."""
+        self._vision_feed_thread = threading.Thread(
+            target=self._vision_feed_loop, name=f"{self.label}-vision-feed", daemon=True
+        )
+        self._vision_feed_thread.start()
+
+    def _stop_vision_feed(self) -> None:
+        """Stop the feed before the session it sends on is closed."""
+        self._vision_feed_stop.set()
+        thread, self._vision_feed_thread = self._vision_feed_thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=READER_JOIN_TIMEOUT_S)
+
+    def _vision_feed_loop(self) -> None:
+        """Republish the latest simulator pose at the external-navigation rate.
+
+        The controller streams pose samples beside the inertial ones; EKF3 accepts
+        an external-navigation measurement only every 20 ms (AP_NavEKF3.h:516 at
+        the pinned commit), so the feed keeps the most recent sample and sends it
+        at VISION_POSE_PERIOD_S. It sends nothing until a pose arrives, and a
+        failed send stops it — a dead link is the reader's failure to raise, not
+        this loop's to retry.
+        """
+        next_send = time.monotonic()
+        while not self._vision_feed_stop.is_set():
+            now = time.monotonic()
+            if now < next_send:
+                if self._vision_feed_stop.wait(next_send - now):
+                    return
+                continue
+            next_send = now + VISION_POSE_PERIOD_S
+            pose = self._latest_pose
+            if pose is None:
+                continue
+            sim_time_s, position, attitude = pose
+            try:
+                self._session.send_vision_position_estimate(
+                    usec=int(round(sim_time_s * 1_000_000)),
+                    x=position[0],
+                    y=position[1],
+                    z=position[2],
+                    roll=attitude[0],
+                    pitch=attitude[1],
+                    yaw=attitude[2],
+                )
+                self._vision_feed_published += 1
+            except BaseException as error:  # noqa: BLE001 - recorded, not raised
+                self._vision_feed_error = error
+                return
+
     def _reader_loop(self) -> None:
         """Read the MAVLink session and the sensor gateway until the adapter stops.
 
@@ -3072,6 +3255,14 @@ class WebotsArduPilot:
         """File one record, then hand it over with its pixels already on disk."""
         if record.kind is Kind.STATUS and record.status is not None:
             self.controller_status = record.status
+        if record.pose is not None:
+            # The vision feed's input: the latest simulator pose wins, because the
+            # autopilot wants the most recent truth, not a queue of past truth.
+            self._latest_pose = (
+                record.sim_time_s,
+                record.pose.position_xyz,
+                record.pose.attitude_rpy,
+            )
         sink = self.record_sink
         if sink is not None:
             sink(record)
@@ -3667,7 +3858,10 @@ class CompatibilityProbe:
         limitations = (
             "sensor_mode is simulator-interface: the autopilot's attitude and position come "
             "from Webots devices through the flight-state packet, so this is compatibility "
-            "evidence and not a sensor-derived result",
+            "evidence and not a sensor-derived result. The EKF-active parameter set feeds "
+            "that same Webots pose to EKF3 as its external-navigation source "
+            "(VISION_POSITION_ESTIMATE, EK3_SRC1_* 6): the estimator flies on the "
+            "simulator's own state, not on an independently sensed one",
             "both runs fly the candidate parameter set, which includes the EKF-active file "
             "(AHRS_EKF_TYPE 3); run A is therefore not the pinned upstream configuration. "
             "The pinned file's simulator AHRS (AHRS_EKF_TYPE 10) was measured to diverge "

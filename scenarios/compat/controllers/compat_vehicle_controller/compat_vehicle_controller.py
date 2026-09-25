@@ -447,6 +447,21 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
                     units="m/s^2; rad/s; rad, ENU negated on y and z into NED",
                 ),
             )
+            # The pose rides the stream beside the inertial sample: the same
+            # position and attitude the flight-state packet carries this step
+            # (including any applied position fault), already in ArduPilot's NED
+            # frame. The analysis process republishes it to the autopilot as
+            # VISION_POSITION_ESTIMATE so EKF3 can fly on the simulator's own
+            # state instead of a synthesized compass.
+            channel.send(
+                SHARED.Kind.POSE,
+                devices.simulator_time_s(),
+                SHARED.encode_pose_payload(
+                    capture_host_ns=time.monotonic_ns(),
+                    position_xyz=state["position_xyz"],
+                    attitude_rpy=state["attitude_rpy"],
+                ),
+            )
 
         for command in channel.poll_commands():
             result = injections.apply_command(command)

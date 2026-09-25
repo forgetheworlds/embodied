@@ -10,20 +10,46 @@ AHRS_EKF_TYPE 3
 EK3_ENABLE 1
 EK2_ENABLE 0
 
-# Webots R2025a exposes no compass device; the magnetometer EKF3 fuses here is
-# synthesized inside SITL from the simulated magnetic field. accept-mission-12
-# run-a ended with "GPS Glitch or Compass error" and "GPS and AHRS differ by
-# 30.0m" before the crash detector disarmed it at AngErr=170 (roll inverted to
-# pi) - the only estimator that has produced that failure class is the one
-# fusing this synthesized compass. Remove it from the fusion and forbid
-# mid-flight mag calibration so the remaining attitude source is the inertial
-# unit plus GPS. One change-set: the synthesized magnetometer.
+# The three values above are the known-good 15/16 baseline (git 3fb6564, flown as
+# accept-mission-10/12: one run per invocation held every waypoint to 2-4 cm while
+# the other suffered a mid-hold EKF attitude divergence). Iteration 14's
+# compass-less GPS-yaw set (EK3_MAG_CAL 5 + EK3_SRC1_YAW 3, which refused to arm)
+# is withdrawn; what follows is the one change-set on top of that baseline.
+
+# Feed the simulator's own pose to EKF3 as ExternalNav. The bridge republishes the
+# flight-state packet's position and attitude (the same Webots devices, converted
+# with the bridge's enu_to_ned) as MAVLink VISION_POSITION_ESTIMATE, so the
+# estimator flies on the simulator-interface truth instead of inferring attitude
+# from a synthesized compass and simulated GPS - the synthesis whose mid-hold
+# divergence produced the 15/16 runs' single failure (accept-mission-12 run-a:
+# "GPS Glitch or Compass error", PreArm "GPS and AHRS differ by 30.0m", crash
+# detector at AngErr=170). P01-L later replaces this truth feed with real
+# visual-inertial navigation.
 #
-# EK3_SRC1_YAW 3 (GPS) is mandatory alongside MAG_CAL 5: pinned firmware
-# rejects that combination otherwise - libraries/AP_NavEKF3/AP_NavEKF3.cpp:1180-1184
-# returns "EK3_MAG_CAL and EK3_SRC1_YAW inconsistent" unless the yaw source is
-# GPS. accept-mission-13 confirmed that rule the hard way (both runs refused
-# to arm with exactly that message).
+# Sources, pinned firmware values (libraries/AP_NavEKF/AP_NavEKF_Source.cpp at
+# af85259 - @Values lines: "0:None, 3:GPS, 4:Beacon, 6:ExternalNav" for POSXY,
+# "... 6:ExternalNav ..." for VELXY, "0:None, 1:Baro, 2:RangeFinder, 3:GPS,
+# 4:Beacon, 6:ExternalNav" for POSZ, "0:None, 1:Compass, 2:GPS, 3:GPS with
+# Compass Fallback, 6:ExternalNav, 8:GSF" for YAW):
+EK3_SRC1_POSXY 6
+EK3_SRC1_VELXY 6
+EK3_SRC1_POSZ 6
+EK3_SRC1_YAW 6
+# ExternalNav yaw aligns and fuses from the pose quaternion while stationary
+# (AP_NavEKF3_MagFusion.cpp:481-486: alignYawAngle then fuseEulerYaw(EXTNAV)), so
+# no compass is needed at any point - unlike GPS yaw, which needs motion, and
+# which is why iteration 14's stationary start refused to arm.
+#
+# The vision messages reach EKF3 only through AP_VisualOdom, which is disabled at
+# its default _TYPE 0: handle_common_vision_position_estimate_data returns unless
+# AP::visualodom() exists, and AP_VisualOdom::handle_pose_estimate exits while
+# !enabled() (AP_VisualOdom.cpp:203-206); only VISO_TYPE 1 (VisualOdom_Type::MAV)
+# creates the AP_VisualOdom_MAV backend that calls writeExtNavData
+# (AP_VisualOdom.cpp:135-141, AP_VisualOdom_MAV.cpp:47).
+VISO_TYPE 1
+# Webots R2025a exposes no compass device; the synthesized magnetometer leaves the
+# fusion entirely. No MAG_CAL line: its default 0 needs no external-yaw
+# grandfathering, and the pinned rule that rejected iteration 14
+# (AP_NavEKF3.cpp:1176-1184, MAG_CAL 5/6 inconsistent with a non-GPS yaw source)
+# is not exercised.
 COMPASS_USE 0
-EK3_MAG_CAL 5
-EK3_SRC1_YAW 3

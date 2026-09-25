@@ -239,6 +239,57 @@ class FakeGateway:
         self.closed = True
 
 
+class PoseStreamingGateway(FakeGateway):
+    """A controller that also streams the truth pose its flight-state packet carries.
+
+    A pose rides the stream beside the other records whatever the test clock is
+    doing, so both the whole-probe runs and a bare adapter see the same supply.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pose_counter = 0
+        self.read_calls = 0
+
+    def _pose(self):
+        self.pose_counter += 1
+        return W.SensorRecord(
+            kind=W.Kind.POSE,
+            sim_time_s=self.clock.monotonic() - 1000.0,
+            sequence=self.pose_counter,
+            flags=0,
+            received_stamp=W.ClockStamp(
+                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+            ),
+            pose=W.PosePayload(
+                capture_host_ns=self.clock.monotonic_ns(),
+                position_xyz=(2.0, -1.0, -1.5),
+                attitude_rpy=(0.01, -0.02, 0.3),
+            ),
+        )
+
+    def read_record(self, timeout_s):
+        self.read_calls += 1
+        if self.read_calls % 2 == 0:
+            return self._pose()
+        if self.queue:
+            return self.queue.pop(0)
+        if not self.status_sent:
+            self.status_sent = True
+            return self._status()
+        now = self.clock.monotonic()
+        if self._produced_until is None:
+            self._produced_until = now
+            return None
+        self._budget += (now - self._produced_until) * self.RECORDS_PER_SECOND
+        self._produced_until = now
+        if self._budget < 1.0:
+            return None
+        self._budget -= 1.0
+        self.sequence += 1
+        return self._pair() if self.sequence % 2 else self._imu()
+
+
 class ScriptedMavlinkSession:
     """A vehicle that answers like an autopilot: it moves when told to and reports it."""
 
@@ -279,6 +330,8 @@ class ScriptedMavlinkSession:
         self.pre_arm_text = pre_arm_failures > 0
         self.pending_parameters = []
         self.sent = []
+        # The truth poses the adapter's external-nav feed published to this vehicle.
+        self.vision_poses = []
         self.commands = []
         self.intervals = []
         self.requested_messages = []
@@ -308,6 +361,11 @@ class ScriptedMavlinkSession:
 
     def request_message(self, message_id):
         self.requested_messages.append(message_id)
+
+    def send_vision_position_estimate(self, *, usec, x, y, z, roll, pitch, yaw):
+        self.vision_poses.append(
+            {"usec": usec, "x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw}
+        )
 
     def request_parameter(self, name):
         self.requested_parameters.append(name)
@@ -612,6 +670,7 @@ def run_probe(
     runner=None,
     output_name="out",
     config_overrides=None,
+    gateway_class=FakeGateway,
     session_class=ScriptedMavlinkSession,
 ):
     """Run the whole checklist against scripted seams and return the result."""
@@ -633,7 +692,7 @@ def run_probe(
         )
 
     def make_gateway():
-        gateway = FakeGateway(clock, **(gateway_kwargs or {}))
+        gateway = gateway_class(clock, **(gateway_kwargs or {}))
         holder["gateway"] = gateway
         return gateway
 
@@ -759,6 +818,25 @@ def test_inertial_and_json_payloads_round_trip():
     assert status == {"a": 1, "b": 2}
     with pytest.raises(W.FramingError):
         W.decode_status_payload(b"[]")
+
+
+def test_the_pose_payload_round_trips_the_flight_state_truth():
+    """The pose sample carries the same six values the flight-state packet carries."""
+    payload = W.encode_pose_payload(
+        capture_host_ns=1234,
+        position_xyz=(2.0, -1.0, -1.5),
+        attitude_rpy=(0.01, -0.02, 0.3),
+    )
+    decoded = W.decode_pose_payload(payload)
+    assert decoded.capture_host_ns == 1234
+    assert decoded.position_xyz == (2.0, -1.0, -1.5)
+    assert decoded.attitude_rpy == (0.01, -0.02, 0.3)
+    with pytest.raises(W.FramingError):
+        W.decode_pose_payload(payload[:-1])
+    with pytest.raises(W.FramingError):
+        W.encode_pose_payload(
+            capture_host_ns=1234, position_xyz=(0.0, 0.0), attitude_rpy=(0.0, 0.0, 0.0)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +1480,70 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert runner.terminated == ["webots", "sitl", "webots", "sitl"]
     assert result.manifest["run_a"]["shutdown"]["exits"] == {"webots": 0, "sitl": 0}
     assert result.manifest["run_b"]["shutdown"]["exits"] == {"webots": 0, "sitl": 0}
+
+
+def pose_streaming_settings(tmp_path):
+    config_path = write_scene(tmp_path)
+    return settings_for(config_path, tmp_path)
+
+
+def test_the_vision_feed_publishes_the_simulator_pose_to_the_autopilot(tmp_path):
+    """A streamed truth pose reaches the autopilot as a vision position estimate.
+
+    The feed republishes what the controller put on the stream, in the NED values
+    that arrived, with the message time taken from the simulation clock — it adds
+    no opinion of its own.
+    """
+    clock = FakeClock()
+    session = ScriptedMavlinkSession(clock)
+    gateway = PoseStreamingGateway(clock)
+    writer = W.EvidenceWriter(tmp_path, "run-x")
+    adapter = W.WebotsArduPilot(
+        pose_streaming_settings(tmp_path),
+        runner=FakeRunner(),
+        session=session,
+        gateway=gateway,
+        evidence=writer,
+        label="run-x",
+        extra_params=(),
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    try:
+        # The real stream starts seconds into simulated time (the controller
+        # waits for SITL before its first packet), so advance the test clock
+        # before the reader exists and no pose carries a zero timestamp.
+        clock.sleep(0.5)
+        adapter.start()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not session.vision_poses:
+            # The feed runs on real time; the stream runs on the test clock, so
+            # both must advance for a pose to travel from gateway to autopilot.
+            clock.sleep(0.02)
+            time.sleep(0.02)
+    finally:
+        adapter.stop()
+    published = session.vision_poses
+    assert published, "the adapter never published the simulator pose to the autopilot"
+    sample = published[-1]
+    assert (sample["x"], sample["y"], sample["z"]) == (2.0, -1.0, -1.5)
+    assert (sample["roll"], sample["pitch"], sample["yaw"]) == (0.01, -0.02, 0.3)
+    # The message time is the simulation time of the pose, in microseconds.
+    assert 0 < sample["usec"] < 1_000_000_000
+    # The feed's own account is recorded beside the run's other evidence.
+    feed = json.loads((tmp_path / "run-x" / "vision-pose-feed.json").read_text())
+    assert feed["published"] == len(published)
+    assert feed["error"] is None
+
+
+def test_a_probe_run_tolerates_a_stream_that_carries_pose_records(tmp_path):
+    """Pose samples ride the stream beside pairs and inertial samples untouched."""
+    result, _, _, _, _ = run_probe(tmp_path, gateway_class=PoseStreamingGateway)
+    assert result.gate_status is cli.GateStatus.PASS, result.reasons
+    for label in ("run-a", "run-b"):
+        feed = json.loads((tmp_path / "out" / label / "vision-pose-feed.json").read_text())
+        assert feed["error"] is None
 
 
 def test_motion_is_published_as_a_guided_setpoint_and_never_as_a_motor_command(tmp_path):
