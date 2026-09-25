@@ -9,3 +9,14 @@
 AHRS_EKF_TYPE 3
 EK3_ENABLE 1
 EK2_ENABLE 0
+
+# Webots R2025a exposes no compass device; the magnetometer EKF3 fuses here is
+# synthesized inside SITL from the simulated magnetic field. accept-mission-12
+# run-a ended with "GPS Glitch or Compass error" and "GPS and AHRS differ by
+# 30.0m" before the crash detector disarmed it at AngErr=170 (roll inverted to
+# pi) - the only estimator that has produced that failure class is the one
+# fusing this synthesized compass. Remove it from the fusion and forbid
+# mid-flight mag calibration so the remaining attitude source is the inertial
+# unit plus GPS. One change-set: the synthesized magnetometer.
+COMPASS_USE 0
+EK3_MAG_CAL 5
