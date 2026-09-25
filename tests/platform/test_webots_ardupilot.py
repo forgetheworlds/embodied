@@ -8,9 +8,11 @@ under test rather than the simulator's behaviour.
 
 import ast
 from pathlib import Path
+import os
 import json
 import re
 import socket
+import signal
 import struct
 import subprocess
 import sys
@@ -306,6 +308,57 @@ class FakeGateway:
         self.closed = True
 
 
+class PoseStreamingGateway(FakeGateway):
+    """A controller that also streams the truth pose its flight-state packet carries.
+
+    A pose rides the stream beside the other records whatever the test clock is
+    doing, so both the whole-probe runs and a bare adapter see the same supply.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pose_counter = 0
+        self.read_calls = 0
+
+    def _pose(self):
+        self.pose_counter += 1
+        return W.SensorRecord(
+            kind=W.Kind.POSE,
+            sim_time_s=self.clock.monotonic() - 1000.0,
+            sequence=self.pose_counter,
+            flags=0,
+            received_stamp=W.ClockStamp(
+                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+            ),
+            pose=W.PosePayload(
+                capture_host_ns=self.clock.monotonic_ns(),
+                position_xyz=(2.0, -1.0, -1.5),
+                attitude_rpy=(0.01, -0.02, 0.3),
+            ),
+        )
+
+    def read_record(self, timeout_s):
+        self.read_calls += 1
+        if self.read_calls % 2 == 0:
+            return self._pose()
+        if self.queue:
+            return self.queue.pop(0)
+        if not self.status_sent:
+            self.status_sent = True
+            return self._status()
+        now = self.clock.monotonic()
+        if self._produced_until is None:
+            self._produced_until = now
+            return None
+        self._budget += (now - self._produced_until) * self.RECORDS_PER_SECOND
+        self._produced_until = now
+        if self._budget < 1.0:
+            return None
+        self._budget -= 1.0
+        self.sequence += 1
+        return self._pair() if self.sequence % 2 else self._imu()
+
+
 class ScriptedMavlinkSession:
     """A vehicle that answers like an autopilot: it moves when told to and reports it."""
 
@@ -346,6 +399,8 @@ class ScriptedMavlinkSession:
         self.pre_arm_text = pre_arm_failures > 0
         self.pending_parameters = []
         self.sent = []
+        # The truth poses the adapter's external-nav feed published to this vehicle.
+        self.vision_poses = []
         self.commands = []
         self.intervals = []
         self.requested_messages = []
@@ -375,6 +430,11 @@ class ScriptedMavlinkSession:
 
     def request_message(self, message_id):
         self.requested_messages.append(message_id)
+
+    def send_vision_position_estimate(self, *, usec, x, y, z, roll, pitch, yaw):
+        self.vision_poses.append(
+            {"usec": usec, "x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw}
+        )
 
     def request_parameter(self, name):
         self.requested_parameters.append(name)
@@ -679,6 +739,8 @@ def run_probe(
     runner=None,
     output_name="out",
     config_overrides=None,
+    gateway_class=FakeGateway,
+    session_class=ScriptedMavlinkSession,
 ):
     """Run the whole checklist against scripted seams and return the result."""
     clock = clock or FakeClock()
@@ -700,14 +762,14 @@ def run_probe(
         return scripted_parameter_values(settings)
 
     def make_gateway():
-        gateway = FakeGateway(clock, **(gateway_kwargs or {}))
+        gateway = gateway_class(clock, **(gateway_kwargs or {}))
         holder["gateway"] = gateway
         return gateway
 
     def make_session():
         values = parameters_for_run()
         overrides = {k: v for k, v in session_kwargs.items() if k != "parameter_values"}
-        session = ScriptedMavlinkSession(
+        session = session_class(
             clock, gateway_holder=holder, parameter_values=values, **overrides
         )
         sessions.append(session)
@@ -828,6 +890,25 @@ def test_inertial_and_json_payloads_round_trip():
         W.decode_status_payload(b"[]")
 
 
+def test_the_pose_payload_round_trips_the_flight_state_truth():
+    """The pose sample carries the same six values the flight-state packet carries."""
+    payload = W.encode_pose_payload(
+        capture_host_ns=1234,
+        position_xyz=(2.0, -1.0, -1.5),
+        attitude_rpy=(0.01, -0.02, 0.3),
+    )
+    decoded = W.decode_pose_payload(payload)
+    assert decoded.capture_host_ns == 1234
+    assert decoded.position_xyz == (2.0, -1.0, -1.5)
+    assert decoded.attitude_rpy == (0.01, -0.02, 0.3)
+    with pytest.raises(W.FramingError):
+        W.decode_pose_payload(payload[:-1])
+    with pytest.raises(W.FramingError):
+        W.encode_pose_payload(
+            capture_host_ns=1234, position_xyz=(0.0, 0.0), attitude_rpy=(0.0, 0.0, 0.0)
+        )
+
+
 # ---------------------------------------------------------------------------
 # The SITL wire
 # ---------------------------------------------------------------------------
@@ -888,6 +969,29 @@ def test_propeller_thrust_is_linearized_before_it_reaches_the_motor():
     assert W.propeller_velocity(0.25, max_velocity=100.0) == pytest.approx(50.0)
     assert W.propeller_velocity(-0.25, max_velocity=100.0) == pytest.approx(-50.0)
     assert W.propeller_velocity(0.0, max_velocity=100.0) == pytest.approx(0.0)
+
+def test_iris_motor_order_and_roll_pitch_geometry_match_the_quad_x_mixer():
+    """Pin scene facts, not the refuted analytic prediction about yaw torque.
+
+    Pinned AP_MotorsMatrix.cpp:530-545,592-600 uses motor order 1..4,
+    roll signs [-,+,+,-] and pitch signs [+,-,+,-]. Webots Iris.proto keeps
+    the upstream thrust/multiplier pairing that produces upward thrust.
+    """
+    scene = (SCENE / "protos" / "Iris.proto").read_text()
+    centers = [(float(x), float(y)) for x, y in re.findall(
+        r"centerOfThrust\s+([+-]?[0-9.]+)\s+([+-]?[0-9.]+)\s+[+-]?[0-9.]+", scene
+    )]
+    assert re.findall(r'name "(m[1-4]_motor)"', scene) == [
+        "m1_motor", "m2_motor", "m3_motor", "m4_motor"
+    ]
+    assert centers == [(0.13, -0.22), (-0.13, 0.2), (0.13, 0.22), (-0.13, -0.2)]
+    assert [float(v) for v in re.findall(r"thrustConstants\s+([^\s]+)\s+0", scene)] == [
+        0.0012, 0.0012, -0.0012, -0.0012
+    ]
+    assert [int(v) for v in re.findall(r"multiplier\s+(-?1)\b", scene)] == [
+        1, 1, -1, -1
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Frame measurement and colour
@@ -1448,6 +1552,70 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert result.manifest["run_b"]["shutdown"]["exits"] == {"webots": 0, "sitl": 0}
 
 
+def pose_streaming_settings(tmp_path):
+    config_path = write_scene(tmp_path)
+    return settings_for(config_path, tmp_path)
+
+
+def test_the_vision_feed_publishes_the_simulator_pose_to_the_autopilot(tmp_path):
+    """A streamed truth pose reaches the autopilot as a vision position estimate.
+
+    The feed republishes what the controller put on the stream, in the NED values
+    that arrived, with the message time taken from the simulation clock — it adds
+    no opinion of its own.
+    """
+    clock = FakeClock()
+    session = ScriptedMavlinkSession(clock)
+    gateway = PoseStreamingGateway(clock)
+    writer = W.EvidenceWriter(tmp_path, "run-x")
+    adapter = W.WebotsArduPilot(
+        pose_streaming_settings(tmp_path),
+        runner=FakeRunner(),
+        session=session,
+        gateway=gateway,
+        evidence=writer,
+        label="run-x",
+        extra_params=(),
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    try:
+        # The real stream starts seconds into simulated time (the controller
+        # waits for SITL before its first packet), so advance the test clock
+        # before the reader exists and no pose carries a zero timestamp.
+        clock.sleep(0.5)
+        adapter.start()
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not session.vision_poses:
+            # The feed runs on real time; the stream runs on the test clock, so
+            # both must advance for a pose to travel from gateway to autopilot.
+            clock.sleep(0.02)
+            time.sleep(0.02)
+    finally:
+        adapter.stop()
+    published = session.vision_poses
+    assert published, "the adapter never published the simulator pose to the autopilot"
+    sample = published[-1]
+    assert (sample["x"], sample["y"], sample["z"]) == (2.0, -1.0, -1.5)
+    assert (sample["roll"], sample["pitch"], sample["yaw"]) == (0.01, -0.02, 0.3)
+    # The message time is the simulation time of the pose, in microseconds.
+    assert 0 < sample["usec"] < 1_000_000_000
+    # The feed's own account is recorded beside the run's other evidence.
+    feed = json.loads((tmp_path / "run-x" / "vision-pose-feed.json").read_text())
+    assert feed["published"] == len(published)
+    assert feed["error"] is None
+
+
+def test_a_probe_run_tolerates_a_stream_that_carries_pose_records(tmp_path):
+    """Pose samples ride the stream beside pairs and inertial samples untouched."""
+    result, _, _, _, _ = run_probe(tmp_path, gateway_class=PoseStreamingGateway)
+    assert result.gate_status is cli.GateStatus.PASS, result.reasons
+    for label in ("run-a", "run-b"):
+        feed = json.loads((tmp_path / "out" / label / "vision-pose-feed.json").read_text())
+        assert feed["error"] is None
+
+
 def test_motion_is_published_as_a_guided_setpoint_and_never_as_a_motor_command(tmp_path):
     _, _, _, sessions, _ = run_probe(tmp_path)
     published = [setpoint for session in sessions for setpoint in session.sent]
@@ -1514,6 +1682,109 @@ def test_motion_opposite_to_the_command_fails_the_motion_item(tmp_path):
     assert commanded, motion.evidence["waypoints"]
     for target, moved in commanded:
         assert target * moved < 0.0, (target, moved, motion.reason)
+
+
+class OvershootThenDescend(ScriptedMavlinkSession):
+    """A climb that overshoots the commanded hover, then correct flight.
+
+    Iteration 5 run-b's start: takeoff is commanded to the 1.5 m hover, the climb
+    overshoots, and waypoint 1's start sample catches the vehicle 0.7 m above the
+    altitude it is about to be commanded to hold. Descending to that target is
+    then compliance with the command; the target coordinate's negative sign says
+    where the target sits, not which way the command asks the vehicle to move.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.climb_overshoot_m = 0.7
+        self.holding_overshoot = False
+
+    def takeoff(self, altitude_m):
+        super().takeoff(altitude_m)
+        self.position = (0.0, 0.0, -altitude_m - self.climb_overshoot_m)
+        self.holding_overshoot = True
+
+    def send_setpoint(self, setpoint):
+        super().send_setpoint(setpoint)
+        self.holding_overshoot = False
+
+    def _advance(self):
+        if self.holding_overshoot or not self.moves or self.target is None:
+            return
+        # Pinned, not drain-timed: run-b held both absolute targets to 2-5 cm, so
+        # the arithmetic under test wants start and end positions it can read
+        # exact values from whatever the drain cadence was.
+        self.position = self.target
+
+
+class ClimbingWhenToldToDescend(OvershootThenDescend):
+    """The same overshoot, then a vehicle that climbs away from its target.
+
+    The command is a descent (the vehicle sits above the target altitude) and
+    the motion is a climb: the rule must still bite when its direction
+    reference is the commanded step.
+    """
+
+    def _advance(self):
+        if self.holding_overshoot or not self.moves or self.target is None:
+            return
+        self.position = (
+            self.target[0],
+            self.target[1],
+            self.target[2] - 2 * self.climb_overshoot_m,
+        )
+
+
+def test_a_descent_to_the_commanded_altitude_is_not_opposite_motion(tmp_path):
+    """Iteration 5 run-b's waypoint record, scripted.
+
+    The climb overshoots, so waypoint 1's start sample sits 0.7 m above the
+    target altitude and the correct flight to it is a descent: displacement
+    +0.7 m on an axis whose commanded coordinate is -1.5 m. Judged against the
+    absolute coordinate that read as opposite motion; judged against the
+    commanded step it is exactly the motion that was asked for.
+    """
+    result, _, _, _, _ = run_probe(tmp_path, session_class=OvershootThenDescend)
+    for name in ("3_guided_local_ned_motion[run-a]", "3_guided_local_ned_motion[run-b]"):
+        motion = next(entry for entry in result.checks if entry.name == name)
+        assert motion.status == "pass", motion.reason
+        first = motion.evidence["waypoints"][0]
+        assert first["position_before_ned"][2] == pytest.approx(-2.2)
+        assert first["displacement_ned"][2] == pytest.approx(0.7)
+
+
+def test_a_climb_against_a_commanded_descent_still_fails_the_motion_item(tmp_path):
+    """The corrected rule still bites: opposite to the commanded step is flagged.
+
+    The command is a descent of 0.7 m and the vehicle climbs 0.7 m instead; the
+    finding names the commanded step, which is the reference it judged against.
+    """
+    result, _, _, _, _ = run_probe(tmp_path, session_class=ClimbingWhenToldToDescend)
+    motion = check(result, "3_guided_local_ned_motion")
+    assert motion.status == "fail"
+    assert "axis 2" in motion.reason
+    assert "commanded step +0.70" in motion.reason
+
+
+def test_a_mid_hold_loss_is_reported_as_the_loss_when_the_motion_followed_the_command(
+    tmp_path,
+):
+    """A lost flight is reported lost, whatever its measured motion said.
+
+    The autopilot leaves Guided mid-hold after two publications; until then the
+    vehicle moved toward the commanded target. The record carries the loss
+    alone: no axis-direction finding is invented for motion that followed the
+    command.
+    """
+    result, _, _, _, _ = run_probe(
+        tmp_path, session_kwargs={"failsafe_after_setpoints": 2}
+    )
+    motion = check(result, "3_guided_local_ned_motion")
+    assert motion.status == "fail"
+    assert "Guided flight was lost" in motion.reason
+    waypoints = motion.evidence["waypoints"]
+    assert waypoints and waypoints[0]["displacement_ned"] is not None
+    assert "axis" not in motion.reason
 
 
 def test_a_run_outside_its_declared_real_time_envelope_is_timing_invalid(tmp_path):
@@ -1911,6 +2182,60 @@ def test_the_launch_commands_carry_the_wipe_and_the_parameter_layers(tmp_path):
     ]
 
 
+def test_the_flown_yaw_pairing_is_the_firmware_stock_paired_with_the_flown_rate_loop():
+    """No control axis flies at a value its own firmware documents as out of range.
+
+    The pin's yaw gains survived every provenance restoration this stage made: the
+    roll/pitch rate pairing came from airsim-quadX.parm (which sets no yaw gains at
+    all) and the roll/pitch angle P returned to the firmware stock 4.5 in iteration
+    7, leaving yaw alone at ATC_ANG_YAW_P 0.5 and ATC_RAT_YAW_P 0.02. Iteration 7's
+    own flights then departed yaw-first (run-a's yaw crossed 0.15 rad 0.76 s before
+    pitch and 0.95 s before roll, with both runs sustaining 180-280 degrees/s yaw
+    spins into the tumble and run-b's EKF3 running an in-flight yaw realignment
+    seconds before the crash disarm), so the values below are pinned as literals
+    with their sources rather than left to the pin's vestigial context.
+    """
+    layered = W.read_configured_parameters(
+        [SCENE / "params" / name for name in
+         ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")]
+    )
+    # Angle P, all three axes, the firmware's own stock: AC_ATTITUDE_CONTROL_ANGLE_P
+    # 4.5f, "default angle P gain for roll, pitch and yaw", applied to roll, pitch
+    # and yaw at work/ardupilot af852591, libraries/AC_AttitudeControl/
+    # AC_AttitudeControl.h:15,51-53. The parameter's documented range is
+    # 3.000-12.000 (AC_AttitudeControl.cpp:62-85); the pin's 0.5 is below it.
+    assert layered["ATC_ANG_RLL_P"] == 4.5
+    assert layered["ATC_ANG_PIT_P"] == 4.5
+    assert layered["ATC_ANG_YAW_P"] == 4.5
+    # Yaw rate P at the firmware stock for this frame class:
+    # AC_ATC_MULTI_RATE_YAW_P 0.180f (AC_AttitudeControl_Multi.h:26). The pin's
+    # 0.02 is below the parameter's own documented range floor of 0.10
+    # (AC_AttitudeControl_Multi.cpp:208-213).
+    assert layered["ATC_RAT_YAW_P"] == 0.18
+    # The yaw integral is declared by no parameter file: the pin never set it, and
+    # the 0.02 iteration 7's autopilot reported is the firmware's own default --
+    # within one increment of the stock 0.018 (AC_AttitudeControl_Multi.h:29).
+    # Nothing to restore, so nothing is declared.
+    assert "ATC_RAT_YAW_I" not in layered
+
+
+def test_guided_takeoff_uses_a_brakeable_climb_speed_for_this_short_hover():
+    """The 1.5 m takeoff should not inherit the firmware's 2.5 m/s climb.
+
+    In iteration 8 both runs actually reached 2.30-2.35 m/s during the climb,
+    overshot to 2.53/2.72 m, then cut throttle into the servo floor. The
+    firmware's WP_SPD_UP default is 2.5 m/s (AC_WPNav.cpp:12,67-74); Guided
+    position control reads it at mode_guided.cpp:251-263 and auto_takeoff.run()
+    uses that position controller (takeoff.cpp:158-202). 1.0 m/s keeps the
+    predicted 1 m/s² stopping distance at 0.5 m, not 2.76 m at 2.35 m/s.
+    """
+    layered = W.read_configured_parameters(
+        [SCENE / "params" / name for name in
+         ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")]
+    )
+    assert layered["WP_SPD_UP"] == 1.0
+
+
 def test_the_probe_requests_control_again_while_the_vehicle_refuses(tmp_path):
     """A vehicle that has just booted is still waiting for its GPS, home and IMU.
 
@@ -2222,3 +2547,573 @@ def test_registering_the_same_command_twice_is_refused():
             run_prefix="p00-compat",
         )
     assert "compat" in cli.COMMAND_REGISTRY
+
+
+# ---------------------------------------------------------------------------
+# The real subprocess runner: who owns a child's death
+# ---------------------------------------------------------------------------
+
+
+IGNORES_SIGTERM = r"""
+import signal, subprocess, sys, time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+grandchild = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+    ]
+)
+print("grandchild", grandchild.pid, flush=True)
+time.sleep(60)
+"""
+
+
+def _wait_until_gone(pid, timeout_s=5.0):
+    """Wait for a pid to stop answering, so a reaped-orphan race is not a flake."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"pid {pid} survived the bounded stop")
+        time.sleep(0.05)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are a POSIX facility")
+def test_the_real_runner_stops_a_sigterm_ignoring_child_and_the_process_group_it_forked(tmp_path):
+    """The stop owns the child's group, stays bounded, and never raises.
+
+    The suite replaces the runner everywhere else, so this is the real stop path:
+    the child here ignores SIGTERM exactly as the pinned SITL does, and it forks a
+    grandchild that ignores it too, exactly as the simulator forks its vehicle
+    controller. A pid-scoped stop would leave both alive and an unguarded wait
+    would raise out of ``stop()``'s ``finally`` — abandoning ``shutdown.json``,
+    which is how iteration 2's invocation lost its evidence.
+    """
+    runner = W.SubprocessRunner()
+    child = runner.spawn(
+        "stubborn",
+        [sys.executable, "-c", IGNORES_SIGTERM],
+        log_path=tmp_path / "stubborn.log",
+    )
+    # The child leads its own group, so signalling that group reaches its forks
+    # and can never reach the harness's group.
+    assert os.getpgid(child.pid) == child.pid
+
+    grandchild_pid = None
+    deadline = time.monotonic() + 10.0
+    while grandchild_pid is None and time.monotonic() < deadline:
+        for line in child.log_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("grandchild "):
+                grandchild_pid = int(line.split()[1])
+                break
+        else:
+            time.sleep(0.05)
+    assert grandchild_pid is not None, "the child never forked, so the test would prove nothing"
+
+    # SIGTERM is ignored: the stop must escalate inside its own bound and return
+    # the observed status instead of raising.
+    exit_code = runner.terminate(child, timeout_s=0.5)
+
+    assert exit_code == -signal.SIGKILL
+    assert runner.poll(child) is not None
+    _wait_until_gone(child.pid)
+    _wait_until_gone(grandchild_pid)
+
+
+# ---------------------------------------------------------------------------
+# The reader thread
+# ---------------------------------------------------------------------------
+
+
+class FiniteGateway:
+    """A controller stream with a fixed set of records, then silence."""
+
+    def __init__(self, records):
+        self.records = list(records)
+        self.reads = 0
+        self.closed = False
+
+    def open(self, host, port, timeout_s):
+        return None
+
+    def read_record(self, timeout_s):
+        self.reads += 1
+        return self.records.pop(0) if self.records else None
+
+    def send_fault(self, injection):
+        raise AssertionError("the reader tests never inject")
+
+    def close(self):
+        self.closed = True
+
+
+class EndlessGateway:
+    """A controller whose stream never ends: one fresh inertial record per read.
+
+    ``record_cost_s`` makes production slower than a consumer, so a consumer pass
+    has to wait for the reader the way it waits on a real stream.
+    """
+
+    def __init__(self, clock, record_cost_s=0.001):
+        self.clock = clock
+        self.record_cost_s = record_cost_s
+        self.produced = 0
+        self.closed = False
+
+    def open(self, host, port, timeout_s):
+        return None
+
+    def read_record(self, timeout_s):
+        time.sleep(self.record_cost_s)
+        self.produced += 1
+        return W.SensorRecord(
+            kind=W.Kind.IMU,
+            sim_time_s=self.clock.monotonic() - 1000.0,
+            sequence=self.produced,
+            flags=0,
+            received_stamp=W.ClockStamp(
+                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+            ),
+            imu=W.ImuPayload(
+                capture_host_ns=self.clock.monotonic_ns(),
+                accelerometer=(0.0, 0.0, -9.81),
+                gyro=(0.0, 0.0, 0.0),
+                inertial_unit_rpy=(0.0, 0.0, 0.0),
+                device_names=("accelerometer", "gyro", "inertial unit"),
+                units="m/s^2; rad/s; rad, ENU negated on y and z into NED",
+            ),
+        )
+
+    def send_fault(self, injection):
+        raise AssertionError("the reader tests never inject")
+
+    def close(self):
+        self.closed = True
+
+
+def reading_rig(tmp_path, gateway, *, clock=None, session=None):
+    """A real adapter whose reader files through the probe's own filing path."""
+    clock = clock or FakeClock()
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+    probe = W.CompatibilityProbe(
+        settings,
+        output_dir=tmp_path / "out",
+        runner_factory=FakeRunner,
+        session_factory=lambda: session or ScriptedMavlinkSession(clock),
+        gateway_factory=lambda: gateway,
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    writer = W.EvidenceWriter(tmp_path / "out", "run-a")
+    adapter = probe._new_adapter(writer, "run-a", ())
+    log = W._FlightLog()
+    probe._calibration = W.load_calibration_declaration(settings.calibration_path)
+    adapter.record_sink = lambda record: probe._file_stream_record(
+        record, adapter, writer, log, label="run-a"
+    )
+    return adapter, probe, writer, log
+
+
+def test_records_read_while_the_consumer_is_elsewhere_are_all_kept(tmp_path):
+    """The stream is read while nobody is consuming it, and nothing is lost.
+
+    Iteration 3's defect: reading shared a thread with the checklist, so a long
+    phase stopped the reading and the bounded queues dropped what arrived. Here
+    the consumer stays away while the whole stream arrives; every record is filed
+    to evidence and then handed over, in order, with the pixels already on disk —
+    which is what keeps the handoff itself metadata-only.
+    """
+    inner = FakeGateway(FakeClock())
+    records = [inner._status()]
+    for _ in range(12):
+        records.append(inner._pair())
+        records.append(inner._imu())
+    gateway = FiniteGateway(records)
+    adapter, _, writer, log = reading_rig(tmp_path, gateway)
+    # What the consumer passes would have declared by the time these arrive.
+    adapter.reader_phase = "flight"
+    adapter.start()
+    try:
+        # The consumer is deliberately elsewhere while the reader drinks the stream.
+        deadline = time.monotonic() + 5.0
+        while gateway.reads < len(records) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert gateway.reads >= len(records), "the reader never finished the stream"
+        handed = []
+        while True:
+            record = adapter.sensor_record(0.02)
+            if record is None:
+                break
+            handed.append(record)
+    finally:
+        adapter.stop()
+    assert len(handed) == len(records)
+    assert [(record.kind, record.sequence) for record in handed] == [
+        (record.kind, record.sequence) for record in records
+    ]
+    # Pair pixels were filed by the reader, so the handoff carried metadata only.
+    assert all(record.pair is None for record in handed if record.kind is W.Kind.PAIR)
+    assert all(record.imu is not None for record in handed if record.kind is W.Kind.IMU)
+    # And every filed record is in the evidence: 12 pairs, 12 inertial samples.
+    assert len(log.pair_metadata) == 12
+    assert len(log.imu) == 12
+    assert len((writer.directory / "imu.jsonl").read_text().splitlines()) == 12
+    assert len((writer.directory / "pairs.jsonl").read_text().splitlines()) == 12
+    assert len(list((writer.directory / "pairs").glob("*-left.ppm"))) == 12
+
+
+def test_the_consumer_pass_reports_when_its_own_valve_stops_it(tmp_path):
+    """The drain bounds cap the consumer's pass, not the socket.
+
+    The valve is wall time on the consumer, so this rig runs on the real clock.
+    A pass that gives up must leave the stream still being read: the next pass
+    gets records the reader gathered while this one had given up, and the pass's
+    own accounting says it stopped early.
+    """
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+    probe = W.CompatibilityProbe(
+        settings,
+        output_dir=tmp_path / "out",
+        runner_factory=FakeRunner,
+        session_factory=lambda: ScriptedMavlinkSession(FakeClock()),
+        gateway_factory=lambda: EndlessGateway(FakeClock()),
+        monotonic_ns=time.monotonic_ns,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    )
+    writer = W.EvidenceWriter(tmp_path / "out", "run-a")
+    adapter = probe._new_adapter(writer, "run-a", ())
+    log = W._FlightLog()
+    adapter.record_sink = lambda record: None  # the valve, not the filing, is under test
+    adapter.start()
+    try:
+        first = probe._read_records(adapter, writer, log, label="run-a")
+        stats = probe.reader_stats()
+        assert stats["drains"] == 1
+        assert stats["records"] == len(first)
+        assert stats["drains_stopped_early"] == 1, stats
+        assert len(first) < W.MAX_DRAINED_RECORDS, (
+            "the time valve fired, so the record bound was never reached"
+        )
+        # The socket was not left behind: the reader kept reading while the
+        # consumer's valve had stopped it, so the next pass is served at once.
+        second = probe._read_records(adapter, writer, log, label="run-a")
+        assert second
+    finally:
+        adapter.stop()
+
+
+def test_an_endless_stream_neither_hangs_nor_grows_the_handoff_unbounded(tmp_path):
+    """A stream that never ends cannot hang the run or grow the handoff.
+
+    The reader keeps reading; the handoff stops growing at its declared bound; a
+    consumer that comes back is served at once; and the adapter still shuts down
+    promptly with the reader mid-stream.
+    """
+    gateway = EndlessGateway(FakeClock(), record_cost_s=0.0005)
+    adapter, _, _, _ = reading_rig(tmp_path, gateway)
+    adapter.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if adapter._handoff.qsize() >= W.SENSOR_HANDOFF_RECORDS:
+                break
+            time.sleep(0.01)
+        # One more beat: the stream keeps producing past the bound, so what holds
+        # the size down is the bound's shedding, never the stream's end.
+        time.sleep(0.05)
+        assert adapter._handoff.qsize() <= W.SENSOR_HANDOFF_RECORDS
+        assert gateway.produced > W.SENSOR_HANDOFF_RECORDS, (
+            "the stream really ran past the bound, so the bound is what stopped the growth"
+        )
+        started = time.monotonic()
+        record = adapter.sensor_record(0.05)
+        assert record is not None
+        assert time.monotonic() - started < 2.0
+    finally:
+        stop_started = time.monotonic()
+        adapter.stop()
+    assert time.monotonic() - stop_started < W.READER_JOIN_TIMEOUT_S + 2.0
+    assert gateway.closed
+
+
+def test_telemetry_folds_the_newest_message_not_the_newest_this_thread_read(tmp_path):
+    """The newest state reaches the fold even when this thread never read it.
+
+    Iteration 3's second defect: a waypoint record's start sample described the
+    vehicle as it had been tens of seconds earlier, because the messages had
+    waited for a busy thread. Here several batches collect while the main thread
+    reads none of them; the next fold must carry the newest one.
+    """
+    clock = FakeClock()
+
+    class AdvancingVehicle(ScriptedMavlinkSession):
+        """Every batch the reader collects reports the vehicle half a metre further."""
+
+        def _telemetry_batch(self):
+            messages = super()._telemetry_batch()
+            self.position = (self.position[0] + 0.5, self.position[1], self.position[2])
+            for message in messages:
+                if message["mavpackettype"] == "LOCAL_POSITION_NED":
+                    message["x"] = self.position[0]
+            return messages
+
+    session = AdvancingVehicle(clock)
+    gateway = FakeGateway(clock)
+    adapter, _, _, _ = reading_rig(tmp_path, gateway, clock=clock, session=session)
+    adapter.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while session.drains < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert session.drains >= 4, "the reader never collected the batches"
+        # Freeze the handoff so the assertion is exact: the fold must reach the
+        # newest batch the reader collected.
+        adapter._reader_stop.set()
+        adapter._reader_thread.join(timeout=2.0)
+        sample = adapter.telemetry()
+        assert sample.local_position_ned[0] == pytest.approx(0.5 * session.drains)
+        assert sample.messages_seen >= 2, (
+            "the newest batch was folded, whatever the queue shed ahead of it"
+        )
+        # With nothing new, the fold keeps the last known state.
+        again = adapter.telemetry()
+        assert again.messages_seen == 0
+        assert again.local_position_ned == sample.local_position_ned
+    finally:
+        adapter.stop()
+
+
+# ---------------------------------------------------------------------------
+# The injection acknowledgement wait
+# ---------------------------------------------------------------------------
+
+
+class SilentFaultGateway:
+    """A controller that takes each fault and keeps its sensor stream silent.
+
+    It never answers on its own: the tests place any acknowledgement in the
+    stream themselves, so the wait's pacing is what is under test, not the
+    controller's willingness to answer.
+    """
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.faults = []
+        self.reads = 0
+        self.closed = False
+
+    def open(self, host, port, timeout_s):
+        return None
+
+    def read_record(self, timeout_s):
+        self.reads += 1
+        return None
+
+    def send_fault(self, injection):
+        self.faults.append(injection)
+
+    def close(self):
+        self.closed = True
+
+
+class LateAckGateway(SilentFaultGateway):
+    """A silent stream that lets one acknowledgement surface only after a delay.
+
+    The delay runs on the real clock from the stream's opening, because the
+    reader that would deliver the record runs on a real thread.
+    """
+
+    def __init__(self, clock, ack, delay_s):
+        super().__init__(clock)
+        self.ack = ack
+        self.delay_s = delay_s
+        self.opened_at = None
+
+    def open(self, host, port, timeout_s):
+        self.opened_at = time.monotonic()
+        return None
+
+    def read_record(self, timeout_s):
+        self.reads += 1
+        if self.ack is not None and time.monotonic() - self.opened_at >= self.delay_s:
+            ack, self.ack = self.ack, None
+            return ack
+        return None
+
+
+def acknowledgement_record(clock, injection):
+    """The record the controller sends for one fault, as FakeGateway builds it."""
+    return W.SensorRecord(
+        kind=W.Kind.FAULT_ACK,
+        sim_time_s=clock.monotonic() - 1000.0,
+        sequence=0,
+        flags=0,
+        received_stamp=W.ClockStamp(
+            host_id="test-host", clock_id="monotonic", monotonic_ns=clock.monotonic_ns()
+        ),
+        fault_ack={
+            "injection_id": injection.injection_id,
+            "applied": True,
+            "state": {},
+            "reason": None,
+        },
+    )
+
+
+def test_the_ack_wait_keeps_up_with_a_full_handoff(tmp_path, monkeypatch):
+    """An acknowledgement queued behind a full handoff is still found.
+
+    Iteration 5's defect: the wait taxed every returned record with a 50 ms
+    sleep — about 20 records a second against a stream that produces about
+    510 — so an acknowledgement entering behind a full bounded handoff was
+    shed off its head before the poll could reach it. Iteration 4's receipt
+    recorded exactly that: ``inj-001-clear`` answered ``"ack": null`` in both
+    runs. Here the handoff is full when the clear is sent, the
+    acknowledgement sits last in it, and the wait is given half a second: the
+    wait must consume what the stream produces and surface it anyway. Under
+    the old pacing this cannot pass — 1024 records at 20 a second is far
+    beyond half a second.
+    """
+    clock = FakeClock()
+    gateway = SilentFaultGateway(clock)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    fault = W.Injection.clear(1, kind="position_step")
+    inner = FakeGateway(clock)
+    # The hold loop has just drained and slept, as it always does before a
+    # clear is sent, so the acknowledgement enters behind a completely full
+    # handoff; enqueueing is the reader's own act, shed rule included.
+    for _ in range(W.SENSOR_HANDOFF_RECORDS):
+        adapter._enqueue(adapter._handoff, inner._imu())
+    adapter._enqueue(adapter._handoff, acknowledgement_record(clock, fault))
+    adapter.start()
+    try:
+        started = clock.now
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 0.5)
+        receipt = adapter.inject(fault)
+    finally:
+        adapter.stop()
+    assert gateway.faults == [fault], "the clear was never even sent"
+    assert receipt.applied is True
+    assert receipt.requested is fault
+    # The wait paid no 50 ms tax at all: a single sleep would have moved this
+    # fake clock by a whole step.
+    assert clock.now - started < 0.05
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["injection"] == fault.injection_id
+    assert line["ack"]["applied"] is True
+
+
+def test_the_ack_wait_still_sleeps_on_an_empty_stream_and_finds_a_late_ack(tmp_path, monkeypatch):
+    """The empty path keeps its courtesy sleep and still catches the answer.
+
+    The pacing change removes the tax on returned records, not the wait's
+    patience: while the stream is silent the poll still sleeps between reads,
+    and an acknowledgement that surfaces later — here a third of a second
+    after the stream opened — is found inside the deadline.
+    """
+    clock = FakeClock()
+    fault = W.Injection.clear(1, kind="position_step")
+    gateway = LateAckGateway(clock, acknowledgement_record(clock, fault), delay_s=0.3)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    adapter.start()
+    try:
+        started = clock.now
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 2.0)
+        receipt = adapter.inject(fault)
+    finally:
+        adapter.stop()
+    assert gateway.faults == [fault]
+    assert receipt.applied is True
+    assert receipt.acknowledged_state is not None
+    # The stream was empty on the first read, so the wait slept: the fake
+    # clock only moves when somebody waits, and it floors every sleep at its
+    # own 0.05 s step, so any movement at all proves the empty path slept
+    # rather than spinning; the deadline was never reached.
+    assert clock.now > started
+    assert clock.now - started < 2.0
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["ack"]["injection_id"] == fault.injection_id
+
+
+def test_an_acknowledgement_that_never_arrives_is_reported_at_the_deadline(tmp_path, monkeypatch):
+    """No acknowledgement means applied: False, with the documented reason.
+
+    A missing acknowledgement is reported as missing information, never
+    assumed into a success: at the shortened deadline the receipt says the
+    controller did not acknowledge, and the evidence line records the null
+    ack — the shape both iteration-4 runs produced for ``inj-001-clear``.
+    """
+    clock = FakeClock()
+    gateway = SilentFaultGateway(clock)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    adapter.start()
+    try:
+        started = clock.now
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 0.1)
+        receipt = adapter.inject(W.Injection.clear(1, kind="position_step"))
+    finally:
+        adapter.stop()
+    assert gateway.faults, "the injection was not even sent"
+    assert receipt.applied is False
+    assert receipt.acknowledged_state is None
+    assert receipt.reason == "the controller did not acknowledge the injection within 10 s"
+    # The wait stopped at its deadline instead of wandering past it.
+    assert clock.now - started < 0.5
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["ack"] is None
+
+
+def test_a_foreign_acknowledgement_is_parked_without_spinning_the_wait(tmp_path, monkeypatch):
+    """An answer to another injection is kept, not re-read in place for ever.
+
+    The mismatch branch hands the record back to ``_pending_records``, which
+    ``sensor_record`` reads first: a wait that re-read it without ever waiting
+    would spin there for ever without advancing its own deadline. Iteration 5's
+    first cut did exactly that — a foreign acknowledgement made this wait
+    outlive a 25 s kill while its own deadline was half a second — so the wait
+    must pace itself, keep the foreign record for the next reader, and report
+    the requested fault as not applied at its deadline. The call runs on its own
+    thread so a regression fails here instead of stalling the whole suite.
+    """
+    clock = FakeClock()
+    fault = W.Injection.clear(1, kind="position_step")
+    foreign = W.Injection.clear(9, kind="position_step")
+    gateway = LateAckGateway(clock, acknowledgement_record(clock, foreign), delay_s=0.0)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    adapter.start()
+    try:
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 0.5)
+        started = clock.now
+        outcome = {}
+
+        def wait_for_the_answer():
+            outcome["receipt"] = adapter.inject(fault)
+
+        caller = threading.Thread(target=wait_for_the_answer, daemon=True)
+        caller.start()
+        caller.join(timeout=10.0)
+        assert not caller.is_alive(), (
+            "the wait never returned: it re-read the parked record instead of pacing itself"
+        )
+        receipt = outcome["receipt"]
+    finally:
+        adapter.stop()
+    assert gateway.faults == [fault]
+    assert receipt.applied is False, "another injection's answer is not this fault's answer"
+    assert receipt.acknowledged_state is None
+    # The foreign record was kept for the next reader, not consumed by this wait.
+    parked = [record.fault_ack for record in adapter._pending_records if record.fault_ack]
+    assert [entry["injection_id"] for entry in parked] == [foreign.injection_id]
+    # And the wait walked its own deadline out instead of spinning in place.
+    assert clock.now > started
+    assert clock.now - started <= 1.0
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["injection"] == fault.injection_id
+    assert line["ack"] is None

@@ -38,11 +38,14 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import select
+import signal
 import socket
 import struct
 import subprocess
+import threading
 import time
 from typing import Any, Callable, Iterable, Sequence
 
@@ -190,6 +193,10 @@ class Kind(IntEnum):
     IMU = 3
     FAULT = 4
     FAULT_ACK = 5
+    # One simulator pose sample: the same truth the flight-state packet carries,
+    # streamed beside the inertial samples so this process can hand it to the
+    # autopilot's external-navigation path (VISION_POSITION_ESTIMATE).
+    POSE = 6
 
 
 @dataclass(frozen=True)
@@ -660,6 +667,54 @@ def decode_imu_payload(payload: bytes) -> ImuPayload:
         inertial_unit_rpy=(values[7], values[8], values[9]),
         device_names=(names[0], names[1], names[2]),
         units=units,
+    )
+
+
+POSE_PAYLOAD_FORMAT = ">Q6d"
+POSE_PAYLOAD_SIZE = struct.calcsize(POSE_PAYLOAD_FORMAT)
+
+
+@dataclass(frozen=True)
+class PosePayload:
+    """One simulator pose sample: the truth the flight-state packet carries.
+
+    The six values are the same position and attitude the flight-state packet hands
+    to SITL, already in ArduPilot's NED frame (the controller converts the Webots
+    devices with :func:`enu_to_ned` exactly as it does for the flight state), so the
+    sample is a repetition of that packet's position and attitude fields, not a
+    second reading of the scene.
+    """
+
+    capture_host_ns: int
+    position_xyz: tuple[float, float, float]
+    attitude_rpy: tuple[float, float, float]
+
+
+def encode_pose_payload(
+    *,
+    capture_host_ns: int,
+    position_xyz: Sequence[float],
+    attitude_rpy: Sequence[float],
+) -> bytes:
+    """Pack one pose sample with its capture stamp."""
+    if len(position_xyz) != 3 or len(attitude_rpy) != 3:
+        raise FramingError("a pose sample carries three position and three attitude values")
+    return struct.pack(
+        POSE_PAYLOAD_FORMAT, int(capture_host_ns), *position_xyz, *attitude_rpy
+    )
+
+
+def decode_pose_payload(payload: bytes) -> PosePayload:
+    """Read one pose sample. A payload that is not exactly one sample is refused."""
+    if len(payload) != POSE_PAYLOAD_SIZE:
+        raise FramingError(
+            f"pose payload is {len(payload)} bytes, expected {POSE_PAYLOAD_SIZE}"
+        )
+    values = struct.unpack(POSE_PAYLOAD_FORMAT, payload)
+    return PosePayload(
+        capture_host_ns=values[0],
+        position_xyz=(values[1], values[2], values[3]),
+        attitude_rpy=(values[4], values[5], values[6]),
     )
 
 
@@ -1320,6 +1375,7 @@ class SensorRecord:
     imu: ImuPayload | None = None
     status: dict[str, Any] | None = None
     fault_ack: dict[str, Any] | None = None
+    pose: PosePayload | None = None
 
 
 COPTER_MODES = {
@@ -1828,6 +1884,10 @@ RECEIVED_AT_KEY = "received_monotonic_ns"
 # The only message types this program may send. Motion travels as a guided
 # setpoint; everything else is a procedure such as a mode request or an interval
 # request. There is no motor, throttle, RC or attitude command in this set.
+# VISION_POSITION_ESTIMATE is the one sensor feed this program sends: the
+# simulator's own pose, handed to the autopilot's external-navigation path. It
+# commands nothing — ArduPilot decides what to fuse from it through the EK3_SRC1
+# source selection (libraries/AP_NavEKF/AP_NavEKF_Source.cpp at the pinned commit).
 ALLOWED_OUTBOUND_TYPES = frozenset(
     {
         "SET_POSITION_TARGET_LOCAL_NED",
@@ -1835,8 +1895,19 @@ ALLOWED_OUTBOUND_TYPES = frozenset(
         "SET_MESSAGE_INTERVAL",
         "PARAM_REQUEST_READ",
         "HEARTBEAT",
+        "VISION_POSITION_ESTIMATE",
     }
 )
+
+# How often the vision feed republishes the latest simulator pose. EKF3 rejects
+# external-navigation measurements closer together than 20 ms
+# (AP_NavEKF3.h:516, extNavIntervalMin_ms = 20, pinned commit af85259), so the
+# feed runs at 25 ms — comfortably inside what the filter accepts, and at the
+# controller's own 20 ms pose cadence (the controller's --pose-period-ms default)
+# the stream carries one small pose record beside every 25 inertial samples
+# instead of one per inertial sample, which starved the stereo pairs in the
+# readiness handoff (measured, extnav-it2 run-a: pair=no at the 90 s deadline).
+VISION_POSE_PERIOD_S = 0.025
 
 
 # ---------------------------------------------------------------------------
@@ -1885,6 +1956,7 @@ class SubprocessRunner:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
         self._processes[name] = process
         return ChildProcess(name=name, argv=tuple(argv), pid=process.pid, log_path=log_path)
@@ -1894,17 +1966,41 @@ class SubprocessRunner:
         return None if process is None else process.poll()
 
     def terminate(self, child: ChildProcess, timeout_s: float = 10.0) -> int | None:
+        """Stop the child and everything it forked, bounded, and never raise.
+
+        The signal goes to the child's process group (it leads its own session,
+        see :meth:`spawn`), so a grandchild such as the simulator's vehicle
+        controller is covered too.  This runs in ``stop()``'s ``finally`` block,
+        so a child that outlives the bounded stop is reported as ``None`` — an
+        honest fact — instead of raising and destroying the run's evidence.
+        """
         process = self._processes.get(child.name)
         if process is None:
             return None
         if process.poll() is None:
-            process.terminate()
+            self._signal_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=timeout_s)
+                self._signal_group(process, signal.SIGKILL)
+                try:
+                    process.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    return None
         return process.returncode
+
+    @staticmethod
+    def _signal_group(process: subprocess.Popen, sig: int) -> None:
+        """Send ``sig`` to the child's process group, ignoring a child already gone."""
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except OSError:
+            # The child already exited (or is unreachable): fall back to the pid
+            # so the signal's intent is still attempted exactly once.
+            try:
+                process.send_signal(sig)
+            except OSError:
+                pass
 
     def tail(self, child: ChildProcess, lines: int = 200) -> list[str]:
         """The last lines of a child's output, bounded so a runaway log cannot fill memory."""
@@ -1932,6 +2028,12 @@ class PymavlinkSession:
         self._mavutil = None
         self.target_system = 0
         self.target_component = 0
+        # One lock around the wire: the vision feed sends from its own thread at a
+        # steady rate while the checklist's thread sends modes, parameters and
+        # setpoints between phases. pymavlink does not serialize concurrent sends,
+        # and interleaved partial frames are unreadable, so every sender passes
+        # through the same lock here.
+        self._send_lock = threading.Lock()
 
     def connect(self, endpoint: str, timeout_s: float) -> dict[str, Any]:
         try:
@@ -1961,7 +2063,39 @@ class PymavlinkSession:
                 f"refusing to send {message_type}: this project commands motion only "
                 "through supported MAVLink guided setpoints"
             )
-        self._connection.mav.send(message)
+        with self._send_lock:
+            self._connection.mav.send(message)
+
+    def send_vision_position_estimate(
+        self, *, usec: int, x: float, y: float, z: float, roll: float, pitch: float, yaw: float
+    ) -> None:
+        """Publish one simulator pose to the autopilot's external-navigation path.
+
+        The values are passed through unchanged: the pose sample arrives from the
+        controller already in ArduPilot's NED frame (the same :func:`enu_to_ned`
+        conversion the flight-state packet applies, webots_ardupilot.py:127-137 at
+        the pinned commit), and MAVLink vision messages are declared in that same
+        NED frame, so a conversion here would be a second opinion the stream never
+        asked for. ArduPilot receives it through GCS_MAVLINK's vision handler
+        (GCS_Common.cpp:4578), AP_VisualOdom turns the Euler angles into the
+        quaternion it forwards (AP_VisualOdom.cpp:212-215), and EKF3 fuses position
+        and yaw per EK3_SRC1 selection. The covariance is NaN, the MAVLink
+        "unknown" declaration: AP_VisualOdom then substitutes its own configured
+        noise (VISO_POS_NSE, VISO_YAW_M_NSE), which is the honest statement — the
+        simulator does not measure a covariance.
+        """
+        self._send(
+            self._connection.mav.vision_position_estimate_encode(
+                int(usec),
+                float(x),
+                float(y),
+                float(z),
+                float(roll),
+                float(pitch),
+                float(yaw),
+                [float("nan")] * 21,
+            )
+        )
 
     def request_message_interval(self, message_id: int, hz: float) -> None:
         self._send(
@@ -2203,6 +2337,8 @@ class TcpSensorGateway:
             record = replace(record, status=decode_status_payload(message.payload))
         elif message.kind is Kind.FAULT_ACK:
             record = replace(record, fault_ack=decode_fault_payload(message.payload))
+        elif message.kind is Kind.POSE:
+            record = replace(record, pose=decode_pose_payload(message.payload))
         return record
 
     def send_fault(self, injection: Injection) -> None:
@@ -2338,28 +2474,36 @@ class EvidenceWriter:
         self.directory = output_dir / label
         self.directory.mkdir(parents=True, exist_ok=True)
         self.artifacts: list[str] = []
+        # Two threads write through one writer once the reader is running. The lock
+        # keeps each whole line, each whole file write and each artifact bookkeeping
+        # step atomic; it imposes no ordering beyond that.
+        self._lock = threading.RLock()
 
     def path(self, name: str) -> Path:
-        target = self.directory / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        relative = str(target.relative_to(self.output_dir))
-        if relative not in self.artifacts:
-            self.artifacts.append(relative)
-        return target
+        with self._lock:
+            target = self.directory / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            relative = str(target.relative_to(self.output_dir))
+            if relative not in self.artifacts:
+                self.artifacts.append(relative)
+            return target
 
     def write_json(self, name: str, document: Any) -> str:
-        target = self.path(name)
-        target.write_text(json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8")
-        return str(target.relative_to(self.output_dir))
+        with self._lock:
+            target = self.path(name)
+            target.write_text(json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8")
+            return str(target.relative_to(self.output_dir))
 
     def write_bytes(self, name: str, data: bytes) -> str:
-        target = self.path(name)
-        target.write_bytes(data)
-        return str(target.relative_to(self.output_dir))
+        with self._lock:
+            target = self.path(name)
+            target.write_bytes(data)
+            return str(target.relative_to(self.output_dir))
 
     def append_jsonl(self, name: str, document: Any) -> None:
-        with self.path(name).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(document, default=str) + "\n")
+        with self._lock:
+            with self.path(name).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(document, default=str) + "\n")
 
     def tail_lines(self, path: Path, lines: int = 200) -> list[str]:
         try:
@@ -2581,6 +2725,32 @@ class WebotsArduPilot:
         self._telemetry: TelemetrySample | None = None
         self._publications: list[SetpointPublication] = []
         self._pending_records: list[SensorRecord] = []
+        # The reader thread and its handoffs. The reader owns both inbound streams
+        # once start() runs: it reads for as long as the adapter is open and hands
+        # decoded records over through bounded queues, so no checklist phase can
+        # stop the reading and let a bounded queue fill and drop. telemetry() and
+        # sensor_record() consume those queues; before start() they read the
+        # sockets in the caller's thread, as they always did.
+        self._handoff: queue.Queue[SensorRecord] = queue.Queue(maxsize=SENSOR_HANDOFF_RECORDS)
+        self._mavlink_handoff: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=MAX_QUEUED_MAVLINK_MESSAGES
+        )
+        # The reader files each record the moment it reads it, through the sink the
+        # run installs: bulk evidence keeps up with the stream even while the
+        # checklist's thread is elsewhere. The sink decides nothing.
+        self.record_sink: Callable[[SensorRecord], None] | None = None
+        # The window the sink tags arriving inertial samples with. The checklist's
+        # thread is the only writer (each consumer pass declares its phase); the
+        # reader only reads it, and a record on a phase boundary carries the phase
+        # its read happened in.
+        self.reader_phase = "startup"
+        self._reader_thread: threading.Thread | None = None
+        self._reader_stop = threading.Event()
+        self._reader_error: BaseException | None = None
+        # The reader's own pacing clock for the MAVLink sweep. It runs on real
+        # time, because the reader is a real thread: the checklist's injected
+        # clock says nothing about when a real socket will next deliver.
+        self._next_mavlink_sweep = 0.0
         self._statustexts: list[str] = []
         self._sequence = 0
         self._mavlink_lines = 0
@@ -2589,6 +2759,17 @@ class WebotsArduPilot:
         self.control_events: list[ControlEvent] = []
         self.refusals: list[dict[str, Any]] = []
         self.navigation_epoch = "nav-1"
+        # The simulator-interface pose feed. The reader stores the latest pose
+        # sample it reads; a dedicated thread republishes it to the autopilot's
+        # external-navigation path at VISION_POSE_PERIOD_S. The slot is a plain
+        # tuple reference — the reader replaces it atomically and the feed reads
+        # whole tuples — and the feed owns no state the checklist reads except the
+        # account stop() records.
+        self._latest_pose: tuple[float, tuple[float, float, float], tuple[float, float, float]] | None = None
+        self._vision_feed_thread: threading.Thread | None = None
+        self._vision_feed_stop = threading.Event()
+        self._vision_feed_error: BaseException | None = None
+        self._vision_feed_published = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -2651,7 +2832,7 @@ class WebotsArduPilot:
         return self.settings.parameter_files(self._extra_params)
 
     def start(self) -> StartupEvidence:
-        """Start Webots and SITL, then open the MAVLink session and the sensor stream."""
+        """Start Webots and SITL, open the MAVLink session and the sensor stream, and start the reader."""
         simulator = self._runner.spawn(
             "webots",
             self.settings.simulator_argv(),
@@ -2672,6 +2853,13 @@ class WebotsArduPilot:
         # would be behind from its first byte and the controller would drop whatever its
         # queue could not hold.
         self._gateway.open("127.0.0.1", self.settings.endpoints.controller_port, 30.0)
+        # The reader starts the moment the stream exists: from here on the
+        # controller's frames are read as they arrive, whether or not this thread
+        # is busy elsewhere.
+        self._start_reader()
+        # The pose feed starts with the reader: both run for the adapter's lifetime,
+        # and the feed publishes only what the reader has actually received.
+        self._start_vision_feed()
         # AUTOPILOT_VERSION answers once, on request, and it is the only statement of
         # which firmware is being exercised.
         self._session.request_message(MSG_ID_AUTOPILOT_VERSION)
@@ -2765,7 +2953,21 @@ class WebotsArduPilot:
         Called from a finally block by the probe, so a failed step still leaves the
         two children terminated and their exit codes and last output recorded.
         """
+        # The vision feed stops first: it is the only other thread that sends on the
+        # MAVLink session, and it must not be touching a socket this method closes.
+        self._stop_vision_feed()
+        # The reader stops next: it is the only reader either stream has, and it
+        # must not be touching a socket this method is about to close.
+        self._stop_reader()
         self._gateway.close()
+        self.evidence.write_json(
+            "vision-pose-feed.json",
+            {
+                "published": self._vision_feed_published,
+                "period_s": VISION_POSE_PERIOD_S,
+                "error": None if self._vision_feed_error is None else repr(self._vision_feed_error),
+            },
+        )
         try:
             self._session.close()
         except Exception:  # noqa: BLE001 - cleanup must not raise over the real failure
@@ -2783,8 +2985,16 @@ class WebotsArduPilot:
     # -- reading -----------------------------------------------------------
 
     def telemetry(self) -> TelemetrySample:
-        """Drain the MAVLink stream, record it, and fold it into the latest known state."""
-        messages = self._session.drain()
+        """Drain the MAVLink stream, record it, and fold it into the latest known state.
+
+        The messages come from the reader thread's handoff queue, so the fold
+        reaches the newest received message even when this thread last called long
+        after it arrived. Before the reader is started, the session is drained in
+        the caller's thread, as it always was.
+        """
+        if self._reader_error is not None:
+            raise self._reader_error
+        messages = self._take_mavlink_batch()
         for document in messages:
             self._record_mavlink(document)
         sample = decode_telemetry(
@@ -2911,16 +3121,205 @@ class WebotsArduPilot:
         )
 
     def sensor_record(self, timeout_s: float) -> SensorRecord | None:
-        """The next sensor record, or None when the stream stays silent for the timeout."""
+        """The next sensor record, or None when the stream stays silent for the timeout.
+
+        The record comes from the reader thread's handoff queue, and the wait on it
+        is real time: the queue fills on a real thread, so that is the clock its
+        emptiness is measured against; the checklist's own pacing stays on the
+        caller's clock. Before the reader is started, the gateway is read in the
+        caller's thread, as it always was.
+        """
+        if self._reader_error is not None:
+            raise self._reader_error
         if self._pending_records:
             record = self._pending_records.pop(0)
-        else:
+        elif self._reader_thread is None:
             record = self._gateway.read_record(timeout_s)
+        else:
+            record = self._take_handoff_record(timeout_s)
         if record is None:
             return None
         if record.kind is Kind.STATUS and record.status is not None:
             self.controller_status = record.status
         return record
+
+    # -- reader thread -----------------------------------------------------
+
+    def _start_reader(self) -> None:
+        """Start the loop that reads both inbound streams for the adapter's lifetime."""
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, name=f"{self.label}-reader", daemon=True
+        )
+        self._reader_thread.start()
+
+    def _stop_reader(self) -> None:
+        """Stop the reader before the streams it reads are closed."""
+        self._reader_stop.set()
+        thread, self._reader_thread = self._reader_thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=READER_JOIN_TIMEOUT_S)
+
+    # -- vision pose feed --------------------------------------------------
+
+    def _start_vision_feed(self) -> None:
+        """Start the thread that republishes the simulator pose to the autopilot."""
+        self._vision_feed_thread = threading.Thread(
+            target=self._vision_feed_loop, name=f"{self.label}-vision-feed", daemon=True
+        )
+        self._vision_feed_thread.start()
+
+    def _stop_vision_feed(self) -> None:
+        """Stop the feed before the session it sends on is closed."""
+        self._vision_feed_stop.set()
+        thread, self._vision_feed_thread = self._vision_feed_thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=READER_JOIN_TIMEOUT_S)
+
+    def _vision_feed_loop(self) -> None:
+        """Republish the latest simulator pose at the external-navigation rate.
+
+        The controller streams pose samples beside the inertial ones; EKF3 accepts
+        an external-navigation measurement only every 20 ms (AP_NavEKF3.h:516 at
+        the pinned commit), so the feed keeps the most recent sample and sends it
+        at VISION_POSE_PERIOD_S. It sends nothing until a pose arrives, and a
+        failed send stops it — a dead link is the reader's failure to raise, not
+        this loop's to retry.
+        """
+        next_send = time.monotonic()
+        while not self._vision_feed_stop.is_set():
+            now = time.monotonic()
+            if now < next_send:
+                if self._vision_feed_stop.wait(next_send - now):
+                    return
+                continue
+            next_send = now + VISION_POSE_PERIOD_S
+            pose = self._latest_pose
+            if pose is None:
+                continue
+            sim_time_s, position, attitude = pose
+            try:
+                self._session.send_vision_position_estimate(
+                    usec=int(round(sim_time_s * 1_000_000)),
+                    x=position[0],
+                    y=position[1],
+                    z=position[2],
+                    roll=attitude[0],
+                    pitch=attitude[1],
+                    yaw=attitude[2],
+                )
+                self._vision_feed_published += 1
+            except BaseException as error:  # noqa: BLE001 - recorded, not raised
+                self._vision_feed_error = error
+                return
+
+    def _reader_loop(self) -> None:
+        """Read the MAVLink session and the sensor gateway until the adapter stops.
+
+        Reading runs here, on its own thread, whether or not the checklist's thread
+        is busy, so no phase of the checklist can stop the reading and let a
+        bounded queue fill and drop. It decodes with the same session and gateway
+        objects as before, files each sensor record through the installed sink,
+        refreshes ``controller_status`` from the stream's own status records, and
+        hands the decoded records over through bounded queues. It decides nothing:
+        every judgement stays on the checklist's thread.
+
+        A failure on either stream is recorded and raised on the consuming thread's
+        next call, which is where a read failure surfaced before this thread
+        existed.
+        """
+        while not self._reader_stop.is_set():
+            progressed = False
+            try:
+                record = self._gateway.read_record(READER_POLL_TIMEOUT_S)
+                if record is not None:
+                    self._dispatch_record(record)
+                    progressed = True
+                # The MAVLink sweep runs at most once per poll interval, on the
+                # reader's own real clock: the link carries tens of messages a
+                # second, and an unthrottled sweep against a session that answers
+                # on every poll would fill the handoff faster than any consumer
+                # could record it — recreating behind the queue exactly the
+                # backlog this thread exists to prevent.
+                now = time.monotonic()
+                if now >= self._next_mavlink_sweep:
+                    self._next_mavlink_sweep = now + READER_POLL_TIMEOUT_S
+                    messages = self._session.drain()
+                    for document in messages:
+                        self._enqueue(self._mavlink_handoff, document)
+                    progressed = progressed or bool(messages)
+            except BaseException as error:  # noqa: BLE001 - re-raised on the consumer's thread
+                self._reader_error = error
+                self._reader_stop.set()
+                return
+            if not progressed and self._reader_stop.wait(READER_POLL_TIMEOUT_S):
+                return
+
+    def _dispatch_record(self, record: SensorRecord) -> None:
+        """File one record, then hand it over with its pixels already on disk."""
+        if record.kind is Kind.STATUS and record.status is not None:
+            self.controller_status = record.status
+        if record.pose is not None:
+            # The vision feed's input: the latest simulator pose wins, because the
+            # autopilot wants the most recent truth, not a queue of past truth.
+            self._latest_pose = (
+                record.sim_time_s,
+                record.pose.position_xyz,
+                record.pose.attitude_rpy,
+            )
+        sink = self.record_sink
+        if sink is not None:
+            sink(record)
+        if record.pair is not None:
+            # The pixels were filed by the sink above; the queue carries metadata
+            # only, which is what makes its record-count bound honest.
+            record = replace(record, pair=None)
+        self._enqueue(self._handoff, record)
+
+    def _enqueue(self, target: queue.Queue[Any], item: Any) -> None:
+        """Put one item on a bounded handoff queue, shedding the oldest when full.
+
+        The oldest goes first because a consumer that comes back wants the newest
+        state; what the controller dropped at its own end is still told by its own
+        drop counter, not by this one.
+        """
+        while True:
+            try:
+                target.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    target.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def _take_handoff_record(self, timeout_s: float) -> SensorRecord | None:
+        """One record from the handoff, or None after a bounded real wait."""
+        try:
+            return self._handoff.get(timeout=max(0.0, float(timeout_s)))
+        except queue.Empty:
+            return None
+
+    def _take_mavlink_batch(self) -> list[dict[str, Any]]:
+        """Every message handed over so far, oldest first.
+
+        The first message is waited for briefly, because the reader delivers on a
+        real thread: a checklist that calls between two of the reader's sweeps
+        would otherwise fold "no change" while the change is milliseconds away.
+        An empty batch still folds, keeping the previous state, exactly as an
+        empty drain always did.
+        """
+        if self._reader_thread is None:
+            return self._session.drain()
+        messages: list[dict[str, Any]] = []
+        try:
+            messages.append(self._mavlink_handoff.get(timeout=MAVLINK_ARRIVAL_WAIT_S))
+        except queue.Empty:
+            return messages
+        while True:
+            try:
+                messages.append(self._mavlink_handoff.get_nowait())
+            except queue.Empty:
+                return messages
 
 
     # -- command -----------------------------------------------------------
@@ -2999,7 +3398,12 @@ class WebotsArduPilot:
         so it is not sent: the refusal is recorded with the mode and status that
         caused it, and the caller reports what the aircraft was actually doing
         instead of what it was told to do.
+
+        The fold is brought current first: with the reader thread delivering on
+        its own clock, a mode change that has already arrived may sit one sweep
+        ahead of the last sample, and a publication decided here must see it.
         """
+        self.telemetry()
         if not self.guidance_held:
             sample = self._telemetry
             refusal = {
@@ -3053,16 +3457,26 @@ class WebotsArduPilot:
         applied when the controller's acknowledgement arrives, and not before.
         """
         self._gateway.send_fault(fault)
-        deadline = self._monotonic() + 10.0
+        deadline = self._monotonic() + INJECTION_ACK_TIMEOUT_S
         while self._monotonic() < deadline:
             record = self.sensor_record(0.25)
-            if record is None or record.fault_ack is None:
-                # Wait a little rather than spinning: the acknowledgement arrives on
-                # the same stream as the sensor records, so it needs its own step.
+            if record is None:
+                # The handoff stayed empty for the whole sensor-record timeout, so
+                # wait a little rather than spinning. A returned record loops
+                # immediately: the wait must not consume slower than the stream
+                # produces, or the bounded handoff sheds the acknowledgement behind
+                # the backlog before this poll ever reaches it.
                 self._sleep(0.05)
                 continue
             ack = record.fault_ack
+            if ack is None:
+                continue
             if ack.get("injection_id") != fault.injection_id:
+                # Another injection's answer, kept for the next reader. This
+                # branch paces itself: sensor_record reads _pending_records
+                # first, so a record parked here is handed straight back to this
+                # same wait, and re-reading it in place would spin here for ever
+                # without ever moving this wait's clock.
                 self._pending_records.append(record)
                 self._sleep(0.05)
                 continue
@@ -3385,6 +3799,7 @@ class CompatibilityProbe:
         self._budget_deadline = 0.0
         self._calibration: Any = None
         self._artifacts: list[str] = []
+        self._artifact_lock = threading.Lock()
         self._prerequisites: tuple[Prerequisite, ...] = ()
         self._reader_stats = new_reader_stats()
 
@@ -3446,7 +3861,10 @@ class CompatibilityProbe:
         limitations = (
             "sensor_mode is simulator-interface: the autopilot's attitude and position come "
             "from Webots devices through the flight-state packet, so this is compatibility "
-            "evidence and not a sensor-derived result",
+            "evidence and not a sensor-derived result. The EKF-active parameter set feeds "
+            "that same Webots pose to EKF3 as its external-navigation source "
+            "(VISION_POSITION_ESTIMATE, EK3_SRC1_* 6): the estimator flies on the "
+            "simulator's own state, not on an independently sensed one",
             "both runs fly the candidate parameter set, which includes the EKF-active file "
             "(AHRS_EKF_TYPE 3); run A is therefore not the pinned upstream configuration. "
             "The pinned file's simulator AHRS (AHRS_EKF_TYPE 10) was measured to diverge "
@@ -3487,12 +3905,19 @@ class CompatibilityProbe:
         adapter = self._new_adapter(writer, label, extra_params)
         checks: list[ProbeCheck] = []
         notes: list[str] = []
+        # The flight log exists before the first item, so the startup item's waits can
+        # read the sensor stream too: every record it files is evidence the later
+        # items judge, and a wait that ignored the stream would both lose frames and
+        # leave a hole in the material the stereo and inertial items are reading.
+        log = _FlightLog()
+        # The reader files each record the moment it reads it, on its own thread, so
+        # bulk evidence keeps up with the stream even while this checklist thread is
+        # elsewhere. The sink is filing only: every decision and every verdict stays
+        # on this thread, consuming the records the reader hands over.
+        adapter.record_sink = lambda record: self._file_stream_record(
+            record, adapter, writer, log, label=label
+        )
         try:
-            # The flight log exists before the first item, so the startup item's waits can
-            # read the sensor stream too: every record it files is evidence the later
-            # items judge, and a wait that ignored the stream would both lose frames and
-            # leave a hole in the material the stereo and inertial items are reading.
-            log = _FlightLog()
             startup_check = self._item_startup(adapter, writer, log, label)
             checks.append(startup_check)
             if startup_check.status == "fail":
@@ -3907,9 +4332,12 @@ class CompatibilityProbe:
         return str(target.relative_to(self.output_dir))
 
     def _record_artifacts(self, *paths: str | None) -> None:
-        for path in paths:
-            if path and path not in self._artifacts:
-                self._artifacts.append(path)
+        # Locked because the reader thread records the stream's artifacts here on
+        # the shared list while the checklist records its own.
+        with self._artifact_lock:
+            for path in paths:
+                if path and path not in self._artifacts:
+                    self._artifacts.append(path)
 
     @property
     def artifacts(self) -> tuple[str, ...]:
@@ -3996,6 +4424,38 @@ class CompatibilityProbe:
             self._sleep(0.02)
         return settled, pre_settle
 
+    def _file_stream_record(
+        self,
+        record: SensorRecord,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        *,
+        label: str,
+    ) -> None:
+        """File one stream record at the moment the reader reads it.
+
+        This runs on the adapter's reader thread — it is what the adapter calls for
+        every record — and it is the same per-record work the consumer pass always
+        did: the simulator-time series, the stereo pair's metadata and pixels, and
+        the inertial sample's evidence line, tagged with the phase its read
+        happened in. Nothing here decides anything; the checklist's own thread
+        keeps every judgement, consuming the records this files.
+        """
+        if record.sim_time_s >= 0.0:
+            log.sim_time_pairs.append(
+                (record.received_stamp.monotonic_ns / 1e9, record.sim_time_s)
+            )
+        if record.pair is not None:
+            self._file_pair(
+                record, writer, log, label=label, controller_status=adapter.controller_status
+            )
+        elif record.imu is not None:
+            phase = adapter.reader_phase
+            if phase == "flight":
+                log.imu.append(record.imu)
+            self._write_imu_sample(writer, phase, record)
+
     def _read_records(
         self,
         adapter: WebotsArduPilot,
@@ -4005,25 +4465,29 @@ class CompatibilityProbe:
         label: str,
         imu_phase: str = "flight",
     ) -> list[SensorRecord]:
-        """Take everything the sensor stream has waiting, and file each record.
+        """Consume what the reader thread has handed over since the last pass.
 
-        The loop drains until the stream is momentarily empty. That is not a detail: the
-        cameras produce about 18 MB of pixels a second, the controller's queue holds
-        about four pairs, and a reader that stopped after a fixed window while the queue
-        was still full would leave a backlog that never cleared — the controller then
-        drops pairs, and the stream the analysis sees has holes in it that no transport
-        actually produced. The elapsed bound below is a safety valve for a pathological
-        pile-up, not the intended exit: a healthy drain ends when the stream is empty.
+        The reading itself no longer waits for this pass: the adapter's reader
+        thread owns both sockets and files each record the moment it reads it, so
+        a pass that ends here leaves no unread socket behind it. The two bounds
+        below are the consumer's valve, not the reader's: they cap how long this
+        pass stays away from the rest of the checklist while the handoff keeps
+        producing, which is the pile-up protection those constants always
+        promised. The stream-empty exit is still the intended one: a reader that
+        keeps up hands the pass a near-empty queue, so a healthy pass ends within
+        moments.
 
-        ``imu_phase`` names the window an inertial sample arrived in, so a wait outside
-        the flight phase does not have to leave its samples unrecorded. Samples from a
-        phase other than ``flight`` are written to the evidence but kept out of the
-        measurement set, which is the flight-phase and at-rest samples only.
+        ``imu_phase`` declares the window this pass belongs to, and the reader
+        tags the inertial samples it reads while the declaration is current with
+        it. Samples from a phase other than ``flight`` are written to the evidence
+        but kept out of the measurement set, which is the flight-phase and
+        at-rest samples only.
         """
         drained: list[SensorRecord] = []
         started = self._monotonic()
         stopped_early = False
         drain_until = started + SENSOR_DRAIN_LIMIT_S
+        adapter.reader_phase = imu_phase
         for _ in range(MAX_DRAINED_RECORDS):
             if self._monotonic() >= drain_until:
                 stopped_early = True
@@ -4032,18 +4496,6 @@ class CompatibilityProbe:
             if record is None:
                 break
             drained.append(record)
-            if record.sim_time_s >= 0.0:
-                log.sim_time_pairs.append(
-                    (record.received_stamp.monotonic_ns / 1e9, record.sim_time_s)
-                )
-            if record.pair is not None:
-                self._file_pair(
-                    record, writer, log, label=label, controller_status=adapter.controller_status
-                )
-            elif record.imu is not None:
-                if imu_phase == "flight":
-                    log.imu.append(record.imu)
-                self._write_imu_sample(writer, imu_phase, record)
         self._note_drain(
             started=started,
             drained=len(drained),
@@ -4191,6 +4643,7 @@ class CompatibilityProbe:
             )
             before = self._sample_once(adapter, writer, log, label=label)
             publication = None
+            first_publication_at: int | None = None
             publications_here = 0
             refusals_here: list[dict[str, Any]] = []
             hold_until = self._monotonic() + self.settings.hold_per_waypoint_s
@@ -4220,6 +4673,8 @@ class CompatibilityProbe:
                     )
                     break
                 publication = sent
+                if first_publication_at is None:
+                    first_publication_at = sent.published_stamp.monotonic_ns
                 publications_here += 1
                 log.publications.append(sent)
                 self._sample_once(adapter, writer, log, label=label)
@@ -4233,6 +4688,25 @@ class CompatibilityProbe:
                 displacement = (end[0] - start[0], end[1] - start[1], end[2] - start[2])
                 residual_m = math.dist(end, target)
             published = None if publication is None else publication.setpoint
+            # How old each of this record's two position samples was against the
+            # decision it anchors: the start sample against the hold's first
+            # publication, the end sample against its last. Iteration 3's verdict
+            # was computed from start samples tens of seconds old; these two
+            # numbers are how a receipt proves its own freshness instead of
+            # asserting it.
+            sample_ages: dict[str, float | None] = {
+                "before_to_first_publication_s": None,
+                "after_from_last_publication_s": None,
+            }
+            if first_publication_at is not None:
+                sample_ages["before_to_first_publication_s"] = (
+                    first_publication_at - before.received_stamp.monotonic_ns
+                ) / 1e9
+            if publication is not None:
+                sample_ages["after_from_last_publication_s"] = (
+                    after.received_stamp.monotonic_ns
+                    - publication.published_stamp.monotonic_ns
+                ) / 1e9
             record = {
                 "waypoint": list(waypoint),
                 "target_ned": list(target),
@@ -4248,6 +4722,7 @@ class CompatibilityProbe:
                 "position_after_ned": list(end) if end is not None else None,
                 "displacement_ned": list(displacement) if displacement is not None else None,
                 "tracking_residual_m": residual_m,
+                "sample_ages_s": sample_ages,
                 "refusals": refusals_here,
                 "statustexts": list(after.statustexts[-5:]),
             }
@@ -4274,13 +4749,22 @@ class CompatibilityProbe:
             for axis, (commanded, measured_axis) in enumerate(
                 zip(entry["target_ned"], displacement)
             ):
+                # What a displacement can comply with is the step that was
+                # commanded, target minus start. The target coordinate's own sign
+                # says where the target sits, not which way the command asks the
+                # vehicle to move: judged against it, a correct descent (start
+                # above the target) reads as motion against the command.
+                commanded_step = (
+                    entry["target_ned"][axis] - entry["position_before_ned"][axis]
+                )
                 moved_opposite = (
-                    commanded * measured_axis < 0.0
+                    commanded_step * measured_axis < 0.0
                     and abs(measured_axis) > AXIS_AGREEMENT_MARGIN_M
                 )
-                if abs(commanded) >= AXIS_AGREEMENT_COMMAND_M and moved_opposite:
+                if abs(commanded_step) >= AXIS_AGREEMENT_COMMAND_M and moved_opposite:
                     reasons.append(
                         f"axis {axis}: target {commanded:+.2f} m, "
+                        f"commanded step {commanded_step:+.2f} m, "
                         f"start {entry['position_before_ned'][axis]:+.2f} m, "
                         f"end {entry['position_after_ned'][axis]:+.2f} m "
                         f"(moved {measured_axis:+.2f} m)"
@@ -4913,6 +5397,37 @@ EKF_VARIANCE_GROWTH = 1.2
 SENSOR_READ_TIMEOUT_S = 0.02
 SENSOR_DRAIN_LIMIT_S = 2.0
 MAX_DRAINED_RECORDS = 4096
+
+# The adapter's reader thread hands decoded records to the checklist through a
+# bounded queue. The bound is a record count, not a byte count: a pair's pixels
+# are filed to disk by the reader as the record is read, so the queue carries
+# metadata only. It is sized from values already declared — the 2 ms inertial
+# period and the 100 ms camera period of configs/first_indoor.yaml, and this
+# file's own drain valve above: one SENSOR_DRAIN_LIMIT_S window produces
+# 2.0/0.002 + 2.0/0.1 = 1020 records, so 1024 holds one full valve window.
+SENSOR_HANDOFF_RECORDS = 1024
+
+# The MAVLink handoff is bounded by the per-call cap the session's drain already
+# applies, so the queue holds one unread drain window per checklist absence and
+# sheds its oldest messages beyond that.
+MAX_QUEUED_MAVLINK_MESSAGES = 2000
+
+# How long the reader waits on each stream before repeating its sweep — the same
+# window an individual sensor read has always waited, kept as its own constant so
+# the drain constants above stay pinned — how long a consumer that finds the
+# MAVLink handoff empty gives the reader to deliver before folding "no change",
+# and how long the shutdown will wait for the reader to stop before proceeding.
+# The reader thread is a daemon besides, so a wedged reader cannot hold the
+# process anyway.
+READER_POLL_TIMEOUT_S = 0.02
+MAVLINK_ARRIVAL_WAIT_S = 0.05
+READER_JOIN_TIMEOUT_S = 5.0
+# How long inject() waits for the controller's fault acknowledgement before it
+# reports the injection as not applied. This is the same 10 s the wait has
+# always carried — it was an inline literal at its call site until the ack-wait
+# pacing was named — and the value itself has never moved; the name exists so a
+# test can bind the wait's pacing to it.
+INJECTION_ACK_TIMEOUT_S = 10.0
 
 # A wall-clock ceiling on the at-rest measurement. The window itself is measured in
 # simulation time; this only stops the probe from waiting forever if the simulation
