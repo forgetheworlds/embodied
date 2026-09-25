@@ -3263,16 +3263,26 @@ class WebotsArduPilot:
         applied when the controller's acknowledgement arrives, and not before.
         """
         self._gateway.send_fault(fault)
-        deadline = self._monotonic() + 10.0
+        deadline = self._monotonic() + INJECTION_ACK_TIMEOUT_S
         while self._monotonic() < deadline:
             record = self.sensor_record(0.25)
-            if record is None or record.fault_ack is None:
-                # Wait a little rather than spinning: the acknowledgement arrives on
-                # the same stream as the sensor records, so it needs its own step.
+            if record is None:
+                # The handoff stayed empty for the whole sensor-record timeout, so
+                # wait a little rather than spinning. A returned record loops
+                # immediately: the wait must not consume slower than the stream
+                # produces, or the bounded handoff sheds the acknowledgement behind
+                # the backlog before this poll ever reaches it.
                 self._sleep(0.05)
                 continue
             ack = record.fault_ack
+            if ack is None:
+                continue
             if ack.get("injection_id") != fault.injection_id:
+                # Another injection's answer, kept for the next reader. This
+                # branch paces itself: sensor_record reads _pending_records
+                # first, so a record parked here is handed straight back to this
+                # same wait, and re-reading it in place would spin here for ever
+                # without ever moving this wait's clock.
                 self._pending_records.append(record)
                 self._sleep(0.05)
                 continue
@@ -5206,6 +5216,12 @@ MAX_QUEUED_MAVLINK_MESSAGES = 2000
 READER_POLL_TIMEOUT_S = 0.02
 MAVLINK_ARRIVAL_WAIT_S = 0.05
 READER_JOIN_TIMEOUT_S = 5.0
+# How long inject() waits for the controller's fault acknowledgement before it
+# reports the injection as not applied. This is the same 10 s the wait has
+# always carried — it was an inline literal at its call site until the ack-wait
+# pacing was named — and the value itself has never moved; the name exists so a
+# test can bind the wait's pacing to it.
+INJECTION_ACK_TIMEOUT_S = 10.0
 
 # A wall-clock ceiling on the at-rest measurement. The window itself is measured in
 # simulation time; this only stops the probe from waiting forever if the simulation

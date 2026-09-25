@@ -2485,3 +2485,232 @@ def test_telemetry_folds_the_newest_message_not_the_newest_this_thread_read(tmp_
         assert again.local_position_ned == sample.local_position_ned
     finally:
         adapter.stop()
+
+
+# ---------------------------------------------------------------------------
+# The injection acknowledgement wait
+# ---------------------------------------------------------------------------
+
+
+class SilentFaultGateway:
+    """A controller that takes each fault and keeps its sensor stream silent.
+
+    It never answers on its own: the tests place any acknowledgement in the
+    stream themselves, so the wait's pacing is what is under test, not the
+    controller's willingness to answer.
+    """
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.faults = []
+        self.reads = 0
+        self.closed = False
+
+    def open(self, host, port, timeout_s):
+        return None
+
+    def read_record(self, timeout_s):
+        self.reads += 1
+        return None
+
+    def send_fault(self, injection):
+        self.faults.append(injection)
+
+    def close(self):
+        self.closed = True
+
+
+class LateAckGateway(SilentFaultGateway):
+    """A silent stream that lets one acknowledgement surface only after a delay.
+
+    The delay runs on the real clock from the stream's opening, because the
+    reader that would deliver the record runs on a real thread.
+    """
+
+    def __init__(self, clock, ack, delay_s):
+        super().__init__(clock)
+        self.ack = ack
+        self.delay_s = delay_s
+        self.opened_at = None
+
+    def open(self, host, port, timeout_s):
+        self.opened_at = time.monotonic()
+        return None
+
+    def read_record(self, timeout_s):
+        self.reads += 1
+        if self.ack is not None and time.monotonic() - self.opened_at >= self.delay_s:
+            ack, self.ack = self.ack, None
+            return ack
+        return None
+
+
+def acknowledgement_record(clock, injection):
+    """The record the controller sends for one fault, as FakeGateway builds it."""
+    return W.SensorRecord(
+        kind=W.Kind.FAULT_ACK,
+        sim_time_s=clock.monotonic() - 1000.0,
+        sequence=0,
+        flags=0,
+        received_stamp=W.ClockStamp(
+            host_id="test-host", clock_id="monotonic", monotonic_ns=clock.monotonic_ns()
+        ),
+        fault_ack={
+            "injection_id": injection.injection_id,
+            "applied": True,
+            "state": {},
+            "reason": None,
+        },
+    )
+
+
+def test_the_ack_wait_keeps_up_with_a_full_handoff(tmp_path, monkeypatch):
+    """An acknowledgement queued behind a full handoff is still found.
+
+    Iteration 5's defect: the wait taxed every returned record with a 50 ms
+    sleep — about 20 records a second against a stream that produces about
+    510 — so an acknowledgement entering behind a full bounded handoff was
+    shed off its head before the poll could reach it. Iteration 4's receipt
+    recorded exactly that: ``inj-001-clear`` answered ``"ack": null`` in both
+    runs. Here the handoff is full when the clear is sent, the
+    acknowledgement sits last in it, and the wait is given half a second: the
+    wait must consume what the stream produces and surface it anyway. Under
+    the old pacing this cannot pass — 1024 records at 20 a second is far
+    beyond half a second.
+    """
+    clock = FakeClock()
+    gateway = SilentFaultGateway(clock)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    fault = W.Injection.clear(1, kind="position_step")
+    inner = FakeGateway(clock)
+    # The hold loop has just drained and slept, as it always does before a
+    # clear is sent, so the acknowledgement enters behind a completely full
+    # handoff; enqueueing is the reader's own act, shed rule included.
+    for _ in range(W.SENSOR_HANDOFF_RECORDS):
+        adapter._enqueue(adapter._handoff, inner._imu())
+    adapter._enqueue(adapter._handoff, acknowledgement_record(clock, fault))
+    adapter.start()
+    try:
+        started = clock.now
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 0.5)
+        receipt = adapter.inject(fault)
+    finally:
+        adapter.stop()
+    assert gateway.faults == [fault], "the clear was never even sent"
+    assert receipt.applied is True
+    assert receipt.requested is fault
+    # The wait paid no 50 ms tax at all: a single sleep would have moved this
+    # fake clock by a whole step.
+    assert clock.now - started < 0.05
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["injection"] == fault.injection_id
+    assert line["ack"]["applied"] is True
+
+
+def test_the_ack_wait_still_sleeps_on_an_empty_stream_and_finds_a_late_ack(tmp_path, monkeypatch):
+    """The empty path keeps its courtesy sleep and still catches the answer.
+
+    The pacing change removes the tax on returned records, not the wait's
+    patience: while the stream is silent the poll still sleeps between reads,
+    and an acknowledgement that surfaces later — here a third of a second
+    after the stream opened — is found inside the deadline.
+    """
+    clock = FakeClock()
+    fault = W.Injection.clear(1, kind="position_step")
+    gateway = LateAckGateway(clock, acknowledgement_record(clock, fault), delay_s=0.3)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    adapter.start()
+    try:
+        started = clock.now
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 2.0)
+        receipt = adapter.inject(fault)
+    finally:
+        adapter.stop()
+    assert gateway.faults == [fault]
+    assert receipt.applied is True
+    assert receipt.acknowledged_state is not None
+    # The stream was empty on the first read, so the wait slept: the fake
+    # clock only moves when somebody waits, and it floors every sleep at its
+    # own 0.05 s step, so any movement at all proves the empty path slept
+    # rather than spinning; the deadline was never reached.
+    assert clock.now > started
+    assert clock.now - started < 2.0
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["ack"]["injection_id"] == fault.injection_id
+
+
+def test_an_acknowledgement_that_never_arrives_is_reported_at_the_deadline(tmp_path, monkeypatch):
+    """No acknowledgement means applied: False, with the documented reason.
+
+    A missing acknowledgement is reported as missing information, never
+    assumed into a success: at the shortened deadline the receipt says the
+    controller did not acknowledge, and the evidence line records the null
+    ack — the shape both iteration-4 runs produced for ``inj-001-clear``.
+    """
+    clock = FakeClock()
+    gateway = SilentFaultGateway(clock)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    adapter.start()
+    try:
+        started = clock.now
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 0.1)
+        receipt = adapter.inject(W.Injection.clear(1, kind="position_step"))
+    finally:
+        adapter.stop()
+    assert gateway.faults, "the injection was not even sent"
+    assert receipt.applied is False
+    assert receipt.acknowledged_state is None
+    assert receipt.reason == "the controller did not acknowledge the injection within 10 s"
+    # The wait stopped at its deadline instead of wandering past it.
+    assert clock.now - started < 0.5
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["ack"] is None
+
+
+def test_a_foreign_acknowledgement_is_parked_without_spinning_the_wait(tmp_path, monkeypatch):
+    """An answer to another injection is kept, not re-read in place for ever.
+
+    The mismatch branch hands the record back to ``_pending_records``, which
+    ``sensor_record`` reads first: a wait that re-read it without ever waiting
+    would spin there for ever without advancing its own deadline. Iteration 5's
+    first cut did exactly that — a foreign acknowledgement made this wait
+    outlive a 25 s kill while its own deadline was half a second — so the wait
+    must pace itself, keep the foreign record for the next reader, and report
+    the requested fault as not applied at its deadline. The call runs on its own
+    thread so a regression fails here instead of stalling the whole suite.
+    """
+    clock = FakeClock()
+    fault = W.Injection.clear(1, kind="position_step")
+    foreign = W.Injection.clear(9, kind="position_step")
+    gateway = LateAckGateway(clock, acknowledgement_record(clock, foreign), delay_s=0.0)
+    adapter, _, writer, _ = reading_rig(tmp_path, gateway, clock=clock)
+    adapter.start()
+    try:
+        monkeypatch.setattr(W, "INJECTION_ACK_TIMEOUT_S", 0.5)
+        started = clock.now
+        outcome = {}
+
+        def wait_for_the_answer():
+            outcome["receipt"] = adapter.inject(fault)
+
+        caller = threading.Thread(target=wait_for_the_answer, daemon=True)
+        caller.start()
+        caller.join(timeout=10.0)
+        assert not caller.is_alive(), (
+            "the wait never returned: it re-read the parked record instead of pacing itself"
+        )
+        receipt = outcome["receipt"]
+    finally:
+        adapter.stop()
+    assert gateway.faults == [fault]
+    assert receipt.applied is False, "another injection's answer is not this fault's answer"
+    assert receipt.acknowledged_state is None
+    # The foreign record was kept for the next reader, not consumed by this wait.
+    parked = [record.fault_ack for record in adapter._pending_records if record.fault_ack]
+    assert [entry["injection_id"] for entry in parked] == [foreign.injection_id]
+    # And the wait walked its own deadline out instead of spinning in place.
+    assert clock.now > started
+    assert clock.now - started <= 1.0
+    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    assert line["injection"] == fault.injection_id
+    assert line["ack"] is None
