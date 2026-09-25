@@ -833,11 +833,10 @@ def run_validation(config_path: Path, *, code_revision: str) -> int:
     referee_cfg = section["referee"]
     evidence = section["evidence"]
 
-    calibration = build_calibration(
-        time_offset_s=0.0,
-        time_offset_error_s=None,  # measured below, then built into the final record
-        validated_limits=None,
-    )
+    # The record before measurement: no offset and no error yet — both None,
+    # because an offset without its measured error is refused by design. The
+    # final record below is built with the measured pair.
+    calibration = build_calibration()
 
     # --- inputs: discover, hash, bind capture identities -------------------
     surfaces = [DeclaredSurface.from_config(entry) for entry in referee_cfg["surfaces"]]
