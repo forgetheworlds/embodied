@@ -1972,6 +1972,23 @@ def test_the_flown_yaw_pairing_is_the_firmware_stock_paired_with_the_flown_rate_
     assert "ATC_RAT_YAW_I" not in layered
 
 
+def test_guided_takeoff_uses_a_brakeable_climb_speed_for_this_short_hover():
+    """The 1.5 m takeoff should not inherit the firmware's 2.5 m/s climb.
+
+    In iteration 8 both runs actually reached 2.30-2.35 m/s during the climb,
+    overshot to 2.53/2.72 m, then cut throttle into the servo floor. The
+    firmware's WP_SPD_UP default is 2.5 m/s (AC_WPNav.cpp:12,67-74); Guided
+    position control reads it at mode_guided.cpp:251-263 and auto_takeoff.run()
+    uses that position controller (takeoff.cpp:158-202). 1.0 m/s keeps the
+    predicted 1 m/s² stopping distance at 0.5 m, not 2.76 m at 2.35 m/s.
+    """
+    layered = W.read_configured_parameters(
+        [SCENE / "params" / name for name in
+         ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")]
+    )
+    assert layered["WP_SPD_UP"] == 1.0
+
+
 def test_the_probe_requests_control_again_while_the_vehicle_refuses(tmp_path):
     """A vehicle that has just booted is still waiting for its GPS, home and IMU.
 

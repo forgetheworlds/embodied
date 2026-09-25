@@ -82,3 +82,12 @@ ATC_RAT_PIT_D   0.003
 # The scheduler loop rate a 500 Hz sensor interface supports. Derived, not tuned:
 # ArduPilot requires the gyro rate to be at least 1.8 times this value.
 SCHED_LOOP_RATE 250
+
+# Iteration 10: guided takeoff/vertical position control reads WP_SPD_UP
+# (ArduCopter/mode_guided.cpp:251-263, takeoff.cpp:158-202). Firmware's 2.5 m/s
+# default (AC_WPNav.cpp:12,67-74) actually produced 2.30-2.35 m/s at 0.84/0.94 m
+# during the 1.5 m climb, followed by 2.53/2.72 m peaks and a collective cut
+# into the 1150 us servo floor (accept-mission-08 run-a/run-b mavlink.jsonl).
+# 1.0 m/s has a 0.50 m stopping distance at the firmware's 1.0 m/s² default
+# vertical acceleration limit, versus 2.76 m from the measured 2.35 m/s.
+WP_SPD_UP       1.0
