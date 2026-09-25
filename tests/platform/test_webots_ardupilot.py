@@ -822,6 +822,29 @@ def test_propeller_thrust_is_linearized_before_it_reaches_the_motor():
     assert W.propeller_velocity(-0.25, max_velocity=100.0) == pytest.approx(-50.0)
     assert W.propeller_velocity(0.0, max_velocity=100.0) == pytest.approx(0.0)
 
+def test_iris_motor_order_and_roll_pitch_geometry_match_the_quad_x_mixer():
+    """Pin scene facts, not the refuted analytic prediction about yaw torque.
+
+    Pinned AP_MotorsMatrix.cpp:530-545,592-600 uses motor order 1..4,
+    roll signs [-,+,+,-] and pitch signs [+,-,+,-]. Webots Iris.proto keeps
+    the upstream thrust/multiplier pairing that produces upward thrust.
+    """
+    scene = (SCENE / "protos" / "Iris.proto").read_text()
+    centers = [(float(x), float(y)) for x, y in re.findall(
+        r"centerOfThrust\s+([+-]?[0-9.]+)\s+([+-]?[0-9.]+)\s+[+-]?[0-9.]+", scene
+    )]
+    assert re.findall(r'name "(m[1-4]_motor)"', scene) == [
+        "m1_motor", "m2_motor", "m3_motor", "m4_motor"
+    ]
+    assert centers == [(0.13, -0.22), (-0.13, 0.2), (0.13, 0.22), (-0.13, -0.2)]
+    assert [float(v) for v in re.findall(r"thrustConstants\s+([^\s]+)\s+0", scene)] == [
+        0.0012, 0.0012, -0.0012, -0.0012
+    ]
+    assert [int(v) for v in re.findall(r"multiplier\s+(-?1)\b", scene)] == [
+        1, 1, -1, -1
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Frame measurement and colour
 # ---------------------------------------------------------------------------
