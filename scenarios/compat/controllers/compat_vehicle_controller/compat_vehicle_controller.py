@@ -85,6 +85,7 @@ def parse_args():
     parser.add_argument("--gps", default="gps")
     parser.add_argument("--imu-period-ms", type=int, default=10)
     parser.add_argument("--status-interval", type=int, default=100)
+    parser.add_argument("--pose-period-ms", type=int, default=20)
     args = parser.parse_args()
     args.motors = [name.strip() for name in args.motors.split(",") if name.strip()]
     return args
@@ -373,8 +374,10 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
     """The simulation loop: flight state out, motor commands in, records beside."""
     camera_period_ms = max(int(args.camera_period_ms), devices.timestep_ms)
     imu_period_ms = max(int(args.imu_period_ms), devices.timestep_ms)
+    pose_period_ms = max(int(args.pose_period_ms), devices.timestep_ms)
     next_camera_ms = 0
     next_imu_ms = 0
+    next_pose_ms = 0
     pair_counter = 0
     last_flight_state = None
     while True:
@@ -447,12 +450,16 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
                     units="m/s^2; rad/s; rad, ENU negated on y and z into NED",
                 ),
             )
-            # The pose rides the stream beside the inertial sample: the same
-            # position and attitude the flight-state packet carries this step
-            # (including any applied position fault), already in ArduPilot's NED
-            # frame. The analysis process republishes it to the autopilot as
-            # VISION_POSITION_ESTIMATE so EKF3 can fly on the simulator's own
-            # state instead of a synthesized compass.
+
+        if elapsed_ms >= next_pose_ms:
+            next_pose_ms = elapsed_ms + pose_period_ms
+            # The pose rides the stream on its own cadence: the same position and
+            # attitude the flight-state packet carries this step (including any
+            # applied position fault), already in ArduPilot's NED frame, sent at
+            # --pose-period-ms (default 20) because EKF3 accepts an external-nav
+            # measurement only every 20 ms and the analysis process republishes it
+            # to the autopilot as VISION_POSITION_ESTIMATE. Flooding it at the
+            # 2 ms inertial cadence doubled the stream's record volume for nothing.
             channel.send(
                 SHARED.Kind.POSE,
                 devices.simulator_time_s(),

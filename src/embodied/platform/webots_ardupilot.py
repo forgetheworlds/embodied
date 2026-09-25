@@ -1902,8 +1902,11 @@ ALLOWED_OUTBOUND_TYPES = frozenset(
 # How often the vision feed republishes the latest simulator pose. EKF3 rejects
 # external-navigation measurements closer together than 20 ms
 # (AP_NavEKF3.h:516, extNavIntervalMin_ms = 20, pinned commit af85259), so the
-# feed runs at 25 ms — comfortably inside what the filter accepts, and far below
-# the ~2 ms cadence the controller streams pose samples at.
+# feed runs at 25 ms — comfortably inside what the filter accepts, and at the
+# controller's own 20 ms pose cadence (the controller's --pose-period-ms default)
+# the stream carries one small pose record beside every 25 inertial samples
+# instead of one per inertial sample, which starved the stereo pairs in the
+# readiness handoff (measured, extnav-it2 run-a: pair=no at the 90 s deadline).
 VISION_POSE_PERIOD_S = 0.025
 
 
