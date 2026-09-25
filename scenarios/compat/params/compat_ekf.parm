@@ -18,5 +18,12 @@ EK2_ENABLE 0
 # fusing this synthesized compass. Remove it from the fusion and forbid
 # mid-flight mag calibration so the remaining attitude source is the inertial
 # unit plus GPS. One change-set: the synthesized magnetometer.
+#
+# EK3_SRC1_YAW 3 (GPS) is mandatory alongside MAG_CAL 5: pinned firmware
+# rejects that combination otherwise - libraries/AP_NavEKF3/AP_NavEKF3.cpp:1180-1184
+# returns "EK3_MAG_CAL and EK3_SRC1_YAW inconsistent" unless the yaw source is
+# GPS. accept-mission-13 confirmed that rule the hard way (both runs refused
+# to arm with exactly that message).
 COMPASS_USE 0
 EK3_MAG_CAL 5
+EK3_SRC1_YAW 3
