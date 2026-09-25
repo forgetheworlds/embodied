@@ -2220,3 +2220,268 @@ def test_the_real_runner_stops_a_sigterm_ignoring_child_and_the_process_group_it
     assert runner.poll(child) is not None
     _wait_until_gone(child.pid)
     _wait_until_gone(grandchild_pid)
+
+
+# ---------------------------------------------------------------------------
+# The reader thread
+# ---------------------------------------------------------------------------
+
+
+class FiniteGateway:
+    """A controller stream with a fixed set of records, then silence."""
+
+    def __init__(self, records):
+        self.records = list(records)
+        self.reads = 0
+        self.closed = False
+
+    def open(self, host, port, timeout_s):
+        return None
+
+    def read_record(self, timeout_s):
+        self.reads += 1
+        return self.records.pop(0) if self.records else None
+
+    def send_fault(self, injection):
+        raise AssertionError("the reader tests never inject")
+
+    def close(self):
+        self.closed = True
+
+
+class EndlessGateway:
+    """A controller whose stream never ends: one fresh inertial record per read.
+
+    ``record_cost_s`` makes production slower than a consumer, so a consumer pass
+    has to wait for the reader the way it waits on a real stream.
+    """
+
+    def __init__(self, clock, record_cost_s=0.001):
+        self.clock = clock
+        self.record_cost_s = record_cost_s
+        self.produced = 0
+        self.closed = False
+
+    def open(self, host, port, timeout_s):
+        return None
+
+    def read_record(self, timeout_s):
+        time.sleep(self.record_cost_s)
+        self.produced += 1
+        return W.SensorRecord(
+            kind=W.Kind.IMU,
+            sim_time_s=self.clock.monotonic() - 1000.0,
+            sequence=self.produced,
+            flags=0,
+            received_stamp=W.ClockStamp(
+                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+            ),
+            imu=W.ImuPayload(
+                capture_host_ns=self.clock.monotonic_ns(),
+                accelerometer=(0.0, 0.0, -9.81),
+                gyro=(0.0, 0.0, 0.0),
+                inertial_unit_rpy=(0.0, 0.0, 0.0),
+                device_names=("accelerometer", "gyro", "inertial unit"),
+                units="m/s^2; rad/s; rad, ENU negated on y and z into NED",
+            ),
+        )
+
+    def send_fault(self, injection):
+        raise AssertionError("the reader tests never inject")
+
+    def close(self):
+        self.closed = True
+
+
+def reading_rig(tmp_path, gateway, *, clock=None, session=None):
+    """A real adapter whose reader files through the probe's own filing path."""
+    clock = clock or FakeClock()
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+    probe = W.CompatibilityProbe(
+        settings,
+        output_dir=tmp_path / "out",
+        runner_factory=FakeRunner,
+        session_factory=lambda: session or ScriptedMavlinkSession(clock),
+        gateway_factory=lambda: gateway,
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    writer = W.EvidenceWriter(tmp_path / "out", "run-a")
+    adapter = probe._new_adapter(writer, "run-a", ())
+    log = W._FlightLog()
+    probe._calibration = W.load_calibration_declaration(settings.calibration_path)
+    adapter.record_sink = lambda record: probe._file_stream_record(
+        record, adapter, writer, log, label="run-a"
+    )
+    return adapter, probe, writer, log
+
+
+def test_records_read_while_the_consumer_is_elsewhere_are_all_kept(tmp_path):
+    """The stream is read while nobody is consuming it, and nothing is lost.
+
+    Iteration 3's defect: reading shared a thread with the checklist, so a long
+    phase stopped the reading and the bounded queues dropped what arrived. Here
+    the consumer stays away while the whole stream arrives; every record is filed
+    to evidence and then handed over, in order, with the pixels already on disk —
+    which is what keeps the handoff itself metadata-only.
+    """
+    inner = FakeGateway(FakeClock())
+    records = [inner._status()]
+    for _ in range(12):
+        records.append(inner._pair())
+        records.append(inner._imu())
+    gateway = FiniteGateway(records)
+    adapter, _, writer, log = reading_rig(tmp_path, gateway)
+    # What the consumer passes would have declared by the time these arrive.
+    adapter.reader_phase = "flight"
+    adapter.start()
+    try:
+        # The consumer is deliberately elsewhere while the reader drinks the stream.
+        deadline = time.monotonic() + 5.0
+        while gateway.reads < len(records) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert gateway.reads >= len(records), "the reader never finished the stream"
+        handed = []
+        while True:
+            record = adapter.sensor_record(0.02)
+            if record is None:
+                break
+            handed.append(record)
+    finally:
+        adapter.stop()
+    assert len(handed) == len(records)
+    assert [(record.kind, record.sequence) for record in handed] == [
+        (record.kind, record.sequence) for record in records
+    ]
+    # Pair pixels were filed by the reader, so the handoff carried metadata only.
+    assert all(record.pair is None for record in handed if record.kind is W.Kind.PAIR)
+    assert all(record.imu is not None for record in handed if record.kind is W.Kind.IMU)
+    # And every filed record is in the evidence: 12 pairs, 12 inertial samples.
+    assert len(log.pair_metadata) == 12
+    assert len(log.imu) == 12
+    assert len((writer.directory / "imu.jsonl").read_text().splitlines()) == 12
+    assert len((writer.directory / "pairs.jsonl").read_text().splitlines()) == 12
+    assert len(list((writer.directory / "pairs").glob("*-left.ppm"))) == 12
+
+
+def test_the_consumer_pass_reports_when_its_own_valve_stops_it(tmp_path):
+    """The drain bounds cap the consumer's pass, not the socket.
+
+    The valve is wall time on the consumer, so this rig runs on the real clock.
+    A pass that gives up must leave the stream still being read: the next pass
+    gets records the reader gathered while this one had given up, and the pass's
+    own accounting says it stopped early.
+    """
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+    probe = W.CompatibilityProbe(
+        settings,
+        output_dir=tmp_path / "out",
+        runner_factory=FakeRunner,
+        session_factory=lambda: ScriptedMavlinkSession(FakeClock()),
+        gateway_factory=lambda: EndlessGateway(FakeClock()),
+        monotonic_ns=time.monotonic_ns,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    )
+    writer = W.EvidenceWriter(tmp_path / "out", "run-a")
+    adapter = probe._new_adapter(writer, "run-a", ())
+    log = W._FlightLog()
+    adapter.record_sink = lambda record: None  # the valve, not the filing, is under test
+    adapter.start()
+    try:
+        first = probe._read_records(adapter, writer, log, label="run-a")
+        stats = probe.reader_stats()
+        assert stats["drains"] == 1
+        assert stats["records"] == len(first)
+        assert stats["drains_stopped_early"] == 1, stats
+        assert len(first) < W.MAX_DRAINED_RECORDS, (
+            "the time valve fired, so the record bound was never reached"
+        )
+        # The socket was not left behind: the reader kept reading while the
+        # consumer's valve had stopped it, so the next pass is served at once.
+        second = probe._read_records(adapter, writer, log, label="run-a")
+        assert second
+    finally:
+        adapter.stop()
+
+
+def test_an_endless_stream_neither_hangs_nor_grows_the_handoff_unbounded(tmp_path):
+    """A stream that never ends cannot hang the run or grow the handoff.
+
+    The reader keeps reading; the handoff stops growing at its declared bound; a
+    consumer that comes back is served at once; and the adapter still shuts down
+    promptly with the reader mid-stream.
+    """
+    gateway = EndlessGateway(FakeClock(), record_cost_s=0.0005)
+    adapter, _, _, _ = reading_rig(tmp_path, gateway)
+    adapter.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if adapter._handoff.qsize() >= W.SENSOR_HANDOFF_RECORDS:
+                break
+            time.sleep(0.01)
+        # One more beat: the stream keeps producing past the bound, so what holds
+        # the size down is the bound's shedding, never the stream's end.
+        time.sleep(0.05)
+        assert adapter._handoff.qsize() <= W.SENSOR_HANDOFF_RECORDS
+        assert gateway.produced > W.SENSOR_HANDOFF_RECORDS, (
+            "the stream really ran past the bound, so the bound is what stopped the growth"
+        )
+        started = time.monotonic()
+        record = adapter.sensor_record(0.05)
+        assert record is not None
+        assert time.monotonic() - started < 2.0
+    finally:
+        stop_started = time.monotonic()
+        adapter.stop()
+    assert time.monotonic() - stop_started < W.READER_JOIN_TIMEOUT_S + 2.0
+    assert gateway.closed
+
+
+def test_telemetry_folds_the_newest_message_not_the_newest_this_thread_read(tmp_path):
+    """The newest state reaches the fold even when this thread never read it.
+
+    Iteration 3's second defect: a waypoint record's start sample described the
+    vehicle as it had been tens of seconds earlier, because the messages had
+    waited for a busy thread. Here several batches collect while the main thread
+    reads none of them; the next fold must carry the newest one.
+    """
+    clock = FakeClock()
+
+    class AdvancingVehicle(ScriptedMavlinkSession):
+        """Every batch the reader collects reports the vehicle half a metre further."""
+
+        def _telemetry_batch(self):
+            messages = super()._telemetry_batch()
+            self.position = (self.position[0] + 0.5, self.position[1], self.position[2])
+            for message in messages:
+                if message["mavpackettype"] == "LOCAL_POSITION_NED":
+                    message["x"] = self.position[0]
+            return messages
+
+    session = AdvancingVehicle(clock)
+    gateway = FakeGateway(clock)
+    adapter, _, _, _ = reading_rig(tmp_path, gateway, clock=clock, session=session)
+    adapter.start()
+    try:
+        deadline = time.monotonic() + 5.0
+        while session.drains < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert session.drains >= 4, "the reader never collected the batches"
+        # Freeze the handoff so the assertion is exact: the fold must reach the
+        # newest batch the reader collected.
+        adapter._reader_stop.set()
+        adapter._reader_thread.join(timeout=2.0)
+        sample = adapter.telemetry()
+        assert sample.local_position_ned[0] == pytest.approx(0.5 * session.drains)
+        assert sample.messages_seen >= 2, (
+            "the newest batch was folded, whatever the queue shed ahead of it"
+        )
+        # With nothing new, the fold keeps the last known state.
+        again = adapter.telemetry()
+        assert again.messages_seen == 0
+        assert again.local_position_ned == sample.local_position_ned
+    finally:
+        adapter.stop()
