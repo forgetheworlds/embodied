@@ -656,8 +656,18 @@ class TestPinEvidence:
             tmp_path,
             SensorMode.SENSOR_DERIVED,
         )
-        assert satisfied is True
-        row = {entry["name"]: entry for entry in rows}["estimator_pin"]
+        # The preflight's TOTAL also covers the BUILT estimator process
+        # (estimator/ov_stream), which is a build output kept out of the repository
+        # by estimator/.gitignore: a checkout that has not run
+        # estimator/build-openvins.sh cannot satisfy it. This test is about the
+        # PIN's row being measured rather than inferred, so it holds that row and
+        # requires any unsatisfied row to be a build output rather than a missing
+        # pin — asserting on the total would only test whether this machine has
+        # run the build.
+        rows_by_name = {entry["name"]: entry for entry in rows}
+        unsatisfied = sorted(name for name, entry in rows_by_name.items() if not entry["satisfied"])
+        assert set(unsatisfied) <= {"estimator_seam"}, unsatisfied
+        row = rows_by_name["estimator_pin"]
         assert row["satisfied"] is True
         evidence = row["evidence"]
         assert evidence["tarball_matches_configured_pin"] is True
@@ -667,7 +677,13 @@ class TestPinEvidence:
         # The hashes are of the files themselves, not of their configured names.
         root = check.repository_root()
         for key in ("library", "executable"):
-            digest = hashlib.sha256((root / evidence[key]["path"]).read_bytes()).hexdigest()
+            path = root / evidence[key]["path"]
+            if not path.is_file():
+                # Only the built process may be absent; the library comes from the
+                # pinned tarball's evidence and its absence is a real failure.
+                assert key == "executable", f"{key} is missing but is not a build output: {path}"
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
             assert evidence[key]["sha256"] == digest
 
     def test_a_tarball_that_is_not_the_pin_fails_the_row_naming_both_digests(self, tmp_path):
