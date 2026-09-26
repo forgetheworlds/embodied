@@ -29,12 +29,14 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from datetime import datetime, timezone
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 __all__ = [
     "AlignmentError",
+    "BringUpLink",
     "EstimatorState",
     "ExternalNavPublisher",
     "HealthBounds",
@@ -809,3 +811,236 @@ class ExternalNavPublisher:
         self._connection.mav.vision_speed_estimate_send(
             usec, velocity[0], velocity[1], velocity[2]
         )
+# ---------------------------------------------------------------------------
+# The ordered bring-up's own link to the autopilot (plan sections 0.6 item 6
+# and 0.8 item 7, Deliverable B)
+# ---------------------------------------------------------------------------
+#
+# The bridge's ``PymavlinkSession`` refuses every message type outside its own
+# ``ALLOWED_OUTBOUND_TYPES`` (webots_ardupilot.py:1951-1958), and two of the
+# bring-up's declarations are not in that set: the EKF origin datum
+# (SET_GPS_GLOBAL_ORIGIN) and the window's parameter writes (PARAM_SET). Adding
+# them to the bridge's list would widen what the SCORED arm can put on the wire,
+# and that file is outside this slice's bounded ownership, so the bring-up sends
+# them on its own connection -- the pattern this module already established for
+# the estimator's seam, where ``ExternalNavPublisher`` opens its own autopilot
+# link rather than borrowing the session's.
+#
+# Exactly three outbound types are allowed here, and each one is a declaration
+# the plan names. The link carries no pose and no motion of its own beyond the
+# one bounded takeoff the window declares.
+BRING_UP_ALLOWED_OUTBOUND_TYPES = frozenset(
+    {
+        # The EKF ORIGIN datum. This is a frame definition, not a pose feed:
+        # it names the geographic anchor of the local frame the vehicle's own
+        # pose is measured in, and the vehicle's attitude and position are its
+        # own. EKF3 never sets that origin from ExternalNav data
+        # (AP_NavEKF3_Measurements.cpp:680-715) -- only from GPS, a beacon, or
+        # this GCS declaration (``GCS_MAVLINK::set_ekf_origin``,
+        # GCS_Common.cpp:3961, reached by SET_GPS_GLOBAL_ORIGIN at :3982-4014)
+        # -- so a GPS-off flight must declare it or nothing has an origin.
+        "SET_GPS_GLOBAL_ORIGIN",
+        # The declared exception window's parameter writes: the ARMING_CHECK
+        # mask and the window's source selection, each restored with the
+        # vehicle's own readback before the claimed arm.
+        "PARAM_SET",
+        # The ALT_HOLD excitation's takeoff, with the one flag that mode needs
+        # (``webots_ardupilot.py:2248-2264`` sends param3 = 0, which makes
+        # ``must_navigate`` true at ArduCopter/GCS_Mavlink_Copter.cpp:594 and
+        # refuses ALT_HOLD's user takeoff at mode.h:512-514).
+        "COMMAND_LONG",
+    }
+)
+
+# MAV_CMD_NAV_TAKEOFF and its documented param3 flag: "the horizontal position
+# is not required to take off" (common.xml:1005). ALT_HOLD's takeoff is a
+# manual-throttle-mode climb, not a navigation, so the flag is what makes it
+# legal for that mode; without it the command is refused outright.
+MAV_CMD_NAV_TAKEOFF = 22
+NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED = 1
+
+
+class BringUpLink:
+    """The declared ordered bring-up's own MAVLink connection to the autopilot.
+
+    Three sends, each recorded as it goes out so the receipt states exactly what
+    the window declared rather than what it intended to declare: the origin
+    datum, one parameter write at a time, and the bounded excitation's takeoff.
+    Every reply the autopilot makes on this link is kept beside them -- a
+    COMMAND_ACK's result is the vehicle's own answer to the takeoff, and a
+    PARAM_VALUE or PARAM_ERROR is its answer to a write.
+
+    The endpoint must be a port the running autopilot actually serves: the
+    pinned SITL accepts one TCP client per serial port, so a port another client
+    owns yields a connection that is accepted and never read. An unanswered
+    heartbeat is therefore a raised error, exactly as the publisher's is.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        source_system: int = 250,
+        source_component: int = 191,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._endpoint = endpoint
+        self._source_system = source_system
+        self._source_component = source_component
+        self._clock = clock
+        self._connection: Any = None
+        self._mavutil: Any = None
+        self.target_system = 0
+        self.target_component = 0
+        self.sent: list[dict[str, Any]] = []
+        self.replies: list[dict[str, Any]] = []
+
+    def connect(self, timeout_s: float = 15.0) -> None:
+        try:
+            from pymavlink import mavutil
+        except ImportError as error:  # pragma: no cover - pinned dependency
+            raise RuntimeError(f"pymavlink is required for the bring-up link: {error}") from error
+        self._mavutil = mavutil
+        self._connection = mavutil.mavlink_connection(
+            self._endpoint, source_system=self._source_system, source_component=self._source_component
+        )
+        if self._connection.wait_heartbeat(timeout=timeout_s) is None:
+            self._connection.close()
+            self._connection = None
+            raise RuntimeError(
+                f"no MAVLink heartbeat on {self._endpoint} within {timeout_s:.0f}s: the "
+                "autopilot does not serve this link, so the bring-up's declarations "
+                "would be a silent void (the pinned SITL accepts one TCP client per "
+                "serial port)"
+            )
+        self.target_system = self._connection.target_system
+        self.target_component = self._connection.target_component
+
+    def close(self) -> None:
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            finally:
+                self._connection = None
+
+    def _send(self, message: Any, declaration: dict[str, Any]) -> dict[str, Any]:
+        message_type = message.get_type()
+        if message_type not in BRING_UP_ALLOWED_OUTBOUND_TYPES:
+            raise RuntimeError(
+                f"refusing to send {message_type} on the bring-up link: the declared "
+                "bring-up carries the origin datum, the window's parameter writes and "
+                "the bounded excitation's takeoff, and nothing else"
+            )
+        if self._connection is None:
+            raise RuntimeError("the bring-up link is not connected")
+        self._connection.mav.send(message)
+        record = {"at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), **declaration}
+        self.sent.append(record)
+        return record
+
+    def declare_origin_datum(
+        self, latitude_deg: float, longitude_deg: float, altitude_m: float
+    ) -> dict[str, Any]:
+        """Declare the local frame's origin once (SET_GPS_GLOBAL_ORIGIN, msgid 48).
+
+        The message carries the frame's geographic anchor and no vehicle state:
+        ArduPilot's handler converts it to a ``Location`` and calls
+        ``set_ekf_origin``, which refuses a re-declaration
+        (``get_origin`` already set -> MAV_RESULT_FAILED), so this is a datum set
+        once per invocation. The altitude is absolute (MSL) and goes on the wire
+        in millimetres, which is the message's declared unit.
+        """
+        message = self._connection.mav.set_gps_global_origin_encode(
+            self.target_system,
+            int(round(latitude_deg * 1e7)),
+            int(round(longitude_deg * 1e7)),
+            int(round(altitude_m * 1e3)),
+            int(round(self._clock() * 1e6)),
+        )
+        return self._send(
+            message,
+            {
+                "message": "SET_GPS_GLOBAL_ORIGIN",
+                "message_id": 48,
+                "latitude_deg": latitude_deg,
+                "longitude_deg": longitude_deg,
+                "altitude_msl_m": altitude_m,
+                "meaning": (
+                    "the local frame's origin datum: a frame definition set once, "
+                    "carrying no vehicle pose"
+                ),
+            },
+        )
+
+    def set_parameter(self, name: str, value: float) -> dict[str, Any]:
+        """Write one parameter (PARAM_SET). The write is verified by readback."""
+        message = self._connection.mav.param_set_encode(
+            self.target_system,
+            self.target_component,
+            name.encode("ascii"),
+            float(value),
+            self._mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+        )
+        return self._send(
+            message, {"message": "PARAM_SET", "name": name, "value": float(value)}
+        )
+
+    def takeoff_without_horizontal_position(self, altitude_m: float) -> dict[str, Any]:
+        """The excitation's takeoff: MAV_CMD_NAV_TAKEOFF with the flag ALT_HOLD needs.
+
+        ``param3 = NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED`` is the
+        documented declaration that the climb is not a navigation
+        (common.xml:1005): it makes ``must_navigate`` false
+        (GCS_Mavlink_Copter.cpp:594), which is what lets a mode that requires no
+        position accept a user takeoff (mode.h:512-514). ``param7`` is the
+        bounded excitation's own altitude.
+        """
+        message = self._connection.mav.command_long_encode(
+            self.target_system,
+            self.target_component,
+            MAV_CMD_NAV_TAKEOFF,
+            0,
+            0.0,
+            0.0,
+            float(NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED),
+            0.0,
+            0.0,
+            0.0,
+            float(altitude_m),
+        )
+        return self._send(
+            message,
+            {
+                "message": "COMMAND_LONG",
+                "command": MAV_CMD_NAV_TAKEOFF,
+                "command_name": "MAV_CMD_NAV_TAKEOFF",
+                "param3": NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED,
+                "param3_meaning": "NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED",
+                "param7_altitude_m": float(altitude_m),
+            },
+        )
+
+    def drain(self) -> list[dict[str, Any]]:
+        """Every reply that has arrived since the last call, stamped as it is read."""
+        if self._connection is None:
+            return []
+        arrived: list[dict[str, Any]] = []
+        while len(arrived) < 200:
+            message = self._connection.recv_match(blocking=False)
+            if message is None:
+                break
+            document = message.to_dict()
+            document.setdefault("mavpackettype", message.get_type())
+            document["received_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            arrived.append(document)
+        self.replies.extend(arrived)
+        return arrived
+
+    def command_ack(self, command: int) -> dict[str, Any] | None:
+        """The autopilot's own answer to one command, if it has arrived."""
+        for reply in reversed(self.replies):
+            if reply.get("mavpackettype") == "COMMAND_ACK" and reply.get("command") == command:
+                return reply
+        return None

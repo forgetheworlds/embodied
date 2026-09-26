@@ -224,6 +224,215 @@ DIAGNOSTIC_TRUTH_EXEMPTION = (
     "estimator works"
 )
 
+# ---------------------------------------------------------------------------
+# The declared ordered bring-up (plan sections 0.6 item 6 and 0.8 item 7,
+# Deliverable B): what makes the sensor-derived arm flyable at all
+# ---------------------------------------------------------------------------
+#
+# E1-DIAG settled the deadlock (work/runs/p01-localization/E1-DIAG-report.md):
+# VioManager::initialized() = is_initialized_vio && timelastupdate != -1
+# (VioManager.h:99), timelastupdate is written only at the tail of
+# do_feature_propagate_update (VioManager.cpp:651), which needs motion -- and
+# the arm gate forbids motion until the vision source is healthy
+# (Check::VISION, AP_Arming.cpp:2090 -> AP_VisualOdom::pre_arm_check) and home
+# exists (Check::GPS, AP_Arming.cpp:748). The diagnostic measured the pinned
+# estimator latching under measured motion, so the remedy is an ORDERED
+# BRING-UP: a bounded window that applies a DECLARED exception and the origin
+# DATUM, flies the excitation, and then RESTORES the full check set with the
+# vehicle's own readback before the scored window opens -- never a silent
+# disable, and never anything that changes what supplies the estimator's input
+# or the scored arm's pose.
+#
+# The exception window is carried as constants rather than configuration keys:
+# the shared cli.py schema rejects unknown localization keys
+# (cli.py:446-448) and the compatibility probe loads this file through that
+# loader (webots_ardupilot.py:5734), so a key here would break
+# `python -m embodied compat` -- the P00 gate's own command (plan section 0.8
+# item 3, Correction C). configs/first_indoor.yaml carries the same
+# declaration as a comment beside the section it belongs to.
+
+# The exception mask's bits and its parameter. AP_Arming::check_enabled is
+# `(checks_to_skip & uint32_t(check)) == 0` (AP_Arming.cpp:329-332), so a SET
+# bit SKIPS that check and 0 is "skip nothing", i.e. every check enabled.
+ARMING_CHECK_BIT_GPS = 1 << 3  # Check::GPS, AP_Arming.h:31
+ARMING_CHECK_BIT_VISION = 1 << 18  # Check::VISION, AP_Arming.h:46
+# The window ORs in exactly the two checks the plan declares excepted.
+BRING_UP_ARMING_SKIP_WINDOW = ARMING_CHECK_BIT_GPS | ARMING_CHECK_BIT_VISION
+BRING_UP_ARMING_ALL_CHECKS_ENABLED = 0
+#
+# The parameter that carries it is ARMING_SKIPCHK, not the plan's ARMING_CHECK,
+# and that is a measured correction rather than a preference: the pinned
+# firmware renamed it (AP_Arming.cpp:199-205, AP_GROUPINFO("SKIPCHK", 13,
+# AP_Arming, checks_to_skip, 0); the migration comment at :233 "ARMING_CHECK ->
+# ARMING_SKIPCHK" and the conversion at :235-260). There is no name alias: the
+# first invocation of this run wrote and then read "ARMING_CHECK", the write
+# took nothing and the readback answered nothing, and its own artifact records
+# exactly that (work/runs/p01-localization/p01l-bringup-20260926T161038Z,
+# bring-up.json: readbacks.window.ARMING_CHECK = null). A write under a name the
+# vehicle does not have is silently dropped or refused, which is the same class
+# of defect as the GPS_TYPE/GPS1_TYPE rename the scored arm already records
+# (plan section 4.7). The value semantics are unchanged: 0 = all checks enabled,
+# and the window sets the two bits above.
+BRING_UP_ARMING_PARAMETER = "ARMING_SKIPCHK"
+
+# The window's mode. ALT_HOLD is the E-EXC mode row of plan section 0.6 item 5,
+# and it is the only mode the sensor-derived window can take off in:
+# `requires_position()` is false (ArduCopter/mode.h:506) so no position
+# estimate is required of an aircraft that has none yet. (The diagnostic
+# carrier flies GUIDED -- plan section 0.7 item 4 -- because its truth-driven
+# arm has a position by construction; that is a different carrier and is
+# recorded as one.)
+BRING_UP_MODE = "ALT_HOLD"
+
+# The one arming check no mask can except, and the window's answer to it.
+# `alt_checks` fails with "Need Alt Estimate" unless the mode has manual
+# throttle (AP_Arming_Copter.cpp:551-557); it is reached from
+# run_pre_arm_checks (:82) in the normal path AND from mandatory_checks
+# (:654-665) when the mask skips everything (:72-73), and forcing the arm does
+# not avoid it either (AP_Arming.cpp:1910). ALT_HOLD has no manual throttle
+# (mode.h:509), and the two modes that do -- STABILIZE, ACRO (mode.h:454) --
+# support no user takeoff at all (mode.h:132). What the check requires is
+# `copter.ekf_alt_ok()` = have_inertial_nav && VERT_POS && VERT_VEL
+# (ArduCopter/system.cpp:294-308); `status.flags.vert_pos` is
+# `!hgtTimeout && ...` (AP_NavEKF3_Control.cpp:795) and hgtTimeout clears only
+# on a height fusion from the SELECTED source (AP_NavEKF3_PosVelFusion.cpp:
+# 1363-1379 for ExternalNav, :1046-1060 for the timeout), with no fallback from
+# EXTNAV to BARO (AP_NavEKF_Source.cpp getPosZSource). So an aircraft whose
+# only height source is the external navigation it has not received yet cannot
+# arm in any mode that can take off -- and the window exists precisely because
+# that stream does not exist yet. The window therefore carries a HEIGHT SOURCE
+# for its own duration: the airframe's own barometer, the only height reference
+# that is not simulator truth. It is a height reference only (no horizontal
+# position, no attitude, no velocity), and it is restored to the seam's
+# ExternalNav before the scored window opens, verified by the vehicle's own
+# readback like every other window parameter.
+BRING_UP_HEIGHT_SOURCE_PARAMETER = "EK3_SRC1_POSZ"
+BRING_UP_HEIGHT_SOURCE_WINDOW_VALUE = 1.0  # AP_NavEKF_Source.h SourceZ::BARO
+BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE = 6.0  # SourceZ::EXTNAV, the declared seam
+
+# The window's parameter writes, each with the value it holds DURING the
+# window, the value it is RESTORED to before the claimed arm, and the pinned
+# source that makes the window value necessary or harmless. The scored arm's
+# declared state is the restore column: no check skipped (ARMING_SKIPCHK 0) and
+# EK3_SRC1_POSZ 6 (ExternalNav, the seam's own declared height source). A window
+# parameter that is not restored exactly is a blocker, not a warning
+# (`_bring_up_closure_blockers`).
+#
+# The window writes no VISO_TYPE, and that is a recorded correction to plan
+# section 0.6 item 6 phase 1's "VISO_TYPE 0 for this phase only". At this pin
+# the backend is created once, from the value the parameter holds at boot:
+# `AP_VisualOdom::init()` switches on `_type.get()` and allocates the driver
+# (AP_VisualOdom.cpp:132-152), the vehicle calls it exactly once
+# (AP_Vehicle.cpp:479), and every later message path forwards only when
+# `_driver != nullptr` (:227-229, :243-245). A runtime 0 -> 1 would therefore
+# leave `_driver` null for the rest of the run: the seam could never be
+# established and the claimed arm could never receive the estimator's pose.
+# The seam's own parameter is consequently left alone, and the Check::VISION
+# exception of the mask is what covers the interval before the adapter's first
+# publication -- which is exactly what that exception is for.
+BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
+    (
+        BRING_UP_ARMING_PARAMETER,
+        float(BRING_UP_ARMING_SKIP_WINDOW),
+        float(BRING_UP_ARMING_ALL_CHECKS_ENABLED),
+        "the two excepted checks, each by its pinned bit: Check::VISION "
+        "(AP_Arming.h:46; the check itself at AP_Arming.cpp:2087-2100 -> "
+        "AP_VisualOdom::pre_arm_check 'not healthy', AP_VisualOdom.cpp:277,292) "
+        "and the home requirement inside Check::GPS (AP_Arming.h:31; the check "
+        "at AP_Arming.cpp:747-750, 'AHRS: waiting for home'). The parameter name "
+        "is the pinned one (ARMING_SKIPCHK, AP_Arming.cpp:199-205): the plan's "
+        "ARMING_CHECK is the pre-4.7 name and does not resolve at this pin",
+    ),
+    (
+        BRING_UP_HEIGHT_SOURCE_PARAMETER,
+        BRING_UP_HEIGHT_SOURCE_WINDOW_VALUE,
+        BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE,
+        "the mandatory altitude check above: baro is the airframe's own height "
+        "reference, needed only while the external navigation does not exist yet, "
+        "and restored to ExternalNav before the scored window opens",
+    ),
+)
+# The retry cadence of the window's own arm loop. The bridge's own numbers are
+# module-private (webots_ardupilot.py ARM_SETTLE_S = 1.0, CONTROL_RETRY_S = 5.0)
+# and this loop is the window's, not the claimed arm's, so they are declared
+# here rather than borrowed.
+BRING_UP_ARM_SETTLE_S = 1.0
+BRING_UP_ARM_RETRY_S = 5.0
+# How long the window waits for the vehicle's own answer to each declaration:
+# the GPS_GLOBAL_ORIGIN echo that proves the origin was accepted, and the
+# COMMAND_ACK that carries the takeoff's result.
+BRING_UP_ORIGIN_ECHO_TIMEOUT_S = 5.0
+BRING_UP_TAKEOFF_ACK_TIMEOUT_S = 5.0
+# The seam's own parameters, read back after the window so the receipt shows
+# the claimed arm's declared source set restored rather than assumed.
+BRING_UP_SEAM_READBACK: tuple[str, ...] = (
+    "VISO_TYPE",
+    "EK3_SRC1_POSXY",
+    "EK3_SRC1_VELXY",
+    "EK3_SRC1_POSZ",
+    "EK3_SRC1_YAW",
+)
+
+# The declared exception window's other two elements, recorded as declarations
+# with their citations so the receipt can be read without the plan.
+BRING_UP_EXCEPTED_CHECKS: tuple[dict[str, Any], ...] = (
+    {
+        "check": "Check::VISION",
+        "bit": ARMING_CHECK_BIT_VISION,
+        "citation": (
+            "AP_Arming.h:46 (the bit); AP_Arming.cpp:2087-2100 visodom_checks, "
+            "gated on check_enabled(Check::VISION), calling "
+            "AP_VisualOdom::pre_arm_check, which reports 'not healthy' while the "
+            "last external-navigation message is older than "
+            "AP_VISUALODOM_TIMEOUT_MS (AP_VisualOdom_Backend.cpp:32-37); "
+            "AP_VisualOdom.cpp:277,292"
+        ),
+        "why": (
+            "the vision source is the estimator's own adapter, and it publishes "
+            "only once VioManager::initialized() is true -- which needs motion, "
+            "which needs this arm. The check is excepted for the window only: the "
+            "seam is not required during the window (VISO_TYPE 0), and it is back "
+            "in force, with the vehicle's readback as proof, before the scored arm"
+        ),
+    },
+    {
+        "check": "Check::GPS (the home requirement)",
+        "bit": ARMING_CHECK_BIT_GPS,
+        "citation": (
+            "AP_Arming.h:31 (the bit); AP_Arming.cpp:747-750 inside "
+            "AP_Arming::gps_checks, gated on check_enabled(Check::GPS): "
+            "'if (!AP::ahrs().home_is_set())' -> 'AHRS: waiting for home'. The "
+            "GPS-fix half of the same check is vacuous here: with GPS1_TYPE and "
+            "GPS2_TYPE 0 no receiver driver exists, so num_instances is 0 "
+            "(AP_GPS.cpp:1067-1073) and the fix loop never runs"
+        ),
+        "why": (
+            "home is derived from the EKF origin (Copter::update_home_from_EKF, "
+            "commands.cpp:4-20), and at this pin EKF3 sets its origin only from "
+            "GPS, a beacon or a GCS declaration -- never from ExternalNav data "
+            "(AP_NavEKF3_Measurements.cpp:680-715; GCS_Common.cpp:3961). The "
+            "window declares the origin as a DATUM instead, and home follows it; "
+            "the exception covers the seconds between the arm attempt and that "
+            "derivation"
+        ),
+    },
+)
+
+# What the exception does NOT change, stated where the code that keeps it true
+# lives, because this is the whole justification for allowing the window at all.
+BRING_UP_JUSTIFICATION = (
+    "The exception changes only WHEN the aircraft may move, never what supplies "
+    "the scored pose. The estimator is the same pinned build, fed the same "
+    "declared stereo and inertial stream; the exception is a bounded window "
+    "(<= 5.0 s from the arm readback to LAND, no lateral setpoint, LAND always) "
+    "that lets the airframe move so the estimator CAN latch, and every element "
+    "of it is restored -- with the vehicle's own parameter readback -- before "
+    "the scored window opens. The scored window's pose source is unchanged: the "
+    "adapter is still the only publisher on the autopilot's external-navigation "
+    "source, the bridge's truth republish is still off by construction, and the "
+    "window publishes nothing to the autopilot whose origin is not the "
+    "estimator's own state."
+)
 # H5's measured cause, and the two markers that separate "the initializer never
 # fired" from "the filter initialised but the pinned readiness accessor never
 # became true". VioManager::initialized() is `is_initialized_vio && timelastupdate
@@ -899,8 +1108,10 @@ def _declared_start_attitude(world: Path) -> tuple[float, float, float]:
 _SITL_SERIAL_PORT_RE = re.compile(r"^SERIAL(\d+) on TCP port (\d+)$", re.MULTILINE)
 
 
-def _autopilot_feed_endpoint(sitl_log: Path, session_endpoint: str) -> str:
-    """The autopilot link the adapter publishes on (plan section 0.5).
+def _autopilot_feed_endpoint(
+    sitl_log: Path, session_endpoint: str, *, already_taken: Sequence[str] = ()
+) -> str:
+    """The autopilot link one seam will open (plan section 0.5).
 
     The pinned SITL serves exactly one TCP client per serial port
     (``UARTDriver.cpp``: a single ``accept()``, then ``_connected``), and this
@@ -910,15 +1121,22 @@ def _autopilot_feed_endpoint(sitl_log: Path, session_endpoint: str) -> str:
     autopilot reported ``VisOdom: not healthy``. The free port is taken from the
     running SITL's own declaration of what it listens on, which its log records;
     no port is guessed and no convention is assumed.
+
+    ``already_taken`` names endpoints this run has already given to another
+    connection, so the adapter's publisher and the ordered bring-up's own link
+    get distinct ports instead of contending for the same one.
     """
     session_port = session_endpoint.rsplit(":", 1)[-1]
+    taken = {session_port}
+    for endpoint in already_taken:
+        taken.add(endpoint.rsplit(":", 1)[-1])
     if sitl_log.is_file():
         ports = [
             (int(number), int(port))
             for number, port in _SITL_SERIAL_PORT_RE.findall(
                 sitl_log.read_text(encoding="utf-8", errors="replace")
             )
-            if str(port) != session_port
+            if str(port) not in taken
         ]
         if ports:
             number, port = sorted(ports)[0]
@@ -1222,6 +1440,197 @@ def _initialization_blocker(diagnostics: dict[str, Any]) -> str:
         "is unavailable-navigation, not a delayed arm"
     )
 
+# ---------------------------------------------------------------------------
+# The declared ordered bring-up (plan sections 0.6 item 6, 0.8 item 7)
+# ---------------------------------------------------------------------------
+
+
+_SITL_HOME_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)")
+
+
+def _sitl_home_origin_datum(sitl_home: str) -> tuple[float, float, float]:
+    """The configured vehicle's own spawn coordinate, as the origin datum.
+
+    ``platform.sitl_home`` is the coordinate the autopilot itself is launched
+    with (``--home``, webots_ardupilot.py sitl_argv), i.e. the world's own
+    (0, 0, 0) in geographic terms. Declaring the EKF's origin there and nowhere
+    else keeps the local frame the autopilot navigates in identical to the frame
+    the scored arm's E1 comparison already uses. A configuration without a
+    parsable home cannot declare an origin, and a GPS-off invocation with no
+    origin cannot fly at all, so this raises rather than guessing.
+    """
+    match = _SITL_HOME_RE.match(sitl_home or "")
+    if match is None:
+        raise ConfigError(
+            f"platform.sitl_home {sitl_home!r} is not 'lat,lon,alt[,yaw]'; the ordered "
+            "bring-up declares the EKF origin from it and cannot invent one (plan "
+            "section 0.6 item 6)"
+        )
+    return (float(match.group(1)), float(match.group(2)), float(match.group(3)))
+
+
+def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
+    """The declared exception window, every element with its citation.
+
+    This is the receipt's own statement of what the bring-up is allowed to do,
+    built from the frozen constants above and the configuration's own declared
+    home. The scored window is judged by none of it: the envelope bounds here
+    are the excitation's, they are the E-EXC numbers the diagnostic flew, and
+    the restoration rows are the state the claimed arm is required to be in.
+    """
+    latitude, longitude, altitude = _sitl_home_origin_datum(settings.sitl_home)
+    return {
+        "platform_limitation": (
+            "the bridge's own session cannot send this window's declarations and this "
+            "run does not widen it: PARAM_SET and SET_GPS_GLOBAL_ORIGIN are not in "
+            "PymavlinkSession's ALLOWED_OUTBOUND_TYPES (webots_ardupilot.py:1951-1958) "
+            "and PymavlinkSession.takeoff hardcodes param3 = 0 "
+            "(webots_ardupilot.py:2248-2264), which ALT_HOLD's user takeoff refuses. The "
+            "bring-up therefore sends them on its own connection, the pattern the "
+            "adapter's publisher already established (localization.py "
+            "ExternalNavPublisher.start). Worth fixing later in the bridge, so a future "
+            "window is not a second code path; not fixed here, because that file is "
+            "outside this slice's bounded ownership"
+        ),
+        "kind": "declared_ordered_bring_up",
+        "authority": (
+            "plan sections 0.6 item 6 (the ordered bring-up) and 0.8 item 7 "
+            "(Deliverable B), whose evidence is the E1-DIAG report: the pinned "
+            "estimator latches under measured motion (188 STATE frames, "
+            "initialized true) and the sensor-derived arm cannot move"
+        ),
+        "window": {
+            "mode": BRING_UP_MODE,
+            "takeoff_altitude_m": EXCITATION_TAKEOFF_ALTITUDE_M,
+            "lateral_setpoint": None,
+            "max_airtime_s": EXCITATION_MAX_AIRTIME_S,
+            "post_land_drain_s": EXCITATION_POST_LAND_DRAIN_S,
+            "ends_with": (
+                "LAND (always), then the parameter restoration below, then the "
+                "vehicle's own readback of it"
+            ),
+            "why_it_excites_propagation": (
+                "VioManager::initialized() needs timelastupdate written once "
+                "(VioManager.cpp:651), which needs do_feature_propagate_update past "
+                "the clone gate (:348), which needs >= 5 camera frames the "
+                "zero-velocity updater declined (UpdaterZeroVelocity.cpp:246: mean "
+                "disparity >= 1.0 px together with a chi2 or velocity violation). A "
+                "climb supplies both terms: thrust makes the accelerometer read other "
+                "than gravity, and at this rig's 554 px focal length ~2.7 mm of "
+                "translation is ~1 px of disparity"
+            ),
+        },
+        "origin_datum": {
+            "message": "SET_GPS_GLOBAL_ORIGIN",
+            "message_id": 48,
+            "frame": "MAV_FRAME_GLOBAL / Location::AltFrame::ABSOLUTE (GCS_Common.cpp:3982-4014)",
+            "latitude_deg": latitude,
+            "longitude_deg": longitude,
+            "altitude_msl_m": altitude,
+            "source": "platform.sitl_home, the coordinate the autopilot is launched with",
+            "is_a_pose_feed": False,
+            "is": (
+                "a DATUM: the local frame's geographic anchor, set once. It carries "
+                "no vehicle position, attitude or velocity, and nothing about it "
+                "measures where the aircraft is"
+            ),
+            "why_it_must_be_declared": (
+                "EKF3 sets its origin from GPS, from a beacon, or from this GCS "
+                "declaration -- never from ExternalNav data "
+                "(AP_NavEKF3_Measurements.cpp:680-715; GCS_MAVLINK::set_ekf_origin, "
+                "GCS_Common.cpp:3961). With GPS off no origin would exist, so the "
+                "aircraft could not derive home (Copter::update_home_from_EKF, "
+                "commands.cpp:4-20) and the claimed arm's own Check::GPS could not "
+                "pass. The diagnostic sharpened this: the truth-driven carrier got "
+                "its origin from the synthesized GPS, and the scored layer has none"
+            ),
+        },
+        "excepted_arming_checks": [dict(row) for row in BRING_UP_EXCEPTED_CHECKS],
+        "arming_skip": {
+            "name": BRING_UP_ARMING_PARAMETER,
+            "window_value": float(BRING_UP_ARMING_SKIP_WINDOW),
+            "restore_value": float(BRING_UP_ARMING_ALL_CHECKS_ENABLED),
+            "bit_semantics": (
+                "a SET bit SKIPS that check: check_enabled = (checks_to_skip & check) "
+                "== 0 (AP_Arming.cpp:329-332); 0 is 'skip nothing', i.e. every check "
+                "enabled, which is the PINNED parameter's own recommended default and "
+                "its restore value here. The pinned name is ARMING_SKIPCHK "
+                "(AP_Arming.cpp:199-205; renamed from ARMING_CHECK, migration at "
+                ":233-260) and the old name does not resolve at this pin"
+            ),
+        },
+        "parameter_window": [
+            {
+                "name": name,
+                "window_value": window_value,
+                "restore_value": restore_value,
+                "why": why,
+            }
+            for name, window_value, restore_value, why in BRING_UP_WINDOW_PARAMETERS
+        ],
+        "not_exceptable": [
+            {
+                "check": "the mandatory altitude check ('Need Alt Estimate')",
+                "citation": (
+                    "AP_Arming_Copter.cpp:551-557; reached from run_pre_arm_checks :82 "
+                    "and from mandatory_checks :654-665 when the mask skips every check "
+                    "(:72-73); AP_Arming::arm() runs mandatory_checks even when arming "
+                    "checks are disabled (AP_Arming.cpp:1910)"
+                ),
+                "resolution": (
+                    "the window carries its own height reference "
+                    f"({BRING_UP_HEIGHT_SOURCE_PARAMETER} = "
+                    f"{BRING_UP_HEIGHT_SOURCE_WINDOW_VALUE:g}, baro) instead of "
+                    "excepting the check, and restores it to the seam's "
+                    f"{BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE:g} (ExternalNav) before the "
+                    "claimed arm"
+                ),
+            },
+        ],
+        "justification": BRING_UP_JUSTIFICATION,
+        "scored_window_requires": [
+            {
+                "name": name,
+                "value": restore_value,
+                "meaning": "the vehicle's own readback must equal this before the arm",
+            }
+            for name, _window_value, restore_value, _why in BRING_UP_WINDOW_PARAMETERS
+        ],
+    }
+
+
+def _bring_up_closure_blockers(applied: dict[str, float]) -> list[str]:
+    """Whether the exception window is fully closed, from the vehicle's own answer.
+
+    The window is bounded in two ways and this is the second one: not only is it
+    time-bounded, it cannot still be in force when the scored window opens. Every
+    parameter the window wrote is compared against the value the configuration
+    declares for the scored arm, and a parameter still at its window value -- or
+    one the vehicle did not answer at all -- refuses the arm. A silent readback
+    confirms nothing, so it is a refusal rather than a pass, exactly as the
+    claimed arm's own readback treats it.
+    """
+    blockers: list[str] = []
+    for name, window_value, restore_value, _why in BRING_UP_WINDOW_PARAMETERS:
+        if name not in applied:
+            blockers.append(
+                f"{name} was never answered by the vehicle after the bring-up window: a "
+                "silent readback cannot show that the declared exception was lifted, so "
+                "the scored window does not open"
+            )
+        elif applied[name] == window_value:
+            blockers.append(
+                f"{name} is still {window_value:g} -- its declared bring-up window value -- "
+                f"at the claimed arm; the window must be restored to {restore_value:g} and "
+                "read back before the scored window opens (plan sections 0.6 item 6, 0.8 "
+                "item 7)"
+            )
+        elif applied[name] != restore_value:
+            blockers.append(
+                f"{name} read back as {applied[name]:g} after the bring-up window; the "
+                f"scored arm's declared value is {restore_value:g}"
+            )
+    return blockers
 # ---------------------------------------------------------------------------
 # Preflight: everything the claimed arm needs, reported in one pass
 # ---------------------------------------------------------------------------
@@ -1835,6 +2244,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         blockers.extend(gps["blockers"])
         return blockers
 
+    bring_up_link: loc.BringUpLink | None = None
+    bring_up: dict[str, Any] = {}
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.startup)
@@ -1845,6 +2256,23 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         )
         publisher.retarget(feed_endpoint)
         log_lines.append(f"adapter publish endpoint: {feed_endpoint}")
+        # The ordered bring-up's own link, on a port of its own (the pinned SITL
+        # serves one client per serial port): the origin datum and the window's
+        # parameter writes are not message types the bridge's session sends, and
+        # widening that session's allowlist would widen what the SCORED arm can
+        # put on the wire.
+        bring_up_endpoint = _autopilot_feed_endpoint(
+            writer.path("sitl.log"),
+            settings.mavlink_endpoint,
+            already_taken=(feed_endpoint,),
+        )
+        bring_up_link = loc.BringUpLink(bring_up_endpoint)
+        try:
+            bring_up_link.connect()
+            log_lines.append(f"ordered bring-up endpoint: {bring_up_endpoint}")
+        except RuntimeError as error:
+            live_blockers.append(f"the ordered bring-up's link is unavailable: {error}")
+            log_lines.append(f"UNRESOLVED: {error}")
         platform.request_telemetry_streams()
         # G4 needs the vehicle's own GPS status during the run, so the two status
         # streams are requested through the session's existing interval path; every
@@ -1879,6 +2307,28 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         scene_blocker = _scene_capture_gate(writer, settings, drain, scene_capture, log_lines)
         if scene_blocker:
             live_blockers.append(scene_blocker)
+        # The DECLARED ORDERED BRING-UP (plan sections 0.6 item 6, 0.8 item 7):
+        # the origin datum, the bounded exception window with its own flight, and
+        # the restoration with the vehicle's own readback. It runs only when
+        # everything before it passed, and every blocker it finds stops the run
+        # before the claimed arm -- the scored window never opens on a window
+        # still in force.
+        if live_blockers:
+            log_lines.append(
+                "ordered bring-up not attempted: a precondition of the scored arm failed"
+            )
+        else:
+            bring_up = _run_ordered_bring_up(
+                settings,
+                platform,
+                session,
+                bring_up_link,
+                writer,
+                drain,
+                log_lines,
+                stats,
+            )
+            live_blockers.extend(bring_up["blockers"])
         initialized_in_window = _wait_initialized(machine, drain, settings.pre_arm_wait_s)
         if not initialized_in_window:
             live_blockers.append(
@@ -1927,6 +2377,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         publisher.stop()
         client.close()
         _stop_estimator(estimator_process)
+        if bring_up_link is not None:
+            bring_up_link.close()
 
     _write_health_events(writer, machine)
     gps_aiding = _gps_aiding_verdict(writer.path("mavlink.jsonl"))
@@ -1937,6 +2389,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     )
     valid_fraction = machine.valid_fraction(time.monotonic_ns())
     truth_published = platform.truth_feed_published
+    bring_up_receipt = _bring_up_manifest(bring_up)
     log_lines.extend(
         [
             f"pairs fed: {stats.pairs}, imu samples fed: {stats.imu_samples}, "
@@ -1947,6 +2400,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             f"valid fraction: {valid_fraction:.4f}, adapter resets: {machine.reset_counter}",
             f"bridge truth poses sent over the whole run: {truth_published}",
             f"scored-window publications compared against truth: {len(published_states)}",
+            f"ordered bring-up: attempted={bring_up_receipt['attempted']}, "
+            f"completed={bring_up_receipt.get('completed')}, "
+            f"closure_blockers={bring_up_receipt.get('closure_blockers')}",
             f"shutdown: {shutdown.exits}",
         ]
     )
@@ -1960,12 +2416,16 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             (
                 "no bound was relaxed and no truth was fed to the estimator; the predeclared "
                 "stop rule (plan section 11) records the blocker and stops",
+                "the declared ordered bring-up (plan sections 0.6 item 6, 0.8 item 7) is "
+                "recorded in bring-up.json, including whether it ran and whether its "
+                "exception window was restored",
                 DISPATCH_REGISTRATION_NOTE,
             ),
             {
                 "stage_id": STAGE_ID,
                 "sensor_mode_label": "sensor-derived",
                 "estimator_pin": estimator,
+                "bring_up": bring_up_receipt,
                 "truth_republish": settings.truth_republish,
                 "bridge_truth_published": truth_published,
                 "gps_aiding_blockers": gps_aiding["blockers"],
@@ -2008,6 +2468,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         "localization": "resolved" if passed else "unresolved",
         "estimator_pin": estimator,
         "bounds": bounds_config,
+        "bring_up": bring_up_receipt,
         "truth_republish": settings.truth_republish,
         "bridge_truth_published": truth_published,
         "truth_samples_read": len(stats.truth_samples),
@@ -2036,6 +2497,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             "the estimator's feed carries stereo pairs and inertial samples and no other "
             "record. A publication with no truth sample inside the join tolerance is "
             "counted as unjoined rather than interpolated",
+            "the claimed arm was reached through a DECLARED ordered bring-up: a bounded "
+            "exception window (plan sections 0.6 item 6, 0.8 item 7) whose elements, "
+            "citations, flight and restoration readbacks are in bring-up.json. The "
+            "exception changed only WHEN the aircraft could move -- and the aircraft's own "
+            "height reference during the window was its barometer, because an external-nav "
+            "height source does not exist before the estimator latches. It was lifted, with "
+            "the vehicle's own readback as proof, before the scored window opened. The "
+            "estimator's input was stereo and inertial throughout, the bridge's truth "
+            "republish stayed off, and no predeclared bound was relaxed",
             "a passing E1 is bounded by this route and this scene: two waypoints with 8 s "
             "holds indoors, never a general navigation claim",
             "reset-signalling agreement (H2) records the adapter's reset counter; the "
@@ -2052,6 +2522,379 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     )
 
 
+def _run_ordered_bring_up(
+    settings: PlatformSettings,
+    platform: WebotsArduPilot,
+    session: PymavlinkSession,
+    link: loc.BringUpLink,
+    writer: EvidenceWriter,
+    drain: Callable[[], None],
+    log_lines: list[str],
+    stats: _FeedStats,
+) -> dict[str, Any]:
+    """The declared ordered bring-up: datum, exception window, excitation, restoration.
+
+    The order is the point (plan section 0.6 item 6). The origin DATUM is declared
+    first, because without it the aircraft has no home and the claimed arm would
+    be refused however well the estimator did. Then the exception window's own
+    parameter writes, each verified by the vehicle's readback before anything
+    moves. Then the bounded excitation -- ALT_HOLD, the flagged takeoff, the climb
+    inside E-EXC's envelope, LAND always. Then the restoration, verified by the
+    same readback, and the closure check that refuses the scored arm while any
+    window value is still in force.
+
+    Nothing here publishes to the autopilot's external-navigation source and
+    nothing here supplies a pose: the window's only outputs are a frame datum, two
+    parameter writes with their restores, and one bounded climb. The estimator's
+    feed, and the adapter that publishes its state, are the ones the scored arm
+    already had.
+
+    Returns the window's record. ``record["blockers"]`` carries anything that
+    stopped it; the caller must not open the scored window with a non-empty list.
+    """
+    declaration = _bring_up_window(settings)
+    names = tuple(name for name, _window, _restore, _why in BRING_UP_WINDOW_PARAMETERS)
+    record: dict[str, Any] = {
+        "declaration": declaration,
+        "sent": [],
+        "replies": [],
+        "readbacks": {},
+        "readback_observations": {},
+        "flight": {},
+        "blockers": [],
+        "completed": False,
+    }
+    blockers: list[str] = record["blockers"]
+    log_lines.append(
+        "ordered bring-up (plan sections 0.6 item 6, 0.8 item 7): "
+        f"{BRING_UP_MODE} excitation to {EXCITATION_TAKEOFF_ALTITUDE_M} m, no lateral "
+        f"setpoint, LAND within {EXCITATION_MAX_AIRTIME_S} s of the arm readback; "
+        "exception window = "
+        + ", ".join(
+            f"{name} {window_value:g} -> {restore_value:g}"
+            for name, window_value, restore_value, _why in BRING_UP_WINDOW_PARAMETERS
+        )
+    )
+
+    # 1. The origin datum: a frame definition, set once, before anything moves.
+    datum = declaration["origin_datum"]
+    record["sent"].append(
+        link.declare_origin_datum(
+            datum["latitude_deg"], datum["longitude_deg"], datum["altitude_msl_m"]
+        )
+    )
+    echo_deadline = time.monotonic() + BRING_UP_ORIGIN_ECHO_TIMEOUT_S
+    echoed: dict[str, Any] | None = None
+    while time.monotonic() < echo_deadline and echoed is None:
+        drain()
+        link.drain()
+        echoed = next(
+            (reply for reply in link.replies if reply.get("mavpackettype") == "GPS_GLOBAL_ORIGIN"),
+            None,
+        )
+        time.sleep(0.05)
+    record["origin_datum_echo"] = echoed
+    if echoed is None:
+        blockers.append(
+            "the vehicle did not emit GPS_GLOBAL_ORIGIN after the origin datum was "
+            f"declared, within {BRING_UP_ORIGIN_ECHO_TIMEOUT_S:.0f} s: "
+            "set_ekf_origin sends MSG_ORIGIN on acceptance and returns before it when an "
+            "origin already exists (GCS_Common.cpp:3961-3979), so a silent link is an "
+            "undeclared origin -- and with GPS off, home is derived from that origin "
+            "(Copter::update_home_from_EKF, commands.cpp:4-20). The window does not fly "
+            "on an undeclared datum"
+        )
+
+    def readback(
+        names: Sequence[str], expected: dict[str, float]
+    ) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        """Ask the vehicle for each name and wait until it answers with ``expected``.
+
+        ``WebotsArduPilot.read_parameters`` returns the newest value the run has
+        seen, so a value seen before the request satisfies it: the second
+        invocation's restoration readback was answered from the value the window
+        write had left there, and reported a restored window as still in force.
+        This asks, then polls until the expected value arrives or the deadline
+        passes, recording every distinct answer so the receipt shows the
+        transition rather than the last cached word.
+        """
+        reported: dict[str, float] = {}
+        observations: list[dict[str, Any]] = []
+        for name in names:
+            session.request_parameter(name)
+        deadline = time.monotonic() + PARAMETER_READ_TIMEOUT_S
+        while True:
+            drain()
+            link.drain()
+            reported.update(platform.telemetry().parameters)
+            snapshot = {name: reported.get(name) for name in names}
+            if not observations or observations[-1]["values"] != snapshot:
+                observations.append(
+                    {
+                        "at_utc": datetime.now(timezone.utc).isoformat(
+                            timespec="milliseconds"
+                        ),
+                        "values": snapshot,
+                    }
+                )
+            if all(reported.get(name) == expected[name] for name in names):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        return reported, observations
+
+    def write_parameters(values: dict[str, float]) -> None:
+        for name in names:
+            record["sent"].append(link.set_parameter(name, values[name]))
+
+    window_values = {name: window_value for name, window_value, _r, _w in BRING_UP_WINDOW_PARAMETERS}
+    restore_values = {name: restore_value for name, _w, restore_value, _r in BRING_UP_WINDOW_PARAMETERS}
+
+    # 2. The window's own parameter writes, read back from the vehicle itself.
+    if not blockers:
+        record["window_opened_at_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        write_parameters(window_values)
+        window_readback, observations = readback(names, window_values)
+        record["readbacks"]["window"] = {name: window_readback.get(name) for name in names}
+        record["readback_observations"] = {"window": observations}
+        for name, window_value, _restore, _why in BRING_UP_WINDOW_PARAMETERS:
+            if window_readback.get(name) != window_value:
+                blockers.append(
+                    f"the bring-up window's {name} did not take effect: the vehicle read "
+                    f"back {window_readback.get(name)} against the declared window value "
+                    f"{window_value:g}, so the aircraft would move under checks this run "
+                    "has not declared"
+                )
+
+    flight: dict[str, Any] = record["flight"]
+    # The window's own motor evidence: the airframe's PWM outputs as the vehicle
+    # reports them. A takeoff the autopilot accepted but the motors never answered
+    # is a different finding from a takeoff it refused, and only the outputs say
+    # which happened.
+    motors = {"max_pwm": 0, "samples": 0}
+    if not blockers:
+        # 3. The window's own arm: ALT_HOLD, retried, every refusal kept.
+        record["arm_attempts"] = 0
+        refusals: dict[str, str] = {}
+        deadline = time.monotonic() + settings.pre_arm_wait_s
+        sample = platform.telemetry()
+        while True:
+            record["arm_attempts"] += 1
+            session.set_mode(BRING_UP_MODE)
+            session.arm()
+            settle_until = time.monotonic() + BRING_UP_ARM_SETTLE_S
+            while time.monotonic() < settle_until:
+                drain()
+                time.sleep(0.05)
+            sample = platform.telemetry()
+            for text in sample.statustexts:
+                if text.startswith("PreArm:") or text.startswith("Arm:"):
+                    refusals[text] = text
+            if sample.armed or time.monotonic() >= deadline:
+                break
+            retry_until = min(deadline, time.monotonic() + BRING_UP_ARM_RETRY_S)
+            while time.monotonic() < retry_until:
+                drain()
+                time.sleep(0.25)
+        record["refusals"] = sorted(refusals)
+        if not sample.armed:
+            blockers.append(
+                f"the bring-up's own arm was refused in {BRING_UP_MODE}: mode="
+                f"{sample.mode_name}, armed={sample.armed}, attempts="
+                f"{record['arm_attempts']}, refusals={sorted(refusals)}. Without the arm "
+                "there is no motion, the estimator still cannot latch, and the run stops "
+                "here rather than spending a flight it cannot answer"
+            )
+
+        max_altitude_m = 0.0
+
+        def sample_motion() -> None:
+            """One telemetry read: the altitude readback and the motor outputs."""
+            nonlocal sample, max_altitude_m
+            sample = platform.telemetry()
+            if sample.local_position_ned is not None:
+                max_altitude_m = max(max_altitude_m, -sample.local_position_ned[2])
+            if sample.servo_outputs is not None:
+                motors["samples"] += 1
+                motors["max_pwm"] = max(motors["max_pwm"], max(sample.servo_outputs[:4]))
+
+        arm_monotonic = time.monotonic()
+        flight["armed_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        flight["mode"] = sample.mode_name
+        flight["pairs_fed_at_arm"] = stats.pairs
+        flight["imu_fed_at_arm"] = stats.imu_samples
+        record["sent"].append(
+            link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
+        )
+        flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        ack_deadline = time.monotonic() + BRING_UP_TAKEOFF_ACK_TIMEOUT_S
+        ack: dict[str, Any] | None = None
+        while time.monotonic() < ack_deadline and ack is None:
+            drain()
+            link.drain()
+            ack = link.command_ack(loc.MAV_CMD_NAV_TAKEOFF)
+            time.sleep(0.05)
+        flight["takeoff_command_ack"] = ack
+        if ack is None:
+            blockers.append(
+                "the autopilot did not answer the excitation's takeoff command within "
+                f"{BRING_UP_TAKEOFF_ACK_TIMEOUT_S:.0f} s: no COMMAND_ACK for "
+                "MAV_CMD_NAV_TAKEOFF arrived on the bring-up link, so whether the "
+                "vehicle will climb is unmeasured"
+            )
+        elif ack.get("result") != 0:
+            blockers.append(
+                "the autopilot refused the excitation's takeoff: COMMAND_ACK result "
+                f"{ack.get('result')} (0 is MAV_RESULT_ACCEPTED); the window's climb "
+                "did not start"
+            )
+        climb_deadline = time.monotonic() + EXCITATION_CLIMB_DRAIN_S
+        while time.monotonic() < climb_deadline:
+            drain()
+            sample_motion()
+            if max_altitude_m >= (
+                EXCITATION_TAKEOFF_ALTITUDE_M - EXCITATION_ALTITUDE_REACHED_MARGIN_M
+            ):
+                break
+            time.sleep(0.05)
+        land_delay_s = time.monotonic() - arm_monotonic
+        flight["land_command_delay_s"] = round(land_delay_s, 3)
+        if land_delay_s > EXCITATION_MAX_AIRTIME_S:
+            blockers.append(
+                f"the LAND command went out {land_delay_s:.3f} s after the arm readback, "
+                f"outside the declared {EXCITATION_MAX_AIRTIME_S} s airtime bound"
+            )
+        session.set_mode("LAND")
+        flight["land_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        flight["pairs_fed_at_land"] = stats.pairs
+        flight["imu_fed_at_land"] = stats.imu_samples
+        descent_deadline = time.monotonic() + EXCITATION_POST_LAND_DRAIN_S
+        while time.monotonic() < descent_deadline:
+            drain()
+            sample_motion()
+            time.sleep(0.05)
+        flight["max_altitude_readback_m"] = round(max_altitude_m, 3)
+        flight["motor_output_max_pwm"] = motors["max_pwm"]
+        flight["motor_output_samples"] = motors["samples"]
+        flight["mode_after_window"] = sample.mode_name
+        flight["armed_after_window"] = sample.armed
+        if max_altitude_m < 0.10:
+            blockers.append(
+                f"the excitation produced no measured motion: max altitude readback "
+                f"{max_altitude_m:.3f} m against the commanded "
+                f"{EXCITATION_TAKEOFF_ALTITUDE_M} m climb, so the estimator had nothing "
+                f"to latch on. The airframe's own outputs are recorded beside it: "
+                f"{motors['max_pwm']} us maximum on the four motors over "
+                f"{motors['samples']} samples -- an accepted takeoff whose motors never "
+                "left idle produced no thrust, which is why there was no motion"
+            )
+
+    # 5. The window is closed: every declared value restored, then read back.
+    if record["flight"]:
+        write_parameters(restore_values)
+        restore_readback, observations = readback(names, restore_values)
+        record["readback_observations"]["restored"] = observations
+        record["readbacks"]["restored"] = {name: restore_readback.get(name) for name in names}
+        closure = _bring_up_closure_blockers(restore_readback)
+        record["closure_blockers"] = closure
+        blockers.extend(closure)
+        # The seam's own source set, read back after the window: the claimed arm's
+        # declared parameters, measured rather than assumed.
+        record["window_closed_at_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        record["height_source_statement"] = (
+            "baro supplied the aircraft's height during the bring-up window only; the "
+            "claimed arm's vertical source is ExternalNav (EK3_SRC1_POSZ "
+            f"{BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE:g}, restored and verified by the "
+            "vehicle's own readback before the claimed arm). Baro supplied no horizontal "
+            "position, no attitude and no velocity, and no truth reached the estimator"
+        )
+        seam_expected = {
+            name: expected
+            for name, expected, _source in SEAM_REQUIREMENTS
+            if name in BRING_UP_SEAM_READBACK
+        }
+        seam_readback, seam_observations = readback(BRING_UP_SEAM_READBACK, seam_expected)
+        record["readback_observations"]["seam_after_window"] = seam_observations
+        record["readbacks"]["seam_after_window"] = {
+            name: seam_readback.get(name) for name in BRING_UP_SEAM_READBACK
+        }
+        for name, expected, source in SEAM_REQUIREMENTS:
+            if name not in BRING_UP_SEAM_READBACK:
+                continue
+            if seam_readback.get(name) != expected:
+                blockers.append(
+                    f"{name} read back as {seam_readback.get(name)} after the bring-up "
+                    f"window; the seam needs {name} {expected:g} from {source}"
+                )
+        record["seam"] = {
+            "statement": (
+                "the seam (VISO_TYPE 1, EK3_SRC1_* = 6) is the claimed arm's declared "
+                "state; the height source returns to ExternalNav here, which changes the "
+                "EKF's aiding and is recorded as a nav_epoch reset (SYSTEM-SPECIFICATION "
+                "sections 4.3 and 6.3), not as a continuation"
+            ),
+            "readback_after_window": record["readbacks"]["seam_after_window"],
+        }
+    else:
+        record["closure_blockers"] = []
+        if not blockers:
+            blockers.append(
+                "the bring-up window never flew, so its exception was never applied and "
+                "never restored; the scored arm does not run on an unmeasured window"
+            )
+
+    record["replies"] = list(link.replies)
+    record["completed"] = not blockers
+    writer.write_json("bring-up.json", record)
+    log_lines.append(
+        f"ordered bring-up: completed={record['completed']}, "
+        f"refusals={record.get('refusals', [])}, "
+        f"max altitude readback {record['flight'].get('max_altitude_readback_m')} m, "
+        f"land delay {record['flight'].get('land_command_delay_s')} s, "
+        f"window readback {record['readbacks'].get('window')}, "
+        f"restored readback {record['readbacks'].get('restored')}"
+    )
+    for blocker in blockers:
+        log_lines.append(f"UNRESOLVED: {blocker}")
+    return record
+
+
+def _bring_up_manifest(record: dict[str, Any]) -> dict[str, Any]:
+    """The bring-up's own line in the receipt, at its full declared strength."""
+    if not record:
+        return {"attempted": False}
+    return {
+        "attempted": True,
+        "completed": record["completed"],
+        "window_parameters": {
+            row["name"]: {"window": row["window_value"], "restore": row["restore_value"]}
+            for row in record["declaration"]["parameter_window"]
+        },
+        "origin_datum": {
+            key: record["declaration"]["origin_datum"][key]
+            for key in ("latitude_deg", "longitude_deg", "altitude_msl_m", "is_a_pose_feed")
+        },
+        "excitation": record["declaration"]["window"],
+        "arm_attempts": record.get("arm_attempts"),
+        "refusals": record.get("refusals", []),
+        "flight": record["flight"],
+        "readbacks": record["readbacks"],
+        "readback_observations": record.get("readback_observations", {}),
+        "closure_blockers": record.get("closure_blockers", []),
+        "window_opened_at_utc": record.get("window_opened_at_utc"),
+        "window_closed_at_utc": record.get("window_closed_at_utc"),
+        "height_source_statement": record.get("height_source_statement"),
+        "blockers": list(record["blockers"]),
+    }
 # ---------------------------------------------------------------------------
 # E1-DIAG: the live pose-assisted diagnostic (plan sections 0.6 item 7, 0.7, 0.8)
 # ---------------------------------------------------------------------------

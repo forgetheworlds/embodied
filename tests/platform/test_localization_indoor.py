@@ -1464,3 +1464,146 @@ class TestPoseAssistedDiagnostic:
             pytest.skip("no recorded sensor-derived run artifact is on this host")
         path, record = scored_artifacts[0]
         assert record["published"] == 0, f"{path} records {record['published']}"
+
+
+# ---------------------------------------------------------------------------
+# T14/T15 (the declared ordered bring-up, plan sections 0.6 item 6, 0.8 item 7):
+# the exception window is declared and applied, and it is BOUNDED -- the scored
+# window refuses to open while it is still in force
+# ---------------------------------------------------------------------------
+
+
+class TestOrderedBringUp:
+    """The two named behaviours that make the exception a declaration, not a bypass.
+
+    The bring-up exists because the sensor-derived arm cannot move: the estimator
+    latches only under motion (E1-DIAG), and the arm gate forbids motion until the
+    vision source is healthy, which is the estimator's own adapter. What makes
+    that legitimate rather than a silent disable is that (a) every element of the
+    window is declared with the pinned source that requires it, and (b) the window
+    cannot still be in force when the scored window opens -- the vehicle's own
+    readback is what says so.
+    """
+
+    def _settings_and_window(self):
+        root = Path(check.__file__).resolve().parents[3]
+        document = check._load_localization_config(Path("configs/first_indoor.yaml"))
+        settings = check._platform_settings(document, root)
+        return settings, check._bring_up_window(settings)
+
+    def test_the_window_applies_the_declared_exception_and_the_origin_datum(self):
+        """The window is the declared one: mask, cited checks, and a datum.
+
+        The mask is asserted bit by bit against the pinned firmware's own
+        enumeration, because that is the whole content of the exception: a SET bit
+        skips exactly that check (AP_Arming.cpp:329-332). The origin is asserted to
+        be a DATUM -- a frame definition carrying no pose -- because that is the
+        difference between declaring the local frame's anchor and feeding the
+        autopilot a position, which no part of this run may do with truth.
+        """
+        settings, window = self._settings_and_window()
+
+        # The mask: exactly the two declared exceptions, each cited -- and the
+        # PINNED name, because the plan's ARMING_CHECK does not resolve at this pin
+        # (AP_Arming.cpp:199-205 renames it; the first invocation of the live run
+        # measured the old name answering nothing).
+        mask = window["arming_skip"]
+        assert mask["name"] == check.BRING_UP_ARMING_PARAMETER == "ARMING_SKIPCHK"
+        assert mask["window_value"] == (
+            check.ARMING_CHECK_BIT_GPS | check.ARMING_CHECK_BIT_VISION
+        )
+        assert mask["window_value"] == 8 | (1 << 18)
+        assert mask["restore_value"] == check.BRING_UP_ARMING_ALL_CHECKS_ENABLED == 0
+        assert "SET bit SKIPS" in mask["bit_semantics"]
+        assert "ARMING_SKIPCHK" in mask["bit_semantics"]
+        excepted = {row["check"]: row for row in window["excepted_arming_checks"]}
+        assert set(excepted) == {"Check::VISION", "Check::GPS (the home requirement)"}
+        assert excepted["Check::VISION"]["bit"] == 1 << 18
+        assert excepted["Check::GPS (the home requirement)"]["bit"] == 1 << 3
+        for row in excepted.values():
+            assert "AP_Arming" in row["citation"] and row["why"]
+
+        # The datum: the configured home's own coordinate, a frame definition.
+        datum = window["origin_datum"]
+        assert datum["message_id"] == 48
+        assert datum["is_a_pose_feed"] is False
+        assert "DATUM" in datum["is"] and "no vehicle" in datum["is"]
+        assert (datum["latitude_deg"], datum["longitude_deg"], datum["altitude_msl_m"]) == (
+            pytest.approx(-35.363261),
+            pytest.approx(149.165230),
+            pytest.approx(584.0),
+        )
+        assert datum["source"] == (
+            "platform.sitl_home, the coordinate the autopilot is launched with"
+        )
+        assert "ExternalNav" in datum["why_it_must_be_declared"]
+
+        # Every window parameter is bounded: a window value, a restore value, a reason.
+        rows = {row["name"]: row for row in window["parameter_window"]}
+        assert set(rows) == {"ARMING_SKIPCHK", "EK3_SRC1_POSZ"}
+        assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
+        assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
+        assert rows["EK3_SRC1_POSZ"]["window_value"] == 1.0  # baro, its own sensor
+        assert rows["EK3_SRC1_POSZ"]["restore_value"] == 6.0  # ExternalNav, the seam
+        assert all(row["why"] for row in rows.values())
+        # The check no mask can except is named, with what the window does instead.
+        assert window["not_exceptable"][0]["check"].startswith("the mandatory altitude")
+        assert "mandatory_checks" in window["not_exceptable"][0]["citation"]
+        # And the scored-window requirement is the restore column, exactly.
+        assert {row["name"]: row["value"] for row in window["scored_window_requires"]} == {
+            "ARMING_SKIPCHK": 0.0,
+            "EK3_SRC1_POSZ": 6.0,
+        }
+
+        # The excitation stays inside the frozen E-EXC envelope.
+        excitation = window["window"]
+        assert excitation["mode"] == check.BRING_UP_MODE
+        assert excitation["takeoff_altitude_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M
+        assert excitation["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S
+        assert excitation["lateral_setpoint"] is None
+        assert "LAND" in excitation["ends_with"]
+
+    def test_the_scored_window_refuses_to_open_while_the_exception_is_in_force(
+        self,
+    ):
+        """Bounded means it cannot still be in force: the readback decides.
+
+        The closure check reads the vehicle's own answers, so a window value
+        surviving to the claimed arm -- or a parameter the vehicle never answered,
+        which confirms nothing -- is a blocker, and the scored window does not
+        open. Beside it, the scored arm's own settings are asserted: the bridge's
+        truth republish is off, because the exception is about WHEN the aircraft
+        may move and never about what carries truth into the estimate.
+        """
+        settings, window = self._settings_and_window()
+        in_force = {row["name"]: row["window_value"] for row in window["parameter_window"]}
+        restored = {row["name"]: row["value"] for row in window["scored_window_requires"]}
+
+        # Still in force: every window parameter is named, with what it should be.
+        blockers = check._bring_up_closure_blockers(dict(in_force))
+        assert len(blockers) == len(in_force)
+        for name, window_value in in_force.items():
+            matching = [blocker for blocker in blockers if blocker.startswith(name)]
+            assert matching, f"{name} in force must be named: {blockers}"
+            assert f"{window_value:g}" in matching[0]
+            assert "restored" in matching[0] or "declared" in matching[0]
+
+        # A silent readback is a refusal, not a pass: it cannot show the lift.
+        assert check._bring_up_closure_blockers({})
+
+        # Restored exactly: the window is closed and the scored arm may proceed.
+        assert check._bring_up_closure_blockers(dict(restored)) == []
+
+        # A third value -- neither the window's nor the declared one -- is a refusal.
+        wrong = dict(restored)
+        wrong["ARMING_SKIPCHK"] = -1.0  # "skip all", neither the window's nor the declared
+        assert check._bring_up_closure_blockers(wrong)
+
+        # The scored arm's own settings: truth republish off, sensor-derived mode.
+        assert settings.truth_republish is False
+        assert settings.sensor_mode is SensorMode.SENSOR_DERIVED
+        # And it is the exception, not the arm, that carries the reason: the
+        # declared exception records the truth exemption nowhere, because there is
+        # none to record for this arm.
+        assert "truth republish is ON" not in window["justification"]
+        assert "truth republish is still off" in window["justification"]

@@ -325,6 +325,134 @@ localization:
   #              that run only, via the bridge's per-run arm= override): it is a
   #              DIAGNOSTIC, never a sensor-derived result, never pooled with one,
   #              and no predeclared E/F/H bound is judged by it.
+  # -------------------------------------------------------------------------
+  # The DECLARED ORDERED BRING-UP (plan sections 0.6 item 6 and 0.8 item 7,
+  # "Deliverable B"), carried here as a comment for the same schema reason the
+  # excitation above is: the shared cli.py schema rejects localization keys it
+  # does not know, and this file is also loaded by the P00 compatibility probe
+  # through that loader. The operative constants are the frozen module
+  # constants in src/embodied/platform/localization_check.py
+  # (BRING_UP_*, ARMING_CHECK_BIT_*, EXCITATION_*); this is the declaration a
+  # reader of the configuration is owed.
+  #
+  # WHY IT EXISTS. E1-DIAG (work/runs/p01-localization/E1-DIAG-report.md,
+  # run pose-assisted-diagnostic-20260926T152643Z) measured the pinned
+  # estimator latching the moment the vehicle moves: 188 STATE frames with
+  # initialized true, 30 completed visual updates, the estimate tracking a
+  # 0.6 m climb. VioManager::initialized() is
+  # `is_initialized_vio && timelastupdate != -1` (VioManager.h:99),
+  # timelastupdate is written only at the tail of do_feature_propagate_update
+  # (VioManager.cpp:651), and that needs motion. The sensor-derived arm could
+  # therefore not move: the arm gate demanded a healthy vision source
+  # (Check::VISION, AP_Arming.cpp:2090) and a home (Check::GPS,
+  # AP_Arming.cpp:748), the vision source is the estimator's own adapter, and
+  # the adapter publishes only an initialized state. The bring-up is the
+  # ordering that breaks exactly that circle, and nothing else.
+  #
+  # THE WINDOW -- bounded, declared, restored.
+  #   duration:  <= 5.0 s (EXCITATION_MAX_AIRTIME_S) from the arm readback to
+  #              the LAND command; termination LAND, always; then a bounded
+  #              post-LAND drain (EXCITATION_POST_LAND_DRAIN_S = 10 s) so the
+  #              descent's frames are fed too. What ENDS it is not only the
+  #              clock: every parameter it writes is restored and read back
+  #              from the vehicle itself, and the scored window refuses to
+  #              open while any window value is still in force
+  #              (`_bring_up_closure_blockers`).
+  #   excitation: ALT_HOLD, one takeoff command to 0.60 m (<= half the declared
+  #              1.5 m hover altitude), NO lateral setpoint, LAND always --
+  #              the same E-EXC envelope the diagnostic flew, in the mode that
+  #              requires no position estimate (requires_position() is false,
+  #              ArduCopter/mode.h:506). The takeoff carries the documented
+  #              flag MAV_CMD_NAV_TAKEOFF param3 =
+  #              NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED
+  #              (common.xml:1005): without it `must_navigate` is true
+  #              (GCS_Mavlink_Copter.cpp:594) and ALT_HOLD's own user takeoff
+  #              is refused (mode.h:512-514).
+  #   excepted checks, each by its pinned bit (a SET bit SKIPS a check:
+  #              AP_Arming::check_enabled = (checks_to_skip & check) == 0,
+  #              AP_Arming.cpp:329-332):
+  #                * Check::VISION = 1<<18 (AP_Arming.h:46): visodom_checks
+  #                  (AP_Arming.cpp:2087-2100) fails while the last
+  #                  external-navigation message is older than
+  #                  AP_VISUALODOM_TIMEOUT_MS = 300 ms
+  #                  (AP_VisualOdom_Backend.cpp:32-37; the failure is
+  #                  AP_VisualOdom.cpp:277,292). The source is the estimator's
+  #                  adapter, which publishes only once initialized() is true.
+  #                * Check::GPS = 1<<3 (AP_Arming.h:31): its home requirement
+  #                  (AP_Arming.cpp:747-750, "AHRS: waiting for home") is met
+  #                  by the origin datum below rather than by GPS, and the
+  #                  exception covers the seconds before that derivation. The
+  #                  GPS-fix half of the same check is vacuous with GPS off: no
+  #                  receiver driver exists, so num_instances is 0.
+  #              ARMING_SKIPCHK during the window = 8 | 262144 = 262152 (the
+  #              GPS-lock bit and the VisualOdometry bit), restored to 0 --
+  #              "skip nothing", every check enabled, which is that parameter's
+  #              own recommended default -- and read back before the claimed arm.
+  #              The NAME IS THE PINNED ONE and that is a measured correction to
+  #              the plan's "ARMING_CHECK mask": the firmware renamed the
+  #              parameter (AP_Arming.cpp:199-205 AP_GROUPINFO("SKIPCHK", 13,
+  #              ...); migration comment at :233 "ARMING_CHECK -> ARMING_SKIPCHK",
+  #              conversion at :235-260), and there is no name alias -- the first
+  #              invocation of this run wrote and then read "ARMING_CHECK", the
+  #              write took nothing and the readback answered nothing
+  #              (work/runs/p01-localization/p01l-bringup-20260926T161038Z,
+  #              run-a/bring-up.json: readbacks.window.ARMING_CHECK = null).
+  #              No default changes: the applied parameter files above are
+  #              untouched, and the write is a runtime parameter on this
+  #              invocation's own vehicle.
+  #   the height reference the window needs, and why it is not an exception:
+  #              alt_checks is MANDATORY -- "Need Alt Estimate"
+  #              (AP_Arming_Copter.cpp:551-557) is reached from
+  #              run_pre_arm_checks (:82) and from mandatory_checks (:654-665)
+  #              when the mask skips everything (:72-73), so no mask can except
+  #              it -- and it requires copter.ekf_alt_ok() = VERT_POS && VERT_VEL
+  #              (ArduCopter/system.cpp:294-308), which exist only once a
+  #              height measurement of the SELECTED source is fused
+  #              (AP_NavEKF3_Control.cpp:795; hgtTimeout clears only on such a
+  #              fusion, AP_NavEKF3_PosVelFusion.cpp:1363-1379). With
+  #              EK3_SRC1_POSZ = 6 (ExternalNav) and no external-nav data yet
+  #              there is no height at all -- the very state the window exists
+  #              to end. The window therefore sets EK3_SRC1_POSZ = 1 (Baro), the
+  #              airframe's OWN height sensor and not simulator truth, for its
+  #              duration only, and restores it to 6 with a readback. It is a
+  #              height reference only: no horizontal position, no attitude, no
+  #              velocity, and nothing about it supplies the scored pose.
+  #              ALT_HOLD is used and not STABILIZE/ACRO because only the
+  #              position-holding modes have a user takeoff (mode.h:132), and
+  #              they need the height estimate their mode check also wants.
+  #              (Recorded correction to plan section 0.6 item 6 phase 1's
+  #              "VISO_TYPE 0 for this phase only": it is not restorable at this
+  #              pin. AP_VisualOdom::init() allocates the backend once, from the
+  #              value the parameter holds at boot (AP_VisualOdom.cpp:132-152;
+  #              called at AP_Vehicle.cpp:479), and every later message path
+  #              forwards only when the driver exists (:227-229). A runtime
+  #              0 -> 1 would leave the seam permanently dead, so the window
+  #              leaves VISO_TYPE alone and the Check::VISION exception covers
+  #              the interval before the adapter's first publication.)
+  #
+  # THE EKF ORIGIN DATUM -- set_ekf_origin, a frame definition, NOT a pose feed.
+  #              The window sends SET_GPS_GLOBAL_ORIGIN (msgid 48,
+  #              common.xml:5487) with platform.sitl_home, the coordinate this
+  #              autopilot is launched with. It is a DATUM: the local frame's
+  #              geographic anchor, set once, carrying no vehicle position,
+  #              attitude or velocity. It must be declared because at this pin
+  #              EKF3 sets its origin only from GPS, from a beacon, or from a
+  #              GCS declaration -- never from ExternalNav data
+  #              (AP_NavEKF3_Measurements.cpp:680-715; GCS_MAVLINK::set_ekf_origin,
+  #              GCS_Common.cpp:3961, reached by handle_set_gps_global_origin
+  #              :3982-4014). The diagnostic sharpened this: its truth-driven
+  #              carrier got an origin from the synthesized GPS, and this
+  #              GPS-off arm has none. Home is then derived from the origin
+  #              (Copter::update_home_from_EKF, commands.cpp:4-20), which is
+  #              what lets the claimed arm's own Check::GPS pass with the full
+  #              check set restored.
+  #
+  # WHAT THE EXCEPTION DOES NOT CHANGE: the estimator pin, its input (the
+  # declared stereo pairs and inertial samples, nothing else), every predeclared
+  # bound, the seam (VISO_TYPE 1, EK3_SRC1_* = 6 at the claimed arm, restored and
+  # read back), and the truth republish (off by construction for this arm). The
+  # exception changes only WHEN the aircraft may move. The claimed arm is GUIDED
+  # with every arming check enabled, and H5 applies to it as written.
   # The sensor-derived development route's world. Separate from scenario.world
   # on purpose: the compatibility gate's 16/16 was measured on scenario.world
   # (compat_stereo.wbt), and repointing that key would silently change the
