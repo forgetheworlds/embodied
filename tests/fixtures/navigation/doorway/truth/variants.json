@@ -1,0 +1,151 @@
+{
+  "blocked": {
+    "expected": [
+      "no_known_supported_route",
+      "blocked"
+    ],
+    "panel": {
+      "axis_bounds_odom_m": {
+        "y": [
+          -0.3,
+          0.9
+        ],
+        "z": [
+          0.0,
+          2.0
+        ]
+      },
+      "name": "closed_door_leaf",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        3.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "fixture_revision": "p03-doorway-fixture-1",
+  "invalid_depth": {
+    "box_px": [
+      0,
+      0,
+      5,
+      5
+    ],
+    "expected": [
+      "unknown_geometry"
+    ],
+    "selection_id": "sel-open-band"
+  },
+  "narrow": {
+    "aperture_y_odom_m": [
+      -0.15,
+      0.55
+    ],
+    "expected": [
+      "aperture_clearance"
+    ],
+    "opening_width_m": 0.651918
+  },
+  "nominal": {
+    "aperture_y_odom_m": [
+      -0.3,
+      0.9
+    ],
+    "surfaces": "wall with the authored aperture, far wall, no panel"
+  },
+  "partial_block": {
+    "expected": [
+      "replanned_route_through_the_remaining_observed_free_part"
+    ],
+    "panel": {
+      "axis_bounds_odom_m": {
+        "y": [
+          -0.3,
+          0.7
+        ],
+        "z": [
+          0.0,
+          2.0
+        ]
+      },
+      "name": "half_door_leaf",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        3.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "pose_degradation": {
+    "epoch": {
+      "expected": [
+        "frame_epoch_mismatch"
+      ],
+      "nav_epoch": "p03-epoch-2",
+      "provenance": "CONTRACTS.md:7 - a nav_epoch reset invalidates every prior control reference"
+    },
+    "jump": {
+      "expected": [
+        "start_state_mismatch"
+      ],
+      "position_offset_odom_m": [
+        0.5,
+        0.0,
+        0.0
+      ],
+      "provenance": "authored start-state tolerance 0.20 m; the injected 0.50 m is 2.5x it, the size of an estimator realignment that keeps the same nav_epoch",
+      "threshold_m": 0.2
+    },
+    "noise": {
+      "expected": [
+        "pose_error_exceeds_allowance"
+      ],
+      "position_offset_odom_m": [
+        0.12,
+        0.0,
+        0.0
+      ],
+      "provenance": "declared error allowance 0.10 m inside the 0.40 m inflation (P03 plan section 4); the injected 0.12 m is 20 percent beyond it",
+      "threshold_m": 0.1
+    },
+    "stale": {
+      "capture_age_s": 6.0,
+      "expected": [
+        "stale_pose",
+        "stale_state"
+      ],
+      "provenance": "declared pose validity 5.0 s (P03 plan section 4); the injected 6.0 s is validity plus 1.0 s of clock skew",
+      "threshold_s": 5.0
+    }
+  },
+  "provenance": "DIAGNOSTIC",
+  "unknown": {
+    "expected": [
+      "unsupported_space"
+    ],
+    "region_odom_m": {
+      "x": [
+        4.35,
+        4.75
+      ],
+      "y": [
+        1.45,
+        1.65
+      ],
+      "z": [
+        0.95,
+        1.15
+      ]
+    }
+  }
+}

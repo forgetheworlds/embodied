@@ -1,0 +1,27 @@
+{
+  "arm": null,
+  "artifacts": {
+    "agent-events.jsonl": "5099279738bf74050bf1a164aeca8897fe4141116d04195b12e52a15a9333902",
+    "payloads/obs-1-left.ppm": "3b0bcae4c46b9bb39f7c3939c0c2fe204c387312c4ca88e51facca49e6ba5e66",
+    "payloads/obs-1-right.ppm": "2cc5f285f4ae6574cb26faae4909116b7196c67611597b79c9575879df4f102c",
+    "payloads/obs-2-left.ppm": "ddf6abac181f8909eb9e58dadf9f8aeec0aa8cdc2a308b0dc33bc02af14d1692",
+    "payloads/obs-2-right.ppm": "9b2385cb2ca6ef9ad646b9278deb0186795f1efe644cc0d8c916b2f46d5d9b0d"
+  },
+  "code_revision": null,
+  "config_hash": null,
+  "episode_id": "p03-doorway-v1",
+  "episode_kind": "synthetic-fixture",
+  "events_revision": "p02-events-1",
+  "manifest_revision": "p02-manifest-1",
+  "model_identity": null,
+  "permitted_projection": [
+    "manifest.json",
+    "agent-events.jsonl",
+    "final-report.json",
+    "payloads/"
+  ],
+  "records_revision": "p00-records-1",
+  "sensor_mode": "pose-assisted",
+  "suite": null,
+  "trial_group_id": null
+}
