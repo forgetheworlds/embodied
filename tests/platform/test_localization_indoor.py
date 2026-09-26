@@ -1205,3 +1205,92 @@ class TestH5Diagnosis:
         diagnostics = check._initializer_diagnostics(tmp_path / "absent.log")
         assert diagnostics["initializer_succeeded"] is False
         assert diagnostics["estimator_log_lines"] == 0
+
+
+class TestZuftFrameDecisions:
+    """T11: the per-frame decision behind H5's blocker (plan section 12 item 14).
+
+    The plan's sufficiency criterion is five frames the zero-velocity updater declines
+    inside the bring-up, because only a declined frame reaches
+    ``do_feature_propagate_update`` and can make a clone (VioManager.cpp:348-352). The
+    line shapes below are the pinned updater's own, taken from a recorded run's
+    ``estimator.log``: a disparity line, then accept/reject, or the starvation warning.
+    """
+
+    PASSED = "[ZUPT]: passed disparity (0.000 < 1.000, 95 features)"
+    ACCEPTED = "[ZUPT]: accepted |v_IinG| = 0.023 (chi2 0.000 < 84.595)"
+    FAILED = "[ZUPT]: failed disparity (2.714 > 1.000, 71 features)"
+    REJECTED = "[ZUPT]: rejected |v_IinG| = 0.412 (chi2 180.220 > 84.595)"
+    STARVED = "[ZUPT]: There are no IMU data to check for zero velocity with!!"
+
+    def _log(self, tmp_path, *lines):
+        path = tmp_path / "estimator.log"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_each_decision_carries_the_numbers_it_was_made_from(self, tmp_path):
+        log = self._log(
+            tmp_path,
+            "\x1b[0m\x1b[36m" + self.PASSED,
+            self.ACCEPTED,
+            self.FAILED,
+            self.REJECTED,
+            self.STARVED,
+        )
+        diagnostics = check._initializer_diagnostics(log)
+        frames = diagnostics["zupt_frames"]
+        assert [frame["decision"] for frame in frames] == [
+            "accepted",
+            "declined_motion",
+            "declined_no_imu",
+        ]
+        assert frames[0]["disparity_px"] == 0.0
+        assert frames[0]["feature_count"] == 95
+        assert frames[0]["velocity_m_s"] == 0.023
+        assert frames[1]["disparity_passed"] is False
+        assert frames[1]["chi2"] == 180.220
+        assert frames[1]["chi2_limit"] == 84.595
+        assert diagnostics["zupt_accepted_updates"] == 1
+        assert diagnostics["zupt_rejected_updates"] == 1
+        assert diagnostics["zupt_frames_without_imu"] == 1
+        assert diagnostics["zupt_frames_reaching_visual_path"] == 2
+
+    def test_a_frame_with_no_verdict_is_not_classified_as_a_decision(self, tmp_path):
+        log = self._log(tmp_path, self.FAILED)
+        diagnostics = check._initializer_diagnostics(log)
+        assert diagnostics["zupt_frames"][0]["decision"] == "no_verdict"
+        assert diagnostics["zupt_frames_reaching_visual_path"] == 0
+
+    def test_the_blocker_names_the_measured_count_against_the_criterion(self, tmp_path):
+        log = self._log(
+            tmp_path,
+            "\x1b[0m\x1b[32m[init]: successful initialization in 0.0015 seconds",
+            self.PASSED,
+            self.ACCEPTED,
+        )
+        blocker = check._initialization_blocker(check._initializer_diagnostics(log))
+        assert "0 frame(s) reached the visual path" in blocker
+        assert "five the accessor needs" in blocker
+
+    def test_the_summary_agrees_with_the_recorded_run_it_was_built_from(self):
+        """The artifact this parses is a real run's log, when that run is on this host.
+
+        ``work/`` is local-only, so a clean clone skips this; on the host that ran it,
+        the recorded pre-arm window must classify without leftovers and its frames
+        reaching the visual path must be the declined ones, which is the quantity the
+        run-6 receipt argued from the log tail.
+        """
+        log = (
+            Path(check.__file__).resolve().parents[3]
+            / "work/runs/p01-localization/p01l-run6-both-eyes-20260926T115350Z/run-a/estimator.log"
+        )
+        if not log.is_file():
+            pytest.skip(f"the recorded run log is not on this host: {log}")
+        diagnostics = check._initializer_diagnostics(log)
+        frames = diagnostics["zupt_frames"]
+        assert frames, "a run that consumed 525 stereo frames recorded decisions"
+        assert all(frame["decision"] != "no_verdict" for frame in frames)
+        assert diagnostics["zupt_accepted_updates"] > 0
+        assert diagnostics["zupt_frames_reaching_visual_path"] == (
+            diagnostics["zupt_rejected_updates"] + diagnostics["zupt_frames_without_imu"]
+        )
