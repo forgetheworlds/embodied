@@ -22,6 +22,7 @@ When the machine stops, it stops completely — no zero pose, no frozen last pos
 
 from __future__ import annotations
 
+import math
 import select
 import socket
 import struct
@@ -251,44 +252,139 @@ def rotmat_to_rpy(matrix: np.ndarray) -> tuple[float, float, float]:
     return (roll, pitch, yaw)
 
 
-# The fixed axis swap from an ENU frame (x east, y north, z up) to a local NED
-# frame (x north, y east, z down): (x, y, z) -> (y, x, -z).
-ENU_TO_NED_AXES = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+# The fixed axis maps of one nav_epoch, each derived from the pinned chain
+# (plan sections 0.3 item 2 and 0.5, the latter written from measurement):
+#
+# - the world is x-north, y-west, z-up (dev-a-single/world.wbt:12) and the
+#   bridge's gate-proven world→autopilot conversion keeps x and negates y and z
+#   (webots_ardupilot.py enu_to_ned, pinned to SIM_Webots_Python.cpp);
+# - the estimator's body is FLU (ov_stream rotates the autopilot-shaped
+#   inertial samples by (x, −y, −z) so a level vehicle presents gravity along
+#   +z, plan section 3.4 convention 1), while ArduPilot's body is FRD, so an
+#   attitude must carry the FLU→FRD map on the right — a 180° roll, measured
+#   missing on the first textured invocation (receipt
+#   p01l-run5-textured-20260926T104945Zb: the −180.0 roll delta A1 reported);
+# - the odom frame's *yaw* is not derivable from geometry at all. The pinned
+#   static initializer builds its world frame with gram_schmidt
+#   (StaticInitializer.cpp:120-123, ov_init/src/utils/helper.h:138-157), whose
+#   branch is decided by |e₁·z| < |e₂·z|; at a level start both terms are
+#   accelerometer noise, so the initializer picks x_axis = z×e₁ or z×e₂ run by
+#   run, i.e. a yaw that is arbitrary and unobservable (no magnetometer and no
+#   GPS in this arm; the options header exposes no yaw parameter). The second
+#   textured invocation measured exactly that: a +90.0 yaw delta where the
+#   geometric prediction said zero.
+#
+# Therefore the epoch rotation is *derived once* from two things that are known
+# at the declared stationary start — the estimator's own first initialized
+# attitude and the world's declared start attitude — and then frozen for the
+# epoch. It is a fixed alignment, never re-estimated in flight, so estimator
+# drift still shows up in the published state instead of being absorbed.
+WORLD_TO_NED_AXES = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+FLU_TO_FRD_AXES = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+
+
+def rotmat_from_rpy(rpy: Sequence[float]) -> np.ndarray:
+    """The NED 3-2-1 rotation matrix of one roll, pitch, yaw triple."""
+    roll, pitch, yaw = (float(value) for value in rpy)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return np.array(
+        [
+            [cp * cy, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy],
+            [cp * sy, sr * sp * sy + cr * cy, cr * sp * sy - sr * cy],
+            [-sp, sr * cp, cr * cp],
+        ]
+    )
 
 
 class OdomAlignment:
     """The fixed odom→local-NED transform of one nav_epoch.
 
-    Odom is the estimator's initialization frame (z-up, axes fixed at startup);
-    the autopilot's local frame is NED with its origin at the vehicle's declared
-    stationary start (``configs/first_indoor.yaml`` calibration.referee). The
-    alignment is computed once per epoch from that declared start and never
-    re-estimated: a moving alignment would hide estimator drift instead of
-    reporting it.
+    The odom origin is the estimator's initialization point, taken from the
+    configured world's own vehicle translation rather than the calibration
+    referee's declared pose (plan section 0.3 item 3). The odom *attitude* is
+    sealed once, at the first initialized state while the vehicle is static at
+    the declared start: the epoch rotation that takes the estimator's reported
+    attitude to the autopilot's NED/FRD attitude is computed from the world's
+    declared start attitude and the estimator's own initial attitude, then
+    frozen. Before sealing, no state may be converted — an unsealed alignment
+    raises rather than guessing a yaw.
     """
 
-    def __init__(self, odom_origin_world_enu_m: Sequence[float]) -> None:
-        self._origin = np.asarray(odom_origin_world_enu_m, dtype=np.float64)
-        if self._origin.shape != (3,):
+    def __init__(
+        self,
+        odom_origin_world_m: Sequence[float],
+        declared_start_rpy: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        origin = np.asarray(odom_origin_world_m, dtype=np.float64)
+        if origin.shape != (3,):
             raise AlignmentError("the odom origin must be one ENU position")
-        self._axes = ENU_TO_NED_AXES
+        if len(declared_start_rpy) != 3:
+            raise AlignmentError("the declared start attitude must be one rpy triple")
+        self._origin_ned = WORLD_TO_NED_AXES @ origin
+        self._declared_start_rpy = tuple(float(value) for value in declared_start_rpy)
+        self._epoch_rotation: np.ndarray | None = None
+
+    @property
+    def sealed(self) -> bool:
+        return self._epoch_rotation is not None
+
+    @property
+    def declared_start_rpy(self) -> tuple[float, float, float]:
+        return self._declared_start_rpy
+
+    @property
+    def epoch_rotation(self) -> np.ndarray:
+        self._require_sealed()
+        return self._epoch_rotation
+
+    def epoch_yaw_deg(self) -> float:
+        """The sealed rotation's yaw on the vertical: recorded, never gated."""
+        return math.degrees(rotmat_to_rpy(self.epoch_rotation)[2])
+
+    def seal(self, initial_quat_odom_wxyz: Sequence[float]) -> None:
+        """Derive and freeze the epoch rotation from the first initialized state.
+
+        ``published = A · q_odom(t) · FLU→FRD`` with
+        ``A = R_declared_start · FLU→FRD · q_odom(start)⁻¹``: one fixed
+        odom→NED rotation per epoch, the estimator's own initialization frame
+        related to the autopilot's frame by the two things known at the declared
+        stationary start. Idempotent: the first seal wins and the rotation never
+        moves afterwards.
+        """
+        if self._epoch_rotation is not None:
+            return
+        initial = quat_to_rotmat(initial_quat_odom_wxyz)
+        declared = rotmat_from_rpy(self._declared_start_rpy)
+        self._epoch_rotation = declared @ FLU_TO_FRD_AXES @ initial.T
+
+    def _require_sealed(self) -> None:
+        if self._epoch_rotation is None:
+            raise AlignmentError(
+                "the odom alignment is not sealed: no initialized estimator state has "
+                "defined this epoch's rotation, and an unsealed alignment must not guess "
+                "the odom frame's unobservable yaw"
+            )
 
     def aligned_position_ned(self, position_odom_m: Sequence[float]) -> tuple[float, float, float]:
-        point = self._axes @ (self._origin + np.asarray(position_odom_m, dtype=np.float64))
+        rotation = self.epoch_rotation
+        point = self._origin_ned + rotation @ np.asarray(position_odom_m, dtype=np.float64)
         return (float(point[0]), float(point[1]), float(point[2]))
 
     def aligned_velocity_ned(self, velocity_odom_mps: Sequence[float]) -> tuple[float, float, float]:
-        ned = self._axes @ np.asarray(velocity_odom_mps, dtype=np.float64)
+        ned = self.epoch_rotation @ np.asarray(velocity_odom_mps, dtype=np.float64)
         return (float(ned[0]), float(ned[1]), float(ned[2]))
 
     def aligned_quat_ned_wxyz(
         self, quat_odom_wxyz: Sequence[float]
     ) -> tuple[float, float, float, float]:
-        rotation = self._axes @ quat_to_rotmat(quat_odom_wxyz)
+        rotation = self.epoch_rotation @ quat_to_rotmat(quat_odom_wxyz) @ FLU_TO_FRD_AXES
         return rotmat_to_quat(rotation)
 
     def aligned_attitude_rpy(self, quat_odom_wxyz: Sequence[float]) -> tuple[float, float, float]:
-        return rotmat_to_rpy(quat_to_rotmat(self.aligned_quat_ned_wxyz(quat_odom_wxyz)))
+        rotation = self.epoch_rotation @ quat_to_rotmat(quat_odom_wxyz) @ FLU_TO_FRD_AXES
+        return rotmat_to_rpy(rotation)
 
     def aligned_state(self, state: EstimatorState) -> dict[str, object]:
         """One aligned state: NED position, NED attitude RPY and velocity."""
@@ -566,12 +662,17 @@ def publish_period_s() -> float:
 class ExternalNavPublisher:
     """Publishes the aligned estimator state to SITL at the proven cadence.
 
-    Two message types on a dedicated MAVLink TCP connection — the gate's
+    Two message types on the adapter's own MAVLink TCP connection — the gate's
     discipline (ALLOWED_OUTBOUND_TYPES, VISION_POSE_PERIOD_S = 0.025 at the
-    pinned bridge). The usec stamp is sim time exactly as the gate published it;
-    the declared pipeline delay rides ``VISO_DELAY_MS``, never a re-stamped
-    field. Covariance entries 0/6/11 carry the estimator's σ² per axis; the
-    firmware computes posErr from them and floors it at ``VISO_POS_M_NSE``.
+    pinned bridge), with the same source identity the gate's feed used. The usec
+    stamp is sim time exactly as the gate published it; the declared pipeline
+    delay rides ``VISO_DELAY_MS``, never a re-stamped field. Covariance entries
+    0/6/11 carry the estimator's σ² per axis; the firmware computes posErr from
+    them and floors it at ``VISO_POS_M_NSE``.
+
+    The endpoint is resolved before ``start()`` and must be a port the autopilot
+    actually serves: the pinned SITL accepts one TCP client per serial port, so a
+    port another client owns yields a connection that is accepted and never read.
     """
 
     def __init__(
@@ -596,20 +697,50 @@ class ExternalNavPublisher:
         self.published = 0
         self.publish_failures: list[str] = []
 
+    def retarget(self, endpoint: str) -> None:
+        """Point the publisher at the autopilot link it will open in ``start()``.
+
+        Called once, after SITL is running and has declared its serial ports, and
+        before any publication. The adapter's endpoint is a property of the live
+        process, not of the configuration: the configured port belongs to the
+        check's own session, and the pinned SITL serves one client per port.
+        """
+        if self._connection is not None:
+            raise RuntimeError("the publisher is already connected; retarget before start()")
+        self._endpoint = endpoint
+
     def offer(self, state: EstimatorState, newest_imu_ns: int) -> None:
         """Hand one candidate state to the publisher's loop."""
         self._latest = state
         self._newest_imu_ns = max(self._newest_imu_ns, newest_imu_ns)
 
     def start(self, heartbeat_timeout_s: float = 15.0) -> None:
+        """Open the adapter's own autopilot link and start publishing.
+
+        The heartbeat is CHECKED, not assumed. The pinned SITL serves exactly one
+        TCP client per serial port (UARTDriver.cpp: a single accept(), then
+        ``_connected``), so a connection to a port another client already owns is
+        accepted by the kernel and never read: sends succeed locally and nothing
+        reaches the autopilot. The third textured invocation measured exactly that
+        -- 2404 publications, ``VisOdom: not healthy`` -- so an unanswered
+        heartbeat is a raised error, not a silent write into a void.
+        """
         try:
             from pymavlink import mavutil
         except ImportError as error:  # pragma: no cover - pinned dependency
             raise RuntimeError(f"pymavlink is required to publish external nav: {error}") from error
         self._connection = mavutil.mavlink_connection(
-            self._endpoint, source_system=251, source_component=191
+            self._endpoint, source_system=250, source_component=190
         )
-        self._connection.wait_heartbeat(timeout=heartbeat_timeout_s)
+        if self._connection.wait_heartbeat(timeout=heartbeat_timeout_s) is None:
+            self._connection.close()
+            self._connection = None
+            raise RuntimeError(
+                f"no MAVLink heartbeat on {self._endpoint} within "
+                f"{heartbeat_timeout_s:.0f}s: the autopilot does not serve this link, so "
+                "publishing into it would be a silent void (the pinned SITL accepts one "
+                "TCP client per serial port)"
+            )
         self._thread = threading.Thread(target=self._loop, name="externalnav-publish", daemon=True)
         self._thread.start()
 
@@ -635,6 +766,13 @@ class ExternalNavPublisher:
             state = self._latest
             if not self._machine.on_state(state, int(now * 1e9)):
                 continue
+            # The epoch's one-time rotation: the first state the machine accepts as
+            # healthy is the estimator's attitude at the declared stationary start
+            # (initialization happens before any publication), and it is the only
+            # observation that can define the odom frame's unobservable yaw. Sealed
+            # here, once, then never moved.
+            if not self._alignment.sealed:
+                self._alignment.seal(state.quat_wxyz)
             try:
                 self._send_state(state)
             except (OSError, ProtocolError, RuntimeError) as error:

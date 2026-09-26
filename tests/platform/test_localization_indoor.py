@@ -28,6 +28,7 @@ from embodied.cli import CommandError, build_parser
 from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
 from embodied.platform import localization_check as check
+from embodied.platform.webots_ardupilot import EvidenceWriter as bridge_EvidenceWriter
 from embodied.platform.webots_ardupilot import PlatformSettings
 
 
@@ -206,60 +207,122 @@ class TestProtocolRoundTrip:
 
 
 class TestConventions:
-    def test_position_axes_swap_and_negate(self):
+    def test_the_world_and_body_maps_are_the_pinned_conversions(self):
+        """Plan section 0.3 item 2: the bridge's world->NED map (keep x, negate y
+        and z) and the estimator-body FLU -> autopilot-body FRD map (a 180-degree
+        roll), both pinned against the bridge the gate proved."""
+        assert loc.WORLD_TO_NED_AXES == pytest.approx(
+            np.diag([1.0, -1.0, -1.0]), abs=1e-12
+        )
+        assert loc.FLU_TO_FRD_AXES == pytest.approx(
+            np.diag([1.0, -1.0, -1.0]), abs=1e-12
+        )
+
+    def test_an_unsealed_alignment_refuses_to_convert(self):
+        """The odom frame's yaw is unobservable, so an alignment that has not been
+        sealed by an initialized state must refuse rather than guess."""
+        alignment = loc.OdomAlignment((-1.0, 0.0, 0.09))
+        assert alignment.sealed is False
+        with pytest.raises(loc.AlignmentError, match="not sealed"):
+            alignment.aligned_position_ned((0.0, 0.0, 0.0))
+        with pytest.raises(loc.AlignmentError, match="not sealed"):
+            alignment.aligned_attitude_rpy((1.0, 0.0, 0.0, 0.0))
+
+    def test_the_seal_makes_every_initial_yaw_publish_the_declared_start(self):
+        """The measured defect that produced this design: the pinned initializer's
+        gram_schmidt branch is decided by accelerometer noise at a level start, so
+        the odom yaw is arbitrary. The seal derives the epoch rotation from the
+        estimator's own first initialized attitude, so whatever yaw the estimator
+        reports, the published attitude at the declared start is the declared
+        start attitude."""
+        for odom_yaw_deg in (0.0, 90.0, 180.0, -90.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((-1.0, 0.0, 0.09), (0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            assert alignment.aligned_attitude_rpy(q_init) == pytest.approx(
+                (0.0, 0.0, 0.0), abs=1e-9
+            )
+            # The seal's own yaw is the derivation's, recorded for the receipt:
+            # the estimator's arbitrary yaw is folded into it, so no run depends on
+            # which gram_schmidt branch the initializer's noise happened to take.
+            assert abs(alignment.epoch_yaw_deg()) <= 180.0
+
+    def test_the_declared_start_yaw_is_honoured_by_the_seal(self):
+        alignment = loc.OdomAlignment((0.0, 0.0, 0.0), (0.0, 0.0, math.pi / 2))
+        alignment.seal((1.0, 0.0, 0.0, 0.0))
+        assert alignment.aligned_attitude_rpy((1.0, 0.0, 0.0, 0.0)) == pytest.approx(
+            (0.0, 0.0, math.pi / 2), abs=1e-9
+        )
+
+    def test_the_seal_is_idempotent_once_taken(self):
+        """The epoch rotation is fixed: a later call must not move it, or drift
+        would be absorbed instead of published."""
         alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        assert alignment.aligned_position_ned((1.0, 2.0, 3.0)) == (2.0, 1.0, -3.0)
+        alignment.seal((0.0, 0.0, 0.0, 1.0))
+        first = alignment.epoch_rotation.copy()
+        alignment.seal((math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4)))
+        assert alignment.epoch_rotation == pytest.approx(first, abs=1e-12)
+
+    def test_position_maps_origin_and_odom_displacement_separately(self):
+        alignment = loc.OdomAlignment((-1.0, 0.0, 0.09), (0.0, 0.0, 0.0))
+        alignment.seal((0.0, 0.0, 0.0, 1.0))  # the geometric branch-b case
+        # One metre north of the dev-a-single spawn: the odom displacement reads
+        # (-1, 0, 0) in that frame, and a perfect estimator's publication equals
+        # the truth's world NED.
+        assert alignment.aligned_position_ned((-1.0, 0.0, 0.0)) == pytest.approx(
+            (0.0, 0.0, -0.09), abs=1e-12
+        )
 
     def test_odom_origin_is_the_declared_start(self):
         alignment = loc.OdomAlignment((0.0, 0.0, 0.02))
+        alignment.seal((math.cos(math.pi / 2), 0.0, 0.0, math.sin(math.pi / 2)))
         north, east, down = alignment.aligned_position_ned((0.0, 0.0, 0.0))
         assert (north, east, down) == (0.0, 0.0, -0.02)
 
-    def test_velocity_axes_match_position_axes(self):
+    def test_velocity_maps_through_the_epoch_rotation(self):
         alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        assert alignment.aligned_velocity_ned((1.0, 0.0, 0.0)) == (0.0, 1.0, 0.0)
+        alignment.seal((0.0, 0.0, 0.0, 1.0))
+        assert alignment.aligned_velocity_ned((1.0, 0.0, 0.0)) == (-1.0, 0.0, 0.0)
 
-    def test_identity_body_pose_is_the_axis_swap(self):
-        """The declared start's identity quaternion faces ENU +x; in NED that is
-        yaw +90 degrees, so the published attitude is the axis swap itself,
-        never identity by accident."""
-        alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        quat = alignment.aligned_quat_ned_wxyz((1.0, 0.0, 0.0, 0.0))
-        assert loc.quat_to_rotmat(quat) == pytest.approx(loc.ENU_TO_NED_AXES, abs=1e-12)
+    def test_the_first_runs_measured_roll_error_is_reproduced(self):
+        """The first textured invocation's refusal, kept as a regression: the
+        geometric map without the FLU->FRD body term (and without a seal) reports a
+        180-degree roll on a level yaw-0 start -- exactly the delta A1 measured
+        (receipt p01l-run5-textured-20260926T104945Zb)."""
+        odom_yaw_180 = (0.0, 0.0, 0.0, 1.0)
+        rotation = loc.quat_to_rotmat(odom_yaw_180)
+        geometric = np.diag([-1.0, 1.0, -1.0])
+        without_body_map = loc.rotmat_to_rpy(geometric @ rotation)
+        with_body_map = loc.rotmat_to_rpy(geometric @ rotation @ loc.FLU_TO_FRD_AXES)
+        assert without_body_map[0] == pytest.approx(math.pi, abs=1e-9)
+        assert with_body_map == pytest.approx((0.0, 0.0, 0.0), abs=1e-12)
 
-    def test_enu_yaw_rotation_maps_through_the_axes(self):
-        alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        yaw_90_enu = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))
-        quat = alignment.aligned_quat_ned_wxyz(yaw_90_enu)
-        expected = loc.ENU_TO_NED_AXES @ _rot_z_90()
-        assert loc.quat_to_rotmat(quat) == pytest.approx(expected, abs=1e-12)
+    def test_rotation_matrix_from_rpy_round_trips(self):
+        assert loc.rotmat_to_rpy(loc.rotmat_from_rpy((0.1, -0.2, 0.3))) == pytest.approx(
+            (0.1, -0.2, 0.3), abs=1e-12
+        )
 
-    def test_enu_east_rotation_becomes_a_ned_north_rotation(self):
+    def test_a_yaw_in_the_odom_frame_composes_through_the_sealed_epoch(self):
         alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        roll_90_enu = (math.cos(math.pi / 4), math.sin(math.pi / 4), 0.0, 0.0)
-        quat = alignment.aligned_quat_ned_wxyz(roll_90_enu)
-        expected = loc.ENU_TO_NED_AXES @ _rot_x_90()
-        assert loc.quat_to_rotmat(quat) == pytest.approx(expected, abs=1e-12)
+        level_yaw_90 = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))
+        alignment.seal(level_yaw_90)
+        quat = alignment.aligned_quat_ned_wxyz(level_yaw_90)
+        assert loc.quat_to_rotmat(quat) == pytest.approx(np.eye(3), abs=1e-12)
 
     def test_aligned_rotation_moves_points_consistently(self):
-        """A body point maps as NED(R @ v): the body coordinates ride unchanged,
-        the world-side axes are remapped once."""
+        """An estimator-body point maps as published(R @ FLU->FRD @ v): the sealed
+        epoch rotation and the body convention each act once."""
         alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        yaw_90_enu = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))
-        quat_ned = alignment.aligned_quat_ned_wxyz(yaw_90_enu)
+        level_yaw_90 = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))
+        alignment.seal(level_yaw_90)
+        quat_ned = alignment.aligned_quat_ned_wxyz(level_yaw_90)
         point_body = np.array([1.0, 0.0, 0.0])
-        rotated_enu = _rot_z_90() @ point_body
-        expected = loc.ENU_TO_NED_AXES @ rotated_enu
+        expected = alignment.epoch_rotation @ _rot_z_90() @ (
+            loc.FLU_TO_FRD_AXES @ point_body
+        )
         rotated_ned = loc.quat_to_rotmat(quat_ned) @ point_body
         assert rotated_ned == pytest.approx(expected, abs=1e-12)
-
-    def test_aligned_state_reports_position_and_velocity(self):
-        alignment = loc.OdomAlignment((0.0, 0.0, 0.02))
-        state = replace(_state(), position_m=(1.0, 0.0, -0.02))
-        aligned = alignment.aligned_state(state)
-        assert aligned["position_ned_m"] == pytest.approx((0.0, 1.0, 0.0), abs=1e-12)
-        assert aligned["velocity_ned_mps"] == pytest.approx((0.2, 0.1, -0.3), abs=1e-12)
-        assert aligned["attitude_rpy"][2] == pytest.approx(math.pi / 2, abs=1e-9)
 
     def test_estimated_body_is_the_declared_imu_frame(self):
         """The estimator's body frame is the declared IMU frame; the feed never
@@ -679,6 +742,17 @@ def _textured_image() -> np.ndarray:
 
 
 class TestSceneAdmission:
+    """T7 and its revision-4 extension: the admission gate is real, both ways,
+    and it only measures frames that can prove which world they show."""
+
+    def _world_settings(self, tmp_path: Path, world_text: str = "#VRML_SIM R2025a utf8\n"):
+        """Settings whose world exists under tmp_path, so its sha256 is real."""
+        world = tmp_path / "scenarios/missions/dev/dev-a-single/world.wbt"
+        world.parent.mkdir(parents=True, exist_ok=True)
+        world.write_text(world_text, encoding="utf-8")
+        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
+        return replace(settings, world=world), world
+
     def test_a_scene_with_trackable_corners_clears_the_floor(self, tmp_path):
         import cv2
 
@@ -687,41 +761,304 @@ class TestSceneAdmission:
             len(detector.detect(_textured_image(), None))
             >= check.INITIALIZER_FEATURE_FLOOR
         )
-        pairs_dir = tmp_path / "work/runs/p00-compat/accept-test/run-a/pairs"
-        _write_left_frame(pairs_dir, "00001-left.ppm", _textured_image())
-        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
-        ok, detail = check._scene_admission_check(settings, tmp_path)
-        assert ok, detail
+        settings, world = self._world_settings(tmp_path)
+        run_dir = tmp_path / "work/runs/p01-localization/run-test/run-a"
+        _write_left_frame(run_dir / "pairs", "00001-left.ppm", _textured_image())
+        (run_dir / "scene-capture.json").write_text(
+            json.dumps({"world_sha256": check._sha256(world)}), encoding="utf-8"
+        )
+        ok, state, detail = check._scene_admission_check(settings, tmp_path)
+        assert (ok, state) == (True, "measured_pass"), detail
 
     def test_a_featureless_scene_fails_with_the_floor_named(self, tmp_path):
-        pairs_dir = tmp_path / "work/runs/p00-compat/accept-test/run-a/pairs"
-        _write_left_frame(pairs_dir, "00001-left.ppm", np.zeros((480, 640), np.uint8))
-        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
-        ok, detail = check._scene_admission_check(settings, tmp_path)
-        assert ok is False
+        settings, world = self._world_settings(tmp_path)
+        run_dir = tmp_path / "work/runs/p01-localization/run-test/run-a"
+        _write_left_frame(run_dir / "pairs", "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        (run_dir / "scene-capture.json").write_text(
+            json.dumps({"world_sha256": check._sha256(world)}), encoding="utf-8"
+        )
+        ok, state, detail = check._scene_admission_check(settings, tmp_path)
+        assert (ok, state) == (False, "measured_fail")
         assert str(check.INITIALIZER_FEATURE_FLOOR) in detail
         assert "[0]" in detail
 
     def test_a_capture_of_another_world_is_skipped(self, tmp_path):
+        settings, _world = self._world_settings(tmp_path)
         run_dir = tmp_path / "work/runs/p00-compat/accept-other/run-a"
         _write_left_frame(run_dir / "pairs", "00001-left.ppm", _textured_image())
         (run_dir / "startup.json").write_text(
             json.dumps({"assets": {"world_sha256": "not-this-world"}}), encoding="utf-8"
         )
-        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
-        ok, detail = check._scene_admission_check(settings, tmp_path)
-        assert ok is False
-        assert "no recorded capture" in detail
+        ok, state, detail = check._scene_admission_check(settings, tmp_path)
+        assert (ok, state) == (True, "deferred_to_arm_gate")
+        assert "no hash-matched recorded capture" in detail
 
-    def test_the_recorded_featureless_scene_blocks_the_preflight_by_name(self, tmp_path):
-        """Today's measured reality, through the gate itself: the configured scene's
-        own recorded frames carry no FAST keypoints against the initializer's floor."""
+    def test_a_capture_that_records_no_world_hash_is_skipped(self, tmp_path):
+        """The accept-5 hole: P00's capture predates the world hash, so its frames
+        cannot prove which world they show -- and with a development route
+        configured, measuring them would judge one scene against another world's
+        gate. Revision 4 skips them instead."""
+        settings, _world = self._world_settings(tmp_path)
+        run_dir = tmp_path / "work/runs/p00-compat/accept-5/run-a"
+        _write_left_frame(run_dir / "pairs", "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        ok, state, detail = check._scene_admission_check(settings, tmp_path)
+        assert (ok, state) == (True, "deferred_to_arm_gate")
+        assert "skipped for recording no world hash" in detail
+
+    def test_the_preflight_no_longer_refuses_the_textured_route(self, tmp_path):
+        """The declared configuration names dev-a-single. The preflight admits it
+        either way: as `deferred_to_arm_gate` before any capture of that world
+        exists, or as `measured_pass` once a run has recorded one -- the first
+        textured invocation's own hash-anchored capture is what turns the first
+        state into the second (plan section 0.3 item 4). What must never happen
+        is the old refusal, where the compat scene's unprovenanced frames were
+        measured against this world's gate."""
         rows, _satisfied = check._preflight(
             check._load_localization_config(Path("configs/first_indoor.yaml")),
             tmp_path,
             SensorMode.SENSOR_DERIVED,
         )
         row = {entry["name"]: entry for entry in rows}["scene_admission"]
-        assert row["satisfied"] is False
-        assert "compat_stereo.wbt" in row["detail"]
-        assert "keypoint counts [0" in row["detail"]
+        assert row["satisfied"] is True
+        assert row["state"] in {"deferred_to_arm_gate", "measured_pass"}
+        assert "dev-a-single" in row["detail"]
+        assert "compat_stereo" not in row["detail"]
+
+    def test_the_arm_gate_refuses_a_featureless_scene_on_its_own_frames(
+        self, tmp_path
+    ):
+        """Run 4's refusal, made procedural: the arm gate measures the run's own
+        recorded frames and refuses the arm when they do not clear the floor."""
+        settings, world = self._world_settings(tmp_path)
+        writer = bridge_EvidenceWriter(tmp_path / "run", "run-a")
+        pairs_dir = tmp_path / "run/run-a/pairs"
+        _write_left_frame(pairs_dir, "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        blocker = check._scene_capture_gate(
+            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+        )
+        assert blocker and "FAST keypoints" in blocker
+
+    def test_the_arm_gate_passes_a_textured_scene_on_its_own_frames(self, tmp_path):
+        settings, _world = self._world_settings(tmp_path)
+        writer = bridge_EvidenceWriter(tmp_path / "run", "run-a")
+        pairs_dir = tmp_path / "run/run-a/pairs"
+        _write_left_frame(pairs_dir, "00001-left.ppm", _textured_image())
+        blocker = check._scene_capture_gate(
+            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+        )
+        assert blocker is None
+        record = json.loads(
+            (tmp_path / "run/run-a/scene-capture.json").read_text(encoding="utf-8")
+        )
+        assert record["state"] == "measured_pass"
+        assert record["world_sha256"] == check._sha256(settings.world)
+
+
+# ---------------------------------------------------------------------------
+# T8/T9/T10 (new in revision 4): world selection, origin from the world, A1
+# ---------------------------------------------------------------------------
+
+
+class TestWorldSelection:
+    """T8: localization.world selects the development route; scenario.world is
+    the compatibility gate's measured vehicle and never moves."""
+
+    def test_the_schema_accepts_the_world_key_and_scenario_world_stands(self):
+        from embodied.cli import load_config
+
+        document = load_config(Path("configs/first_indoor.yaml"))
+        assert document["localization"]["world"] == (
+            "scenarios/missions/dev/dev-a-single/world.wbt"
+        )
+        assert document["scenario"]["world"] == "scenarios/compat/worlds/compat_stereo.wbt"
+
+    def test_the_check_runs_in_the_declared_development_world(self):
+        document = _declared_document()
+        settings = check._platform_settings(document, Path.cwd().resolve())
+        assert settings.world.name == "world.wbt"
+        assert "dev-a-single" in str(settings.world)
+
+    def test_an_absent_key_falls_back_to_scenario_world(self):
+        document = _declared_document()
+        document["localization"].pop("world")
+        settings = check._platform_settings(document, Path.cwd().resolve())
+        plain = PlatformSettings.from_config(document, root=Path.cwd().resolve())
+        assert settings.world == plain.world
+        assert plain.world.name == "compat_stereo.wbt"
+
+
+class TestOdomOriginFromTheWorld:
+    """T9: the odom origin is the configured world's own vehicle translation."""
+
+    def test_the_dev_world_declares_the_vestibule_spawn(self):
+        origin = check._declared_start_origin(
+            Path("scenarios/missions/dev/dev-a-single/world.wbt")
+        )
+        assert origin == (-1.0, 0.0, 0.09)
+
+    def test_the_mission_yaml_spawn_agrees_with_the_world(self):
+        mission = yaml.safe_load(
+            Path("scenarios/missions/dev/dev-a-single/mission.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        spawn = mission["spawn_pose"]
+        origin = check._declared_start_origin(
+            Path("scenarios/missions/dev/dev-a-single/world.wbt")
+        )
+        assert (spawn["x"], spawn["y"], spawn["z"]) == origin
+
+    def test_the_compat_worlds_own_spawn_disagrees_with_the_referee(self):
+        """The recorded 7 cm gap (plan section 13): the referee declares
+        [0, 0, 0.02] while the compat scene's own Iris spawns at 0.09 -- which is
+        why the world file, not the referee, is the odom anchor."""
+        origin = check._declared_start_origin(
+            Path("scenarios/compat/worlds/compat_stereo.wbt")
+        )
+        referee = _declared_document()["calibration"]["referee"][
+            "body_position_world_m"
+        ]
+        assert origin == (0.0, 0.0, 0.09)
+        assert referee == [0.0, 0.0, 0.02]
+
+    def test_a_world_without_a_vehicle_translation_is_refused(self, tmp_path):
+        world = tmp_path / "empty.wbt"
+        world.write_text("#VRML_SIM R2025a utf8\n", encoding="utf-8")
+        with pytest.raises(Exception, match="Iris"):
+            check._declared_start_origin(world)
+
+    def test_the_declared_start_attitude_is_the_identity_in_both_worlds(self):
+        """Neither declared world rotates its Iris node, and the seal rests on
+        that declaration, so it is asserted rather than assumed."""
+        assert check._declared_start_attitude(
+            Path("scenarios/missions/dev/dev-a-single/world.wbt")
+        ) == (0.0, 0.0, 0.0)
+        assert check._declared_start_attitude(
+            Path("scenarios/compat/worlds/compat_stereo.wbt")
+        ) == (0.0, 0.0, 0.0)
+
+    def test_the_mission_yaw_agrees_with_the_worlds_declared_start(self):
+        mission = yaml.safe_load(
+            Path("scenarios/missions/dev/dev-a-single/mission.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert mission["spawn_pose"]["yaw_rad"] == check._declared_start_attitude(
+            Path("scenarios/missions/dev/dev-a-single/world.wbt")
+        )[2]
+
+    def test_a_tilted_start_rotation_is_refused_not_approximated(self, tmp_path):
+        world = tmp_path / "tilted.wbt"
+        world.write_text(
+            'Iris {\n  translation 0 0 0.09\n  rotation 1 0 0 0.5\n'
+            '  controller "x"\n}\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(Exception, match="tilted"):
+            check._declared_start_attitude(world)
+
+    def test_a_yaw_only_start_rotation_becomes_a_negative_ned_yaw(self, tmp_path):
+        world = tmp_path / "yawed.wbt"
+        world.write_text(
+            'Iris {\n  translation 0 0 0.09\n  rotation 0 0 1 1.5707963267948966\n'
+            '  controller "x"\n}\n',
+            encoding="utf-8",
+        )
+        assert check._declared_start_attitude(world) == pytest.approx(
+            (0.0, 0.0, -math.pi / 2), abs=1e-9
+        )
+
+
+class TestAttitudeGate:
+    """T10's A1 half, second form: the pre-arm gate checks the composition the
+    adapter performed and the world's declaration the seal rests on, and refuses
+    the arm by name when either is off."""
+
+    @staticmethod
+    def _writer(tmp_path: Path):
+        return bridge_EvidenceWriter(tmp_path / "run", "run-a")
+
+    @staticmethod
+    def _stats(truth_rpy=(0.0, 0.0, 0.0)):
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((1_000_000_000, tuple(truth_rpy)))
+        return stats
+
+    @staticmethod
+    def _alignment(declared=(0.0, 0.0, 0.0), initial=(0.0, 0.0, 0.0, 1.0)):
+        alignment = loc.OdomAlignment((0.0, 0.0, 0.0), declared)
+        alignment.seal(initial)
+        return alignment
+
+    def test_the_sealed_start_passes_against_truth(self, tmp_path):
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, 0.0)},
+            self._alignment(initial=(math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))),
+            self._stats(),
+            [],
+        )
+        assert blocker is None
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["state"] == "measured_pass"
+        # The unobservable yaw is recorded, not gated: this run's estimator yawed
+        # 90 degrees at initialization and the seal absorbed exactly that.
+        assert record["epoch_yaw_deg"] == pytest.approx(90.0, abs=1e-6)
+
+    def test_a_composition_that_misses_the_declared_start_refuses_the_arm(self, tmp_path):
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, math.pi / 2)},
+            self._alignment(),
+            self._stats(),
+            [],
+        )
+        assert blocker and "composition deltas" in blocker
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["state"] == "measured_fail"
+
+    def test_a_declaration_that_contradicts_the_simulator_refuses_the_arm(self, tmp_path):
+        """The world's declared start is checked against the simulator's own
+        attitude: a declaration that names a yaw the scene does not have is a
+        refusal, not a silent rotation of the published frame."""
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, math.pi / 2)},
+            self._alignment(declared=(0.0, 0.0, math.pi / 2)),
+            self._stats(truth_rpy=(0.0, 0.0, 0.0)),
+            [],
+        )
+        assert blocker and "declaration deltas" in blocker
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert max(abs(value) for value in record["declaration_deltas_deg"]) == pytest.approx(
+            90.0, abs=1e-6
+        )
+
+    def test_a_tilted_sealed_frame_refuses_the_arm(self, tmp_path):
+        """The vertical chain is gated: a sealed rotation that does not carry
+        odom-up to NED-down cannot pass on a 90-degree level error."""
+        tilted = (math.cos(math.pi / 4), math.sin(math.pi / 4), 0.0, 0.0)
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, 0.0)},
+            self._alignment(initial=tilted),
+            self._stats(),
+            [],
+        )
+        assert blocker and "level error" in blocker
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["level_error_deg"] == pytest.approx(90.0, abs=1e-6)
+
+    def test_no_publication_to_compare_is_a_blocker_not_a_pass(self, tmp_path):
+        blocker = check._attitude_gate(
+            self._writer(tmp_path), None, self._alignment(), self._stats(), []
+        )
+        assert blocker and "no published state" in blocker

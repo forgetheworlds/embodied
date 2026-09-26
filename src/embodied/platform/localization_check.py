@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import ast
 from bisect import bisect_left
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -46,7 +47,6 @@ import subprocess
 import sys
 import time
 from typing import Any, Callable, Sequence
-
 from embodied.cli import (
     COMMAND_REGISTRY,
     CONFIG_SCHEMA,
@@ -54,6 +54,7 @@ from embodied.cli import (
     CommandStatus,
     ConfigError,
     GateStatus,
+    _Optional,
     _validate,
     register_command,
     repository_root,
@@ -166,6 +167,20 @@ SCENE_ADMISSION_MAX_FRAMES = 24
 INITIALIZER_FEATURE_FLOOR = 15
 FAST_THRESHOLD = 20
 
+# Revision 4: the run's own bounded static-start capture (plan section 0.3 item 4).
+# Same conditions as P00's accept-5 capture -- the vehicle at the declared start
+# on the ground -- recorded so the arm gate can measure the configured world
+# itself when no hash-matched capture exists yet, and so every later preflight
+# has a hash-anchored capture to measure instead of an unprovenanced one.
+SCENE_CAPTURE_MAX_FRAMES = 24
+SCENE_CAPTURE_MIN_SPACING_S = 0.3
+SCENE_CAPTURE_TIMEOUT_S = 30.0
+
+# A1: the pre-arm attitude gate (plan section 0.3 item 5). A frame-map defect is
+# a 90- or 180-degree error, not a 5-degree one; the gate converts nothing and
+# calibrates nothing -- it refuses the arm naming the per-axis error.
+ATTITUDE_GATE_TOLERANCE_DEG = 5.0
+
 # How many stereo pairs the reader's sink may hold for the feed. A pair is ~614 KB of
 # pixels at the declared 640x480, and the sink is called from the reader's thread while
 # the drain loop feeds the estimator, so a small bound keeps memory predictable while
@@ -185,6 +200,13 @@ PARAMETER_READ_TIMEOUT_S = 5.0
 # measurement; they are never adjusted after seeing a run.
 LOCALIZATION_SECTION: dict[str, Any] = {
     "mode": str,
+    # The sensor-derived development route's world, optional because older
+    # configurations -- and the compatibility gate's own -- do not carry it. The
+    # shared cli.py schema carries the same key (eb6b180); this section
+    # overrides that schema for the check's own loader, so the key must live in
+    # both. The check runs in this world when present and falls back to
+    # scenario.world otherwise (plan section 0.3 item 1).
+    "world": _Optional(str),
     "estimator": {
         "name": str,
         "tag": str,
@@ -640,65 +662,225 @@ def _recorded_world_sha256(run_dir: Path) -> str | None:
     return None
 
 
-def _scene_admission_check(settings: PlatformSettings, root: Path) -> tuple[bool, str]:
+def _platform_settings(document: dict[str, Any], root: Path) -> PlatformSettings:
+    """Settings with the sensor-derived development route applied (plan 0.3 item 1).
+
+    ``localization.world``, when present, is the world this check runs in; an
+    absent key leaves ``scenario.world`` -- and with it the compatibility gate's
+    measured vehicle -- untouched. The shared schema carries the key as optional
+    (main eb6b180), so older configurations load unchanged.
+    """
+    settings = PlatformSettings.from_config(document, root=root)
+    world_name = (document.get("localization") or {}).get("world")
+    if not world_name:
+        return settings
+    world = Path(world_name).expanduser()
+    if not world.is_absolute():
+        world = settings.root / world
+    return replace(settings, world=world)
+
+
+_VEHICLE_TRANSLATION_RE = re.compile(
+    r"^\s*translation\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)"
+)
+
+
+def _declared_start_origin(world: Path) -> tuple[float, float, float]:
+    """The configured world's own vehicle translation, as the odom origin (0.3 item 3).
+
+    The odom origin is a property of the world the route flies. The calibration
+    referee's declared start cannot serve: it disagrees with the compat world's
+    own spawn by 7 cm in z (plan section 13's recorded gap), and it describes the
+    compat scene's depth checks, not this route. ``mission.yaml`` pins the
+    vehicle node's translation as the spawn ("identical to the Iris translation
+    in world.wbt, plan section 6 pin 8"), so the world file is the anchor.
+    """
+    lines = world.read_text(encoding="utf-8", errors="replace").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith("Iris {"):
+            for candidate in lines[index + 1 : index + 40]:
+                match = _VEHICLE_TRANSLATION_RE.match(candidate)
+                if match:
+                    return (
+                        float(match.group(1)),
+                        float(match.group(2)),
+                        float(match.group(3)),
+                    )
+            break
+    raise ConfigError(
+        f"{world} declares no Iris vehicle translation; the odom origin cannot be derived "
+        "from the scene (plan section 0.3 item 3)"
+    )
+
+_VEHICLE_ROTATION_RE = re.compile(
+    r"^\s*rotation\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)"
+    r"\s+(-?\d+(?:\.\d+)?)"
+)
+
+
+def _declared_start_attitude(world: Path) -> tuple[float, float, float]:
+    """The vehicle's declared start attitude, as NED roll/pitch/yaw (0.3 item 5).
+
+    The declared stationary start is what the epoch rotation is derived from,
+    together with the estimator's own first initialized attitude, because the
+    odom frame's yaw is unobservable (see ``OdomAlignment.seal``). A pure yaw is
+    accepted and converted from Webots' rotation about +z; a tilted start is
+    refused rather than approximated, since a wrong declaration would rotate the
+    whole published frame. No rotation field means the identity start, which is
+    what both declared worlds carry; ``mission.yaml``'s ``spawn_pose.yaw_rad``
+    is the independent cross-check.
+    """
+    lines = world.read_text(encoding="utf-8", errors="replace").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith("Iris {"):
+            for candidate in lines[index + 1 : index + 20]:
+                stripped = candidate.strip()
+                if stripped.startswith("controllerArgs") or stripped.startswith("children"):
+                    break
+                match = _VEHICLE_ROTATION_RE.match(candidate)
+                if match:
+                    x, y, z, angle = (float(value) for value in match.groups())
+                    norm = math.sqrt(x * x + y * y + z * z)
+                    if norm == 0.0:
+                        return (0.0, 0.0, 0.0)
+                    axis = (x / norm, y / norm, z / norm)
+                    if abs(abs(axis[2]) - 1.0) > 1e-6:
+                        raise ConfigError(
+                            f"{world} declares a tilted start rotation {match.groups()}; "
+                            "the declared start must be level with a pure yaw (plan "
+                            "section 0.3 item 5)"
+                        )
+                    # A right-handed rotation about +z turns north toward west, which
+                    # is a negative NED yaw.
+                    yaw = -angle if axis[2] > 0.0 else angle
+                    return (0.0, 0.0, yaw)
+            return (0.0, 0.0, 0.0)
+    raise ConfigError(
+        f"{world} declares no Iris vehicle node; the start attitude cannot be derived "
+        "(plan section 0.3 item 5)"
+    )
+
+
+_SITL_SERIAL_PORT_RE = re.compile(r"^SERIAL(\d+) on TCP port (\d+)$", re.MULTILINE)
+
+
+def _autopilot_feed_endpoint(sitl_log: Path, session_endpoint: str) -> str:
+    """The autopilot link the adapter publishes on (plan section 0.5).
+
+    The pinned SITL serves exactly one TCP client per serial port
+    (``UARTDriver.cpp``: a single ``accept()``, then ``_connected``), and this
+    check's own session already owns the configured port. A second client on that
+    port is accepted by the kernel and never read -- the third textured
+    invocation published 2404 poses into exactly such a connection and the
+    autopilot reported ``VisOdom: not healthy``. The free port is taken from the
+    running SITL's own declaration of what it listens on, which its log records;
+    no port is guessed and no convention is assumed.
+    """
+    session_port = session_endpoint.rsplit(":", 1)[-1]
+    if sitl_log.is_file():
+        ports = [
+            (int(number), int(port))
+            for number, port in _SITL_SERIAL_PORT_RE.findall(
+                sitl_log.read_text(encoding="utf-8", errors="replace")
+            )
+            if str(port) != session_port
+        ]
+        if ports:
+            number, port = sorted(ports)[0]
+            return f"tcp:127.0.0.1:{port}"
+    raise ConfigError(
+        f"{sitl_log} declares no free SITL serial port besides {session_endpoint}: the "
+        "adapter cannot be given a link the autopilot actually serves, and publishing "
+        "into an unserved one is a silent void (plan section 0.5)"
+    )
+
+def _fast_keypoint_counts(frame_paths: Sequence[Path]) -> list[int] | None:
+    """Measure frames with exactly the detector call the pinned tracker makes.
+
+    Returns None when OpenCV is not importable -- unmeasurable, not zero.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    detector = cv2.FastFeatureDetector_create(threshold=FAST_THRESHOLD, nonmaxSuppression=True)
+    counts: list[int] = []
+    for frame_path in frame_paths:
+        image = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+        if image is not None:
+            counts.append(len(detector.detect(image, None)))
+    return counts
+
+
+def _scene_admission_check(
+    settings: PlatformSettings, root: Path
+) -> tuple[bool, str, str]:
     """T7: the scene must admit the pinned initializer, measured on its own frames.
 
     The initializer needs at least 15 trackable features per window and the pinned
     tracker hunts with FAST at the pinned threshold with non-max suppression. The
-    newest recorded capture of this scenario is measured with exactly that call; a
-    capture that records a different world's hash says nothing and is skipped.
+    newest recorded capture of this scenario is measured with exactly that call.
+
+    Revision 4, two changes and one unchanged property. A capture that records no
+    world hash is now skipped rather than measured: it cannot prove which world
+    its frames show, and with a development route configured it would measure one
+    scene against another world's gate. And when no hash-matched capture of the
+    configured world exists, the check defers to the arm gate instead of refusing
+    to start: the run records its own static-start frames with the world's hash,
+    and the arm is refused unless those measured frames clear the floor -- so no
+    flight can be spent on a scene the initializer cannot fire in, which is the
+    property that has held since run 4's receipt.
     """
     capture_dirs: list[Path] = []
     for pattern in SCENE_ADMISSION_CAPTURE_GLOBS:
         capture_dirs.extend(path for path in root.glob(pattern) if path.is_dir())
     current_sha256 = _sha256(settings.world)
+    unhashed = 0
     for pairs_dir in sorted(capture_dirs, key=lambda path: path.stat().st_mtime, reverse=True):
         frames = [path for path in sorted(pairs_dir.glob("*-left.ppm")) if path.is_file()]
         if not frames:
             continue
         recorded = _recorded_world_sha256(pairs_dir.parent)
-        if recorded is not None and recorded != current_sha256:
+        if recorded is None:
+            unhashed += 1
             continue
-        try:
-            import cv2
-        except ImportError:
-            return False, (
+        if recorded != current_sha256:
+            continue
+        counts = _fast_keypoint_counts(frames[:SCENE_ADMISSION_MAX_FRAMES])
+        if counts is None:
+            return (
+                False,
+                "cv2_unavailable",
                 "the scene-admission check needs OpenCV (cv2) to measure the scene's "
-                "recorded frames the way the pinned tracker does; it is not importable"
+                "recorded frames the way the pinned tracker does; it is not importable",
             )
-        detector = cv2.FastFeatureDetector_create(
-            threshold=FAST_THRESHOLD, nonmaxSuppression=True
-        )
-        counts: list[int] = []
-        for frame_path in frames[:SCENE_ADMISSION_MAX_FRAMES]:
-            image = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
-            if image is not None:
-                counts.append(len(detector.detect(image, None)))
         if not counts:
-            return False, (
+            return (
+                False,
+                "measured_fail",
                 f"{pairs_dir} holds recorded left frames but none could be read, so the "
-                "scene cannot be measured against the initializer's feature floor"
+                "scene cannot be measured against the initializer's feature floor",
             )
         detail = (
             f"{len(counts)} recorded left frames of {settings.world} measured with "
             f"FAST({FAST_THRESHOLD}, non-max suppression): keypoint counts {counts}, "
             f"against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
-            "features per window"
+            "features per window; the capture's recorded world sha256 matches the "
+            "configured world"
         )
-        if recorded is None:
-            detail += (
-                f"; the capture's artifacts record no world hash to compare (the "
-                f"current world's sha256 is {current_sha256})"
-            )
-        else:
-            detail += "; the capture's recorded world sha256 matches the configured world"
-        return min(counts) >= INITIALIZER_FEATURE_FLOOR, detail
-    return False, (
-        f"no recorded capture of this scenario exists under the accepted-run artifacts, "
-        f"so the scene cannot be measured against the pinned initializer's floor of "
-        f"{INITIALIZER_FEATURE_FLOOR} features; the admission check is measured, not "
-        "asserted (plan sections 3.6 and 12.6)"
+        return (
+            min(counts) >= INITIALIZER_FEATURE_FLOOR,
+            "measured_pass" if min(counts) >= INITIALIZER_FEATURE_FLOOR else "measured_fail",
+            detail,
+        )
+    detail = (
+        f"no hash-matched recorded capture of {settings.world} (sha256 {current_sha256}) "
+        f"exists under the accepted-run artifacts ({unhashed} capture(s) skipped for "
+        "recording no world hash); the arm gate will measure this run's own static-start "
+        f"frames against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
+        "features and refuse the arm if they do not clear it (plan section 0.3 item 4)"
     )
+    return True, "deferred_to_arm_gate", detail
 
 
 def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
@@ -737,7 +919,7 @@ def _preflight(
     applies.
     """
     root = repository_root()
-    settings = PlatformSettings.from_config(document, root=root)
+    settings = _platform_settings(document, root)
     rows: list[dict[str, Any]] = []
     satisfied = True
     mode_blockers = _mode_blockers(document, mode)
@@ -763,8 +945,15 @@ def _preflight(
         }
     )
     satisfied = satisfied and not truth_blockers
-    scene_ok, scene_detail = _scene_admission_check(settings, root)
-    rows.append({"name": "scene_admission", "satisfied": scene_ok, "detail": scene_detail})
+    scene_ok, scene_state, scene_detail = _scene_admission_check(settings, root)
+    rows.append(
+        {
+            "name": "scene_admission",
+            "satisfied": scene_ok,
+            "state": scene_state,
+            "detail": scene_detail,
+        }
+    )
     satisfied = satisfied and scene_ok
     for check in check_prerequisites(settings, output_dir):
         rows.append({"name": check.name, "satisfied": check.satisfied, "detail": check.detail})
@@ -907,6 +1096,9 @@ class _FeedStats:
         self.imu_latencies_ns: list[int] = []
         self.newest_imu_ns = 0
         self.truth_samples: list[tuple[int, tuple[float, float, float]]] = []
+        # A1's evidence channel: the same pose records' attitudes, read for the
+        # pre-arm attitude gate and sent nowhere (plan section 0.3 item 5).
+        self.truth_attitudes: list[tuple[int, tuple[float, float, float]]] = []
         # Pairs the reader's sink offered with their pixels, and how many of those the
         # feed's bounded queue could not take. The two together are the difference
         # between "the stream carried no pairs" and "the feed was too slow".
@@ -1000,7 +1192,7 @@ def _write_environment(
 
 def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> CommandOutcome:
     root = repository_root()
-    settings = PlatformSettings.from_config(document, root=root)
+    settings = _platform_settings(document, root)
     localization = document["localization"]
     estimator = localization["estimator"]
     bounds_config = localization["bounds"]
@@ -1017,8 +1209,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     )
     writer = EvidenceWriter(output_dir, "run-a")
     _write_environment(writer, settings, estimator)
-    alignment_origin = document["calibration"]["referee"]["body_position_world_m"]
-    alignment = loc.OdomAlignment(alignment_origin)
+    alignment_origin = _declared_start_origin(settings.world)
+    declared_start_rpy = _declared_start_attitude(settings.world)
+    alignment = loc.OdomAlignment(alignment_origin, declared_start_rpy)
     machine = loc.HealthMachine(bounds)
 
     estimator_process = _start_estimator(estimator, root, writer)
@@ -1073,6 +1266,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     # the drain loop and frames cannot interleave.
     pending_pairs: queue.Queue = queue.Queue(maxsize=PAIR_QUEUE_FRAMES)
 
+    scene_capture = {"count": 0, "last_s": 0.0}
+
     def file_record(record: Any) -> None:
         if record.kind is not Kind.PAIR or record.pair is None:
             return
@@ -1081,6 +1276,24 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             pending_pairs.put_nowait(record)
         except queue.Full:
             stats.pair_records_dropped += 1
+        # The run's own scene capture (plan section 0.3 item 4): bounded left
+        # frames at the declared static start, with the world's own pixels — the
+        # same conditions as P00's accept-5 capture, written so the arm gate and
+        # every later preflight measure the configured world instead of trusting
+        # a capture that cannot say which world it shows.
+        now = time.monotonic()
+        if (
+            scene_capture["count"] < SCENE_CAPTURE_MAX_FRAMES
+            and now - scene_capture["last_s"] >= SCENE_CAPTURE_MIN_SPACING_S
+        ):
+            scene_capture["last_s"] = now
+            index = scene_capture["count"] + 1
+            writer.write_bytes(
+                f"pairs/{index:05d}-left.ppm",
+                f"P6\n{settings.stereo.width} {settings.stereo.height}\n255\n".encode()
+                + bytes(record.pair.left_bytes),
+            )
+            scene_capture["count"] += 1
 
     def on_publish(state: loc.EstimatorState, aligned: dict[str, object]) -> None:
         nonlocal latest_aligned
@@ -1123,7 +1336,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     log_lines: list[str] = [
         f"P01-L sensor-derived live run, started {datetime.now(timezone.utc).isoformat()}",
         f"estimator pin: {estimator['name']} {estimator['tag']} ({estimator['commit']})",
-        f"odom origin (declared start, ENU): {alignment_origin}",
+        f"odom origin (the world's own vehicle translation, ENU): {alignment_origin}, "
+        f"declared start attitude rpy: {declared_start_rpy}",
         f"parameter layer: {[str(path) for path in settings.estimator_params]}",
     ]
 
@@ -1173,6 +1387,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             # converted into, so E1 is a subtraction in one common frame.
             stats.truth_samples.append(
                 (sim_time_ns(record.sim_time_s), tuple(record.pose.position_xyz))
+            )
+            stats.truth_attitudes.append(
+                (sim_time_ns(record.sim_time_s), tuple(record.pose.attitude_rpy))
             )
 
     last_telemetry_sample = 0.0
@@ -1285,6 +1502,13 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.startup)
+        # The adapter's own link: a port the running SITL declares it serves and
+        # that this check's session does not already own (plan section 0.5).
+        feed_endpoint = _autopilot_feed_endpoint(
+            writer.path("sitl.log"), settings.mavlink_endpoint
+        )
+        publisher.retarget(feed_endpoint)
+        log_lines.append(f"adapter publish endpoint: {feed_endpoint}")
         platform.request_telemetry_streams()
         # G4 needs the vehicle's own GPS status during the run, so the two status
         # streams are requested through the session's existing interval path; every
@@ -1307,20 +1531,36 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             f"autopilot parameter readback: {applied}; refused by the vehicle: {sorted(refusals)}"
         )
         live_blockers.extend(gate_the_scored_arm(applied, refusals))
-        publisher.start()
+        try:
+            publisher.start()
+        except RuntimeError as error:
+            # An unserved link: the autopilot never answered on this port, so
+            # publishing would be a silent void (plan section 0.5). Named, not
+            # ignored -- the third textured invocation's measured failure mode.
+            live_blockers.append(str(error))
+            log_lines.append(f"UNRESOLVED: {error}")
 
-        if not _wait_initialized(machine, drain, settings.pre_arm_wait_s):
+        scene_blocker = _scene_capture_gate(writer, settings, drain, scene_capture, log_lines)
+        if scene_blocker:
+            live_blockers.append(scene_blocker)
+        initialized_in_window = _wait_initialized(machine, drain, settings.pre_arm_wait_s)
+        if not initialized_in_window:
             live_blockers.append(
                 "the estimator did not initialize inside the pre-arm window (H5); "
                 "initialization is from the declared stationary launch interval, and a "
                 "degenerate initialization is unavailable-navigation, not a delayed arm"
             )
-        elif live_blockers:
-            # A section-4.6 gate failed above. The arm stops here, before the scored window
-            # opens, so the flight is not spent: nothing is substituted to get past it.
-            log_lines.append("not arming: a precondition of the scored arm failed")
         else:
             log_lines.append("estimator initialized before arm (H5)")
+            a1_blocker = _attitude_gate(writer, latest_aligned, alignment, stats, log_lines)
+            if a1_blocker:
+                live_blockers.append(a1_blocker)
+        if live_blockers:
+            # A pre-arm gate failed (sections 4.6, 4.7, or revision 4's scene and
+            # attitude gates). The arm stops here, before the scored window opens,
+            # so the flight is not spent: nothing is substituted to get past it.
+            log_lines.append("not arming: a precondition of the scored arm failed")
+        else:
             control = platform.arm_and_guided(settings.step_timeout_s.flight, drain=drain)
             if control.refused:
                 live_blockers.append(
@@ -1488,6 +1728,150 @@ def _wait_initialized(
             return True
         time.sleep(0.05)
     return False
+
+def _scene_capture_gate(
+    writer: EvidenceWriter,
+    settings: PlatformSettings,
+    drain: Callable[[], None],
+    scene_capture: dict[str, Any],
+    log_lines: list[str],
+) -> str | None:
+    """Revision 4's arm-side scene admission (plan section 0.3 item 4).
+
+    The preflight measured a hash-matched capture when one existed; this gate
+    measures the run's own recorded static-start frames, with the world's own
+    hash written beside them, and refuses the arm when they do not clear the
+    initializer's floor. No flight can be spent on a scene the initializer
+    cannot fire in.
+    """
+    deadline = time.monotonic() + SCENE_CAPTURE_TIMEOUT_S
+    while scene_capture["count"] < SCENE_CAPTURE_MAX_FRAMES and time.monotonic() < deadline:
+        drain()
+        time.sleep(0.05)
+    pairs_dir = writer.directory / "pairs"
+    frames = sorted(path for path in pairs_dir.glob("*-left.ppm") if path.is_file())
+    record: dict[str, Any] = {
+        "world": str(settings.world),
+        "world_sha256": _sha256(settings.world),
+        "frames": [path.name for path in frames],
+        "feature_floor": INITIALIZER_FEATURE_FLOOR,
+        "fast_threshold": FAST_THRESHOLD,
+    }
+    counts = _fast_keypoint_counts(frames[:SCENE_ADMISSION_MAX_FRAMES])
+    if counts is None:
+        record["state"] = "cv2_unavailable"
+        writer.write_json("scene-capture.json", record)
+        return (
+            "the scene-admission gate could not measure this run's own frames: OpenCV "
+            "(cv2) is not importable"
+        )
+    record["keypoint_counts"] = counts
+    passed = bool(counts) and min(counts) >= INITIALIZER_FEATURE_FLOOR
+    record["state"] = "measured_pass" if passed else "measured_fail"
+    writer.write_json("scene-capture.json", record)
+    log_lines.append(
+        f"scene admission at the arm gate: {len(counts)} frames measured, "
+        f"keypoint counts {counts}, floor {INITIALIZER_FEATURE_FLOOR}"
+    )
+    if not passed:
+        lowest = min(counts) if counts else 0
+        return (
+            f"the configured scene's own recorded frames carry {lowest} FAST keypoints "
+            f"against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
+            "(plan section 0.3 item 4): visual odometry cannot initialize in this "
+            "scene, so the arm is refused"
+        )
+    return None
+
+
+def _wrap_angle(radius: float) -> float:
+    return (radius + math.pi) % (2.0 * math.pi) - math.pi
+def _attitude_gate(
+    writer: EvidenceWriter,
+    aligned: dict[str, object] | None,
+    alignment: loc.OdomAlignment,
+    stats: _FeedStats,
+    log_lines: list[str],
+) -> str | None:
+    """A1, second form: the sealed epoch frame, checked before the arm (0.3 item 5).
+
+    The first textured invocation measured a −180° roll (the missing FLU→FRD body
+    map) and the second a +90° yaw (the odom frame's yaw, unobservable and chosen
+    by the initializer's noise-decided gram_schmidt branch). Both were refused
+    before any arm, and the adapter now derives its epoch rotation from the
+    estimator's own first initialized attitude and the world's declared start
+    attitude. A1 therefore checks the two things that remain independently
+    checkable: that the published attitude equals the *declared* start attitude
+    (the composition the adapter performed), and that the declared start attitude
+    equals the simulator's own truth attitude (the declaration itself). It also
+    gates the vertical chain — the sealed rotation must carry odom-up to NED-down
+    — and records the derived yaw, which is not gated because nothing in this arm
+    observes it. That the seal absorbs the estimator's own initialization tilt is
+    a recorded limitation, not a hidden one: a real tilt error shows up in E1 and
+    H3 once the vehicle moves.
+    """
+    declared = tuple(alignment.declared_start_rpy)
+    record: dict[str, Any] = {
+        "tolerance_deg": ATTITUDE_GATE_TOLERANCE_DEG,
+        "declared_start_rpy_rad": list(declared),
+    }
+    if aligned is None or not stats.truth_attitudes:
+        reason = (
+            "no published state to compare"
+            if aligned is None
+            else "no truth attitude arrived on the pose records"
+        )
+        record.update({"state": "unmeasured", "reason": reason})
+        writer.write_json("attitude-gate.json", record)
+        return f"A1 could not run: {reason}"
+    published = aligned["attitude_rpy"]
+    truth_time_ns, truth_rpy = stats.truth_attitudes[-1]
+    composition_deg = [
+        math.degrees(_wrap_angle(p - d)) for p, d in zip(published, declared)
+    ]
+    declaration_deg = [math.degrees(_wrap_angle(d - t)) for d, t in zip(declared, truth_rpy)]
+    odom_up_down_component = float(alignment.epoch_rotation[2][2])
+    level_error_deg = math.degrees(
+        math.acos(max(-1.0, min(1.0, -odom_up_down_component)))
+    )
+    passed = (
+        max(abs(delta) for delta in composition_deg) <= ATTITUDE_GATE_TOLERANCE_DEG
+        and max(abs(delta) for delta in declaration_deg) <= ATTITUDE_GATE_TOLERANCE_DEG
+        and level_error_deg <= ATTITUDE_GATE_TOLERANCE_DEG
+    )
+    record.update(
+        {
+            "state": "measured_pass" if passed else "measured_fail",
+            "published_rpy_rad": list(published),
+            "truth_rpy_rad": list(truth_rpy),
+            "truth_time_ns": truth_time_ns,
+            "composition_deltas_deg": composition_deg,
+            "declaration_deltas_deg": declaration_deg,
+            "epoch_yaw_deg": alignment.epoch_yaw_deg(),
+            "level_error_deg": level_error_deg,
+            "note": (
+                "epoch_yaw_deg is recorded, not gated: nothing in this arm observes the "
+                "odom frame's yaw, which the pinned initializer fixes by a "
+                "noise-decided branch; the seal derives it once from the declared start"
+            ),
+        }
+    )
+    writer.write_json("attitude-gate.json", record)
+    log_lines.append(
+        f"A1 attitude gate: composition deltas (deg) {composition_deg}, declaration "
+        f"deltas (deg) {declaration_deg}, epoch yaw {record['epoch_yaw_deg']:.2f} deg, "
+        f"level error {level_error_deg:.3f} deg"
+    )
+    if passed:
+        return None
+    return (
+        f"A1: the sealed epoch frame does not hold up: composition deltas "
+        f"{composition_deg} deg, declaration deltas {declaration_deg} deg, level error "
+        f"{level_error_deg:.3f} deg against the declared "
+        f"{ATTITUDE_GATE_TOLERANCE_DEG} deg tolerance (plan section 0.3 item 5), so the "
+        "arm is refused"
+    )
+
 
 def _percentile(values: Sequence[float], fraction: float) -> float:
     """The nearest-rank percentile of an unsorted sample, order-statistic honest at any n."""

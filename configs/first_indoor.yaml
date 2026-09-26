@@ -298,6 +298,20 @@ localization:
   # bridge's actual setting disagrees with the requested mode; an absent key
   # reproduces the P00 gate's behaviour exactly (republish on, bit for bit).
   mode: sensor-derived
+  # The sensor-derived development route's world. Separate from scenario.world
+  # on purpose: the compatibility gate's 16/16 was measured on scenario.world
+  # (compat_stereo.wbt), and repointing that key would silently change the
+  # vehicle the gate measures. The localize-check command runs in this world
+  # when the key is present and falls back to scenario.world otherwise. Why
+  # this world: the compat scene measured ZERO FAST keypoints across 12
+  # recorded frames (run-2026-09-26T08-30-18-273Z), so no visual odometry can
+  # initialize there; dev-a-single is the dev group's simplest textured layout
+  # (Plaster walls, Parquetry floor; one room, one centred 1.0 m doorway), the
+  # vehicle spawns at rest yaw 0 in its vestibule, and the frozen two-waypoint
+  # route fits its geometry unchanged (work/runs/p01-localization/plan.md
+  # section 0.3 item 1; headless device validation in
+  # work/runs/scenarios/validation/dev-a-single.json).
+  world: scenarios/missions/dev/dev-a-single/world.wbt
   estimator:
     name: openvins
     tag: v2.7
