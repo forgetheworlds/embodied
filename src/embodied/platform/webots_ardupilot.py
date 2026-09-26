@@ -896,6 +896,10 @@ class PlatformSettings:
     # is silent corruption rather than a redundant measurement (plan section 4.6).
     truth_republish: bool = True
 
+    # The localization arm's own parameter layer (localization.params_file). It is
+    # NOT part of the compatibility probe: see compat_estimator_params.
+    localization_params_file: Path | None = None
+
     @property
     def webots_binary(self) -> Path:
         """The Webots executable inside the configured application bundle."""
@@ -957,8 +961,19 @@ class PlatformSettings:
         return ClockStamp(host_id=self.host_id, clock_id=self.clock_id, monotonic_ns=monotonic_ns)
 
     @staticmethod
-    def from_config(document: dict[str, Any], *, root: Path | None = None) -> "PlatformSettings":
-        """Build settings from an already-validated configuration document."""
+    def from_config(
+        document: dict[str, Any], *, root: Path | None = None, arm: str | None = None
+    ) -> "PlatformSettings":
+        """Build settings from an already-validated configuration document.
+
+        ``arm`` overrides the configuration's declared localization mode FOR THIS
+        RUN. The mode is a property of the run, not of the file: the
+        compatibility probe is a transport gate that declares simulator-interface
+        and keeps the truth republish on — the behaviour it was measured on —
+        whatever the scenario's localization section says. The localization check
+        passes no override and follows the declaration, which turns the republish
+        off for the sensor-derived arm.
+        """
         base = Path(root).resolve() if root is not None else Path.cwd()
 
         def resolve(relative: str) -> Path:
@@ -971,10 +986,10 @@ class PlatformSettings:
         probe = document["probe"]
         fault = probe["estimator_fault"]
         timeouts = probe["step_timeout_s"]
-        # The truth-republish switch, read from the additive localization section the
-        # check command validates. An absent key is not an ambiguity: it is the
+        # The truth-republish switch. An absent key is not an ambiguity: it is the
         # configuration the P00 gate was measured on, and it stays republish-on.
-        mode = (document.get("localization") or {}).get("mode")
+        declared_mode = (document.get("localization") or {}).get("mode")
+        mode = arm if arm is not None else declared_mode
         truth_republish = mode != SensorMode.SENSOR_DERIVED.value
         settings = PlatformSettings(
             root=base,
@@ -998,6 +1013,11 @@ class PlatformSettings:
             params=tuple(resolve(name) for name in document["scenario"]["params"]),
             estimator_params=tuple(
                 resolve(name) for name in document["scenario"]["estimator_params"]
+            ),
+            localization_params_file=(
+                resolve(document["localization"]["params_file"])
+                if (document.get("localization") or {}).get("params_file")
+                else None
             ),
             stereo=StereoSettings(
                 left=stereo["left"],
@@ -1123,6 +1143,22 @@ class PlatformSettings:
     def parameter_files(self, extra_params: Sequence[Path] = ()) -> tuple[Path, ...]:
         """Every parameter file one run layers, in the order it layers them."""
         return (*self.params, *extra_params)
+
+    @property
+    def compat_estimator_params(self) -> tuple[Path, ...]:
+        """The estimator layers the compatibility probe applies and verifies.
+
+        The localization arm's layer is excluded. It configures a DIFFERENT arm —
+        GPS off, the VISO_* selection — and this firmware hides those parameters
+        while the driver is off, so expecting them failed the probe's own readback
+        check; applying them also changed the vehicle the probe was measured on.
+        The localization check applies that layer itself, through
+        ``localization.params_file``.
+        """
+        excluded = self.localization_params_file
+        if excluded is None:
+            return tuple(self.estimator_params)
+        return tuple(path for path in self.estimator_params if path != excluded)
 
     def sitl_argv(self, extra_params: Sequence[Path] = ()) -> tuple[str, ...]:
         """The exact SITL command line for the pinned vehicle and ports.
@@ -2840,7 +2876,12 @@ class WebotsArduPilot:
             batch, pending = pending[:PARAMETER_READ_BATCH], pending[PARAMETER_READ_BATCH:]
             for name in batch:
                 self._session.request_parameter(name)
-            while self._monotonic() < deadline:
+            # One batch is waited for only as long as it deserves. A parameter the
+            # firmware never answers — a driver that is off hides its parameters —
+            # used to consume the whole deadline, so the batches behind it were never
+            # even requested and thirty readable names were reported as unanswered.
+            batch_deadline = min(deadline, self._monotonic() + PARAMETER_READ_BATCH_TIMEOUT_S)
+            while self._monotonic() < batch_deadline:
                 if drain is not None:
                     drain()
                 sample = self.telemetry()
@@ -3887,10 +3928,10 @@ class CompatibilityProbe:
         self._calibration = load_calibration_declaration(self.settings.calibration_path)
 
         checks_a, manifest_a, notes_a = self._run_once(
-            "run-a", self.settings.estimator_params
+            "run-a", self.settings.compat_estimator_params
         )
         checks_b, manifest_b, notes_b = self._run_once(
-            "run-b", self.settings.estimator_params
+            "run-b", self.settings.compat_estimator_params
         )
 
         checks = checks_a + checks_b
@@ -5430,6 +5471,7 @@ PARAMETER_READ_TIMEOUT_S = 60.0
 # ArduPilot drops a parameter request when its pending queue is full, so the requests go
 # out a few at a time and each batch is waited for before the next is sent.
 PARAMETER_READ_BATCH = 4
+PARAMETER_READ_BATCH_TIMEOUT_S = 5.0
 PARAMETER_VALUE_TOLERANCE = 1e-6
 
 
@@ -5689,7 +5731,13 @@ def _compat_command(args: Any, output_dir: Path) -> CommandOutcome:
     fail the gate is still a completed result (exit 0) with ``gate_status: fail``.
     """
     document = load_config(Path(args.config))
-    settings = PlatformSettings.from_config(document, root=repository_root())
+    # The compatibility probe declares simulator-interface: it is a transport,
+    # clock and frame gate, not a localization arm. Without this override the
+    # scenario's localization.mode would silently turn off the probe's own pose
+    # source and change the vehicle it measures.
+    settings = PlatformSettings.from_config(
+        document, root=repository_root(), arm=SensorMode.SIMULATOR_INTERFACE.value
+    )
     probe = build_compatibility_probe(settings, output_dir)
     try:
         result = probe.run()
