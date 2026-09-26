@@ -109,6 +109,7 @@ LOCALIZATION_SECTION: dict[str, Any] = {
         "tarball_path": str,
         "tarball_sha256": str,
         "build_log": str,
+        "build_success_marker": str,
         "library": str,
         "executable": str,
         "socket_port": int,
@@ -222,9 +223,13 @@ def _pin_blockers(localization: dict[str, Any], root: Path) -> list[str]:
             f"the pinned estimator has no build log at {estimator['build_log']}; a pin needs "
             "a successful build on this host as version evidence (plan section 3)"
         )
-    elif "BUILD OK" not in build_log.read_text(encoding="utf-8", errors="replace"):
+    elif estimator["build_success_marker"] not in build_log.read_text(
+        encoding="utf-8", errors="replace"
+    ):
         blockers.append(
-            f"the estimator build log {estimator['build_log']} records no successful build"
+            f"the estimator build log {estimator['build_log']} does not record "
+            f"{estimator['build_success_marker']!r}: no successful build of the pinned "
+            "estimator tree is evidenced"
         )
     library = root / estimator["library"]
     if not library.is_file():
@@ -244,17 +249,21 @@ def _executable_blockers(localization: dict[str, Any], root: Path) -> list[str]:
 
 
 def _seam_blockers(document: dict[str, Any], root: Path) -> list[str]:
-    """The ExternalNav seam's parameter selection, read from the files that would run."""
+    """The ExternalNav seam's parameter selection, read from the files that would run.
+
+    Every requirement is reported, including the ones a missing file hides:
+    a blocked run is most useful when it names everything that is absent in one
+    pass, and the missing file and the missing selection have different owners.
+    """
     paths = [root / name for name in document["scenario"]["estimator_params"]]
-    missing = [str(path) for path in paths if not path.is_file()]
-    if missing:
-        return [
-            f"the estimator parameter layer is missing {', '.join(missing)}; "
-            f"{P01L_PARAMS_FILENAME} is integrator action 2 (plan section 1) and the merged "
-            "gate's EKF source selection is integrator action 1"
-        ]
-    configured = read_configured_parameters(paths)
     blockers: list[str] = []
+    for path in paths:
+        if not path.is_file():
+            blockers.append(
+                f"the estimator parameter layer is missing {path}; {P01L_PARAMS_FILENAME} "
+                "is integrator action 2 (plan section 1)"
+            )
+    configured = read_configured_parameters([path for path in paths if path.is_file()])
     for name, expected, source in SEAM_REQUIREMENTS:
         actual = configured.get(name)
         if actual is None:

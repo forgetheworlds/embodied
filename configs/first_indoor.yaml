@@ -297,6 +297,10 @@ localization:
     tarball_path: work/runs/p01-localization/pin-evidence/open_vins-2.7.tar.gz
     tarball_sha256: 0135af4acd8dc099c8b50fc51c9faf53fe69462d0e6bad9e986ad4090af02df8
     build_log: work/runs/p01-localization/pin-evidence/build-openvins.log
+    # The build script writes this line only after the whole pinned tree
+    # (ov_core + ov_msckf) has built and installed; the pin's evidence is the
+    # line, the library below, and the unmodified tarball's sha256 above.
+    build_success_marker: OV_MSCKF BUILD OK
     library: work/runs/p01-localization/pin-evidence/open_vins-2.7/ov_msckf/build/install/lib/libov_msckf_lib.dylib
     executable: estimator/ov_stream
     socket_port: 9021
