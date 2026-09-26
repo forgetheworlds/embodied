@@ -14,6 +14,7 @@ of the receipt would see it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import struct
@@ -632,6 +633,53 @@ class TestTruthRepublishGate:
         finally:
             listener.close()
 
+
+# ---------------------------------------------------------------------------
+# The pin, recorded as a measurement rather than a silent pass (plan section 3)
+# ---------------------------------------------------------------------------
+
+
+class TestPinEvidence:
+    """The pin leg's evidence, read from the bytes on disk.
+
+    The preflight refused to start an arm on an unproven pin, but a satisfied pin
+    left no row at all, so a reader of the receipt could only infer the version
+    evidence from the absence of a failure — the reading section 4.6's
+    truth-republish gate was re-pointed at. These tests hold the pin's row to a
+    measurement: the tarball re-hashed, the build marker read out of the build
+    log, and the library and the process hashed as they are.
+    """
+
+    def test_the_preflight_records_the_pin_it_re_hashed(self, tmp_path):
+        rows, satisfied = check._preflight(
+            check._load_localization_config(Path("configs/first_indoor.yaml")),
+            tmp_path,
+            SensorMode.SENSOR_DERIVED,
+        )
+        assert satisfied is True
+        row = {entry["name"]: entry for entry in rows}["estimator_pin"]
+        assert row["satisfied"] is True
+        evidence = row["evidence"]
+        assert evidence["tarball_matches_configured_pin"] is True
+        assert evidence["tarball_sha256_measured"] == evidence["tarball_sha256_configured"]
+        assert evidence["build_marker_present"] is True
+        assert "sha256" in row["detail"] and "matches the configured pin" in row["detail"]
+        # The hashes are of the files themselves, not of their configured names.
+        root = check.repository_root()
+        for key in ("library", "executable"):
+            digest = hashlib.sha256((root / evidence[key]["path"]).read_bytes()).hexdigest()
+            assert evidence[key]["sha256"] == digest
+
+    def test_a_tarball_that_is_not_the_pin_fails_the_row_naming_both_digests(self, tmp_path):
+        document = _declared_document()
+        tarball = tmp_path / "open_vins-2.7.tar.gz"
+        tarball.write_bytes(b"not the pinned tarball")
+        document["localization"]["estimator"]["tarball_path"] = str(tarball)
+
+        record, blockers = check._pin_evidence(document["localization"], tmp_path)
+        assert record["tarball_matches_configured_pin"] is False
+        assert blockers and record["tarball_sha256_measured"] in blockers[0]
+        assert record["tarball_sha256_configured"] in blockers[0]
 
 # ---------------------------------------------------------------------------
 # T6: the re-derived GPS-off gate (plan sections 4.6, 4.7)

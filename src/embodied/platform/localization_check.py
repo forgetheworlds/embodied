@@ -346,38 +346,74 @@ def _port_is_free(port: int) -> bool:
             return False
 
 
-def _pin_blockers(localization: dict[str, Any], root: Path) -> list[str]:
-    """Version evidence for the pin: sha256 on disk, a successful build, the library."""
+def _pin_evidence(localization: dict[str, Any], root: Path) -> tuple[dict[str, Any], list[str]]:
+    """The pin's version evidence, measured on disk rather than quoted (plan section 3).
+
+    A pin that is only asserted is not a pin. This re-derives the pinned tarball's
+    sha256 from the bytes on disk, checks that the build log carries the success
+    marker the configuration names, and records what the built library and the
+    estimator process actually are. The record travels into the preflight beside
+    the row it justifies, so a reader of the receipt sees the measurement instead
+    of inferring it from the absence of a failure — the standard section 4.6's
+    truth-republish gate was re-pointed at, applied to the pin leg.
+    """
     estimator = localization["estimator"]
-    blockers: list[str] = []
-    tarball = root / estimator["tarball_path"]
-    if not tarball.is_file():
-        blockers.append(f"the pinned tarball {estimator['tarball_path']} is not on disk")
-    else:
-        digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
-        if digest != estimator["tarball_sha256"]:
-            blockers.append(
-                f"the pinned tarball's sha256 {digest} does not match the configured pin "
-                f"{estimator['tarball_sha256']}"
-            )
     build_log = root / estimator["build_log"]
-    if not build_log.is_file():
+    build_text = (
+        build_log.read_text(encoding="utf-8", errors="replace") if build_log.is_file() else None
+    )
+    measured_tarball = _sha256(root / estimator["tarball_path"])
+    record = {
+        "name": estimator["name"],
+        "tag": estimator["tag"],
+        "commit": estimator["commit"],
+        "tarball_path": estimator["tarball_path"],
+        "tarball_sha256_configured": estimator["tarball_sha256"],
+        "tarball_sha256_measured": measured_tarball,
+        "tarball_matches_configured_pin": measured_tarball == estimator["tarball_sha256"],
+        "build_log": estimator["build_log"],
+        "build_success_marker": estimator["build_success_marker"],
+        "build_marker_present": bool(
+            build_text is not None and estimator["build_success_marker"] in build_text
+        ),
+        "library": {"path": estimator["library"], "sha256": _sha256(root / estimator["library"])},
+        "executable": {
+            "path": estimator["executable"],
+            "sha256": _sha256(root / estimator["executable"]),
+        },
+    }
+    blockers: list[str] = []
+    if measured_tarball is None:
+        blockers.append(f"the pinned tarball {estimator['tarball_path']} is not on disk")
+    elif not record["tarball_matches_configured_pin"]:
+        blockers.append(
+            f"the pinned tarball's sha256 {measured_tarball} does not match the configured pin "
+            f"{estimator['tarball_sha256']}"
+        )
+    if build_text is None:
         blockers.append(
             f"the pinned estimator has no build log at {estimator['build_log']}; a pin needs "
             "a successful build on this host as version evidence (plan section 3)"
         )
-    elif estimator["build_success_marker"] not in build_log.read_text(
-        encoding="utf-8", errors="replace"
-    ):
+    elif not record["build_marker_present"]:
         blockers.append(
             f"the estimator build log {estimator['build_log']} does not record "
             f"{estimator['build_success_marker']!r}: no successful build of the pinned "
             "estimator tree is evidenced"
         )
-    library = root / estimator["library"]
-    if not library.is_file():
+    if record["library"]["sha256"] is None:
         blockers.append(f"the built estimator library {estimator['library']} is not on disk")
-    return blockers
+    return record, blockers
+
+
+def _pin_summary(record: dict[str, Any]) -> str:
+    """One line stating what was measured, for the preflight row's detail."""
+    return (
+        f"tarball {record['tarball_path']} sha256 {record['tarball_sha256_measured']} matches "
+        f"the configured pin; the build log records {record['build_success_marker']!r}; "
+        f"library {record['library']['path']} sha256 {record['library']['sha256']}; "
+        f"process {record['executable']['path']} sha256 {record['executable']['sha256']}"
+    )
 
 
 def _executable_blockers(localization: dict[str, Any], root: Path) -> list[str]:
@@ -1175,8 +1211,17 @@ def _preflight(
     )
     satisfied = satisfied and port_free
     localization = document["localization"]
+    pin_record, pin_blockers = _pin_evidence(localization, root)
+    rows.append(
+        {
+            "name": "estimator_pin",
+            "satisfied": not pin_blockers,
+            "detail": pin_blockers[0] if pin_blockers else _pin_summary(pin_record),
+            "evidence": pin_record,
+        }
+    )
+    satisfied = satisfied and not pin_blockers
     for blocker in (
-        *_pin_blockers(localization, root),
         *_executable_blockers(localization, root),
         *_seam_blockers(document, root),
     ):
