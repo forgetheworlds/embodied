@@ -1,0 +1,72 @@
+layout: holdout-h-clutter
+group: holdout
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 7.0
+  length_m: 5.0
+  height_m: 2.8
+- name: R2
+  width_m: 6.0
+  length_m: 4.0
+  height_m: 2.8
+corridor:
+  width_m: 1.4
+  turns: 1
+  junction: none
+doorways:
+- width_m: 0.8
+  placement: corner_adjacent
+  offset_m: 0.4
+  height_m: 2.0
+obstacles:
+  count: 10
+  pattern: nine_clustered_in_region_plus_threshold_box
+  suspended: false
+  near_threshold_m: 0.4
+  names:
+  - obstacle_1
+  - obstacle_2
+  - obstacle_3
+  - obstacle_4
+  - obstacle_5
+  - obstacle_6
+  - obstacle_7
+  - obstacle_8
+  - obstacle_9
+  - obstacle_10_table
+  static: true
+textures:
+  wall: Marble
+  floor: CementTiles
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 0.45
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 3
+  sky_color:
+  - 0.35
+  - 0.35
+  - 0.5
+target:
+  class: cylinder
+  present: true
+  node: target_can
+  placement_m:
+  - 10.7
+  - 4.5
+  - 0.15
+  support: R2 floor, inside the cluster
+distractors: []
+variants:
+- name: mid_mission_semantic_change
+  trigger: bench_supplied_retask
+  world_contains: true
+  note: the goal object changes mid-mission; the world file is unchanged
+manual_review:
+- obstacle_1 is 0.4 m from the threshold edge
+- the north-east corner is the deliberately shadowed one

@@ -1,0 +1,66 @@
+layout: holdout-e-wide
+group: holdout
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 8.0
+  length_m: 8.0
+  height_m: 3.2
+- name: R2
+  width_m: 5.0
+  length_m: 7.0
+  height_m: 3.2
+corridor:
+  width_m: 1.4
+  turns: 1
+  junction: none
+doorways:
+- width_m: 0.8
+  placement: offset_one_third_from_north_end
+  offset_m: 2.67
+  height_m: 2.0
+obstacles:
+  count: 8
+  pattern: six_floor_one_table_one_suspended
+  suspended: true
+  near_threshold_m: 0.4
+  names:
+  - obstacle_1
+  - obstacle_2_table
+  - obstacle_3
+  - obstacle_4
+  - obstacle_5
+  - obstacle_6
+  - obstacle_7
+  - obstacle_8_suspended
+  static: true
+textures:
+  wall: RedBricks
+  floor: CementTiles
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 0.4
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 2
+  sky_color:
+  - 0.35
+  - 0.35
+  - 0.5
+target:
+  class: cylinder
+  present: true
+  node: target_can
+  placement_m:
+  - 13.5
+  - 9.5
+  - 1.55
+  support: target_shelf (1.4 m)
+distractors: []
+variants: []
+manual_review:
+- the target is occluded from the spawn by the offset door edge
+- obstacle_5 sits 0.4 m from the doorway gap edge

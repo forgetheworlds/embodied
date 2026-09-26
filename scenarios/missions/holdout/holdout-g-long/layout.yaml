@@ -1,0 +1,65 @@
+layout: holdout-g-long
+group: holdout
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 4.0
+  length_m: 14.0
+  height_m: 2.6
+- name: spur
+  width_m: 1.6
+  length_m: 5.0
+  height_m: 2.6
+corridor:
+  width_m: 1.6
+  turns: 1
+  junction: t_branch
+doorways:
+- width_m: 1.2
+  placement: offset_one_third_along_wall
+  offset_m: 4.67
+  height_m: 2.0
+obstacles:
+  count: 9
+  pattern: declared_grid
+  suspended: false
+  near_threshold_m: null
+  names:
+  - obstacle_1
+  - obstacle_2
+  - obstacle_3
+  - obstacle_4
+  - obstacle_5
+  - obstacle_6
+  - obstacle_7
+  - obstacle_8
+  - obstacle_9
+  static: true
+textures:
+  wall: RedBricks
+  floor: PorcelainChevronTiles
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 0.6
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 2
+  sky_color:
+  - 0.35
+  - 0.35
+  - 0.5
+target:
+  class: cylinder
+  present: false
+  node: null
+  placement_m: null
+  support: 'no target object: absent-target search over room union spur'
+distractors: []
+variants: []
+manual_review:
+- the nine obstacle boxes sit on the declared grid x=[0.9, 3.1], y=[2.5, 6.5, 10.5, 13.0] plus one in
+  the spur
+- absence must be reported honestly rather than guessed

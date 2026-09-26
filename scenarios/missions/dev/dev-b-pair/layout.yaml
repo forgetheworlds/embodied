@@ -1,0 +1,70 @@
+layout: dev-b-pair
+group: dev
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 5.0
+  length_m: 5.0
+  height_m: 2.5
+- name: R2
+  width_m: 4.0
+  length_m: 6.0
+  height_m: 2.5
+corridor:
+  width_m: 1.6
+  turns: 1
+  junction: none
+doorways:
+- width_m: 1.1
+  placement: centred
+  offset_m: 0.0
+  height_m: 2.0
+obstacles:
+  count: 4
+  pattern: three_floor_boxes_plus_table
+  suspended: false
+  near_threshold_m: null
+  names:
+  - obstacle_1
+  - obstacle_2
+  - obstacle_3_table
+  - obstacle_4
+  static: true
+textures:
+  wall: Roughcast
+  floor: DarkParquetry
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 1.0
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 1
+  sky_color:
+  - 0.6
+  - 0.6
+  - 0.85
+target:
+  class: sphere
+  present: true
+  node: target_sphere
+  placement_m:
+  - 8.0
+  - 5.4
+  - 0.25
+  support: R2 floor, behind obstacle_3_table
+distractors:
+- node: distractor_block
+  kind: ambiguous_candidate
+  class: box
+variants:
+- name: blocked_route_elapsed_time
+  trigger: elapsed_time
+  world_contains: false
+  note: the barrier node across the link corridor is added by the variant build; the default world is
+    route-open (plan section 3 axis 4)
+manual_review:
+- route clearance >= 1.0 m along spawn-to-door-to-corridor
+- blocked-route barrier is declared, not present in this world file
