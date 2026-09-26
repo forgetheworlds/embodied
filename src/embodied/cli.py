@@ -199,6 +199,20 @@ class _Choice:
         self.values = values
 
 
+class _Optional:
+    """A section that may be absent from the document.
+
+    Added 2026-09-26 with the calibration and localization sections. A stage
+    that owns a configuration file can add a section before the shared schema
+    knows about it; configurations that predate the section — and the platform
+    fixtures — must keep loading. Keys INSIDE an optional section are still
+    required, so a typo inside it is caught exactly as before.
+    """
+
+    def __init__(self, schema: Any) -> None:
+        self.schema = schema
+
+
 # The configuration schema. A section is a dict of expected keys, a leaf is a
 # Python type, a sequence of one type is a one-element list. Unknown keys at the
 # top level are rejected: a silently ignored section is a substituted experiment.
@@ -265,6 +279,119 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "step_timeout_s": {"startup": float, "ready": float, "flight": float},
         "budget_wall_clock_s": float,
     },
+    # Added by P01-C (calibration) and P01-L (localization). Both are optional so
+    # that a configuration predating them still loads; inside each, every key is
+    # required. Without these the real first_indoor.yaml was refused outright
+    # ("unknown keys: calibration, localization"), which broke every command that
+    # reads it — including the compatibility gate.
+    "calibration": _Optional(
+        {
+            "calibration_id": str,
+            "version": str,
+            "records_revision": str,
+            "evidence": {
+                "pair_dirs": [str],
+                "accept5_receipt": str,
+                "accept5_manifest": str,
+                "timebase_run_a": str,
+                "timebase_run_b": str,
+                "declared_calibration": str,
+                "declared_calibration_sha256": str,
+                "world": str,
+                "world_sha256": str,
+                "proto": str,
+                "proto_sha256": str,
+            },
+            "referee": {
+                "pose_source": str,
+                "body_position_world_m": [float],
+                "body_quaternion_world_wxyz": [float],
+                "surfaces": [
+                    {
+                        "name": str,
+                        "plane_point_world_m": [float],
+                        "plane_normal_world": [float],
+                        # Bounds are per-axis and a surface declares only the axes it
+                        # spans: the floor carries x and y, a wall carries the two it
+                        # needs. Optional keys, so a surface is not forced to invent an
+                        # axis it does not have.
+                        "axis_bounds_world_m": {
+                            "x": _Optional([float]),
+                            "y": _Optional([float]),
+                            "z": _Optional([float]),
+                        },
+                    }
+                ],
+            },
+            "bounds": {
+                "rectification_row_residual_median_px": float,
+                "rectification_row_residual_p95_px": float,
+                "min_retained_matches": int,
+                "depth_abs_tol_m": float,
+                "depth_rel_tol": float,
+                "depth_range_m": [float],
+                "min_compared_samples_per_surface": int,
+                "min_within_fraction": float,
+                "min_eligible_pixels_per_surface": int,
+                "border_px": int,
+            },
+            "features": {
+                "detector": str,
+                "nfeatures": int,
+                "scale_factor": float,
+                "nlevels": int,
+                "descriptor_ratio_threshold": float,
+            },
+            "matcher": {
+                "algorithm": str,
+                "num_disparities": int,
+                "block_size": int,
+                "uniqueness_ratio": int,
+                "speckle_window_size": int,
+                "speckle_range": int,
+                "texture_threshold": int,
+                "lr_tolerance_px": float,
+                "disparity_quantization_sigma_px": float,
+            },
+            "output": str,
+        }
+    ),
+    "localization": _Optional(
+        {
+            "mode": _Choice("sensor-derived", "pose-assisted"),
+            "estimator": {
+                "name": str,
+                "tag": str,
+                "commit": str,
+                "tarball_path": str,
+                "tarball_sha256": str,
+                "build_log": str,
+                "build_success_marker": str,
+                "library": str,
+                "executable": str,
+                "socket_port": int,
+            },
+            "publish": {"period_ms": int},
+            "declared": {"viso_delay_ms": int},
+            "params_file": str,
+            "bounds": {
+                "state_lost_after_ms": int,
+                "published_state_age_max_ms": int,
+                "max_publish_gap_ms": int,
+                "visual_update_warn_ms": int,
+                "visual_update_fail_ms": int,
+                "valid_fraction_min": float,
+                "sigma_min_m": float,
+                "sigma_max_m": float,
+                "disagreement_p95_m": float,
+                "disagreement_max_m": float,
+                "error_p95_horizontal_m": float,
+                "error_p95_vertical_m": float,
+                "error_max_horizontal_m": float,
+                "error_max_vertical_m": float,
+            },
+        }
+    ),
     "output": str,
 }
 
@@ -313,8 +440,14 @@ def _validate(value: Any, schema: Any, where: str) -> None:
             raise ConfigError(f"{where} has unknown keys: {', '.join(unknown)}")
         for key, sub_schema in schema.items():
             if key not in value:
+                if isinstance(sub_schema, _Optional):
+                    continue
                 raise ConfigError(f"{where}.{key} is required")
-            _validate(value[key], sub_schema, f"{where}.{key}")
+            _validate(
+                value[key],
+                sub_schema.schema if isinstance(sub_schema, _Optional) else sub_schema,
+                f"{where}.{key}",
+            )
         return
     if isinstance(schema, list):
         if value is None or isinstance(value, (str, bytes)) or not isinstance(value, list):
