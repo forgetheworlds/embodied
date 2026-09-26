@@ -2685,8 +2685,25 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 for index, waypoint in enumerate(settings.waypoints_local_ned, start=1):
                     if lost_guided:
                         break
-                    target = tuple(waypoint)
-                    log_lines.append(f"waypoint {index} commanded at local-NED {target}")
+                    # The configuration's own contract: "waypoints are local-NED
+                    # offsets from the takeoff point; z is added to the hover
+                    # altitude" (configs/first_indoor.yaml probe.waypoints_local_ned).
+                    # The compatibility gate's own guided item subtracts the hover
+                    # altitude the same way (webots_ardupilot.py:5103-5107). Sending
+                    # z unchanged (measured, run p01l-bringup-20260926T204753Z:
+                    # commanded local-NED (2.0, 0.0, 0.0) while the vehicle was at
+                    # z=-1.69 mid-climb) targets the GROUND: a 1.5 m descent command
+                    # racing the takeoff it interrupted.
+                    target = (
+                        float(waypoint[0]),
+                        float(waypoint[1]),
+                        float(waypoint[2]) - settings.hover_altitude_m,
+                    )
+                    log_lines.append(
+                        f"waypoint {index} commanded at local-NED {target} "
+                        f"(config offset {tuple(float(v) for v in waypoint)}, "
+                        f"hover altitude {settings.hover_altitude_m})"
+                    )
                     hold_end = time.monotonic() + settings.hold_per_waypoint_s
                     while time.monotonic() < hold_end:
                         # Keep the stream alive while holding: a guided target lapses
