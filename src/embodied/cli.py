@@ -120,7 +120,11 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {}
 # Modules that register commands. They are imported when the parser is built, not
 # at import time, so a command module can import this one for the registry without
 # creating a cycle.
-COMMAND_MODULES = ("embodied.platform.webots_ardupilot", "embodied.bench.cli")
+COMMAND_MODULES = (
+    "embodied.platform.webots_ardupilot",
+    "embodied.bench.cli",
+    "embodied.platform.localization_check",
+)
 
 
 def register_command(
