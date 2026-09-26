@@ -1,0 +1,242 @@
+#VRML_SIM R2025a utf8
+# dev-a-single — development group: one room, a start vestibule, one centred doorway.
+# Mission: search + inspect + return (a red block on a plinth against the far wall).
+#
+# Provenance: structure, vehicle reference, controller block and determinism pins are
+# inherited from scenarios/compat/worlds/compat_stereo.wbt (branch scenarios/indoor,
+# 46af9ce). Walls, floor, lights, obstacles and the target are plain nodes; the only
+# protos referenced are the compat Iris and the vendored Apache-2.0 appearances recorded
+# in scenarios/missions/common/PROVENANCE.md. No stock Cyberbotics object proto, no
+# remote EXTERNPROTO, nothing fetched at load time.
+#
+# Axis values for this layout: scenarios/missions/dev/dev-a-single/layout.yaml
+# EMBODIED_WORLD_ZERO world origin at floor level, x north, y west, z up (ENU).
+EXTERNPROTO "../../../compat/protos/Iris.proto"
+EXTERNPROTO "../../common/appearances/protos/Plaster.proto"
+EXTERNPROTO "../../common/appearances/protos/Parquetry.proto"
+
+WorldInfo {
+  title "indoor dev-a-single: one room with a vestibule"
+  basicTimeStep 2
+  FPS 20
+  optimalThreadCount 1
+  randomSeed 0
+}
+Viewpoint {
+  orientation 0.35 -0.85 -0.40 1.30
+  position -4.5 -4.0 4.5
+}
+Background {
+  skyColor [0.6 0.6 0.85]
+}
+# Development lighting family: one explicit DirectionalLight at compatibility intensity.
+DirectionalLight {
+  direction 0.2 -0.4 -1
+  intensity 1.2
+}
+# Floor: one plane under vestibule and room, Parquetry (mosaic) as declared.
+Solid {
+  name "floor"
+  translation 2 0 -0.02
+  children [
+    Shape {
+      appearance Parquetry {}
+      geometry Plane {
+        size 8.2 4.2
+      }
+    }
+  ]
+  boundingObject Plane {
+    size 8.2 4.2
+  }
+}
+# --- Walls (thickness 0.1, interior height 2.5, doorway gap top at 2.0) --------------
+# Shared wall at x = 0 with the 1.00 m centred doorway: two segments and a lintel.
+Solid {
+  name "w_r1_west_a"
+  translation 0 -1.25 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 0.1 1.5 2.5 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.5 2.5 }
+}
+Solid {
+  name "w_r1_west_b"
+  translation 0 1.25 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 0.1 1.5 2.5 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.5 2.5 }
+}
+Solid {
+  name "w_r1_west_lintel"
+  translation 0 0 2.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 0.1 1 0.5 }
+    }
+  ]
+  boundingObject Box { size 0.1 1 0.5 }
+}
+Solid {
+  name "w_r1_east"
+  translation 6.05 0 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 0.1 4 2.5 }
+    }
+  ]
+  boundingObject Box { size 0.1 4 2.5 }
+}
+Solid {
+  name "w_r1_north"
+  translation 3 2.05 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 6 0.1 2.5 }
+    }
+  ]
+  boundingObject Box { size 6 0.1 2.5 }
+}
+Solid {
+  name "w_r1_south"
+  translation 3 -2.05 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 6 0.1 2.5 }
+    }
+  ]
+  boundingObject Box { size 6 0.1 2.5 }
+}
+Solid {
+  name "w_vest_west"
+  translation -2.05 0 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 0.1 2 2.5 }
+    }
+  ]
+  boundingObject Box { size 0.1 2 2.5 }
+}
+Solid {
+  name "w_vest_north"
+  translation -1 1.05 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 2 0.1 2.5 }
+    }
+  ]
+  boundingObject Box { size 2 0.1 2.5 }
+}
+Solid {
+  name "w_vest_south"
+  translation -1 -1.05 1.25
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 2 0.1 2.5 }
+    }
+  ]
+  boundingObject Box { size 2 0.1 2.5 }
+}
+# --- Obstacles: two floor boxes, 1.5 m clear of the spawn-to-target line ------------
+Solid {
+  name "obstacle_1"
+  translation 3 1.75 0.25
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.5 0.52 0.55 roughness 0.9 }
+      geometry Box { size 0.5 0.5 0.5 }
+    }
+  ]
+  boundingObject Box { size 0.5 0.5 0.5 }
+}
+Solid {
+  name "obstacle_2"
+  translation 4.5 -1.75 0.25
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.5 0.52 0.55 roughness 0.9 }
+      geometry Box { size 0.5 0.5 0.5 }
+    }
+  ]
+  boundingObject Box { size 0.5 0.5 0.5 }
+}
+# --- Target: red block on a plinth against the far wall, plus a near-red distractor -
+Solid {
+  name "target_plinth"
+  translation 5.6 0 0.375
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.45 0.4 0.35 roughness 0.8 }
+      geometry Box { size 0.6 0.6 0.75 }
+    }
+  ]
+  boundingObject Box { size 0.6 0.6 0.75 }
+}
+Solid {
+  name "target_block"
+  translation 5.6 0 0.9
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.85 0.05 0.05 metalness 0 roughness 0.6 }
+      geometry Box { size 0.3 0.3 0.3 }
+    }
+  ]
+  boundingObject Box { size 0.3 0.3 0.3 }
+}
+# Registered distractor: near-red plinth side panel, wrong shade on purpose.
+Solid {
+  name "distractor_panel"
+  translation 5.28 0 0.375
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.15 0.1 metalness 0 roughness 0.7 }
+      geometry Box { size 0.02 0.6 0.75 }
+    }
+  ]
+  boundingObject Box { size 0.02 0.6 0.75 }
+}
+Iris {
+  translation -1 0 0.09
+  controller "compat_vehicle_controller"
+  controllerArgs [
+    "--sitl-address"
+    "127.0.0.1"
+    "--sitl-port"
+    "9002"
+    "--controller-port"
+    "9010"
+    "--motors"
+    "m1_motor, m2_motor, m3_motor, m4_motor"
+    "--camera-left"
+    "camera left"
+    "--camera-right"
+    "camera right"
+    "--camera-period-ms"
+    "100"
+    "--accelerometer"
+    "accelerometer"
+    "--gyro"
+    "gyro"
+    "--inertial-unit"
+    "inertial unit"
+    "--gps"
+    "gps"
+    "--imu-period-ms"
+    "2"
+  ]
+  customData "{\"group\": \"dev\", \"layout\": \"dev-a-single\", \"mission\": \"search_inspect_return\", \"world_zero\": \"floor level, ENU\"}"
+}

@@ -1,0 +1,79 @@
+layout: dev-c-triple
+group: dev
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 5.0
+  length_m: 4.0
+  height_m: 2.4
+- name: R2
+  width_m: 4.0
+  length_m: 4.0
+  height_m: 2.4
+- name: R3
+  width_m: 3.5
+  length_m: 6.0
+  height_m: 2.4
+corridor:
+  width_m: 1.6
+  turns: 1
+  junction: none
+doorways:
+- width_m: 1.0
+  placement: centred
+  offset_m: 0.0
+  height_m: 2.0
+- width_m: 0.95
+  placement: centred
+  offset_m: 0.0
+  height_m: 2.0
+obstacles:
+  count: 5
+  pattern: floor_and_table_one_occluding_spawn_view
+  suspended: false
+  near_threshold_m: null
+  names:
+  - obstacle_1
+  - obstacle_2
+  - obstacle_3
+  - obstacle_4_table
+  - obstacle_5
+  static: true
+textures:
+  wall: PaintedWood
+  floor: ChequeredParquetry
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 1.2
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 2
+  sky_color:
+  - 0.6
+  - 0.6
+  - 0.85
+target:
+  class: box
+  present: true
+  node: target_block
+  placement_m:
+  - 15.4
+  - -7.5
+  - 1.35
+  support: target_shelf (1.2 m)
+distractors:
+- node: obstacle_1
+  kind: spawn_sightline_occluder
+  class: obstacle
+variants:
+- name: absent_target_declared_region
+  trigger: variant_build_omits_target_node
+  world_contains: true
+  note: the default world has the target; the absent variant omits target_block over the declared region
+    R1 union R2 union R3
+manual_review:
+- obstacle_1 really occludes the target from the spawn sightline
+- absent-variant region declaration matches the room set

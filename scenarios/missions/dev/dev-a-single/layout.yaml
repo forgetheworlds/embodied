@@ -1,0 +1,67 @@
+layout: dev-a-single
+group: dev
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 6.0
+  length_m: 4.0
+  height_m: 2.5
+- name: vestibule
+  width_m: 2.0
+  length_m: 2.0
+  height_m: 2.5
+corridor:
+  width_m: null
+  turns: 0
+  junction: none
+doorways:
+- width_m: 1.0
+  placement: centred
+  offset_m: 0.0
+  height_m: 2.0
+obstacles:
+  count: 2
+  pattern: floor_boxes_0_5m
+  suspended: false
+  near_threshold_m: null
+  names:
+  - obstacle_1
+  - obstacle_2
+  static: true
+textures:
+  wall: Plaster
+  floor: Parquetry
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 1.2
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 0
+  sky_color:
+  - 0.6
+  - 0.6
+  - 0.85
+target:
+  class: box
+  present: true
+  node: target_block
+  placement_m:
+  - 5.6
+  - 0.0
+  - 0.9
+  support: target_plinth (0.75 m)
+distractors:
+- node: distractor_panel
+  kind: near_red_wrong_shade
+  class: box
+variants:
+- name: mid_mission_change
+  trigger: bench_supplied_instruction_revision
+  world_contains: true
+  note: the goal text is revised mid-mission; the world file is unchanged
+manual_review:
+- obstacle clearance against the spawn-to-target line (geometry, not greppable)
+- distractor shade is near-red but not the witness red

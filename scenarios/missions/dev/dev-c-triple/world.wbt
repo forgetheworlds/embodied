@@ -1,0 +1,434 @@
+#VRML_SIM R2025a utf8
+# dev-c-triple — development group: three rooms, two centred doorways (1.00 m and
+# 0.95 m), two link corridors with one 90-degree turn.
+# Mission: search + inspect + return (red block on a 1.2 m shelf in R3; the absent-target
+# variant omits the target node over the declared region R1 u R2 u R3).
+#
+# Provenance: structure, vehicle reference, controller block and determinism pins are
+# inherited from scenarios/compat/worlds/compat_stereo.wbt (branch scenarios/indoor,
+# 46af9ce). Walls, floor, lights, obstacles and the target are plain nodes; the only
+# protos referenced are the compat Iris and the vendored Apache-2.0 appearances recorded
+# in scenarios/missions/common/PROVENANCE.md. No stock Cyberbotics object proto, no
+# remote EXTERNPROTO, nothing fetched at load time.
+#
+# Axis values for this layout: scenarios/missions/dev/dev-c-triple/layout.yaml
+# EMBODIED_WORLD_ZERO world origin at floor level, x north, y west, z up (ENU).
+EXTERNPROTO "../../../compat/protos/Iris.proto"
+EXTERNPROTO "../../common/appearances/protos/PaintedWood.proto"
+EXTERNPROTO "../../common/appearances/protos/ChequeredParquetry.proto"
+
+WorldInfo {
+  title "indoor dev-c-triple: three rooms, two doorways, one turn"
+  basicTimeStep 2
+  FPS 20
+  optimalThreadCount 1
+  randomSeed 0
+}
+Viewpoint {
+  orientation 0.35 -0.85 -0.40 2.00
+  position -4.0 -6.0 8.0
+}
+Background {
+  skyColor [0.6 0.6 0.85]
+}
+# Development lighting family: DirectionalLight plus two warm PointLights (R1, R3).
+DirectionalLight {
+  direction 0.2 -0.4 -1
+  intensity 1.2
+}
+PointLight {
+  translation 2.5 0 2.1
+  color 1 0.9 0.75
+  intensity 0.6
+}
+PointLight {
+  translation 14.1 -5.4 2.1
+  color 1 0.9 0.75
+  intensity 0.6
+}
+# Floor: one plane under all three rooms and both links, ChequeredParquetry as declared.
+Solid {
+  name "floor"
+  translation 7.95 -3.2 -0.02
+  children [
+    Shape {
+      appearance ChequeredParquetry {}
+      geometry Plane {
+        size 16.1 10.6
+      }
+    }
+  ]
+  boundingObject Plane {
+    size 16.1 10.6
+  }
+}
+# --- Walls (thickness 0.1, interior height 2.4, doorway gap top at 2.0) --------------
+Solid {
+  name "w_r1_west"
+  translation -0.05 0 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 4 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 4 2.4 }
+}
+Solid {
+  name "w_r1_north"
+  translation 2.5 2.05 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 5 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 5 0.1 2.4 }
+}
+Solid {
+  name "w_r1_south"
+  translation 2.5 -2.05 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 5 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 5 0.1 2.4 }
+}
+# R1 east wall with the 1.00 m centred doorway into link 1.
+Solid {
+  name "w_r1_east_a"
+  translation 5 -1.25 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.5 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.5 2.4 }
+}
+Solid {
+  name "w_r1_east_b"
+  translation 5 1.25 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.5 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.5 2.4 }
+}
+Solid {
+  name "w_r1_east_lintel"
+  translation 5 0 2.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1 0.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1 0.4 }
+}
+# Link 1: straight 1.6 m corridor from R1 to R2.
+Solid {
+  name "w_corr1_north"
+  translation 6 0.85 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 2 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 2 0.1 2.4 }
+}
+Solid {
+  name "w_corr1_south"
+  translation 6 -0.85 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 2 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 2 0.1 2.4 }
+}
+# R2 west wall: the 1.6 m link-1 mouth is its opening.
+Solid {
+  name "w_r2_west_a"
+  translation 7 -1.4 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.2 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.2 2.4 }
+}
+Solid {
+  name "w_r2_west_b"
+  translation 7 1.4 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.2 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.2 2.4 }
+}
+Solid {
+  name "w_r2_north"
+  translation 9 2.05 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 4 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 4 0.1 2.4 }
+}
+Solid {
+  name "w_r2_south"
+  translation 9 -2.05 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 4 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 4 0.1 2.4 }
+}
+# R2 east wall with the 0.95 m centred doorway into link 2.
+Solid {
+  name "w_r2_east_a"
+  translation 11 -1.2375 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.525 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.525 2.4 }
+}
+Solid {
+  name "w_r2_east_b"
+  translation 11 1.2375 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.525 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.525 2.4 }
+}
+Solid {
+  name "w_r2_east_lintel"
+  translation 11 0 2.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 0.95 0.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 0.95 0.4 }
+}
+# Link 2: east leg, then one 90-degree turn south into R3.
+Solid {
+  name "w_corr2_north"
+  translation 12.5 0.85 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 3 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 3 0.1 2.4 }
+}
+Solid {
+  name "w_corr2_south_west"
+  translation 11.7 -0.85 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 1.4 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 1.4 0.1 2.4 }
+}
+Solid {
+  name "w_corr2_leg_b_west"
+  translation 12.35 -1.6 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 1.6 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 1.6 2.4 }
+}
+Solid {
+  name "w_corr2_east"
+  translation 14.05 -0.8 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 3.2 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 3.2 2.4 }
+}
+# R3: the link-2 mouth is the opening in its north wall.
+Solid {
+  name "w_r3_north"
+  translation 14.95 -2.35 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 1.9 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 1.9 0.1 2.4 }
+}
+Solid {
+  name "w_r3_west"
+  translation 12.35 -5.4 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 6 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 6 2.4 }
+}
+Solid {
+  name "w_r3_east"
+  translation 15.95 -5.4 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 0.1 6 2.4 }
+    }
+  ]
+  boundingObject Box { size 0.1 6 2.4 }
+}
+Solid {
+  name "w_r3_south"
+  translation 14.15 -8.45 1.2
+  children [
+    Shape {
+      appearance PaintedWood {}
+      geometry Box { size 3.5 0.1 2.4 }
+    }
+  ]
+  boundingObject Box { size 3.5 0.1 2.4 }
+}
+# --- Obstacles: five, one of them on the spawn sightline to the target --------------
+Solid {
+  name "obstacle_1"
+  translation 7.7 -1.3 0.4
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.5 0.52 0.55 roughness 0.9 }
+      geometry Box { size 0.6 0.6 0.8 }
+    }
+  ]
+  boundingObject Box { size 0.6 0.6 0.8 }
+}
+Solid {
+  name "obstacle_2"
+  translation 3 1.5 0.25
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.5 0.52 0.55 roughness 0.9 }
+      geometry Box { size 0.5 0.5 0.5 }
+    }
+  ]
+  boundingObject Box { size 0.5 0.5 0.5 }
+}
+Solid {
+  name "obstacle_3"
+  translation 2 -1.5 0.25
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.5 0.52 0.55 roughness 0.9 }
+      geometry Box { size 0.5 0.5 0.5 }
+    }
+  ]
+  boundingObject Box { size 0.5 0.5 0.5 }
+}
+Solid {
+  name "obstacle_4_table"
+  translation 9.5 1.4 0.375
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.55 0.45 0.35 roughness 0.8 }
+      geometry Box { size 1.2 0.6 0.75 }
+    }
+  ]
+  boundingObject Box { size 1.2 0.6 0.75 }
+}
+Solid {
+  name "obstacle_5"
+  translation 13.4 -4.5 0.3
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.5 0.52 0.55 roughness 0.9 }
+      geometry Box { size 0.6 0.6 0.6 }
+    }
+  ]
+  boundingObject Box { size 0.6 0.6 0.6 }
+}
+# --- Target: red block on a 1.2 m shelf against R3's east wall ----------------------
+Solid {
+  name "target_shelf"
+  translation 15.4 -7.5 0.6
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.45 0.4 0.35 roughness 0.8 }
+      geometry Box { size 0.7 0.5 1.2 }
+    }
+  ]
+  boundingObject Box { size 0.7 0.5 1.2 }
+}
+Solid {
+  name "target_block"
+  translation 15.4 -7.5 1.35
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.85 0.05 0.05 metalness 0 roughness 0.6 }
+      geometry Box { size 0.3 0.3 0.3 }
+    }
+  ]
+  boundingObject Box { size 0.3 0.3 0.3 }
+}
+Iris {
+  translation 1 0 0.09
+  controller "compat_vehicle_controller"
+  controllerArgs [
+    "--sitl-address"
+    "127.0.0.1"
+    "--sitl-port"
+    "9002"
+    "--controller-port"
+    "9010"
+    "--motors"
+    "m1_motor, m2_motor, m3_motor, m4_motor"
+    "--camera-left"
+    "camera left"
+    "--camera-right"
+    "camera right"
+    "--camera-period-ms"
+    "100"
+    "--accelerometer"
+    "accelerometer"
+    "--gyro"
+    "gyro"
+    "--inertial-unit"
+    "inertial unit"
+    "--gps"
+    "gps"
+    "--imu-period-ms"
+    "2"
+  ]
+  customData "{\"group\": \"dev\", \"layout\": \"dev-c-triple\", \"mission\": \"search_inspect_return\", \"world_zero\": \"floor level, ENU\"}"
+}

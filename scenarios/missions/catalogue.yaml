@@ -1,0 +1,280 @@
+# Scenario catalogue — the eight indoor worlds of the first-indoor mission track.
+#
+# One entry per world: group, variation values (the plan's seven axes), world path,
+# target/mission and the declared device set. tests/scenarios/ checks this file is
+# internally consistent and that every world it lists exists and carries the
+# determinism pins; scenarios/missions/tools/validate_scenarios.py loads every listed
+# world headless and checks the declared devices are exposed.
+#
+# Plan: work/runs/scenarios/env-plan.md (env-plan section numbers in comments below).
+# This file claims nothing about the drone: it is a layout contract (plan section 10).
+schema_version: 1
+
+# Plan section 6: the pins every listed world must carry.
+pins:
+  header: "#VRML_SIM R2025a utf8"
+  basic_time_step_ms: 2
+  optimal_thread_count: 1
+  random_seed_min: 0
+  remote_externproto_allowed: false
+
+# Plan section 2: two separately named groups, four layouts each.
+groups:
+  dev: 4
+  holdout: 4
+
+scenarios:
+  - id: dev-a-single
+    group: dev
+    world: scenarios/missions/dev/dev-a-single/world.wbt
+    mission:
+      type: search_inspect_return
+      instruction_family: development_single_clause
+      target: red block
+      target_class: box
+      target_present: true
+      search_region: room
+    variations:
+      rooms:
+        - {name: R1, width_m: 6.0, length_m: 4.0, height_m: 2.5}
+        - {name: vestibule, width_m: 2.0, length_m: 2.0, height_m: 2.5}
+      corridor_width_m: null
+      corridor_turns: 0
+      junction: none
+      doorways:
+        - {width_m: 1.0, placement: centred, offset_m: 0.0}
+      obstacles:
+        count: 2
+        pattern: floor_boxes_0_5m
+        suspended: false
+        near_threshold_m: null
+      textures: {wall: Plaster, floor: Parquetry}
+      lighting: {directional_intensity: 1.2, point_count: 0}
+      spawn_pose: [-1.0, 0.0, 0.09]
+      variants: [mid_mission_change]
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: dev-b-pair
+    group: dev
+    world: scenarios/missions/dev/dev-b-pair/world.wbt
+    mission:
+      type: search_inspect_return
+      instruction_family: development_single_clause
+      target: red sphere
+      target_class: sphere
+      target_present: true
+      search_region: room_pair
+      distractors:
+        - {kind: ambiguous_candidate, class: box, where: R1}
+    variations:
+      rooms:
+        - {name: R1, width_m: 5.0, length_m: 5.0, height_m: 2.5}
+        - {name: R2, width_m: 4.0, length_m: 6.0, height_m: 2.5}
+      corridor_width_m: 1.6
+      corridor_turns: 1
+      junction: none
+      doorways:
+        - {width_m: 1.1, placement: centred, offset_m: 0.0}
+      obstacles:
+        count: 4
+        pattern: three_floor_boxes_plus_table
+        suspended: false
+        near_threshold_m: null
+      textures: {wall: Roughcast, floor: DarkParquetry}
+      lighting: {directional_intensity: 1.0, point_count: 1}
+      spawn_pose: [2.0, 0.0, 0.09]
+      variants: [blocked_route_elapsed_time]
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: dev-c-triple
+    group: dev
+    world: scenarios/missions/dev/dev-c-triple/world.wbt
+    mission:
+      type: search_inspect_return
+      instruction_family: development_single_clause
+      target: red block
+      target_class: box
+      target_present: true
+      search_region: three_rooms
+      distractors:
+        - {kind: spawn_sightline_occluder, class: obstacle, where: R2}
+    variations:
+      rooms:
+        - {name: R1, width_m: 5.0, length_m: 4.0, height_m: 2.4}
+        - {name: R2, width_m: 4.0, length_m: 4.0, height_m: 2.4}
+        - {name: R3, width_m: 3.5, length_m: 6.0, height_m: 2.4}
+      corridor_width_m: 1.6
+      corridor_turns: 1
+      junction: none
+      doorways:
+        - {width_m: 1.0, placement: centred, offset_m: 0.0}
+        - {width_m: 0.95, placement: centred, offset_m: 0.0}
+      obstacles:
+        count: 5
+        pattern: floor_and_table_one_occluding_spawn_view
+        suspended: false
+        near_threshold_m: null
+      textures: {wall: PaintedWood, floor: ChequeredParquetry}
+      lighting: {directional_intensity: 1.2, point_count: 2}
+      spawn_pose: [1.0, 0.0, 0.09]
+      variants: [absent_target_declared_region]
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: dev-d-corridor
+    group: dev
+    world: scenarios/missions/dev/dev-d-corridor/world.wbt
+    mission:
+      type: traverse_inspect
+      instruction_family: development_single_clause
+      target: red inspection stripe
+      target_class: none
+      target_present: false
+      search_region: end_chamber
+    variations:
+      rooms:
+        - {name: corridor, width_m: 1.6, length_m: 8.0, height_m: 2.4}
+        - {name: chamber, width_m: 3.0, length_m: 3.0, height_m: 2.4}
+      corridor_width_m: 1.6
+      corridor_turns: 1
+      junction: none
+      doorways:
+        - {width_m: 1.1, placement: centred, offset_m: 0.0}
+      obstacles:
+        count: 3
+        pattern: flush_against_corridor_walls
+        suspended: false
+        near_threshold_m: null
+      textures: {wall: Plaster, floor: Parquetry}
+      lighting: {directional_intensity: 1.0, point_count: 0}
+      spawn_pose: [0.8, 0.0, 0.09]
+      variants: []
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: holdout-e-wide
+    group: holdout
+    world: scenarios/missions/holdout/holdout-e-wide/world.wbt
+    mission:
+      type: search_inspect_return
+      instruction_family: heldout_multi_clause
+      target: red can
+      target_class: cylinder
+      target_present: true
+      search_region: far_room
+      occluded_from_spawn: true
+    variations:
+      rooms:
+        - {name: R1, width_m: 8.0, length_m: 8.0, height_m: 3.2}
+        - {name: R2, width_m: 5.0, length_m: 7.0, height_m: 3.2}
+      corridor_width_m: 1.4
+      corridor_turns: 1
+      junction: none
+      doorways:
+        - {width_m: 0.8, placement: offset_one_third_from_north_end, offset_m: 2.67}
+      obstacles:
+        count: 8
+        pattern: six_floor_one_table_one_suspended
+        suspended: true
+        near_threshold_m: 0.4
+      textures: {wall: RedBricks, floor: CementTiles}
+      lighting: {directional_intensity: 0.4, point_count: 2}
+      spawn_pose: [2.0, 0.0, 0.09]
+      variants: []
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: holdout-f-z
+    group: holdout
+    world: scenarios/missions/holdout/holdout-f-z/world.wbt
+    mission:
+      type: search_inspect_return
+      instruction_family: heldout_multi_clause
+      target: red bottle
+      target_class: cylinder
+      target_present: true
+      search_region: far_room
+    variations:
+      rooms:
+        - {name: R1, width_m: 5.5, length_m: 5.5, height_m: 2.2}
+        - {name: R2, width_m: 4.5, length_m: 5.0, height_m: 2.2}
+      corridor_width_m: 1.4
+      corridor_turns: 2
+      junction: none
+      doorways:
+        - {width_m: 1.2, placement: corner_adjacent, offset_m: 0.4}
+      obstacles:
+        count: 7
+        pattern: six_floor_one_suspended_mid_corridor
+        suspended: true
+        near_threshold_m: null
+      textures: {wall: Marble, floor: PorcelainChevronTiles}
+      lighting: {directional_intensity: 0.5, point_count: 3}
+      spawn_pose: [2.0, 1.0, 0.09]
+      variants: [blocked_route_spatial_event]
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: holdout-g-long
+    group: holdout
+    world: scenarios/missions/holdout/holdout-g-long/world.wbt
+    mission:
+      type: search_absent_report
+      instruction_family: heldout_multi_clause
+      target: red can
+      target_class: cylinder
+      target_present: false
+      search_region: room_union_spur
+    variations:
+      rooms:
+        - {name: R1, width_m: 4.0, length_m: 14.0, height_m: 2.6}
+        - {name: spur, width_m: 1.6, length_m: 5.0, height_m: 2.6}
+      corridor_width_m: 1.6
+      corridor_turns: 1
+      junction: t_branch
+      doorways:
+        - {width_m: 1.2, placement: offset_one_third_along_wall, offset_m: 4.67}
+      obstacles:
+        count: 9
+        pattern: declared_grid
+        suspended: false
+        near_threshold_m: null
+      textures: {wall: RedBricks, floor: PorcelainChevronTiles}
+      lighting: {directional_intensity: 0.6, point_count: 2}
+      spawn_pose: [2.0, 1.0, 0.09]
+      variants: []
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
+
+  - id: holdout-h-clutter
+    group: holdout
+    world: scenarios/missions/holdout/holdout-h-clutter/world.wbt
+    mission:
+      type: inspect_search_retask
+      instruction_family: heldout_multi_clause
+      target: red can
+      target_class: cylinder
+      target_present: true
+      search_region: inspection_cluster
+    variations:
+      rooms:
+        - {name: R1, width_m: 7.0, length_m: 5.0, height_m: 2.8}
+        - {name: R2, width_m: 6.0, length_m: 4.0, height_m: 2.8}
+      corridor_width_m: 1.4
+      corridor_turns: 1
+      junction: none
+      doorways:
+        - {width_m: 0.8, placement: corner_adjacent, offset_m: 0.4}
+      obstacles:
+        count: 10
+        pattern: nine_clustered_in_region_plus_threshold_box
+        suspended: false
+        near_threshold_m: 0.4
+      textures: {wall: Marble, floor: CementTiles}
+      lighting: {directional_intensity: 0.45, point_count: 3}
+      spawn_pose: [1.5, 1.5, 0.09]
+      variants: [mid_mission_semantic_change]
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]

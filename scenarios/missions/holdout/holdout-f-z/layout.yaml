@@ -1,0 +1,70 @@
+layout: holdout-f-z
+group: holdout
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: R1
+  width_m: 5.5
+  length_m: 5.5
+  height_m: 2.2
+- name: R2
+  width_m: 4.5
+  length_m: 5.0
+  height_m: 2.2
+corridor:
+  width_m: 1.4
+  turns: 2
+  junction: none
+doorways:
+- width_m: 1.2
+  placement: corner_adjacent
+  offset_m: 0.4
+  height_m: 1.8
+obstacles:
+  count: 7
+  pattern: six_floor_one_suspended_mid_corridor
+  suspended: true
+  near_threshold_m: null
+  names:
+  - obstacle_1
+  - obstacle_2
+  - obstacle_3
+  - obstacle_4
+  - obstacle_5
+  - obstacle_6_table
+  - obstacle_7_suspended
+  static: true
+textures:
+  wall: Marble
+  floor: PorcelainChevronTiles
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 0.5
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 3
+  sky_color:
+  - 0.35
+  - 0.35
+  - 0.5
+target:
+  class: cylinder
+  present: true
+  node: target_bottle
+  placement_m:
+  - 12.0
+  - 5.0
+  - 0.225
+  support: R2 floor
+distractors: []
+variants:
+- name: blocked_route_spatial_event
+  trigger: spatial_event
+  world_contains: false
+  note: the barrier node across the Z corridor is added by the variant build; the default world is route-open
+    (plan section 3 axis 4)
+manual_review:
+- the doorway gap edge is 0.40 m off the perpendicular wall
+- blocked-route barrier is declared, not present in this world file

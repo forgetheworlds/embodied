@@ -1,0 +1,60 @@
+layout: dev-d-corridor
+group: dev
+world: world.wbt
+source_plan: work/runs/scenarios/env-plan.md (section 3 axis values)
+rooms:
+- name: corridor
+  width_m: 1.6
+  length_m: 8.0
+  height_m: 2.4
+- name: chamber
+  width_m: 3.0
+  length_m: 3.0
+  height_m: 2.4
+corridor:
+  width_m: 1.6
+  turns: 1
+  junction: none
+doorways:
+- width_m: 1.1
+  placement: centred
+  offset_m: 0.0
+  height_m: 2.0
+obstacles:
+  count: 3
+  pattern: flush_against_corridor_walls
+  suspended: false
+  near_threshold_m: null
+  names:
+  - obstacle_1
+  - obstacle_2
+  - obstacle_3
+  static: true
+textures:
+  wall: Plaster
+  floor: Parquetry
+  vendored_from: scenarios/missions/common/appearances/protos
+lighting:
+  directional_intensity: 1.0
+  direction:
+  - 0.2
+  - -0.4
+  - -1.0
+  point_count: 0
+  sky_color:
+  - 0.6
+  - 0.6
+  - 0.85
+target:
+  class: none
+  present: false
+  node: inspection_stripe
+  placement_m:
+  - 7.9
+  - 5.37
+  - 1.2
+  support: end chamber north wall
+distractors: []
+variants: []
+manual_review:
+- obstacles sit flush against the corridor walls with >= 0.6 m of route left
