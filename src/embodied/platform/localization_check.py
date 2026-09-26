@@ -28,10 +28,10 @@ Evaluator truth measures error; it never enters the runtime. On a branch
 without the merged gate's truth channel the E1 statistics are recorded as
 ``not_measured`` with the reason, and the gate cannot pass.
 """
-
 from __future__ import annotations
 
 import argparse
+import ast
 from bisect import bisect_left
 from datetime import datetime, timezone
 import hashlib
@@ -39,7 +39,9 @@ import json
 import math
 from pathlib import Path
 import queue
+import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -95,12 +97,74 @@ SEAM_REQUIREMENTS: tuple[tuple[str, float, str], ...] = (
     ("EK3_SRC1_YAW", 6.0, "merged compat_ekf.parm"),
     ("VISO_TYPE", 1.0, "merged compat_ekf.parm"),
     ("COMPASS_USE", 0.0, "merged compat_ekf.parm"),
-    ("GPS_TYPE", 0.0, "p01l_sensor.parm"),
+    ("GPS1_TYPE", 0.0, "p01l_sensor.parm"),
+    ("GPS2_TYPE", 0.0, "p01l_sensor.parm"),
     ("VISO_DELAY_MS", 50.0, "p01l_sensor.parm"),
     ("VISO_QUAL_MIN", 0.0, "p01l_sensor.parm"),
     ("FS_EKF_ACTION", 1.0, "p01l_sensor.parm"),
 )
 P01L_PARAMS_FILENAME = "p01l_sensor.parm"
+VEHICLE_DEFAULT_REQUIREMENTS: tuple[tuple[str, float], ...] = (
+    ("EK3_SRC2_POSXY", 0.0),
+    ("EK3_SRC2_VELXY", 0.0),
+    ("EK3_SRC2_YAW", 0.0),
+    ("EK3_SRC3_POSXY", 0.0),
+    ("EK3_SRC3_VELXY", 0.0),
+    ("EK3_SRC3_YAW", 0.0),
+)
+# Everything the running vehicle must answer for the claimed arm (plan section 4.7):
+# the applied layer's names (G1) and the source-set defaults observed, not assumed (G3).
+VEHICLE_REQUIREMENTS: tuple[tuple[str, float, str], ...] = SEAM_REQUIREMENTS + tuple(
+    (name, expected, "the firmware's own defaults, observed from the vehicle")
+    for name, expected in VEHICLE_DEFAULT_REQUIREMENTS
+)
+
+# G2: a name the vehicle refuses is a failure, never an absence. An unknown parameter
+# is answered with PARAM_ERROR (msgid 345) carrying MAV_PARAM_ERROR_DOES_NOT_EXIST
+# (GCS_Param.cpp:414-421, sent at :502-510). This host's pymavlink predates the
+# message -- the recorded answer arrived as UNKNOWN_345 -- so the frame is parsed
+# here with a local struct and no new dependency. The wire order is pinned against
+# the vehicle's own recorded frame (run-2026-09-26T07-40-00Z/run-a/mavlink.jsonl):
+# param_index -1, target_system 250, target_component 190, param_id "GPS_TYPE",
+# error 1.
+PARAM_ERROR_MSG_ID = 345
+MAV_PARAM_ERROR_DOES_NOT_EXIST = 1
+_PARAM_ERROR_PAYLOAD = struct.Struct("<hBB16sB")
+
+# G4: the vehicle's runtime answer. SYS_STATUS (msgid 1) carries the GPS-present bit
+# (MAV_SYS_STATUS_SENSOR_GPS = 32, common.xml:121) only when a GPS driver is running
+# (GCS.cpp:499-506); GPS_RAW_INT (msgid 24) carries fix_type; the driver's own probe
+# and detect notices ride STATUSTEXT (GPS_Backend.cpp:136). The streams are requested
+# through the session's existing SET_MESSAGE_INTERVAL path and every inbound message
+# is recorded by platform.telemetry(), so the whole-run verdict is re-derivable from
+# the run's own artifacts.
+MSG_ID_SYS_STATUS = 1
+MSG_ID_GPS_RAW_INT = 24
+GPS_AIDING_SAMPLE_HZ = 2.0
+GPS_SENSOR_PRESENT_BIT = 32
+
+# The drain loop folds the recorded telemetry at this cadence: the readback and arming
+# sample the stream through their own paths, but the rest of the run would otherwise
+# be recorded only incidentally, and a gate about what the vehicle reports during the
+# run needs the run's whole window sampled (plan section 4.7).
+TELEMETRY_SAMPLE_PERIOD_S = 0.2
+
+# T7 (plan sections 3.6 and 12.6): the scene-admission check. The pinned initializer
+# needs at least feat_thresh = 15 trackable features per window
+# (InertialInitializer.cpp:115-119) and its tracker hunts with cv::FAST at the pinned
+# default threshold 20 with non-max suppression (VioManagerOptions.h:424,
+# Grider_GRID.h:125, TrackKLT.cpp:494). A scene that gives that detector nothing makes
+# initialization structurally impossible, so the preflight measures the scene's own
+# recorded frames instead of letting a run spend its pre-arm window on an initializer
+# that cannot fire. Captures are the platform's accepted-run artifacts: P00's
+# compatibility gate and this stage's own runs.
+SCENE_ADMISSION_CAPTURE_GLOBS = (
+    "work/runs/p00-compat/accept-*/run-*/pairs",
+    "work/runs/p01-localization/*-*/run-*/pairs",
+)
+SCENE_ADMISSION_MAX_FRAMES = 24
+INITIALIZER_FEATURE_FLOOR = 15
+FAST_THRESHOLD = 20
 
 # How many stereo pairs the reader's sink may hold for the feed. A pair is ~614 KB of
 # pixels at the declared 640x480, and the sink is called from the reader's thread while
@@ -345,35 +409,332 @@ def _truth_republish_blockers(settings: PlatformSettings) -> list[str]:
     ]
 
 
-def _readback_blockers(applied: dict[str, float]) -> list[str]:
-    """The vehicle's own parameter readback against the claimed arm (plan section 4.6).
+def _readback_blockers(applied: dict[str, float], refusals: dict[str, int]) -> list[str]:
+    """The vehicle's own parameter readback against the claimed arm (plan section 4.7).
 
     The applied file is what we asked for; this is what the autopilot reported about
-    itself, which is the only statement of the configuration actually running. GPS_TYPE
-    is the load-bearing entry — the synthesized GPS is simulator-truth-derived, so a run
-    that still has it on is not the claimed arm — and the rest of the seam is checked in
-    the same pass because they fail the same way.
+    itself, which is the only statement of the configuration actually running. Every
+    required name must be answered with the claimed value, and the outcomes are kept
+    distinct (G2): answered, refused — the vehicle itself replied that the name does
+    not exist, which means the layer that named it never took effect — and silent,
+    which is a readback that cannot confirm anything and so confirms nothing.
     """
-    unmet = [
-        f"{name} read back as {applied.get(name)!r} from the vehicle itself"
-        for name, expected, _source in SEAM_REQUIREMENTS
-        if applied.get(name) != expected
-    ]
-    if not unmet:
-        return []
-    return [
-        "the vehicle's own parameter readback does not match the claimed arm: "
-        + "; ".join(unmet)
-    ]
+    blockers: list[str] = []
+    for name, expected, _source in VEHICLE_REQUIREMENTS:
+        if name in applied:
+            if applied[name] != expected:
+                blockers.append(
+                    f"{name} read back as {applied[name]:g} from the vehicle itself; "
+                    f"the claimed arm needs {name} {expected:g}"
+                )
+        elif name in refusals:
+            error = refusals[name]
+            error_name = (
+                "MAV_PARAM_ERROR_DOES_NOT_EXIST"
+                if error == MAV_PARAM_ERROR_DOES_NOT_EXIST
+                else str(error)
+            )
+            blockers.append(
+                f"the vehicle refused {name} with PARAM_ERROR {error_name}: a defaults "
+                "line under a name the vehicle does not have is silently dropped "
+                "(AP_Param.cpp:2421-2431), so the layer that named it did not take effect"
+            )
+        else:
+            blockers.append(
+                f"{name} was never answered by the vehicle; a silent readback confirms "
+                "nothing and the claimed arm does not run on it"
+            )
+    return blockers
 
+
+def _sha256(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _frame_bytes(document: dict[str, Any]) -> bytes | None:
+    """The raw frame behind a recorded message dict, whatever shape the recorder kept."""
+    data = document.get("data")
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, str) and data.startswith("bytearray(") and data.endswith(")"):
+        try:
+            parsed = ast.literal_eval(data[len("bytearray(") : -1])
+        except (ValueError, SyntaxError):
+            return None
+        return parsed if isinstance(parsed, bytes) else None
+    return None
+
+
+def _decode_param_error(document: dict[str, Any]) -> dict[str, Any] | None:
+    """One PARAM_ERROR, decoded from the vehicle's own frame (plan section 4.7 G2).
+
+    A pymavlink new enough to know the message records it decoded; this host's records
+    it as UNKNOWN_345 with the raw frame, which is parsed against the wire layout
+    pinned with the constants above.
+    """
+    kind = str(document.get("mavpackettype", ""))
+    if kind == "PARAM_ERROR":
+        param_id = str(document.get("param_id", "")).rstrip("\x00")
+        index = document.get("param_index")
+        error = document.get("error")
+        if param_id and index is not None and error is not None:
+            return {"param_id": param_id, "param_index": int(index), "error": int(error)}
+        return None
+    if kind != f"UNKNOWN_{PARAM_ERROR_MSG_ID}":
+        return None
+    frame = _frame_bytes(document)
+    if frame is None or len(frame) < 10 + _PARAM_ERROR_PAYLOAD.size:
+        return None
+    if frame[7] | (frame[8] << 8) | (frame[9] << 16) != PARAM_ERROR_MSG_ID:
+        return None
+    param_index, target_system, target_component, raw_id, error = _PARAM_ERROR_PAYLOAD.unpack(
+        frame[10 : 10 + _PARAM_ERROR_PAYLOAD.size]
+    )
+    param_id = raw_id.split(b"\x00")[0].decode("utf-8", errors="replace")
+    return {
+        "param_id": param_id,
+        "param_index": param_index,
+        "error": error,
+        "target_system": target_system,
+        "target_component": target_component,
+    }
+
+
+def _param_error_refusals(mavlink_log: Path) -> dict[str, int]:
+    """Every parameter name the vehicle itself refused, from the run's own record."""
+    refusals: dict[str, int] = {}
+    if not mavlink_log.is_file():
+        return refusals
+    with mavlink_log.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(document, dict):
+                continue
+            decoded = _decode_param_error(document)
+            if decoded and decoded["param_index"] == -1 and decoded["param_id"]:
+                refusals.setdefault(decoded["param_id"], decoded["error"])
+    return refusals
+
+
+_GPS_STATUSTEXT = re.compile(r"GPS\s*\d*\s*:", re.IGNORECASE)
+
+
+def _gps_aiding_verdict(mavlink_log: Path) -> dict[str, Any]:
+    """What the vehicle reported about GPS over the covered window (plan section 4.7 G4).
+
+    Three signals, each required clean: no SYS_STATUS sample may carry the GPS-present
+    bit, no GPS_RAW_INT sample may carry a fix, and no STATUSTEXT may be the driver's
+    own probe or detect notice. Zero samples is not a pass: an unsampled claim is an
+    asserted-only prerequisite, which this gate exists to remove.
+    """
+    sys_status = 0
+    gps_present = 0
+    raw_int = 0
+    fix_types: list[int] = []
+    statustexts: list[str] = []
+    if mavlink_log.is_file():
+        with mavlink_log.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    document = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(document, dict):
+                    continue
+                kind = document.get("mavpackettype")
+                if kind == "SYS_STATUS":
+                    sys_status += 1
+                    present = int(document.get("onboard_control_sensors_present") or 0)
+                    if present & GPS_SENSOR_PRESENT_BIT:
+                        gps_present += 1
+                elif kind == "GPS_RAW_INT":
+                    raw_int += 1
+                    fix_type = document.get("fix_type")
+                    if fix_type is not None:
+                        fix_types.append(int(fix_type))
+                elif kind == "STATUSTEXT":
+                    text = str(document.get("text", ""))
+                    if _GPS_STATUSTEXT.search(text):
+                        statustexts.append(text)
+    blockers: list[str] = []
+    if sys_status == 0:
+        blockers.append(
+            "the vehicle's SYS_STATUS was never sampled, so GPS-off is unconfirmed"
+        )
+    if gps_present:
+        blockers.append(
+            f"SYS_STATUS carried the GPS-present bit (MAV_SYS_STATUS_SENSOR_GPS) in "
+            f"{gps_present} of {sys_status} samples"
+        )
+    if any(fix_type != 0 for fix_type in fix_types):
+        blockers.append(
+            f"GPS_RAW_INT reported a fix: fix_type values {sorted(set(fix_types))} over "
+            f"{raw_int} samples"
+        )
+    for text in statustexts:
+        blockers.append(f"the GPS driver announced itself in STATUSTEXT: {text!r}")
+    return {
+        "sys_status_samples": sys_status,
+        "sys_status_gps_present": gps_present,
+        "gps_raw_int_samples": raw_int,
+        "fix_types": sorted(set(fix_types)),
+        "statustexts": statustexts,
+        "blockers": blockers,
+    }
+
+
+def _params_applied_record(applied: dict[str, float], refusals: dict[str, int]) -> dict[str, Any]:
+    """Every required name with its outcome kept distinct (plan section 4.7 G2)."""
+    record: dict[str, Any] = {}
+    for name, expected, source in VEHICLE_REQUIREMENTS:
+        if name in applied:
+            record[name] = {
+                "outcome": "answered",
+                "value": applied[name],
+                "expected": expected,
+                "source": source,
+            }
+        elif name in refusals:
+            record[name] = {
+                "outcome": "refused",
+                "param_error": refusals[name],
+                "expected": expected,
+                "source": source,
+            }
+        else:
+            record[name] = {"outcome": "silent", "expected": expected, "source": source}
+    return record
+
+
+def _find_world_sha256(node: Any) -> str | None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "world_sha256" and isinstance(value, str):
+                return value
+            found = _find_world_sha256(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_world_sha256(item)
+            if found:
+                return found
+    return None
+
+
+def _recorded_world_sha256(run_dir: Path) -> str | None:
+    """The world hash a capture's own artifacts record, when one is recorded."""
+    for path in sorted(run_dir.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        found = _find_world_sha256(document)
+        if found:
+            return found
+    return None
+
+
+def _scene_admission_check(settings: PlatformSettings, root: Path) -> tuple[bool, str]:
+    """T7: the scene must admit the pinned initializer, measured on its own frames.
+
+    The initializer needs at least 15 trackable features per window and the pinned
+    tracker hunts with FAST at the pinned threshold with non-max suppression. The
+    newest recorded capture of this scenario is measured with exactly that call; a
+    capture that records a different world's hash says nothing and is skipped.
+    """
+    capture_dirs: list[Path] = []
+    for pattern in SCENE_ADMISSION_CAPTURE_GLOBS:
+        capture_dirs.extend(path for path in root.glob(pattern) if path.is_dir())
+    current_sha256 = _sha256(settings.world)
+    for pairs_dir in sorted(capture_dirs, key=lambda path: path.stat().st_mtime, reverse=True):
+        frames = [path for path in sorted(pairs_dir.glob("*-left.ppm")) if path.is_file()]
+        if not frames:
+            continue
+        recorded = _recorded_world_sha256(pairs_dir.parent)
+        if recorded is not None and recorded != current_sha256:
+            continue
+        try:
+            import cv2
+        except ImportError:
+            return False, (
+                "the scene-admission check needs OpenCV (cv2) to measure the scene's "
+                "recorded frames the way the pinned tracker does; it is not importable"
+            )
+        detector = cv2.FastFeatureDetector_create(
+            threshold=FAST_THRESHOLD, nonmaxSuppression=True
+        )
+        counts: list[int] = []
+        for frame_path in frames[:SCENE_ADMISSION_MAX_FRAMES]:
+            image = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+            if image is not None:
+                counts.append(len(detector.detect(image, None)))
+        if not counts:
+            return False, (
+                f"{pairs_dir} holds recorded left frames but none could be read, so the "
+                "scene cannot be measured against the initializer's feature floor"
+            )
+        detail = (
+            f"{len(counts)} recorded left frames of {settings.world} measured with "
+            f"FAST({FAST_THRESHOLD}, non-max suppression): keypoint counts {counts}, "
+            f"against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
+            "features per window"
+        )
+        if recorded is None:
+            detail += (
+                f"; the capture's artifacts record no world hash to compare (the "
+                f"current world's sha256 is {current_sha256})"
+            )
+        else:
+            detail += "; the capture's recorded world sha256 matches the configured world"
+        return min(counts) >= INITIALIZER_FEATURE_FLOOR, detail
+    return False, (
+        f"no recorded capture of this scenario exists under the accepted-run artifacts, "
+        f"so the scene cannot be measured against the pinned initializer's floor of "
+        f"{INITIALIZER_FEATURE_FLOOR} features; the admission check is measured, not "
+        "asserted (plan sections 3.6 and 12.6)"
+    )
+
+
+def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
+    """What the estimator itself said about initialization, from its own log.
+
+    The pinned initializer prints nothing while its feature database is empty — the
+    silent return at InertialInitializer.cpp:86-88 — so an empty initializer_output
+    behind consumed frames means the scene's pixels gave the front end nothing to
+    track, which the preflight's scene_admission check measures directly.
+    """
+    lines: list[str] = []
+    if estimator_log.is_file():
+        lines = estimator_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    return {
+        "estimator_log_lines": len(lines),
+        "initializer_output": [line for line in lines if "[init" in line][-50:],
+        "progress_reports": [line for line in lines if "initialized=" in line][-12:],
+        "note": (
+            "the pinned initializer prints nothing while its feature database is empty; "
+            "an empty initializer_output behind consumed frames means the scene gave "
+            "the front end nothing to track"
+        ),
+    }
+
+# ---------------------------------------------------------------------------
+# Preflight: everything the claimed arm needs, reported in one pass
+# ---------------------------------------------------------------------------
 def _preflight(
     document: dict[str, Any], output_dir: Path, mode: SensorMode
 ) -> tuple[list[dict[str, Any]], bool]:
     """Every prerequisite, reported in one pass. Nothing is started by this function.
 
     Row order is the order a reader needs: the arm's own declaration first, then the
-    gate that decides whether truth can reach the estimate, then the files and
-    selections the claimed arm applies.
+    gate that decides whether truth can reach the estimate, then whether the scene can
+    feed the pinned estimator at all, then the files and selections the claimed arm
+    applies.
     """
     root = repository_root()
     settings = PlatformSettings.from_config(document, root=root)
@@ -402,6 +763,9 @@ def _preflight(
         }
     )
     satisfied = satisfied and not truth_blockers
+    scene_ok, scene_detail = _scene_admission_check(settings, root)
+    rows.append({"name": "scene_admission", "satisfied": scene_ok, "detail": scene_detail})
+    satisfied = satisfied and scene_ok
     for check in check_prerequisites(settings, output_dir):
         rows.append({"name": check.name, "satisfied": check.satisfied, "detail": check.detail})
         satisfied = satisfied and check.satisfied
@@ -811,12 +1175,14 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 (sim_time_ns(record.sim_time_s), tuple(record.pose.position_xyz))
             )
 
+    last_telemetry_sample = 0.0
     def drain() -> None:
         """Consume the sensor stream and the estimator's answers without judging.
 
         The health machine is driven only by the publisher's tick; this loop
         feeds, and stops the machine only when the feed itself fails.
         """
+        nonlocal last_telemetry_sample
         while True:
             try:
                 record = platform.sensor_record(0.0)
@@ -842,6 +1208,18 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     return
                 if state is not None:
                     publisher.offer(state, stats.newest_imu_ns)
+                if time.monotonic() - last_telemetry_sample >= TELEMETRY_SAMPLE_PERIOD_S:
+                    last_telemetry_sample = time.monotonic()
+                    # G4's evidence is the run's own record: folding the telemetry here
+                    # records every inbound MAVLink message through the whole window,
+                    # not only the windows the readback and arming happen to sample.
+                    try:
+                        platform.telemetry()
+                    except ProbeFailure as error:
+                        machine.stop(
+                            time.monotonic_ns(), f"the telemetry stream failed: {error}"
+                        )
+                        return
                 return
             try:
                 feed_record(record)
@@ -872,11 +1250,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     live_blockers: list[str] = []
     shutdown: Any = None
 
-    def gate_the_scored_arm(applied: dict[str, float]) -> list[str]:
-        """Section 4.6, as observation: what the bridge sent, and what the vehicle reports.
+    def gate_the_scored_arm(applied: dict[str, float], refusals: dict[str, int]) -> list[str]:
+        """Sections 4.6 and 4.7, as observation: what was sent, and what the vehicle reports.
 
-        Both are read from the things that acted — the bridge's own count of simulator
-        poses it has sent, and the autopilot's own parameter readback — so neither is a
+        Every item is read from the things that acted — the bridge's own count of
+        simulator poses it has sent, the autopilot's own parameter answers and
+        refusals, and the vehicle's own GPS status streams — so none of it is a
         promise about behaviour. A failure here stops the arm before the scored window
         opens, which is the only place it can be stopped without spending a flight.
         """
@@ -893,26 +1272,41 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "autopilot's external-navigation source would both carry truth (plan "
                 "section 4.6)"
             )
-        blockers.extend(_readback_blockers(applied))
+        blockers.extend(_readback_blockers(applied, refusals))
+        gps = _gps_aiding_verdict(writer.path("mavlink.jsonl"))
+        log_lines.append(
+            f"GPS-off at the gate: {gps['sys_status_samples']} SYS_STATUS samples, "
+            f"{gps['gps_raw_int_samples']} GPS_RAW_INT samples, "
+            f"{len(gps['statustexts'])} GPS STATUSTEXTs recorded so far"
+        )
+        blockers.extend(gps["blockers"])
         return blockers
 
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.startup)
         platform.request_telemetry_streams()
+        # G4 needs the vehicle's own GPS status during the run, so the two status
+        # streams are requested through the session's existing interval path; every
+        # inbound message is recorded by platform.telemetry() either way.
+        for message_id in (MSG_ID_SYS_STATUS, MSG_ID_GPS_RAW_INT):
+            session.request_message_interval(message_id, GPS_AIDING_SAMPLE_HZ)
         # Read one parameter at a time. The shared reader waits for a whole batch, so a
         # single name the autopilot never answers would consume the deadline and leave
         # the later names unrequested -- a readback that cannot say whether it asked.
         # Asked individually, every name gets its own chance and its own answer or its
         # own absence, which is exactly what the gate records.
         applied: dict[str, float] = {}
-        for name, _expected, _source in SEAM_REQUIREMENTS:
+        for name, _expected, _source in VEHICLE_REQUIREMENTS:
             applied.update(
                 platform.read_parameters((name,), timeout_s=PARAMETER_READ_TIMEOUT_S, drain=drain)
             )
-        writer.write_json("params-applied.json", applied)
-        log_lines.append(f"autopilot parameter readback: {applied}")
-        live_blockers.extend(gate_the_scored_arm(applied))
+        refusals = _param_error_refusals(writer.path("mavlink.jsonl"))
+        writer.write_json("params-applied.json", _params_applied_record(applied, refusals))
+        log_lines.append(
+            f"autopilot parameter readback: {applied}; refused by the vehicle: {sorted(refusals)}"
+        )
+        live_blockers.extend(gate_the_scored_arm(applied, refusals))
         publisher.start()
 
         if not _wait_initialized(machine, drain, settings.pre_arm_wait_s):
@@ -961,6 +1355,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         _stop_estimator(estimator_process)
 
     _write_health_events(writer, machine)
+    gps_aiding = _gps_aiding_verdict(writer.path("mavlink.jsonl"))
+    writer.write_json("gps-aiding.json", gps_aiding)
+    writer.write_json(
+        "initializer-diagnostics.json",
+        _initializer_diagnostics(writer.path("estimator.log")),
+    )
     valid_fraction = machine.valid_fraction(time.monotonic_ns())
     truth_published = platform.truth_feed_published
     log_lines.extend(
@@ -994,6 +1394,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "estimator_pin": estimator,
                 "truth_republish": settings.truth_republish,
                 "bridge_truth_published": truth_published,
+                "gps_aiding_blockers": gps_aiding["blockers"],
                 "pairs_filed": stats.pair_records_filed,
                 "pairs_fed": stats.pairs,
                 "imu_samples_fed": stats.imu_samples,
@@ -1022,6 +1423,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         truth_comparison,
         disagreement_summary,
         truth_published,
+        gps_aiding,
     )
     writer.write_json("checks.json", checks)
     _write_log(writer, log_lines)
@@ -1203,6 +1605,7 @@ def _score(
     truth_comparison: dict[str, Any],
     disagreement_summary: dict[str, Any],
     truth_published: int,
+    gps_aiding: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """The predeclared bounds, evaluated exactly as frozen. E1 unmeasured fails the gate."""
     checks: list[dict[str, Any]] = []
@@ -1215,6 +1618,21 @@ def _score(
                 "external-navigation source had exactly one publisher, the adapter"
                 if truth_published == 0
                 else f"the bridge sent {truth_published} simulator poses during the run"
+            ),
+        }
+    )
+    gps_ok = not gps_aiding["blockers"]
+    checks.append(
+        {
+            "name": "G4",
+            "status": "pass" if gps_ok else "fail",
+            "detail": (
+                f"GPS-off confirmed at runtime: {gps_aiding['sys_status_samples']} "
+                "SYS_STATUS samples without the GPS-present bit, "
+                f"{gps_aiding['gps_raw_int_samples']} GPS_RAW_INT samples without a "
+                f"fix, no GPS driver STATUSTEXT"
+                if gps_ok
+                else "; ".join(gps_aiding["blockers"])
             ),
         }
     )

@@ -513,17 +513,19 @@ class TestTruthRepublishGate:
         assert "truth republish is ON" in rows["bridge_truth_republish"]["detail"]
 
     def test_a_gps_type_readback_that_is_not_zero_fails_the_claimed_arm(self):
-        """GPS off is confirmed from the vehicle's own readback, not from the file we
-        wrote: the synthesized GPS is simulator-truth-derived."""
-        declared = {name: expected for name, expected, _source in check.SEAM_REQUIREMENTS}
-        assert check._readback_blockers(declared) == []
+        """Re-pointed (plan section 10, T5/T6): the first layer named GPS_TYPE and the
+        vehicle has no such parameter (AP_GPS.cpp:364), so the layer now names
+        GPS1_TYPE/GPS2_TYPE and the readback gate judges those names."""
+        declared = {name: expected for name, expected, _source in check.VEHICLE_REQUIREMENTS}
+        assert check._readback_blockers(declared, {}) == []
 
-        with_gps = dict(declared, GPS_TYPE=1.0)
-        blockers = check._readback_blockers(with_gps)
-        assert blockers and "GPS_TYPE" in blockers[0]
+        with_gps = dict(declared, GPS1_TYPE=1.0)
+        blockers = check._readback_blockers(with_gps, {})
+        assert blockers and "GPS1_TYPE" in blockers[0]
 
-        unanswered = {name: value for name, value in declared.items() if name != "GPS_TYPE"}
-        assert "GPS_TYPE" in check._readback_blockers(unanswered)[0]
+        unanswered = {name: value for name, value in declared.items() if name != "GPS1_TYPE"}
+        blockers = check._readback_blockers(unanswered, {})
+        assert any("GPS1_TYPE" in blocker and "silent" in blocker for blocker in blockers)
 
     def test_the_declared_switch_is_read_by_the_bridge_it_configures(self):
         """The value the gate reads is the value the bridge's own loader produces, so
@@ -566,3 +568,160 @@ class TestTruthRepublishGate:
             client.close()
         finally:
             listener.close()
+
+
+# ---------------------------------------------------------------------------
+# T6: the re-derived GPS-off gate (plan sections 4.6, 4.7)
+# ---------------------------------------------------------------------------
+
+
+# The vehicle's own recorded answer to the first layer's GPS_TYPE read
+# (run-2026-09-26T07-40-00Z/run-a/mavlink.jsonl, recorded as UNKNOWN_345): a
+# PARAM_ERROR frame whose payload is param_index -1, target_system 250,
+# target_component 190, param_id "GPS_TYPE", error 1 (DOES_NOT_EXIST).
+CAPTURED_PARAM_ERROR_FRAME = (
+    b"\xfd\x15\x00\x00\x04\x01\x01Y\x01\x00"
+    b"\xff\xff\xfa\xbe"
+    b"GPS_TYPE\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x01\x0f\x96"
+)
+
+
+class TestGpsOffGate:
+    def test_the_captured_param_error_frame_decodes_as_the_vehicle_s_refusal(self):
+        decoded = check._decode_param_error(
+            {
+                "mavpackettype": "UNKNOWN_345",
+                "data": str(bytearray(CAPTURED_PARAM_ERROR_FRAME)),
+            }
+        )
+        assert decoded == {
+            "param_id": "GPS_TYPE",
+            "param_index": -1,
+            "error": 1,
+            "target_system": 250,
+            "target_component": 190,
+        }
+
+    def test_a_required_name_the_vehicle_refuses_fails_the_arm_naming_refused(self):
+        blockers = check._readback_blockers({}, {"GPS1_TYPE": 1})
+        named = [blocker for blocker in blockers if "GPS1_TYPE" in blocker]
+        assert len(named) == 1 and "refused" in named[0]
+
+    def test_gps_status_samples_are_judged_per_signal(self, tmp_path):
+        log = tmp_path / "mavlink.jsonl"
+
+        def write(*records: dict) -> None:
+            log.write_text(
+                "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+            )
+
+        write(
+            {"mavpackettype": "SYS_STATUS", "onboard_control_sensors_present": 31},
+            {"mavpackettype": "GPS_RAW_INT", "fix_type": 0},
+        )
+        verdict = check._gps_aiding_verdict(log)
+        assert verdict["blockers"] == []
+        assert verdict["sys_status_samples"] == 1
+        assert verdict["gps_raw_int_samples"] == 1
+
+        write({"mavpackettype": "SYS_STATUS", "onboard_control_sensors_present": 32})
+        verdict = check._gps_aiding_verdict(log)
+        assert any("GPS-present bit" in blocker for blocker in verdict["blockers"])
+
+        write({"mavpackettype": "STATUSTEXT", "text": "GPS 1: detected u-blox"})
+        verdict = check._gps_aiding_verdict(log)
+        assert any("detected u-blox" in blocker for blocker in verdict["blockers"])
+
+        write({"mavpackettype": "GPS_RAW_INT", "fix_type": 3})
+        verdict = check._gps_aiding_verdict(log)
+        assert any("fix_type" in blocker for blocker in verdict["blockers"])
+
+        log.write_text("", encoding="utf-8")
+        verdict = check._gps_aiding_verdict(log)
+        assert any("never sampled" in blocker for blocker in verdict["blockers"])
+
+    def test_the_source_sets_that_cannot_select_gps_are_required(self):
+        required = {name: expected for name, expected, _source in check.VEHICLE_REQUIREMENTS}
+        assert required["EK3_SRC2_POSXY"] == 0.0
+        assert required["EK3_SRC3_YAW"] == 0.0
+        gps_selected = dict(required, EK3_SRC2_POSXY=3.0)
+        blockers = check._readback_blockers(gps_selected, {})
+        assert any("EK3_SRC2_POSXY" in blocker for blocker in blockers)
+
+    def test_params_applied_record_keeps_the_three_outcomes_distinct(self):
+        record = check._params_applied_record({"GPS1_TYPE": 0.0}, {"GPS2_TYPE": 1})
+        assert record["GPS1_TYPE"]["outcome"] == "answered"
+        assert record["GPS2_TYPE"]["outcome"] == "refused"
+        assert record["GPS2_TYPE"]["param_error"] == 1
+        assert record["EK3_SRC2_POSXY"]["outcome"] == "silent"
+
+
+# ---------------------------------------------------------------------------
+# T7: the scene-admission check (plan sections 3.6, 10, 12.6)
+# ---------------------------------------------------------------------------
+
+
+def _write_left_frame(pairs_dir: Path, name: str, image: np.ndarray) -> None:
+    import cv2
+
+    pairs_dir.mkdir(parents=True, exist_ok=True)
+    # The recorded captures are 3-channel ppm files; the check reads them back as
+    # grayscale, so the fixture writes the same shape the platform produces.
+    cv2.imwrite(str(pairs_dir / name), cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))
+
+
+def _textured_image() -> np.ndarray:
+    """A textured scene: seeded noise is dense with corners the FAST detector finds,
+    which is what the pinned tracker's front end needs (plan section 3.6)."""
+    rng = np.random.default_rng(7)
+    return rng.integers(0, 256, size=(480, 640), dtype=np.uint8)
+
+
+class TestSceneAdmission:
+    def test_a_scene_with_trackable_corners_clears_the_floor(self, tmp_path):
+        import cv2
+
+        detector = cv2.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
+        assert (
+            len(detector.detect(_textured_image(), None))
+            >= check.INITIALIZER_FEATURE_FLOOR
+        )
+        pairs_dir = tmp_path / "work/runs/p00-compat/accept-test/run-a/pairs"
+        _write_left_frame(pairs_dir, "00001-left.ppm", _textured_image())
+        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
+        ok, detail = check._scene_admission_check(settings, tmp_path)
+        assert ok, detail
+
+    def test_a_featureless_scene_fails_with_the_floor_named(self, tmp_path):
+        pairs_dir = tmp_path / "work/runs/p00-compat/accept-test/run-a/pairs"
+        _write_left_frame(pairs_dir, "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
+        ok, detail = check._scene_admission_check(settings, tmp_path)
+        assert ok is False
+        assert str(check.INITIALIZER_FEATURE_FLOOR) in detail
+        assert "[0]" in detail
+
+    def test_a_capture_of_another_world_is_skipped(self, tmp_path):
+        run_dir = tmp_path / "work/runs/p00-compat/accept-other/run-a"
+        _write_left_frame(run_dir / "pairs", "00001-left.ppm", _textured_image())
+        (run_dir / "startup.json").write_text(
+            json.dumps({"assets": {"world_sha256": "not-this-world"}}), encoding="utf-8"
+        )
+        settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
+        ok, detail = check._scene_admission_check(settings, tmp_path)
+        assert ok is False
+        assert "no recorded capture" in detail
+
+    def test_the_recorded_featureless_scene_blocks_the_preflight_by_name(self, tmp_path):
+        """Today's measured reality, through the gate itself: the configured scene's
+        own recorded frames carry no FAST keypoints against the initializer's floor."""
+        rows, _satisfied = check._preflight(
+            check._load_localization_config(Path("configs/first_indoor.yaml")),
+            tmp_path,
+            SensorMode.SENSOR_DERIVED,
+        )
+        row = {entry["name"]: entry for entry in rows}["scene_admission"]
+        assert row["satisfied"] is False
+        assert "compat_stereo.wbt" in row["detail"]
+        assert "keypoint counts [0" in row["detail"]

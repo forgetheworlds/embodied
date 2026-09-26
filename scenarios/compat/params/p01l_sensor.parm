@@ -1,6 +1,12 @@
 # P01-L sensor-derived layer. GPS off: the synthesized GPS is simulator-truth-derived,
 # and the claimed arm must not leak truth into the estimate (slice line 9).
-GPS_TYPE 0
+# The name is the firmware's: GPS_TYPE was renamed GPS1_TYPE in 4.6 (AP_GPS.cpp:364,
+# :2061) and a defaults line under a name the vehicle does not have is silently dropped
+# (AP_Param.cpp:2421-2431) -- which is what happened in run-2026-09-26T07-40-00Z
+# (plan section 0.2 item 1, section 4.7). GPS2_TYPE is set for the same reason: a
+# second receiver is the other route by which a global position could reach the filter.
+GPS1_TYPE 0
+GPS2_TYPE 0
 # Declared pipeline delay (capture->publish, sim time), mid-range of the measured
 # envelope; frozen from the dev-replay measurement before the scored run.
 # Range 0-250 ms (AP_VisualOdom.cpp:77-83).
