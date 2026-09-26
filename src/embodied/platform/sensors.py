@@ -32,6 +32,7 @@ __all__ = [
     "capture_latency_ns",
     "device_time_offset",
     "same_domain",
+    "sim_time_ns",
     "stamp",
 ]
 
@@ -86,6 +87,20 @@ class SensorSample:
 def capture_latency_ns(sample: SensorSample) -> int:
     """Nanoseconds from capture to receipt, inside the sample's one clock domain."""
     return R.elapsed_ns(sample.capture_stamp, sample.receipt_stamp)
+
+
+def sim_time_ns(sim_time_s: float) -> int:
+    """The estimator feed's timestamp: simulator time in nanoseconds.
+
+    Sim time is the one clock the declared cameras and IMU share, so it is the
+    one clock the estimator is given (plan section 4.1). A sample whose
+    ``sim_time_s`` is missing has no estimator timestamp: passing ``None``
+    here is a refused substitution, not a zero.
+    """
+    finite = sim_time_s is not None and sim_time_s == sim_time_s
+    if not finite or sim_time_s in (float("inf"), float("-inf")):
+        raise RecordError("a sample without a finite sim time has no estimator timestamp")
+    return int(round(sim_time_s * 1_000_000_000))
 
 
 def device_time_offset(calibration: R.Calibration) -> tuple[float, float]:
