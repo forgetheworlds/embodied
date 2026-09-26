@@ -22,6 +22,7 @@ When the machine stops, it stops completely — no zero pose, no frozen last pos
 
 from __future__ import annotations
 
+import select
 import socket
 import struct
 import threading
@@ -464,7 +465,8 @@ class OvStreamClient:
     Sends feed frames and pulls at most the newest STATE per poll; a dead or
     silent socket raises, and the caller stops the machine — a crashed or hung
     estimator is indistinguishable from a dead sensor, which is exactly the
-    unresolved protocol.
+    unresolved protocol. Silence is not death: a poll with nothing to read returns
+    None, and only a closed or failed connection ends the stream.
     """
 
     def __init__(self, host: str, port: int, timeout_s: float = 1.0) -> None:
@@ -476,7 +478,15 @@ class OvStreamClient:
 
     def connect(self) -> None:
         self._socket = socket.create_connection((self._host, self._port), timeout=self._timeout_s)
-        self._socket.setblocking(False)
+        # The socket stays blocking, and that is deliberate. The feed is a bulk,
+        # strictly ordered stream: a stereo pair is 614 KB, so a write that meets a
+        # full send buffer must wait for the estimator to consume it rather than be
+        # reported as a dead link or silently dropped -- dropping the newest frame
+        # would leave the estimator with a stream whose frames no longer line up with
+        # the inertial samples that were meant to precede them. Reading, by contrast,
+        # must never wait, so polling asks select first and never blocks on the
+        # estimator's silence.
+        self._socket.settimeout(None)
 
     def close(self) -> None:
         if self._socket is not None:
@@ -498,8 +508,14 @@ class OvStreamClient:
         if self._socket is None:
             raise ProtocolError("the estimator client is not connected")
         try:
+            readable, _writable, _errored = select.select([self._socket], [], [], 0)
+        except (OSError, ValueError) as error:
+            self._lost(f"the estimator socket could not be polled: {error}")
+        if not readable:
+            return None
+        try:
             data = self._socket.recv(1 << 16)
-        except (BlockingIOError, InterruptedError):
+        except InterruptedError:
             return None
         except OSError as error:
             self._lost(f"read failed: {error}")

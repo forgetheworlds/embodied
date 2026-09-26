@@ -290,6 +290,14 @@ calibration:
 #                         divergence without tripping on fusion transients.
 
 localization:
+  # The arm this configuration declares, and the one key the bridge reads to
+  # decide whether it republishes the simulator's own pose. sensor-derived means
+  # the bridge's truth feed stays off, so the autopilot's external-navigation
+  # source has exactly one publisher (the estimator adapter) and no truth enters
+  # the estimate. The check command refuses to start a claimed arm when the
+  # bridge's actual setting disagrees with the requested mode; an absent key
+  # reproduces the P00 gate's behaviour exactly (republish on, bit for bit).
+  mode: sensor-derived
   estimator:
     name: openvins
     tag: v2.7
@@ -320,3 +328,15 @@ localization:
     sigma_max_m: 1.0
     disagreement_p95_m: 0.20
     disagreement_max_m: 0.40
+    # E1, against evaluator truth in the odom-aligned frame (plan section 6,
+    # plan-fixed): p95 0.10 m horizontal is the upper edge of the advisory band
+    # and consistent with ~1.5% of the ~6 m route; p95 0.15 m vertical is the
+    # same band's upper edge on the gravity-constrained axis. Max 0.15 m
+    # horizontal is the smallest declared opening: the witness face at x = 2.4 m
+    # stands 0.4 m beyond waypoint-1's x = 2.0 and the rotor-hub diagonal reach is
+    # ~0.256 m; max 0.30 m vertical is that geometry in z. Truth measures error
+    # and never enters the estimator.
+    error_p95_horizontal_m: 0.10
+    error_p95_vertical_m: 0.15
+    error_max_horizontal_m: 0.15
+    error_max_vertical_m: 0.30

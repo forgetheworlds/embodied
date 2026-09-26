@@ -1,0 +1,7 @@
+# The built estimator process is a product, not source.
+#
+# estimator/build-openvins.sh rebuilds it from the pinned tarball whose sha256
+# configs/first_indoor.yaml records; the binary depends on this host's OpenCV 4,
+# Eigen 3 and Ceres 2.1, so committing it would pin a local toolchain instead of
+# the pin the evidence names.
+ov_stream

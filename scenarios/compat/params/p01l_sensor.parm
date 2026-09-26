@@ -1,0 +1,16 @@
+# P01-L sensor-derived layer. GPS off: the synthesized GPS is simulator-truth-derived,
+# and the claimed arm must not leak truth into the estimate (slice line 9).
+GPS_TYPE 0
+# Declared pipeline delay (capture->publish, sim time), mid-range of the measured
+# envelope; frozen from the dev-replay measurement before the scored run.
+# Range 0-250 ms (AP_VisualOdom.cpp:77-83).
+VISO_DELAY_MS 50
+# Fusion noise floors, left at firmware defaults and recorded
+# (AP_VisualOdom.cpp:85-105: VEL 0.1 m/s, POS 0.2 m, YAW 0.2 rad).
+# Quality cannot carry -1 on VISION_POSITION_ESTIMATE at af85259
+# (GCS_Common.cpp:4150 hardcodes quality 0), so the health gate lives in the
+# adapter (section 6 H-bounds), and VISO_QUAL_MIN stays 0 (AP_VisualOdom.cpp:109-115).
+VISO_QUAL_MIN 0
+# EKF failsafe action on estimator loss: Land (the firmware default made explicit;
+# ArduCopter/config.h:112-113, ArduCopter/parameters.cpp:268-273).
+FS_EKF_ACTION 1
