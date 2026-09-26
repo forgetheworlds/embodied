@@ -346,8 +346,8 @@ class OdomAlignment:
     def seal(self, initial_quat_odom_wxyz: Sequence[float]) -> None:
         """Derive and freeze the epoch rotation from the first initialized state.
 
-        ``published = A · q_odom(t) · FLU→FRD`` with
-        ``A = R_declared_start · FLU→FRD · q_odom(start)⁻¹``: one fixed
+        Position and velocity are published as ``A · p_odom`` and ``A · v_odom``
+        with ``A = R_declared_start · FLU→FRD · q_odom(start)⁻¹``: one fixed
         odom→NED rotation per epoch, the estimator's own initialization frame
         related to the autopilot's frame by the two things known at the declared
         stationary start. Idempotent: the first seal wins and the rotation never
@@ -358,6 +358,28 @@ class OdomAlignment:
         initial = quat_to_rotmat(initial_quat_odom_wxyz)
         declared = rotmat_from_rpy(self._declared_start_rpy)
         self._epoch_rotation = declared @ FLU_TO_FRD_AXES @ initial.T
+        # Why the attitude is not composed through the epoch rotation: the
+        # pinned estimator reports its attitude with the initialization frame's
+        # yaw carried on the right of the relative rotation, so
+        # epoch @ R_odom(t) @ FLU->FRD conjugates the rotation since start by
+        # the initializer's noise-decided gram_schmidt yaw
+        # (ov_init/src/utils/helper.h:138-157) and permutes pitch into roll
+        # whenever that yaw is near +/-90 degrees. Measured: run
+        # p01l-bringup-20260926T202549Z published a physical pitch sequence of
+        # (0.117, 0.414, 1.52) rad nose down as roll (0.112, 0.439, 1.557)
+        # with pitch near zero, value for value, and the 204753Z bring-up
+        # (sealed epoch yaw 89.62 degrees) shows the same permutation from the
+        # first degree of rotation. aligned_attitude_rpy therefore publishes
+        # declared @ FLU->FRD @ R_odom(t) @ R_odom(start)^-1 @ FLU->FRD and
+        # keeps the epoch rotation on position and velocity only. Validated
+        # against the recorded publications of 202549Z itself (SITL pitch of
+        # 0.414 rad nose down at sim 38.81 comes out as published pitch 0.439
+        # under this composition instead of roll 0.439 under the old one) and
+        # against the pinned binary offline, where steering the initializer to
+        # the +/-90 degree branch reproduces the permutation through this
+        # module and this composition recovers the axis for both branches.
+        self._declared_rotation = declared
+        self._initial_odom_rotation_inv = initial.T
 
     def _require_sealed(self) -> None:
         if self._epoch_rotation is None:
@@ -376,15 +398,21 @@ class OdomAlignment:
         ned = self.epoch_rotation @ np.asarray(velocity_odom_mps, dtype=np.float64)
         return (float(ned[0]), float(ned[1]), float(ned[2]))
 
+    def _aligned_attitude_rotation(self, quat_odom_wxyz: Sequence[float]) -> np.ndarray:
+        # See seal(): the rotation since the sealed start, conjugated into FRD
+        # and composed onto the declared start attitude. The epoch rotation
+        # stays on position and velocity only.
+        self._require_sealed()
+        since_start = quat_to_rotmat(quat_odom_wxyz) @ self._initial_odom_rotation_inv
+        return self._declared_rotation @ FLU_TO_FRD_AXES @ since_start @ FLU_TO_FRD_AXES
+
     def aligned_quat_ned_wxyz(
         self, quat_odom_wxyz: Sequence[float]
     ) -> tuple[float, float, float, float]:
-        rotation = self.epoch_rotation @ quat_to_rotmat(quat_odom_wxyz) @ FLU_TO_FRD_AXES
-        return rotmat_to_quat(rotation)
+        return rotmat_to_quat(self._aligned_attitude_rotation(quat_odom_wxyz))
 
     def aligned_attitude_rpy(self, quat_odom_wxyz: Sequence[float]) -> tuple[float, float, float]:
-        rotation = self.epoch_rotation @ quat_to_rotmat(quat_odom_wxyz) @ FLU_TO_FRD_AXES
-        return rotmat_to_rpy(rotation)
+        return rotmat_to_rpy(self._aligned_attitude_rotation(quat_odom_wxyz))
 
     def aligned_state(self, state: EstimatorState) -> dict[str, object]:
         """One aligned state: NED position, NED attitude RPY and velocity."""

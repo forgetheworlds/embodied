@@ -309,6 +309,36 @@ class TestConventions:
         assert alignment.aligned_attitude_rpy((1.0, 0.0, 0.0, 0.0)) == pytest.approx(
             (0.0, 0.0, math.pi / 2), abs=1e-9
         )
+    def test_a_pitch_stays_a_pitch_under_every_sealed_initial_yaw(self):
+        """The measured departure mechanism, kept as a regression: the pinned
+        estimator reports its attitude with the initialization frame's yaw
+        composed on the right of the rotation since start, so publishing through
+        the epoch rotation conjugates the relative rotation by the initializer's
+        gram_schmidt yaw and turns a physical pitch into a published roll
+        whenever that yaw is near +/-90 degrees (run
+        p01l-bringup-20260926T202549Z: SITL pitch -0.117/-0.414/-1.52 rad
+        published as vision roll -0.112/-0.439/-1.557 with pitch near zero;
+        204753Z sealed epoch yaw 89.62 degrees and departed on the first
+        pitch). The published attitude must be the rotation since the sealed
+        start conjugated into FRD: a pitch is a pitch for every branch."""
+        pitch_nose_up = 0.30
+        for odom_yaw_deg in (0.0, 90.0, 180.0, -90.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            # What the pinned estimator reports after rotating since start: the
+            # relative rotation (a nose-up pitch in the FLU body, which is a
+            # rotation by -pitch about the FLU y-left axis) composed on the
+            # LEFT of its initialization attitude.
+            since_start = loc.rotmat_from_rpy((0.0, -pitch_nose_up, 0.0))
+            reported = loc.rotmat_to_quat(since_start @ loc.quat_to_rotmat(q_init))
+            roll, pitch, yaw = alignment.aligned_attitude_rpy(reported)
+            assert roll == pytest.approx(0.0, abs=1e-9), (
+                f"odom yaw {odom_yaw_deg} deg: a physical pitch was published as roll"
+            )
+            assert pitch == pytest.approx(pitch_nose_up, abs=1e-9)
+            assert yaw == pytest.approx(0.0, abs=1e-9)
 
     def test_the_seal_is_idempotent_once_taken(self):
         """The epoch rotation is fixed: a later call must not move it, or drift
