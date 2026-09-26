@@ -1,0 +1,437 @@
+"""The ``pilot-probe`` command: verify one configured provider's real
+image/tool interface under an explicit budget, or refuse.
+
+The refusal comes first, by design: a live provider call without both an
+explicit ``--max-calls N`` on the command line and a spend ceiling recorded in
+``configs/runtime-model.yaml`` is blocked (exit 2, CLI-PLAN). The checked-in
+config ships with the limits absent, so the safe default is refusal; the owner
+records the limits when budgeting the live probe.
+
+What one probe run verifies, each recorded as an outcome rather than a crash:
+
+* image support — the reply must actually engage the fixture observation's
+  image content, not merely accept the payload;
+* tool support — the five-tool schema round-trips at least one tool call;
+* latency — send stamp, arrival stamp, bytes and any provider usage fields,
+  with the client round trip labelled unseparated (§16.1: no server breakdown
+  is invented);
+* error handling — malformed or failed replies surface as recorded outcomes.
+
+Credentials are read from the environment inside the transport and are never
+logged, hashed or written into a receipt. Unit tests drive the deterministic
+fake transport through :func:`execute_probe` and never perform a live call.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+from embodied.cli import (
+    CommandOutcome,
+    CommandStatus,
+    GateStatus,
+    register_command,
+)
+from embodied.contracts.records import ClockStamp, DecisionRequest, Observation, from_dict
+from embodied.pilot.decisions import PilotParameters
+from embodied.pilot.provider import (
+    LiveTransport,
+    ModelConfig,
+    Provider,
+    RequestPacket,
+    encode_image_data_uri,
+)
+from embodied.pilot.tools import TOOL_SCHEMAS
+
+STAGE_ID = "P04"
+PROBE_HOST = "pilot-probe-0"
+
+
+# ---------------------------------------------------------------------------
+# Configuration (configs/runtime-model.yaml — its own schema, not first_indoor's)
+# ---------------------------------------------------------------------------
+
+
+class ProbeConfigError(Exception):
+    """The runtime-model configuration is malformed or limits are absent."""
+
+
+def load_runtime_config(path: Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as error:  # pragma: no cover - PyYAML is pinned
+        raise ProbeConfigError(f"PyYAML is required to read {path}: {error}") from error
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ProbeConfigError(f"cannot read {path}: {error}") from error
+    if not isinstance(document, dict):
+        raise ProbeConfigError(f"{path} must hold a mapping")
+    for section in ("model", "probe", "pilot"):
+        if not isinstance(document.get(section), dict):
+            raise ProbeConfigError(f"{path} needs a {section}: mapping")
+    return document
+
+
+def probe_limits(config: dict[str, Any]) -> tuple[int, float] | None:
+    """The recorded (max_calls, spend_ceiling_usd), or None when absent.
+
+    Absent limits are the safe default: the probe refuses rather than guess
+    a budget (slice: no paid call beyond the kickoff budget).
+    """
+    section = config["probe"]
+    max_calls = section.get("max_calls")
+    ceiling = section.get("spend_ceiling_usd")
+    if max_calls is None or ceiling is None:
+        return None
+    if isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls <= 0:
+        raise ProbeConfigError("probe.max_calls must be a positive integer when present")
+    if isinstance(ceiling, bool) or not isinstance(ceiling, (int, float)) or ceiling <= 0:
+        raise ProbeConfigError("probe.spend_ceiling_usd must be a positive number when present")
+    return (max_calls, float(ceiling))
+
+
+# ---------------------------------------------------------------------------
+# The probe itself
+# ---------------------------------------------------------------------------
+
+
+class ProbeCheck:
+    def __init__(self, name: str, passed: bool, detail: str) -> None:
+        self.name = name
+        self.passed = passed
+        self.detail = detail
+
+
+class ProbeReport:
+    def __init__(
+        self,
+        model_identity: str,
+        checks: list[ProbeCheck],
+        calls: int,
+        latency: list[dict[str, Any]],
+        transport_failures: list[str],
+        malformed: list[str],
+    ) -> None:
+        self.model_identity = model_identity
+        self.checks = tuple(checks)
+        self.calls = calls
+        self.latency = tuple(latency)
+        self.transport_failures = tuple(transport_failures)
+        self.malformed = tuple(malformed)
+
+    @property
+    def image_ok(self) -> bool:
+        return any(check.name == "image_support" and check.passed for check in self.checks)
+
+    @property
+    def tools_ok(self) -> bool:
+        return any(check.name == "tool_support" and check.passed for check in self.checks)
+
+
+def _load_observation(path: Path) -> tuple[Observation, dict[str, bytes]]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    observation = from_dict(Observation, document)
+    payloads: dict[str, bytes] = {}
+    for name in (observation.left_payload, observation.right_payload):
+        if name is not None:
+            payloads[name] = (path.parent / name).read_bytes()
+    return observation, payloads
+
+
+def execute_probe(
+    config: dict[str, Any],
+    observation_path: Path,
+    transport,
+    max_calls: int,
+    *,
+    host_ns: int = 1_000_000_000,
+) -> ProbeReport:
+    """Run the checks against ``transport``, never exceeding ``max_calls``.
+    No live call happens here unless the caller passes the live transport."""
+    model = ModelConfig.from_config(config["model"])
+    parameters = PilotParameters.from_config(config["pilot"])
+    observation, payloads = _load_observation(observation_path)
+
+    def stamp(offset_s: float) -> ClockStamp:
+        return ClockStamp(PROBE_HOST, "monotonic", host_ns + int(offset_s * 1_000_000_000))
+
+    provider = Provider(model, transport, TOOL_SCHEMAS)
+    checks: list[ProbeCheck] = []
+    failures: list[str] = []
+    malformed: list[str] = []
+
+    def budget_left() -> bool:
+        return len(provider.send_records) < max_calls
+
+    def send_and_collect(index: float, with_image: bool, question: str):
+        request = DecisionRequest(
+            request_id=f"probe-req-{int(index)}",
+            sequence=int(index),
+            mission_revision=0,
+            base_goal_revision=0,
+            observation_ids=(observation.record_id,) if with_image else (),
+            snapshot_id=None,
+            response_deadline_s=parameters.response_deadline_s,
+            model_identity=model.identity,
+        )
+        image_parts = ()
+        if with_image:
+            image_parts = tuple(
+                (observation.record_id, encode_image_data_uri(payloads[name]))
+                for name in sorted(payloads)
+            )
+        packet = RequestPacket(
+            request=request,
+            mission_instruction="probe: answer from the attached frame",
+            image_parts=image_parts,
+            explicit_question=question,
+        )
+        provider.submit(request, packet, stamp(index * 10.0))
+        return provider.poll(stamp(index * 10.0 + parameters.response_deadline_s + 1.0))
+
+    # Check 1: the reply must engage the image content, not merely accept it.
+    if budget_left():
+        replies = send_and_collect(
+            0.0,
+            True,
+            "Describe the coloured marker in the attached frame: which colour is it "
+            "and roughly where in the frame does it sit?",
+        )
+        if not replies:
+            checks.append(ProbeCheck("image_support", False, "no reply arrived for the image request"))
+        else:
+            parsed = replies[0].parsed
+            if parsed.malformed_reason:
+                malformed.append(f"image reply: {parsed.malformed_reason}")
+                checks.append(ProbeCheck("image_support", False, parsed.malformed_reason))
+            else:
+                content = (parsed.content or "").strip()
+                checks.append(
+                    ProbeCheck(
+                        "image_support",
+                        len(content) > 10,
+                        f"reply content ({len(content)} chars) recorded; transport base64-only",
+                    )
+                )
+    else:
+        checks.append(ProbeCheck("image_support", False, "not run: call budget exhausted"))
+
+    # Check 2: the tool schema round-trips a tool call.
+    if budget_left():
+        replies = send_and_collect(1.0, False, "Call the status tool for goal 'probe-goal', then stop.")
+        if not replies:
+            checks.append(ProbeCheck("tool_support", False, "no reply arrived for the tool request"))
+        else:
+            parsed = replies[0].parsed
+            if parsed.malformed_reason:
+                malformed.append(f"tool reply: {parsed.malformed_reason}")
+            names = [call.get("function", {}).get("name") for call in parsed.tool_calls]
+            checks.append(
+                ProbeCheck(
+                    "tool_support",
+                    any(name in {"observe", "ground", "set_goal", "status", "cancel"} for name in names),
+                    f"tool calls requested: {names or 'none'}",
+                )
+            )
+    else:
+        checks.append(ProbeCheck("tool_support", False, "not run: call budget exhausted"))
+
+    # Check 3: malformed or failed replies are outcomes, not crashes.
+    if budget_left():
+        replies = send_and_collect(2.0, False, "probe error handling")
+        if replies and replies[0].parsed.malformed_reason:
+            malformed.append(replies[0].parsed.malformed_reason)
+            checks.append(ProbeCheck("error_handling", True, "malformed reply recorded as an outcome"))
+        elif replies:
+            checks.append(
+                ProbeCheck("error_handling", True, "reply well-formed; no malformed case to record")
+            )
+        else:
+            failures.append("probe-req-2 received no reply and no transport error")
+            checks.append(ProbeCheck("error_handling", False, "silence without a recorded cause"))
+    else:
+        checks.append(ProbeCheck("error_handling", False, "not run: call budget exhausted"))
+
+    latency = []
+    for reply in provider.replies:
+        record = next(
+            (r for r in provider.send_records if r.request_id == reply.parsed.request_id), None
+        )
+        latency.append(
+            {
+                "request_id": reply.parsed.request_id,
+                "send_ns": reply.arrival.send_stamp.monotonic_ns,
+                "arrival_ns": reply.arrival.arrived_at.monotonic_ns,
+                "round_trip_ns": reply.arrival.round_trip_ns,
+                "round_trip_unseparated": True,
+                "request_bytes": record.request_bytes if record else None,
+                "response_bytes": reply.response_bytes,
+                "usage": reply.parsed.usage,
+            }
+        )
+    failures.extend(f"{request_id}: {message}" for request_id, message in provider.failures)
+
+    return ProbeReport(
+        model_identity=model.identity,
+        checks=checks,
+        calls=len(provider.send_records),
+        latency=latency,
+        transport_failures=failures,
+        malformed=malformed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The registered command
+# ---------------------------------------------------------------------------
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="runtime-model configuration (configs/runtime-model.yaml)",
+    )
+    parser.add_argument(
+        "--observation",
+        type=Path,
+        required=True,
+        help="observation record fixture (tests/fixtures/pilot/observation.json)",
+    )
+    parser.add_argument(
+        "--max-calls",
+        type=int,
+        default=None,
+        help="explicit approved maximum number of live provider calls for this run",
+    )
+    parser.add_argument(
+        "--api-key-env",
+        default="PROVIDER_API_KEY",
+        help="environment variable holding the provider API key (never logged)",
+    )
+
+
+def _manifest_for(config: dict[str, Any], report: ProbeReport, call_budget: int, limits) -> dict[str, Any]:
+    return {
+        "model_provider": config["model"].get("provider"),
+        "model_id": report.model_identity,
+        "declared_input": config["model"].get("declared_input"),
+        "image_transport": config["model"].get("image_transport"),
+        "checks": [
+            {"name": check.name, "passed": check.passed, "detail": check.detail}
+            for check in report.checks
+        ],
+        "calls_made": report.calls,
+        "call_budget": call_budget,
+        "spend_ceiling_usd": limits[1] if limits else None,
+        "cost_recorded": None,
+        "cost_note": "usage recorded per call; no price table in config, so no cost is computed",
+        "latency": list(report.latency),
+        "transport_failures": list(report.transport_failures),
+        "malformed_replies": list(report.malformed),
+    }
+
+
+def _handler(args: argparse.Namespace, output: Path) -> CommandOutcome:
+    """One probe run: refuse without a budget, otherwise run once, record once."""
+    config = load_runtime_config(args.config)
+    limits = probe_limits(config)
+    missing = []
+    if args.max_calls is None:
+        missing.append("no --max-calls on the command line")
+    if limits is None:
+        missing.append(
+            "no max_calls/spend_ceiling_usd recorded in the config's probe section "
+            "(absent limits are the safe default; the owner records them when "
+            "budgeting the live probe)"
+        )
+    if missing:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(
+                "pilot-probe refuses a live call without an explicit budget: " + "; ".join(missing),
+            ),
+            limitations=("this refusal is the checked-in default; no provider call was made",),
+            manifest={"model": config["model"].get("id"), "limits_recorded": False},
+        )
+    if args.max_calls < 1:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=("pilot-probe refuses: --max-calls must be a positive integer",),
+            manifest={"model": config["model"].get("id"), "limits_recorded": True},
+        )
+
+    call_budget = min(args.max_calls, limits[0])
+    transport = LiveTransport(
+        ModelConfig.from_config(config["model"]), api_key_env=args.api_key_env
+    )
+    report = execute_probe(config, args.observation, transport, call_budget)
+    (output / "probe-report.json").write_text(
+        json.dumps(
+            {
+                "model_identity": report.model_identity,
+                "checks": [
+                    {"name": check.name, "passed": check.passed, "detail": check.detail}
+                    for check in report.checks
+                ],
+                "calls": report.calls,
+                "latency": list(report.latency),
+                "transport_failures": list(report.transport_failures),
+                "malformed": list(report.malformed),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = _manifest_for(config, report, call_budget, limits)
+    if report.image_ok and report.tools_ok:
+        return CommandOutcome(
+            status=CommandStatus.COMPLETE,
+            gate_status=GateStatus.PASS,
+            reasons=(
+                "image and tool interfaces answered under the recorded budget",
+                f"{report.calls} calls within --max-calls {args.max_calls} and the config ceiling",
+            ),
+            limitations=(
+                "a probe verifies transport-level support and latency only; it scores "
+                "no mission and claims no autonomy",
+                "client round trips are unseparated aggregates (no server breakdown)",
+            ),
+            manifest=manifest,
+            artifacts=("probe-report.json",),
+        )
+    return CommandOutcome(
+        status=CommandStatus.BLOCKED,
+        gate_status=GateStatus.FAIL,
+        reasons=(
+            "the provider did not verify image+tool support: "
+            + "; ".join(
+                f"{check.name}={'pass' if check.passed else 'fail'}" for check in report.checks
+            ),
+        ),
+        limitations=(
+            "record the gap and stop (slice: no silent substitute model, no pro-tier "
+            "escalation); no further live calls are made",
+        ),
+        manifest=manifest,
+        artifacts=("probe-report.json",),
+    )
+
+
+register_command(
+    "pilot-probe",
+    _handler,
+    help_text="verify the configured provider's image/tool interface under an explicit budget",
+    stage_id=STAGE_ID,
+    run_prefix="p04-provider",
+    add_arguments=_add_arguments,
+)

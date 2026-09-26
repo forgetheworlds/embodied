@@ -1,0 +1,29 @@
+{
+  "arm": "B2",
+  "artifacts": {
+    "agent-events.jsonl": "302d71c0315b28b3bea292d007f21696bdb828613f32f3576e336e0c69373500",
+    "payloads/obs-0-left.ppm": "b545ce20ce804126ab0407b23676e9fa96eeca86e7ce8ed786cdc8bd197762b1",
+    "payloads/obs-0-right.ppm": "24dadfa56417abc2df01a36253893e90c8609bf75a8f79e1f2d3af3c6a6669df",
+    "payloads/obs-1-left.ppm": "5b5063d051b43497a2b6b480af09138c1b9f5533976d587a423fa0766509fcf3",
+    "payloads/obs-1-right.ppm": "914a7aad75e35255b30a9c1c73e6b2deed70516f7b5449324adf41ba7c1fdec9",
+    "payloads/obs-2-left.ppm": "b545ce20ce804126ab0407b23676e9fa96eeca86e7ce8ed786cdc8bd197762b1",
+    "payloads/obs-2-right.ppm": "24dadfa56417abc2df01a36253893e90c8609bf75a8f79e1f2d3af3c6a6669df"
+  },
+  "code_revision": null,
+  "config_hash": null,
+  "episode_id": "delayed-replies-001",
+  "episode_kind": "synthetic-fixture",
+  "events_revision": "p02-events-1",
+  "manifest_revision": "p02-manifest-1",
+  "model_identity": "opencode-go/deepseek-v4.1-flash (scripted replies; no live provider call)",
+  "permitted_projection": [
+    "manifest.json",
+    "agent-events.jsonl",
+    "final-report.json",
+    "payloads/"
+  ],
+  "records_revision": "p00-records-1",
+  "sensor_mode": "simulator-interface",
+  "suite": null,
+  "trial_group_id": null
+}

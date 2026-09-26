@@ -1,0 +1,40 @@
+{
+  "calibration_id": "cal-pilot-0",
+  "capture_pose_ref": null,
+  "capture_stamp": {
+    "clock_id": "monotonic",
+    "host_id": "pilot-fixture-0",
+    "monotonic_ns": 1000000000
+  },
+  "depth_source": null,
+  "encoding": "ppm-p3",
+  "episode_id": "pilot-probe-001",
+  "height": 12,
+  "left_payload": "pilot-obs-0-left.ppm",
+  "pair_id": "pair-probe-0",
+  "quality": {
+    "channel_identical_fraction": 0.0,
+    "channel_means": [
+      0.35,
+      0.28,
+      0.4
+    ],
+    "is_colour": true,
+    "saturated_pixel_fraction": 0.0
+  },
+  "receipt_stamp": {
+    "clock_id": "monotonic",
+    "host_id": "pilot-fixture-0",
+    "monotonic_ns": 1005000000
+  },
+  "record_id": "obs-probe-0",
+  "right_payload": "pilot-obs-0-right.ppm",
+  "sensor_ids": {
+    "imu": "pilot-imu",
+    "left": "pilot-left",
+    "right": "pilot-right"
+  },
+  "sequence": 0,
+  "sim_time_s": null,
+  "width": 16
+}
