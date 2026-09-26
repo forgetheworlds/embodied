@@ -1,0 +1,332 @@
+{
+  "aperture": {
+    "crossing_direction": "+x (the requested side and the current approach agree)",
+    "wall_x_odom_m": 3.0,
+    "width_m": 1.2,
+    "y_odom_m": [
+      -0.3,
+      0.9
+    ],
+    "z_odom_m": [
+      0.0,
+      2.0
+    ]
+  },
+  "calibration": {
+    "T_body_camera_left_translation_m": [
+      0.05,
+      0.05,
+      0.05
+    ],
+    "T_camera_left_camera_right_translation_m": [
+      0.0,
+      -0.1,
+      0.0
+    ],
+    "baseline_m": 0.1,
+    "calibration_id": "first-indoor-stereo-1",
+    "depth_convention": "metric depth z = f*B/d in metres along the LEFT RECTIFIED optical axis; disparity d in pixels, left-positive (d = x_left - x_right > 0 for points in front); depth is valid only where the validity mask is true; a masked sample is unknown, never zero",
+    "focal_length_px": 554.2562584220407,
+    "pixel_convention": "top-left origin, [column, row]; columns run along body -y (rightward) and rows run along body -z (down), because a Webots camera's optical axis is its own +x; pixel (0,0) is the top-left of a 640x480 image",
+    "principal_point_px": [
+      320.0,
+      240.0
+    ],
+    "version": "2"
+  },
+  "depth": {
+    "border_margin_px": 8,
+    "far_wall_depth_m": 5.95,
+    "note": "a masked sample is unknown; invalid depth clears nothing and grounds nothing",
+    "provenance": "DIAGNOSTIC",
+    "reasons": {
+      "border": 4,
+      "depth_range": 3,
+      "lr_mismatch": 2,
+      "no_return": 1,
+      "valid": 0
+    },
+    "sigma_disparity_px": 1.0,
+    "sigma_pixel_px": 1.0,
+    "source": "embodied.perception.camera.declared_depth_map over the declared surfaces",
+    "wall_depth_m": 2.95
+  },
+  "dynamic": {
+    "class": "pedestrian",
+    "reach_s": 1.5,
+    "speed_mps": 1.2
+  },
+  "evaluation_ns": 1600000000,
+  "fixture_revision": "p03-doorway-fixture-1",
+  "floor": {
+    "declared": false,
+    "reason": "floor-plane metric depth is unresolved (APPROVAL-RECORD.md:1053-1068); no floor surface is declared and no expected value depends on one"
+  },
+  "frame": {
+    "axes": "x through the doorway, y left, z up; identity quaternions at both views",
+    "gravity_aligned": true,
+    "handedness": "right",
+    "name": "odom"
+  },
+  "limits": {
+    "a_max_mps2": 1.0,
+    "ambiguity_margin": 0.15,
+    "jerk_max_mps3": 4.0,
+    "pose_sigma_limit_m": 0.03333333333333333,
+    "pose_sigma_nominal_m": 0.02,
+    "pose_validity_s": 5.0,
+    "setpoint_period_s": 0.1,
+    "setpoint_prefix_horizon_s": 2.0,
+    "start_state_tolerance_m": 0.2,
+    "v_max_mps": 0.5
+  },
+  "map": {
+    "bounds_odom_m": {
+      "x": [
+        -5.0,
+        7.0
+      ],
+      "y": [
+        -4.0,
+        4.0
+      ],
+      "z": [
+        -0.5,
+        3.0
+      ]
+    },
+    "free_threshold": 1.4,
+    "freshness_s": 5.0,
+    "log_odds_clamp": 4.0,
+    "log_odds_hit": 0.7,
+    "log_odds_pass": -0.4,
+    "min_clearing_rays": 3,
+    "occupied_threshold": 1.4,
+    "surface_band_m": 0.1,
+    "voxel_m": 0.1
+  },
+  "nav_epoch": "p03-epoch-1",
+  "provenance": "DIAGNOSTIC (declared scene and declared depth; never sensor-derived)",
+  "selections": {
+    "aperture": {
+      "box_px": [
+        103,
+        5,
+        443,
+        447
+      ],
+      "encloses_rectangle_odom_m": {
+        "plane_x_odom_m": 3.0,
+        "y_odom_m": [
+          -0.6,
+          1.2
+        ],
+        "z_odom_m": [
+          -0.05,
+          2.3
+        ]
+      },
+      "selection_id": "sel-aperture"
+    },
+    "aperture_v2": {
+      "box_px": [
+        228,
+        140,
+        372,
+        328
+      ],
+      "selection_id": "sel-aperture-v2"
+    },
+    "far_point": {
+      "point_px": [
+        297,
+        245
+      ],
+      "selection_id": "sel-far-point"
+    },
+    "open_band": {
+      "box_px": [
+        0,
+        0,
+        5,
+        5
+      ],
+      "selection_id": "sel-open-band"
+    }
+  },
+  "surfaces": [
+    {
+      "axis_bounds_odom_m": {
+        "y": [
+          -2.0,
+          -0.3
+        ],
+        "z": [
+          -1.0,
+          2.4
+        ]
+      },
+      "name": "wall_left",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "axis_bounds_odom_m": {
+        "y": [
+          0.9,
+          2.0
+        ],
+        "z": [
+          -1.0,
+          2.4
+        ]
+      },
+      "name": "wall_right",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "axis_bounds_odom_m": {
+        "y": [
+          -0.3,
+          0.9
+        ],
+        "z": [
+          -1.0,
+          0.0
+        ]
+      },
+      "name": "wall_sill",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "axis_bounds_odom_m": {
+        "y": [
+          -0.3,
+          0.9
+        ],
+        "z": [
+          2.0,
+          2.4
+        ]
+      },
+      "name": "wall_header",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        3.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "axis_bounds_odom_m": {
+        "y": [
+          -2.0,
+          2.0
+        ],
+        "z": [
+          -1.0,
+          3.5
+        ]
+      },
+      "name": "far_wall",
+      "plane_normal_odom": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "plane_point_odom_m": [
+        6.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "units": "metres, seconds, nanoseconds",
+  "vehicle": {
+    "body_radius_m": 0.3,
+    "error_allowance_m": 0.1,
+    "inflation_m": 0.4
+  },
+  "views": [
+    {
+      "body_position_odom_m": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "body_quaternion_odom_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "camera_center_odom_m": [
+        0.05,
+        0.05,
+        1.05
+      ],
+      "capture_ns": 1000000000,
+      "left_payload": "payloads/obs-1-left.ppm",
+      "observation_id": "obs-1",
+      "pair_id": "pair-1",
+      "record_id": "obs-1",
+      "right_payload": "payloads/obs-1-right.ppm",
+      "sim_time_s": 1.0
+    },
+    {
+      "body_position_odom_m": [
+        -4.0,
+        0.0,
+        1.0
+      ],
+      "body_quaternion_odom_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "camera_center_odom_m": [
+        -3.95,
+        0.05,
+        1.05
+      ],
+      "capture_ns": 1500000000,
+      "left_payload": "payloads/obs-2-left.ppm",
+      "observation_id": "obs-2",
+      "pair_id": "pair-2",
+      "record_id": "obs-2",
+      "right_payload": "payloads/obs-2-right.ppm",
+      "sim_time_s": 1.5
+    }
+  ]
+}
