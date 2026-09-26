@@ -167,6 +167,19 @@ SCENE_ADMISSION_MAX_FRAMES = 24
 INITIALIZER_FEATURE_FLOOR = 15
 FAST_THRESHOLD = 20
 
+# H5's measured cause, and the two markers that separate "the initializer never
+# fired" from "the filter initialised but the pinned readiness accessor never
+# became true". VioManager::initialized() is `is_initialized_vio && timelastupdate
+# != -1` (VioManager.h:99), and timelastupdate is assigned only at the tail of
+# do_feature_propagate_update (VioManager.cpp:651); the zero-velocity updater
+# returns early from track_image_and_update before that assignment
+# (VioManager.cpp:294), so a stationary start with try_zupt enabled reaches it
+# only on a camera frame where ZUPT itself had no bracketing inertial data.
+# Recorded from the run's own log instead of inferring the cause from the bound.
+INITIALIZER_SUCCESS_MARKER = "[init]: successful initialization"
+ZUPT_ACCEPTED_MARKER = "[ZUPT]: accepted"
+ZUPT_STARVED_MARKER = "[ZUPT]: There are no IMU data"
+
 # Revision 4: the run's own bounded static-start capture (plan section 0.3 item 4).
 # Same conditions as P00's accept-5 capture -- the vehicle at the declared start
 # on the ground -- recorded so the arm gate can measure the configured world
@@ -812,6 +825,51 @@ def _fast_keypoint_counts(frame_paths: Sequence[Path]) -> list[int] | None:
     return counts
 
 
+def _stereo_capture_measurement(pairs_dir: Path, limit: int) -> dict[str, Any]:
+    """Per-eye FAST counts for a recorded capture, or why it cannot gate a stereo arm.
+
+    The gate answers one question — can the pinned tracker's front end see this
+    scene — and the arm it gates feeds the estimator two image planes. A capture
+    holding only the left eye cannot answer it, and neither can one whose two eyes
+    are byte-identical: one view duplicated is not a stereo pair. Both are reported
+    as unusable rather than measured. The defect this replaces is a gate that passed
+    at 16 left-eye keypoints while nothing in the run recorded what the second view
+    contained, so a stereo arm could open on a single eye's worth of evidence.
+    """
+    left_paths = sorted(path for path in pairs_dir.glob("*-left.ppm") if path.is_file())
+    measurement: dict[str, Any] = {
+        "pairs_dir": str(pairs_dir),
+        "pairs": 0,
+        "left_counts": [],
+        "right_counts": [],
+        "missing_right": [],
+        "identical_pairs": [],
+        "cv2_unavailable": False,
+    }
+    pairs: list[tuple[Path, Path]] = []
+    for left_path in left_paths:
+        right_path = left_path.with_name(left_path.name.replace("-left.ppm", "-right.ppm"))
+        if not right_path.is_file():
+            measurement["missing_right"].append(left_path.name)
+            continue
+        if left_path.read_bytes() == right_path.read_bytes():
+            measurement["identical_pairs"].append(left_path.name)
+            continue
+        pairs.append((left_path, right_path))
+    measurement["pairs"] = len(pairs)
+    if not pairs:
+        return measurement
+    measured = pairs[:limit]
+    left_counts = _fast_keypoint_counts([left for left, _right in measured])
+    right_counts = _fast_keypoint_counts([right for _left, right in measured])
+    if left_counts is None or right_counts is None:
+        measurement["cv2_unavailable"] = True
+        return measurement
+    measurement["left_counts"] = left_counts
+    measurement["right_counts"] = right_counts
+    return measurement
+
+
 def _scene_admission_check(
     settings: PlatformSettings, root: Path
 ) -> tuple[bool, str, str]:
@@ -830,15 +888,23 @@ def _scene_admission_check(
     and the arm is refused unless those measured frames clear the floor -- so no
     flight can be spent on a scene the initializer cannot fire in, which is the
     property that has held since run 4's receipt.
+
+    Revision 5 adds a third: the capture must hold **both eyes**. The arm this gates
+    feeds the estimator two planes, and every capture recorded before this revision
+    holds only `-left.ppm` -- so the gate passed at 16 left-eye keypoints while
+    nothing in the run showed what the second view contained. A capture missing its
+    right eye, or whose right eye is byte-identical to its left, is now skipped
+    rather than measured, exactly as an unhashed capture is, and the run's own
+    arm-gate capture records and measures both.
     """
     capture_dirs: list[Path] = []
     for pattern in SCENE_ADMISSION_CAPTURE_GLOBS:
         capture_dirs.extend(path for path in root.glob(pattern) if path.is_dir())
     current_sha256 = _sha256(settings.world)
     unhashed = 0
+    unusable = 0
     for pairs_dir in sorted(capture_dirs, key=lambda path: path.stat().st_mtime, reverse=True):
-        frames = [path for path in sorted(pairs_dir.glob("*-left.ppm")) if path.is_file()]
-        if not frames:
+        if not any(pairs_dir.glob("*-left.ppm")):
             continue
         recorded = _recorded_world_sha256(pairs_dir.parent)
         if recorded is None:
@@ -846,39 +912,43 @@ def _scene_admission_check(
             continue
         if recorded != current_sha256:
             continue
-        counts = _fast_keypoint_counts(frames[:SCENE_ADMISSION_MAX_FRAMES])
-        if counts is None:
+        measurement = _stereo_capture_measurement(pairs_dir, SCENE_ADMISSION_MAX_FRAMES)
+        if measurement["cv2_unavailable"]:
             return (
                 False,
                 "cv2_unavailable",
                 "the scene-admission check needs OpenCV (cv2) to measure the scene's "
                 "recorded frames the way the pinned tracker does; it is not importable",
             )
-        if not counts:
-            return (
-                False,
-                "measured_fail",
-                f"{pairs_dir} holds recorded left frames but none could be read, so the "
-                "scene cannot be measured against the initializer's feature floor",
-            )
+        measured_both_eyes = (
+            measurement["pairs"]
+            and measurement["left_counts"]
+            and measurement["right_counts"]
+        )
+        if not measured_both_eyes:
+            unusable += 1
+            continue
+        lowest_left = min(measurement["left_counts"])
+        lowest_right = min(measurement["right_counts"])
+        lowest = min(lowest_left, lowest_right)
+        passed = lowest >= INITIALIZER_FEATURE_FLOOR
         detail = (
-            f"{len(counts)} recorded left frames of {settings.world} measured with "
-            f"FAST({FAST_THRESHOLD}, non-max suppression): keypoint counts {counts}, "
-            f"against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
-            "features per window; the capture's recorded world sha256 matches the "
-            "configured world"
+            f"{measurement['pairs']} recorded stereo pairs of {settings.world} measured "
+            f"with FAST({FAST_THRESHOLD}, non-max suppression) in both eyes: keypoint "
+            f"counts left {measurement['left_counts']}, right "
+            f"{measurement['right_counts']}, against the pinned initializer's floor of "
+            f"{INITIALIZER_FEATURE_FLOOR} features per window; the capture's recorded "
+            "world sha256 matches the configured world"
         )
-        return (
-            min(counts) >= INITIALIZER_FEATURE_FLOOR,
-            "measured_pass" if min(counts) >= INITIALIZER_FEATURE_FLOOR else "measured_fail",
-            detail,
-        )
+        return passed, ("measured_pass" if passed else "measured_fail"), detail
     detail = (
-        f"no hash-matched recorded capture of {settings.world} (sha256 {current_sha256}) "
-        f"exists under the accepted-run artifacts ({unhashed} capture(s) skipped for "
-        "recording no world hash); the arm gate will measure this run's own static-start "
-        f"frames against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
-        "features and refuse the arm if they do not clear it (plan section 0.3 item 4)"
+        f"no hash-matched recorded stereo capture of {settings.world} (sha256 "
+        f"{current_sha256}) exists under the accepted-run artifacts ({unhashed} "
+        "capture(s) skipped for recording no world hash, "
+        f"{unusable} for recording no complete, distinct, readable stereo pair); the "
+        "arm gate will measure this run's own static-start frames in both eyes against "
+        f"the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} features and "
+        "refuse the arm if they do not clear it (plan section 0.3 item 4)"
     )
     return True, "deferred_to_arm_gate", detail
 
@@ -890,6 +960,13 @@ def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
     silent return at InertialInitializer.cpp:86-88 — so an empty initializer_output
     behind consumed frames means the scene's pixels gave the front end nothing to
     track, which the preflight's scene_admission check measures directly.
+
+    The last three fields exist because an empty or populated initializer_output
+    alone cannot say *why* a run blocked at H5: the pinned readiness accessor is a
+    conjunction (VioManager.h:99), and its second term is set only by a completed
+    visual update. Recording whether the initializer fired, how many zero-velocity
+    updates it accepted, and how many camera frames ZUPT had no inertial data for
+    lets a reader re-derive the verdict from the artifact instead of the log's prose.
     """
     lines: list[str] = []
     if estimator_log.is_file():
@@ -898,12 +975,60 @@ def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
         "estimator_log_lines": len(lines),
         "initializer_output": [line for line in lines if "[init" in line][-50:],
         "progress_reports": [line for line in lines if "initialized=" in line][-12:],
+        "initializer_succeeded": any(
+            INITIALIZER_SUCCESS_MARKER in line for line in lines
+        ),
+        "zupt_accepted_updates": sum(
+            1 for line in lines if ZUPT_ACCEPTED_MARKER in line
+        ),
+        "zupt_frames_without_imu": sum(
+            1 for line in lines if ZUPT_STARVED_MARKER in line
+        ),
         "note": (
             "the pinned initializer prints nothing while its feature database is empty; "
             "an empty initializer_output behind consumed frames means the scene gave "
-            "the front end nothing to track"
+            "the front end nothing to track. initializer_succeeded says whether the "
+            "initializer's own success line is present; initialized() also needs "
+            "timelastupdate, set only by a completed visual update, which the "
+            "zero-velocity updater pre-empts (VioManager.cpp:294)"
         ),
     }
+
+
+def _initialization_blocker(diagnostics: dict[str, Any]) -> str:
+    """H5's stop reason, stated from the estimator's own log (plan section 11).
+
+    Two different failures read the same from the bound alone, and they point a
+    later session in opposite directions: an initializer that never fired is a
+    scene/feature question, while an initializer that fired behind a readiness
+    accessor that stayed false is a filter-configuration question. The first
+    textured re-run's receipt said "did not initialize" while its own
+    initializer_output recorded the success line, and the next plan revision was
+    written against the wrong cause; this function is what stops that reading.
+    """
+    if diagnostics["initializer_succeeded"]:
+        return (
+            "the pinned estimator's readiness accessor stayed false through the whole "
+            "pre-arm window (H5), although the initializer itself fired: its own log "
+            f"records {INITIALIZER_SUCCESS_MARKER!r}, while VioManager::initialized() "
+            "(VioManager.h:99) is `is_initialized_vio && timelastupdate != -1` and "
+            "timelastupdate is assigned only at the tail of do_feature_propagate_update "
+            "(VioManager.cpp:651). The zero-velocity updater returned early from "
+            "track_image_and_update before that assignment (VioManager.cpp:294) on the "
+            "camera frames it accepted: "
+            f"{diagnostics['zupt_accepted_updates']} accepted zero-velocity update(s) "
+            f"against {diagnostics['zupt_frames_without_imu']} frame(s) where it had no "
+            "bracketing inertial data and the visual path ran instead. No state was "
+            "published, so no bound was measured; changing the zero-velocity "
+            "configuration or the H5 criterion is the owner's disposition, not a "
+            "worker's"
+        )
+    return (
+        "the estimator did not initialize inside the pre-arm window (H5): the pinned "
+        "initializer's own log records no successful initialization, and initialization "
+        "is from the declared stationary launch interval -- a degenerate initialization "
+        "is unavailable-navigation, not a delayed arm"
+    )
 
 # ---------------------------------------------------------------------------
 # Preflight: everything the claimed arm needs, reported in one pass
@@ -1276,11 +1401,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             pending_pairs.put_nowait(record)
         except queue.Full:
             stats.pair_records_dropped += 1
-        # The run's own scene capture (plan section 0.3 item 4): bounded left
-        # frames at the declared static start, with the world's own pixels — the
-        # same conditions as P00's accept-5 capture, written so the arm gate and
-        # every later preflight measure the configured world instead of trusting
-        # a capture that cannot say which world it shows.
+        # The run's own scene capture (plan section 0.3 item 4): bounded pairs at
+        # the declared static start, with the world's own pixels — the same
+        # conditions as P00's accept-5 capture, written so the arm gate and every
+        # later preflight measure the configured world instead of trusting a
+        # capture that cannot say which world it shows. Both eyes are written, and
+        # from the same pair record the feed converts and sends, so the gate
+        # measures exactly the two planes the estimator is given: the captures
+        # recorded before this revision held only the left frame, and the gate
+        # passed on one eye while nothing recorded what the second one contained.
         now = time.monotonic()
         if (
             scene_capture["count"] < SCENE_CAPTURE_MAX_FRAMES
@@ -1288,10 +1417,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         ):
             scene_capture["last_s"] = now
             index = scene_capture["count"] + 1
+            header = f"P6\n{settings.stereo.width} {settings.stereo.height}\n255\n".encode()
             writer.write_bytes(
-                f"pairs/{index:05d}-left.ppm",
-                f"P6\n{settings.stereo.width} {settings.stereo.height}\n255\n".encode()
-                + bytes(record.pair.left_bytes),
+                f"pairs/{index:05d}-left.ppm", header + bytes(record.pair.left_bytes)
+            )
+            writer.write_bytes(
+                f"pairs/{index:05d}-right.ppm", header + bytes(record.pair.right_bytes)
             )
             scene_capture["count"] += 1
 
@@ -1546,9 +1677,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         initialized_in_window = _wait_initialized(machine, drain, settings.pre_arm_wait_s)
         if not initialized_in_window:
             live_blockers.append(
-                "the estimator did not initialize inside the pre-arm window (H5); "
-                "initialization is from the declared stationary launch interval, and a "
-                "degenerate initialization is unavailable-navigation, not a delayed arm"
+                _initialization_blocker(_initializer_diagnostics(writer.path("estimator.log")))
             )
         else:
             log_lines.append("estimator initialized before arm (H5)")
@@ -1736,53 +1865,80 @@ def _scene_capture_gate(
     scene_capture: dict[str, Any],
     log_lines: list[str],
 ) -> str | None:
-    """Revision 4's arm-side scene admission (plan section 0.3 item 4).
+    """Revision 4's arm-side scene admission (plan section 0.3 item 4), both eyes.
 
     The preflight measured a hash-matched capture when one existed; this gate
     measures the run's own recorded static-start frames, with the world's own
     hash written beside them, and refuses the arm when they do not clear the
     initializer's floor. No flight can be spent on a scene the initializer
     cannot fire in.
+
+    Revision 5 measures the pair, not the left frame: both eyes must clear the
+    floor, and a capture with no complete, distinct pair cannot open the arm at
+    all. The estimator this arm feeds receives two planes, so one eye's keypoint
+    count is not evidence about it.
     """
     deadline = time.monotonic() + SCENE_CAPTURE_TIMEOUT_S
     while scene_capture["count"] < SCENE_CAPTURE_MAX_FRAMES and time.monotonic() < deadline:
         drain()
         time.sleep(0.05)
     pairs_dir = writer.directory / "pairs"
-    frames = sorted(path for path in pairs_dir.glob("*-left.ppm") if path.is_file())
+    measurement = _stereo_capture_measurement(pairs_dir, SCENE_ADMISSION_MAX_FRAMES)
     record: dict[str, Any] = {
         "world": str(settings.world),
         "world_sha256": _sha256(settings.world),
-        "frames": [path.name for path in frames],
+        "pairs_recorded": measurement["pairs"],
+        "left_keypoint_counts": measurement["left_counts"],
+        "right_keypoint_counts": measurement["right_counts"],
+        "missing_right": measurement["missing_right"],
+        "identical_pairs": measurement["identical_pairs"],
         "feature_floor": INITIALIZER_FEATURE_FLOOR,
         "fast_threshold": FAST_THRESHOLD,
     }
-    counts = _fast_keypoint_counts(frames[:SCENE_ADMISSION_MAX_FRAMES])
-    if counts is None:
+    if measurement["cv2_unavailable"]:
         record["state"] = "cv2_unavailable"
         writer.write_json("scene-capture.json", record)
         return (
             "the scene-admission gate could not measure this run's own frames: OpenCV "
             "(cv2) is not importable"
         )
-    record["keypoint_counts"] = counts
-    passed = bool(counts) and min(counts) >= INITIALIZER_FEATURE_FLOOR
+    if not measurement["pairs"]:
+        record["state"] = "no_stereo_pair"
+        writer.write_json("scene-capture.json", record)
+        return (
+            "the scene-admission gate refuses the arm: this run recorded no complete "
+            "stereo pair (both eyes present and not the same image twice), so nothing "
+            "in its own evidence says what the second view feeds the estimator "
+            f"(missing right frames {len(measurement['missing_right'])}, identical "
+            f"pairs {len(measurement['identical_pairs'])})"
+        )
+    if not measurement["left_counts"] or not measurement["right_counts"]:
+        record["state"] = "unreadable"
+        writer.write_json("scene-capture.json", record)
+        return (
+            "the scene-admission gate refuses the arm: this run's recorded pairs could "
+            "not be read back as images, so neither eye could be measured"
+        )
+    lowest_left = min(measurement["left_counts"])
+    lowest_right = min(measurement["right_counts"])
+    passed = min(lowest_left, lowest_right) >= INITIALIZER_FEATURE_FLOOR
     record["state"] = "measured_pass" if passed else "measured_fail"
     writer.write_json("scene-capture.json", record)
     log_lines.append(
-        f"scene admission at the arm gate: {len(counts)} frames measured, "
-        f"keypoint counts {counts}, floor {INITIALIZER_FEATURE_FLOOR}"
+        f"scene admission at the arm gate: {measurement['pairs']} stereo pairs measured, "
+        f"keypoints left {measurement['left_counts']}, right "
+        f"{measurement['right_counts']}, floor {INITIALIZER_FEATURE_FLOOR}"
     )
-    if not passed:
-        lowest = min(counts) if counts else 0
-        return (
-            f"the configured scene's own recorded frames carry {lowest} FAST keypoints "
-            f"against the pinned initializer's floor of {INITIALIZER_FEATURE_FLOOR} "
-            "(plan section 0.3 item 4): visual odometry cannot initialize in this "
-            "scene, so the arm is refused"
-        )
-    return None
-
+    if passed:
+        return None
+    worst_eye = "left" if lowest_left <= lowest_right else "right"
+    return (
+        f"the configured scene's own recorded frames carry "
+        f"{min(lowest_left, lowest_right)} FAST keypoints in the {worst_eye} eye "
+        f"(left {lowest_left}, right {lowest_right}) against the pinned initializer's "
+        f"floor of {INITIALIZER_FEATURE_FLOOR} (plan section 0.3 item 4): the stereo "
+        "stream this front end is given cannot initialize, so the arm is refused"
+    )
 
 def _wrap_angle(radius: float) -> float:
     return (radius + math.pi) % (2.0 * math.pi) - math.pi

@@ -734,6 +734,24 @@ def _write_left_frame(pairs_dir: Path, name: str, image: np.ndarray) -> None:
     cv2.imwrite(str(pairs_dir / name), cv2.cvtColor(image, cv2.COLOR_GRAY2BGR))
 
 
+def _write_pair_frames(
+    pairs_dir: Path, index: int, left: np.ndarray, right: np.ndarray
+) -> None:
+    """A capture holds a stereo pair or it holds nothing the stereo gate can use.
+
+    Passing one array twice writes two byte-identical files, which is the duplicate
+    second eye the gate must refuse.
+    """
+    _write_left_frame(pairs_dir, f"{index:05d}-left.ppm", left)
+    _write_left_frame(pairs_dir, f"{index:05d}-right.ppm", right)
+
+
+def _featureless_image(value: int = 0) -> np.ndarray:
+    """A flat frame, and its two eyes differ by the one value, so a pair of two
+    featureless views is still a pair and is refused for its features alone."""
+    return np.full((480, 640), value, np.uint8)
+
+
 def _textured_image() -> np.ndarray:
     """A textured scene: seeded noise is dense with corners the FAST detector finds,
     which is what the pinned tracker's front end needs (plan section 3.6)."""
@@ -753,7 +771,7 @@ class TestSceneAdmission:
         settings = PlatformSettings.from_config(_declared_document(), root=tmp_path)
         return replace(settings, world=world), world
 
-    def test_a_scene_with_trackable_corners_clears_the_floor(self, tmp_path):
+    def test_a_stereo_scene_that_clears_the_floor_in_both_eyes_passes(self, tmp_path):
         import cv2
 
         detector = cv2.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
@@ -763,35 +781,75 @@ class TestSceneAdmission:
         )
         settings, world = self._world_settings(tmp_path)
         run_dir = tmp_path / "work/runs/p01-localization/run-test/run-a"
-        _write_left_frame(run_dir / "pairs", "00001-left.ppm", _textured_image())
+        _write_pair_frames(
+            run_dir / "pairs",
+            1,
+            _textured_image(),
+            np.roll(_textured_image(), 4, axis=1),
+        )
         (run_dir / "scene-capture.json").write_text(
             json.dumps({"world_sha256": check._sha256(world)}), encoding="utf-8"
         )
         ok, state, detail = check._scene_admission_check(settings, tmp_path)
         assert (ok, state) == (True, "measured_pass"), detail
+        assert "left" in detail and "right" in detail
 
-    def test_a_featureless_scene_fails_with_the_floor_named(self, tmp_path):
+    def test_a_featureless_pair_fails_with_both_eyes_and_the_floor_named(self, tmp_path):
         settings, world = self._world_settings(tmp_path)
         run_dir = tmp_path / "work/runs/p01-localization/run-test/run-a"
-        _write_left_frame(run_dir / "pairs", "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        _write_pair_frames(
+            run_dir / "pairs", 1, _featureless_image(0), _featureless_image(1)
+        )
         (run_dir / "scene-capture.json").write_text(
             json.dumps({"world_sha256": check._sha256(world)}), encoding="utf-8"
         )
         ok, state, detail = check._scene_admission_check(settings, tmp_path)
         assert (ok, state) == (False, "measured_fail")
         assert str(check.INITIALIZER_FEATURE_FLOOR) in detail
-        assert "[0]" in detail
+        assert "left [0]" in detail and "right [0]" in detail
+
+    def test_a_capture_whose_two_eyes_are_the_same_image_cannot_gate(self, tmp_path):
+        """One view duplicated is not a stereo pair: a capture that records the same
+        plane twice says nothing about what the estimator's second input carries, so
+        it is skipped like an unhashed capture and the arm gate measures the run's
+        own pair instead."""
+        settings, world = self._world_settings(tmp_path)
+        run_dir = tmp_path / "work/runs/p01-localization/run-test/run-a"
+        textured = _textured_image()
+        _write_pair_frames(run_dir / "pairs", 1, textured, textured)
+        (run_dir / "scene-capture.json").write_text(
+            json.dumps({"world_sha256": check._sha256(world)}), encoding="utf-8"
+        )
+        ok, state, detail = check._scene_admission_check(settings, tmp_path)
+        assert (ok, state) == (True, "deferred_to_arm_gate"), detail
+        assert "no complete, distinct, readable stereo pair" in detail
+
+    def test_a_left_only_capture_cannot_gate_a_stereo_arm(self, tmp_path):
+        """Every capture recorded before this revision holds only `-left.ppm` -- the
+        last invocation's 24 frames among them -- and the gate passed at 16 left-eye
+        keypoints while nothing recorded the second view. A left-only capture is now
+        skipped, exactly as an unhashed one is."""
+        settings, world = self._world_settings(tmp_path)
+        run_dir = tmp_path / "work/runs/p01-localization/run-test/run-a"
+        _write_left_frame(run_dir / "pairs", "00001-left.ppm", _textured_image())
+        (run_dir / "scene-capture.json").write_text(
+            json.dumps({"world_sha256": check._sha256(world)}), encoding="utf-8"
+        )
+        ok, state, detail = check._scene_admission_check(settings, tmp_path)
+        assert (ok, state) == (True, "deferred_to_arm_gate"), detail
 
     def test_a_capture_of_another_world_is_skipped(self, tmp_path):
         settings, _world = self._world_settings(tmp_path)
         run_dir = tmp_path / "work/runs/p00-compat/accept-other/run-a"
-        _write_left_frame(run_dir / "pairs", "00001-left.ppm", _textured_image())
+        _write_pair_frames(
+            run_dir / "pairs", 1, _textured_image(), np.roll(_textured_image(), 4, axis=1)
+        )
         (run_dir / "startup.json").write_text(
             json.dumps({"assets": {"world_sha256": "not-this-world"}}), encoding="utf-8"
         )
         ok, state, detail = check._scene_admission_check(settings, tmp_path)
         assert (ok, state) == (True, "deferred_to_arm_gate")
-        assert "no hash-matched recorded capture" in detail
+        assert "no hash-matched recorded stereo capture" in detail
 
     def test_a_capture_that_records_no_world_hash_is_skipped(self, tmp_path):
         """The accept-5 hole: P00's capture predates the world hash, so its frames
@@ -800,7 +858,9 @@ class TestSceneAdmission:
         gate. Revision 4 skips them instead."""
         settings, _world = self._world_settings(tmp_path)
         run_dir = tmp_path / "work/runs/p00-compat/accept-5/run-a"
-        _write_left_frame(run_dir / "pairs", "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        _write_pair_frames(
+            run_dir / "pairs", 1, _featureless_image(0), _featureless_image(1)
+        )
         ok, state, detail = check._scene_admission_check(settings, tmp_path)
         assert (ok, state) == (True, "deferred_to_arm_gate")
         assert "skipped for recording no world hash" in detail
@@ -808,11 +868,11 @@ class TestSceneAdmission:
     def test_the_preflight_no_longer_refuses_the_textured_route(self, tmp_path):
         """The declared configuration names dev-a-single. The preflight admits it
         either way: as `deferred_to_arm_gate` before any capture of that world
-        exists, or as `measured_pass` once a run has recorded one -- the first
-        textured invocation's own hash-anchored capture is what turns the first
-        state into the second (plan section 0.3 item 4). What must never happen
-        is the old refusal, where the compat scene's unprovenanced frames were
-        measured against this world's gate."""
+        exists, or as `measured_pass` once a run has recorded a stereo capture --
+        the first textured invocation's own hash-anchored capture is what turns the
+        first state into the second (plan section 0.3 item 4). What must never
+        happen is the old refusal, where the compat scene's unprovenanced frames
+        were measured against this world's gate."""
         rows, _satisfied = check._preflight(
             check._load_localization_config(Path("configs/first_indoor.yaml")),
             tmp_path,
@@ -824,25 +884,47 @@ class TestSceneAdmission:
         assert "dev-a-single" in row["detail"]
         assert "compat_stereo" not in row["detail"]
 
-    def test_the_arm_gate_refuses_a_featureless_scene_on_its_own_frames(
-        self, tmp_path
-    ):
+    def test_the_arm_gate_refuses_a_featureless_pair_on_its_own_frames(self, tmp_path):
         """Run 4's refusal, made procedural: the arm gate measures the run's own
         recorded frames and refuses the arm when they do not clear the floor."""
         settings, world = self._world_settings(tmp_path)
         writer = bridge_EvidenceWriter(tmp_path / "run", "run-a")
         pairs_dir = tmp_path / "run/run-a/pairs"
-        _write_left_frame(pairs_dir, "00001-left.ppm", np.zeros((480, 640), np.uint8))
+        _write_pair_frames(pairs_dir, 1, _featureless_image(0), _featureless_image(1))
         blocker = check._scene_capture_gate(
             writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
         )
         assert blocker and "FAST keypoints" in blocker
+        assert "left 0, right 0" in blocker
 
-    def test_the_arm_gate_passes_a_textured_scene_on_its_own_frames(self, tmp_path):
+    def test_the_arm_gate_refuses_a_duplicate_second_eye_without_measuring(self, tmp_path):
+        """The gap the last invocation exposed: the capture recorded one eye and the
+        gate passed on it. With both eyes recorded, a run whose right plane is the
+        left plane duplicated cannot open the arm -- there is no stereo stream to
+        feed, and the refusal says which evidence was missing."""
         settings, _world = self._world_settings(tmp_path)
         writer = bridge_EvidenceWriter(tmp_path / "run", "run-a")
         pairs_dir = tmp_path / "run/run-a/pairs"
-        _write_left_frame(pairs_dir, "00001-left.ppm", _textured_image())
+        textured = _textured_image()
+        _write_pair_frames(pairs_dir, 1, textured, textured)
+        blocker = check._scene_capture_gate(
+            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+        )
+        assert blocker and "no complete stereo pair" in blocker
+        assert "identical pairs 1" in blocker
+        record = json.loads(
+            (tmp_path / "run/run-a/scene-capture.json").read_text(encoding="utf-8")
+        )
+        assert record["state"] == "no_stereo_pair"
+        assert record["identical_pairs"] == ["00001-left.ppm"]
+
+    def test_the_arm_gate_passes_a_textured_pair_on_its_own_frames(self, tmp_path):
+        settings, _world = self._world_settings(tmp_path)
+        writer = bridge_EvidenceWriter(tmp_path / "run", "run-a")
+        pairs_dir = tmp_path / "run/run-a/pairs"
+        _write_pair_frames(
+            pairs_dir, 1, _textured_image(), np.roll(_textured_image(), 4, axis=1)
+        )
         blocker = check._scene_capture_gate(
             writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
         )
@@ -852,6 +934,9 @@ class TestSceneAdmission:
         )
         assert record["state"] == "measured_pass"
         assert record["world_sha256"] == check._sha256(settings.world)
+        assert record["pairs_recorded"] == 1
+        assert min(record["left_keypoint_counts"]) >= check.INITIALIZER_FEATURE_FLOOR
+        assert min(record["right_keypoint_counts"]) >= check.INITIALIZER_FEATURE_FLOOR
 
 
 # ---------------------------------------------------------------------------
@@ -1062,3 +1147,61 @@ class TestAttitudeGate:
             self._writer(tmp_path), None, self._alignment(), self._stats(), []
         )
         assert blocker and "no published state" in blocker
+
+
+class TestH5Diagnosis:
+    """H5's blocker must name the failure the run actually measured (plan section 11).
+
+    The first textured re-run's receipt read "the estimator did not initialize"
+    while its own `initializer-diagnostics.json` recorded the pinned initializer's
+    success line, and the plan revision that followed was written against the wrong
+    cause. These fixtures are the two line shapes that decision rests on, taken
+    from that run's recorded `estimator.log`.
+    """
+
+    def _log(self, tmp_path, *lines):
+        path = tmp_path / "estimator.log"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_a_successful_initialization_reads_as_the_accessor_not_the_initializer(
+        self, tmp_path
+    ):
+        log = self._log(
+            tmp_path,
+            "ov_stream ready: openvins v2.7, 2 cameras, gravity 9.81, try_zupt=1",
+            "ov_stream: 1 stereo frames, 981 imu samples, initialized=0",
+            "\x1b[0m\x1b[32m[init]: successful initialization in 0.0015 seconds",
+            "[ZUPT]: passed disparity (0.000 < 1.000, 95 features)",
+            "[ZUPT]: accepted |v_IinG| = 0.001 (chi2 0.000 < 84.595)",
+            "[ZUPT]: There are no IMU data to check for zero velocity with!!",
+            "ov_stream: 550 stereo frames, 27593 imu samples, initialized=0",
+        )
+        diagnostics = check._initializer_diagnostics(log)
+        assert diagnostics["initializer_succeeded"] is True
+        assert diagnostics["zupt_accepted_updates"] == 1
+        assert diagnostics["zupt_frames_without_imu"] == 1
+        blocker = check._initialization_blocker(diagnostics)
+        assert "timelastupdate" in blocker
+        assert "did not initialize" not in blocker
+        assert "no successful initialization" not in blocker
+        assert "1 accepted zero-velocity update(s)" in blocker
+        assert "owner's disposition" in blocker
+
+    def test_an_initializer_that_never_fired_keeps_the_degenerate_reading(self, tmp_path):
+        log = self._log(
+            tmp_path,
+            "ov_stream: 25 stereo frames, 1470 imu samples, initialized=0",
+            "[init]: not enough feats to compute disp: 0,0 < 15",
+        )
+        diagnostics = check._initializer_diagnostics(log)
+        assert diagnostics["initializer_succeeded"] is False
+        blocker = check._initialization_blocker(diagnostics)
+        assert "did not initialize" in blocker
+        assert "no successful initialization" in blocker
+        assert "timelastupdate" not in blocker
+
+    def test_a_missing_log_is_not_a_successful_initialization(self, tmp_path):
+        diagnostics = check._initializer_diagnostics(tmp_path / "absent.log")
+        assert diagnostics["initializer_succeeded"] is False
+        assert diagnostics["estimator_log_lines"] == 0
