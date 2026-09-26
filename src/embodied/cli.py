@@ -374,6 +374,14 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "publish": {"period_ms": int},
             "declared": {"viso_delay_ms": int},
             "params_file": str,
+            # The development route's world for the SENSOR-DERIVED arm. Separate
+            # from scenario.world on purpose: the compatibility gate's 16/16 was
+            # measured on scenario.world, and repointing that key would silently
+            # change the vehicle the gate measures. The localization check uses
+            # this when present and falls back to scenario.world otherwise. Added
+            # 2026-09-26 after measuring zero FAST keypoints in the compat scene:
+            # a scene with no features cannot support visual odometry at all.
+            "world": _Optional(str),
             "bounds": {
                 "state_lost_after_ms": int,
                 "published_state_age_max_ms": int,
