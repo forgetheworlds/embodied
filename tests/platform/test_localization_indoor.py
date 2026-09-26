@@ -457,10 +457,16 @@ class TestRefusals:
         assert "already exists" in capsys.readouterr().err
 
     def test_pose_assisted_receipt_is_labelled_and_not_applicable(self, tmp_path, capsys):
+        """The pose-assisted arm is now the live E1-DIAG diagnostic; a preflight
+        that cannot be satisfied must block BEFORE anything starts, labelled. The
+        config here has no estimator process, so the diagnostic blocks in its own
+        preflight and the test stays hermetic -- the declared configuration would
+        otherwise attempt a real flight on a host that has the simulator."""
+        config_path = _config_without_the_estimator(tmp_path)
         exit_code = check.main(
             [
                 "--config",
-                "configs/first_indoor.yaml",
+                str(config_path),
                 "--mode",
                 "pose-assisted",
                 "--output",
@@ -476,6 +482,8 @@ class TestRefusals:
             for limitation in receipt["limitations"]
         )
         assert any("cannot pass P01-L" in reason for reason in receipt["reasons"])
+        # The diagnostic blocks, it never resolves or unresolves the stage claim.
+        assert "localization=unresolved" not in receipt["reasons"]
 
     def test_a_missing_estimator_process_blocks_with_a_concrete_reason(self, tmp_path):
         """Prerequisites are reported before anything starts: a claimed arm whose
@@ -1342,3 +1350,117 @@ class TestZuftFrameDecisions:
         assert diagnostics["zupt_frames_reaching_visual_path"] == (
             diagnostics["zupt_rejected_updates"] + diagnostics["zupt_frames_without_imu"]
         )
+
+
+# ---------------------------------------------------------------------------
+# T12/T13 (E1-DIAG, plan sections 0.7 item 5, 0.8 item 3): the diagnostic's
+# labels, and the sensor-derived arm's unchanged behaviour beside it
+# ---------------------------------------------------------------------------
+
+
+class TestPoseAssistedDiagnostic:
+    """E1-DIAG's two named behaviours: labelled beyond misreading, and the
+    sensor-derived arm untouched by it.
+
+    The diagnostic flies the bounded excitation on the truth-driven arm while the
+    pinned estimator observes (plan sections 0.6 item 7, 0.8). Its result can
+    never be read as a scored one, and the arm that CAN be scored must come out
+    of the build exactly as it went in: truth republish off, nothing published by
+    the bridge.
+    """
+
+    def test_the_diagnostic_is_labelled_and_refuses_to_be_read_as_a_scored_result(
+        self, tmp_path
+    ):
+        """Every shape the diagnostic's outcome can take carries the labels.
+
+        A completed diagnostic is COMPLETE -- its measurement is a result -- and
+        that is exactly the outcome a reader could mistake for a pass, so the
+        labels must make the mistake impossible: gate not applicable,
+        localization not applicable, the never-pool non-claim, and no
+        predeclared bound judged.
+        """
+        completed = check._pose_assisted_outcome(())
+        assert completed.status.value == "complete"
+        assert completed.gate_status.value == "not_applicable"
+        assert completed.manifest["sensor_mode_label"] == "pose-assisted-diagnostic"
+        assert completed.manifest["localization"] == "not_applicable"
+        limitations = " ".join(completed.limitations)
+        assert "NOT a sensor-derived result" in limitations
+        assert "never be pooled" in limitations
+        assert "no predeclared E/F/H bound is judged" in limitations
+        assert "truth republish" in limitations  # the exemption is stated, not silent
+        assert any("cannot pass P01-L" in reason for reason in completed.reasons)
+
+        blocked = check._pose_assisted_outcome(("a blocker",), {"pairs_fed": 3})
+        assert blocked.status.value == "blocked"
+        assert blocked.gate_status.value == "not_applicable"
+        assert blocked.manifest["localization"] == "not_applicable"
+        assert blocked.manifest["pairs_fed"] == 3
+        assert "localization=unresolved" not in blocked.reasons
+
+        # And the diagnostic's own preflight rows declare, rather than hide, the
+        # two things a scored preflight would refuse: the per-run arm override
+        # and the truth-republish exemption.
+        document = check._load_localization_config(Path("configs/first_indoor.yaml"))
+        rows, satisfied = check._diagnostic_preflight(document, tmp_path)
+        rows = {row["name"]: row for row in rows}
+        assert rows["diagnostic_arm_override"]["satisfied"] is True
+        assert "sensor-derived" in rows["diagnostic_arm_override"]["detail"]
+        assert rows["bridge_truth_republish"]["state"] == "declared_exemption"
+        assert rows["bridge_truth_republish"]["satisfied"] is True
+        assert "truth republish is ON" in rows["bridge_truth_republish"]["detail"]
+        # The declared configuration's scored preflight is unchanged by all this.
+        scored_rows, scored_satisfied = check._preflight(
+            document, tmp_path, SensorMode.SENSOR_DERIVED
+        )
+        scored_rows = {row["name"]: row for row in scored_rows}
+        assert scored_rows["localization_mode"]["satisfied"] is True
+        assert scored_rows["bridge_truth_republish"]["satisfied"] is True
+        assert "exactly one publisher" in scored_rows["bridge_truth_republish"]["detail"]
+
+    def test_the_sensor_derived_arm_is_unchanged_truth_republish_off_published_zero(
+        self, tmp_path
+    ):
+        """The diagnostic's per-run arm override never leaks into the scored arm.
+
+        The scored arm's settings are built with no override, so the bridge's
+        truth republish stays off however the diagnostic asks for its own; and
+        the recorded scored runs' own artifact answers the same question from
+        the vehicle side: the bridge published zero simulator poses.
+        """
+        root = Path(check.__file__).resolve().parents[3]
+        document = check._load_localization_config(Path("configs/first_indoor.yaml"))
+        assert document["localization"]["mode"] == "sensor-derived"
+        scored = check._platform_settings(document, root)
+        assert scored.truth_republish is False
+        assert scored.sensor_mode is SensorMode.SENSOR_DERIVED
+        # The override exists only when the diagnostic passes it explicitly.
+        diagnostic = check._platform_settings(
+            document, root, arm=SensorMode.POSE_ASSISTED.value
+        )
+        assert diagnostic.truth_republish is True
+        assert scored.truth_republish is False  # unchanged by the diagnostic's ask
+
+        # The recorded scored arm's own artifact, when this host has one: the
+        # bridge's vision-pose feed recorded enabled false and published 0.
+        recorded = sorted(
+            (
+                path
+                for path in (root / "work/runs/p01-localization").glob(
+                    "*/run-a/vision-pose-feed.json"
+                )
+                if path.is_file()
+            ),
+            key=lambda path: path.stat().st_mtime,
+        )
+        scored_artifacts = []
+        for path in reversed(recorded):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("enabled") is False:
+                scored_artifacts.append((path, record))
+                break
+        if not scored_artifacts:
+            pytest.skip("no recorded sensor-derived run artifact is on this host")
+        path, record = scored_artifacts[0]
+        assert record["published"] == 0, f"{path} records {record['published']}"

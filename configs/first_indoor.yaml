@@ -298,6 +298,33 @@ localization:
   # bridge's actual setting disagrees with the requested mode; an absent key
   # reproduces the P00 gate's behaviour exactly (republish on, bit for bit).
   mode: sensor-derived
+
+  # E1-DIAG's declared bounded excitation (E-EXC), DECLARED HERE AS A COMMENT on
+  # purpose: the operative carrier is the frozen module constants in
+  # src/embodied/platform/localization_check.py (EXCITATION_*), because this file
+  # is also loaded by the compatibility probe through the shared cli.py schema,
+  # which rejects localization keys it does not know -- a localization.excitation
+  # key here would break `python -m embodied compat`, the P00 gate's own command
+  # (work/runs/p01-localization/plan.md section 0.8 item 3, Correction C). The
+  # declaration, and the reason it should excite feature propagation:
+  #   distance:  one vertical takeoff command to 0.60 m, NO lateral setpoint --
+  #              half the declared 1.5 m hover altitude, well under the 2.0 m
+  #              doorway lintel. A climb is deliberate estimator excitation:
+  #              VioManager::initialized() needs timelastupdate (VioManager.cpp:651),
+  #              which needs >= 5 camera frames the zero-velocity updater DECLINED
+  #              (UpdaterZeroVelocity.cpp:246: disparity >= 1.0 px together with a
+  #              chi2/velocity violation); thrust makes the accelerometer read
+  #              other than gravity (the chi2 term) and at this rig's 554 px focal
+  #              length ~2.7 mm of translation is ~1 px of disparity, so >= 0.5 s
+  #              of climb at the declared 10 Hz stereo rate is >= 5 declining
+  #              frames (plan section 0.6 item 5).
+  #   duration:  <= 5.0 s from the arm readback to the LAND command (a factor of
+  #              ten over that criterion), termination LAND always, plus a
+  #              bounded post-LAND drain so the descent's frames are fed too.
+  #   carrier:   the pose-assisted diagnostic arm (GUIDED, truth republish ON for
+  #              that run only, via the bridge's per-run arm= override): it is a
+  #              DIAGNOSTIC, never a sensor-derived result, never pooled with one,
+  #              and no predeclared E/F/H bound is judged by it.
   # The sensor-derived development route's world. Separate from scenario.world
   # on purpose: the compatibility gate's 16/16 was measured on scenario.world
   # (compat_stereo.wbt), and repointing that key would silently change the

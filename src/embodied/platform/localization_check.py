@@ -166,6 +166,63 @@ SCENE_ADMISSION_CAPTURE_GLOBS = (
 SCENE_ADMISSION_MAX_FRAMES = 24
 INITIALIZER_FEATURE_FLOOR = 15
 FAST_THRESHOLD = 20
+# ---------------------------------------------------------------------------
+# E1-DIAG (plan sections 0.6 item 7, 0.7, 0.8): the pose-assisted diagnostic arm
+# ---------------------------------------------------------------------------
+
+# The declared bounded excitation (E-EXC), frozen as module constants before any
+# motion measurement existed (plan sections 0.6 item 5, 0.7 item 4, 0.8 item 3).
+# Carrier GUIDED, no lateral setpoint at all, termination LAND always:
+#
+#   height    <= 0.60 m, the commanded takeoff altitude -- half the declared 1.5 m
+#               hover altitude and well under the 2.0 m doorway lintel;
+#   airtime   <= 5.0 s from the arm readback to the LAND command;
+#   post-LAND drain 10.0 s, so the descent's frames are fed too -- still motion,
+#               still inside the same flight event, still terminated by LAND.
+#
+# Why a 0.60 m climb excites feature propagation, read from the pinned source
+# (plan section 0.6 item 5) rather than hoped: VioManager::initialized() needs
+# timelastupdate written once (VioManager.cpp:651), which needs
+# do_feature_propagate_update past the clone gate (VioManager.cpp:348), which
+# needs >= 5 frames the zero-velocity updater declined
+# (UpdaterZeroVelocity.cpp:246: disparity >= zupt_max_disparity 1.0 px together
+# with a chi2 or velocity violation). A climb supplies both terms: thrust makes
+# the accelerometer read other than gravity (the chi2 residual of the
+# zero-velocity hypothesis) and, at the rig's 554 px focal length, ~2.7 mm of
+# translation is ~1 px of mean disparity -- so >= 0.5 s of climb at the declared
+# 10 Hz stereo rate is >= 5 declining frames, and the 5.0 s bound carries a
+# factor of ten over a criterion read from the code.
+#
+# The envelope is carried as constants, not a localization.excitation
+# configuration key, because the shared cli.py schema rejects unknown
+# localization keys (cli.py:446-448) and the compatibility probe loads this
+# stage's configuration through that shared loader (webots_ardupilot.py:5734),
+# so the key would break `python -m embodied compat` -- the P00 gate's own
+# command (plan section 0.8 item 3, Correction C). configs/first_indoor.yaml
+# carries the same declaration as a comment beside the section it belongs to.
+EXCITATION_MODE = "GUIDED"
+EXCITATION_TAKEOFF_ALTITUDE_M = 0.60
+EXCITATION_MAX_AIRTIME_S = 5.0
+EXCITATION_CLIMB_DRAIN_S = 3.5
+EXCITATION_POST_LAND_DRAIN_S = 10.0
+EXCITATION_ALTITUDE_REACHED_MARGIN_M = 0.05
+
+# The diagnostic's labels, at full strength (plan sections 0.7 item 7, 0.8 item 5).
+DIAGNOSTIC_SENSOR_MODE_LABEL = "pose-assisted-diagnostic"
+DIAGNOSTIC_NON_CLAIM = (
+    "this is a pose-assisted diagnostic: the autopilot's external-navigation source "
+    "is the simulator's own pose (truth republish ON by construction), so this is NOT "
+    "a sensor-derived result and may never be pooled with one, and no predeclared "
+    "E/F/H bound is judged by it (gate_status not_applicable)"
+)
+DIAGNOSTIC_TRUTH_EXEMPTION = (
+    "the 4.6 truth-republish gate is exempt for this arm by declaration, not skipped "
+    "silently: that gate keeps truth out of the estimator's INPUT, and this arm's "
+    "estimator input is unchanged (stereo pairs and inertial samples only; the "
+    "ov_stream protocol has no truth field). Only the vehicle's navigation is "
+    "truth-driven here, which is exactly what makes the arm flyable before the "
+    "estimator works"
+)
 
 # H5's measured cause, and the two markers that separate "the initializer never
 # fired" from "the filter initialised but the pinned readiness accessor never
@@ -730,15 +787,25 @@ def _recorded_world_sha256(run_dir: Path) -> str | None:
     return None
 
 
-def _platform_settings(document: dict[str, Any], root: Path) -> PlatformSettings:
+def _platform_settings(
+    document: dict[str, Any], root: Path, arm: str | None = None
+) -> PlatformSettings:
     """Settings with the sensor-derived development route applied (plan 0.3 item 1).
 
     ``localization.world``, when present, is the world this check runs in; an
     absent key leaves ``scenario.world`` -- and with it the compatibility gate's
     measured vehicle -- untouched. The shared schema carries the key as optional
     (main eb6b180), so older configurations load unchanged.
+
+    ``arm`` is the per-run override of the localization mode, the bridge's own
+    existing mechanism (``PlatformSettings.from_config``): the arm is a property
+    of the RUN, not of the file. The sensor-derived arm passes no override and
+    follows the configuration's declaration -- which is what keeps its truth
+    republish off. Only the pose-assisted diagnostic passes one, so the bridge
+    republishes the simulator's pose for that run alone while the configuration's
+    declared arm stays untouched (plan sections 0.7 item 5, 0.8 item 3).
     """
-    settings = PlatformSettings.from_config(document, root=root)
+    settings = PlatformSettings.from_config(document, root=root, arm=arm)
     world_name = (document.get("localization") or {}).get("world")
     if not world_name:
         return settings
@@ -1070,6 +1137,13 @@ def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
     was made from, so the sufficiency criterion of plan section 0.6 item 5 (the
     accessor needs five frames that ZUPT declined before its first completed visual
     update can write ``timelastupdate``) is measurable per frame from the artifact.
+
+    Revision 6 adds the decisive marker: ``timelastupdate``'s assignment at
+    VioManager.cpp:651 is immediately followed by a ``q_GtoI`` line at PRINT_INFO
+    (:654), while ``ov_stream`` reports ``initialized=`` only every 25th frame
+    (ov_stream.cpp:488-490) -- so the report count alone cannot distinguish "never
+    latched" from "latched after the last report" (plan section 0.7 item 2,
+    Correction B).
     """
     lines: list[str] = []
     if estimator_log.is_file():
@@ -1079,6 +1153,8 @@ def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
         "estimator_log_lines": len(lines),
         "initializer_output": [line for line in lines if "[init" in line][-50:],
         "progress_reports": [line for line in lines if "initialized=" in line][-12:],
+        "q_GtoI_tail_lines": sum(1 for line in lines if "q_GtoI = " in line),
+        "q_GtoI_last_lines": [line for line in lines if "q_GtoI = " in line][-12:],
         "initializer_succeeded": any(
             INITIALIZER_SUCCESS_MARKER in line for line in lines
         ),
@@ -1254,23 +1330,35 @@ def _blocked_unresolved(
     )
 
 
-def _pose_assisted_outcome(reasons: Sequence[str]) -> CommandOutcome:
-    """The labelled diagnostic outcome: never a gate result, never pooled."""
+def _pose_assisted_outcome(
+    reasons: Sequence[str],
+    manifest: dict[str, Any] | None = None,
+    artifacts: Sequence[str] = (),
+) -> CommandOutcome:
+    """The labelled diagnostic outcome: never a gate result, never pooled.
+
+    Whatever the diagnostic measured, the outcome cannot be read as a scored one:
+    ``gate_status`` is not applicable, ``localization`` is not applicable, and the
+    limitations carry the non-claim and the truth-exemption in full. A completed
+    diagnostic (``reasons`` empty) is still COMPLETE -- its measurement is a
+    result, and the receipt's labels are what keep it out of every E/F/H verdict.
+    """
     return CommandOutcome(
         status=CommandStatus.BLOCKED if reasons else CommandStatus.COMPLETE,
         gate_status=GateStatus.NOT_APPLICABLE,
         reasons=(*reasons, "diagnostic mode cannot pass P01-L"),
         limitations=(
-            "sensor_mode pose-assisted-diagnostic: this run would use the gate's "
-            "truth-quality pose feed and is labelled a diagnostic in every artifact; it can "
-            "never pass P01-L and is never pooled with a sensor-derived arm",
+            f"sensor_mode {DIAGNOSTIC_SENSOR_MODE_LABEL}: " + DIAGNOSTIC_NON_CLAIM,
+            DIAGNOSTIC_TRUTH_EXEMPTION,
             DISPATCH_REGISTRATION_NOTE,
         ),
         manifest={
             "stage_id": STAGE_ID,
-            "sensor_mode_label": "pose-assisted-diagnostic",
+            "sensor_mode_label": DIAGNOSTIC_SENSOR_MODE_LABEL,
             "localization": "not_applicable",
+            **(manifest or {}),
         },
+        artifacts=tuple(artifacts),
         sensor_mode=SensorMode.POSE_ASSISTED,
     )
 
@@ -1279,15 +1367,7 @@ def _localize_check_command(args: argparse.Namespace, output_dir: Path) -> Comma
     mode = SensorMode(args.mode)
     document = _load_localization_config(Path(args.config))
     if mode is SensorMode.POSE_ASSISTED:
-        return _pose_assisted_outcome(
-            (
-                "the pose-assisted diagnostic arm is not built by this stage: driving the "
-                "adapter from the gate's truth pose needs a configuration declaring "
-                "localization.mode pose-assisted, so that the bridge republishes the truth "
-                f"pose; the configuration declares {document['localization'].get('mode')!r}",
-                *_mode_blockers(document, mode),
-            ),
-        )
+        return _run_pose_assisted_diagnostic(document, output_dir)
 
     rows, satisfied = _preflight(document, output_dir, mode)
     preflight = {
@@ -1970,6 +2050,634 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         artifacts=(*writer.artifacts, "preflight.json"),
         sensor_mode=SensorMode.SENSOR_DERIVED,
     )
+
+
+# ---------------------------------------------------------------------------
+# E1-DIAG: the live pose-assisted diagnostic (plan sections 0.6 item 7, 0.7, 0.8)
+# ---------------------------------------------------------------------------
+
+
+def _diagnostic_preflight(
+    document: dict[str, Any], output_dir: Path
+) -> tuple[list[dict[str, Any]], bool]:
+    """Every prerequisite the diagnostic's flight needs, reported in one pass.
+
+    Two of the sensor-derived preflight's rows are deliberately absent here, and
+    the absence is the design (plan sections 0.7 item 7, 0.8 item 3):
+
+    * ``localization_mode`` -- the arm is a property of the run, not of the file.
+      The configuration keeps its declared ``sensor-derived`` arm untouched; this
+      run overrides the arm through the bridge's own per-run ``arm=`` mechanism,
+      which is what turns the truth republish on for this run alone.
+    * the 4.6 truth-republish refusal -- replaced by a row that records the
+      DECLARED exemption at full strength: the gate keeps truth out of the
+      estimator's input, the estimator's input here is stereo and inertial only,
+      and only the vehicle's navigation is truth-driven, which is what makes the
+      arm flyable before the estimator works.
+
+    Everything else the flight needs is still checked: the scene must be able to
+      feed the pinned initializer (a featureless scene cannot answer the question),
+      the simulator and SITL must exist, the ports must be free, and the pin must
+      hold.
+    """
+    root = repository_root()
+    settings = _platform_settings(document, root, arm=SensorMode.POSE_ASSISTED.value)
+    rows: list[dict[str, Any]] = []
+    satisfied = True
+    declared_mode = (document.get("localization") or {}).get("mode")
+    rows.append(
+        {
+            "name": "diagnostic_arm_override",
+            "satisfied": True,
+            "detail": (
+                "the configuration declares localization.mode "
+                f"{declared_mode!r} and that declaration is untouched; this run "
+                "overrides the arm to pose-assisted through the bridge's per-run "
+                "arm= mechanism (webots_ardupilot.py PlatformSettings.from_config), "
+                "so the truth republish is on for this run alone and the "
+                "sensor-derived arm's behaviour is unchanged (plan section 0.8)"
+            ),
+        }
+    )
+    rows.append(
+        {
+            "name": "bridge_truth_republish",
+            "satisfied": True,
+            "state": "declared_exemption",
+            "detail": (
+                "the bridge's truth republish is ON for this run by construction: "
+                + DIAGNOSTIC_TRUTH_EXEMPTION
+            ),
+        }
+    )
+    scene_ok, scene_state, scene_detail = _scene_admission_check(settings, root)
+    rows.append(
+        {
+            "name": "scene_admission",
+            "satisfied": scene_ok,
+            "state": scene_state,
+            "detail": scene_detail,
+        }
+    )
+    satisfied = satisfied and scene_ok
+    for check in check_prerequisites(settings, output_dir):
+        rows.append({"name": check.name, "satisfied": check.satisfied, "detail": check.detail})
+        satisfied = satisfied and check.satisfied
+    mavlink_port = _parse_mavlink_port(settings.mavlink_endpoint)
+    port_free = mavlink_port is not None and _port_is_free(mavlink_port)
+    rows.append(
+        {
+            "name": "port_mavlink",
+            "satisfied": port_free,
+            "detail": f"tcp {settings.mavlink_endpoint} is "
+            + ("free" if port_free else "already in use; kill orphaned SITL processes first"),
+        }
+    )
+    satisfied = satisfied and port_free
+    localization = document["localization"]
+    pin_record, pin_blockers = _pin_evidence(localization, root)
+    rows.append(
+        {
+            "name": "estimator_pin",
+            "satisfied": not pin_blockers,
+            "detail": pin_blockers[0] if pin_blockers else _pin_summary(pin_record),
+            "evidence": pin_record,
+        }
+    )
+    satisfied = satisfied and not pin_blockers
+    for blocker in (
+        *_executable_blockers(localization, root),
+        *_seam_blockers(document, root),
+    ):
+        rows.append({"name": "estimator_seam", "satisfied": False, "detail": blocker})
+        satisfied = False
+    return rows, satisfied
+
+
+def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) -> CommandOutcome:
+    """E1-DIAG: fly the bounded excitation on truth, observe the pinned estimator.
+
+    The question is one fact (plan sections 0.6 item 7, 0.8 item 1): does
+    VioManager::initialized() latch when the platform actually moves? The arm
+    that can already fly supplies the motion -- the bridge republishes the
+    simulator's own pose as the autopilot's external-navigation source (the
+    P00 gate's proven arm), so the vehicle arms and flies a bounded vertical
+    excitation while the pinned estimator runs alongside as a PURE OBSERVER on
+    the same declared stereo and inertial stream:
+
+    * no ``ExternalNavPublisher`` is constructed -- the estimator's states are
+      recorded and published nowhere;
+    * the estimator's input is the declared stereo pairs and inertial samples
+      and nothing else (the ov_stream protocol has no truth field);
+    * ``ov_stream`` sends a STATE frame only while ``sys->initialized()`` is
+      true (ov_stream.cpp:513) and the frame's ``initialized`` field is that
+      accessor's own value (ov_stream.cpp:301), so the first STATE frame to
+      arrive IS the accessor flipping, independent of the 25-frame-quantized
+      ``initialized=`` progress lines.
+
+    Every artifact and the receipt carry the diagnostic labels and the
+    non-claim; nothing from this directory enters any E/F/H verdict.
+    """
+    root = repository_root()
+    settings = _platform_settings(document, root, arm=SensorMode.POSE_ASSISTED.value)
+    localization = document["localization"]
+    estimator = localization["estimator"]
+
+    rows, satisfied = _diagnostic_preflight(document, output_dir)
+    preflight = {
+        "mode": SensorMode.POSE_ASSISTED.value,
+        "sensor_mode_label": DIAGNOSTIC_SENSOR_MODE_LABEL,
+        "checks": rows,
+        "satisfied": satisfied,
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    (output_dir / "preflight.json").write_text(
+        json.dumps(preflight, indent=2) + "\n", encoding="utf-8"
+    )
+    if not satisfied:
+        blockers = tuple(f"{row['name']}: {row['detail']}" for row in rows if not row["satisfied"])
+        return _pose_assisted_outcome(
+            blockers,
+            {"preflight": rows, "estimator_pin": estimator},
+            ("preflight.json",),
+        )
+
+    writer = EvidenceWriter(output_dir, "run-a")
+    _write_environment(writer, settings, estimator)
+    writer.write_json(
+        "diagnostic-identity.json",
+        {
+            "run_kind": "E1-DIAG",
+            "sensor_mode_label": DIAGNOSTIC_SENSOR_MODE_LABEL,
+            "question": (
+                "does VioManager::initialized() latch when the platform actually "
+                "moves? (plan sections 0.6 item 7, 0.7, 0.8)"
+            ),
+            "carrier": (
+                "the truth-driven arm: GUIDED, the bridge republishing the "
+                "simulator's own pose as the autopilot's external-navigation source, "
+                "on the P00 gate's own parameter layers (GPS on, origin and home "
+                "from the synthesized GPS) -- the arm that can already fly"
+            ),
+            "observer": (
+                "the pinned estimator on the declared stereo+inertial stream; no "
+                "ExternalNavPublisher exists in this run, so the estimator publishes "
+                "nowhere and no truth field exists in its protocol"
+            ),
+            "excitation": {
+                "mode": EXCITATION_MODE,
+                "takeoff_altitude_m": EXCITATION_TAKEOFF_ALTITUDE_M,
+                "max_airtime_s": EXCITATION_MAX_AIRTIME_S,
+                "lateral_setpoint": None,
+                "termination": "LAND",
+            },
+            "non_claim": DIAGNOSTIC_NON_CLAIM,
+            "truth_exemption": DIAGNOSTIC_TRUTH_EXEMPTION,
+            "reading_rule": (
+                "latch beside measured motion = the deadlock is a bring-up "
+                "artifact; motion declines with no latch = the estimator is refuted "
+                "on this stream; fewer than five declining frames = inconclusive, "
+                "one E-EXC-B re-fly (ceiling 1.5 m) is predeclared (plan section "
+                "0.7 item 6). A latch that appears only beside starvation declines "
+                "(no-IMU warnings) repeats the feed artifact and does not answer "
+                "the question"
+            ),
+        },
+    )
+
+    estimator_process = _start_estimator(estimator, root, writer)
+    if estimator_process is None:
+        return _pose_assisted_outcome(
+            (
+                f"the estimator process {estimator['executable']} did not open port "
+                f"{estimator['socket_port']}; see run-a/estimator.log",
+            ),
+            {"estimator_pin": estimator},
+            (*writer.artifacts, "preflight.json"),
+        )
+    client = loc.OvStreamClient("127.0.0.1", int(estimator["socket_port"]))
+    try:
+        client.connect()
+    except (OSError, loc.ProtocolError) as error:
+        _stop_estimator(estimator_process)
+        return _pose_assisted_outcome(
+            (
+                f"the observer could not connect to the estimator on 127.0.0.1:"
+                f"{estimator['socket_port']}: {error}",
+            ),
+            {"estimator_pin": estimator},
+            (*writer.artifacts, "preflight.json"),
+        )
+
+    stats = _FeedStats()
+    states_log = writer.path("observer-states.jsonl")
+    progress_log = writer.path("observer-progress.jsonl")
+    # The phase names the flight's own clock: bring_up (feeding, waiting for the
+    # arm), airborne (arm readback to the LAND command), descent (LAND command to
+    # the end of the post-land drain). Every observer record carries one.
+    phase: dict[str, str] = {"name": "bring_up"}
+    observer: dict[str, Any] = {
+        "states_received": 0,
+        "first_state_at": None,
+        "first_state_phase": None,
+        "first_state_after_pairs": None,
+        "max_altitude_m": 0.0,
+        "feed_error": None,
+    }
+    pending_pairs: queue.Queue = queue.Queue(maxsize=PAIR_QUEUE_FRAMES)
+    last_telemetry_sample = 0.0
+
+    def file_record(record: Any) -> None:
+        if record.kind is not Kind.PAIR or record.pair is None:
+            return
+        stats.pair_records_filed += 1
+        try:
+            pending_pairs.put_nowait(record)
+        except queue.Full:
+            stats.pair_records_dropped += 1
+
+    def feed_record(record: Any) -> None:
+        if record.kind is Kind.PAIR and record.pair is not None:
+            # Only reachable before the reader strips pixels; the sink's queue is
+            # the normal path, but a pair that arrives with its planes is fed
+            # rather than dropped.
+            feed_pair(record)
+        elif record.kind is Kind.IMU and record.imu is not None:
+            imu = record.imu
+            stamp_ns = sim_time_ns(record.sim_time_s)
+            stats.newest_imu_ns = max(stats.newest_imu_ns, stamp_ns)
+            client.send(loc.encode_imu(stamp_ns, imu.gyro, imu.accelerometer))
+            stats.imu_samples += 1
+        elif record.kind is Kind.POSE and record.pose is not None:
+            # The vehicle's own pose on the sensor stream: read for the motion
+            # record and sent nowhere. The estimator's feed handles PAIR and IMU
+            # only, so this branch cannot reach it.
+            stats.truth_samples.append(
+                (sim_time_ns(record.sim_time_s), tuple(record.pose.position_xyz))
+            )
+            stats.truth_attitudes.append(
+                (sim_time_ns(record.sim_time_s), tuple(record.pose.attitude_rpy))
+            )
+
+    def feed_pair(record: Any) -> None:
+        pair = record.pair
+        left = loc.grayscale_rgb8(pair.left_bytes, settings.stereo.width, settings.stereo.height)
+        right = loc.grayscale_rgb8(
+            pair.right_bytes, settings.stereo.width, settings.stereo.height
+        )
+        client.send(
+            loc.encode_stereo(
+                sim_time_ns(record.sim_time_s),
+                left,
+                right,
+                settings.stereo.width,
+                settings.stereo.height,
+            )
+        )
+        stats.pairs += 1
+
+    def observe_state(state: loc.EstimatorState) -> None:
+        observer["states_received"] += 1
+        if observer["first_state_at"] is None:
+            observer["first_state_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            observer["first_state_phase"] = phase["name"]
+            observer["first_state_after_pairs"] = stats.pairs
+        with states_log.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "at_utc": datetime.now(timezone.utc).isoformat(
+                            timespec="milliseconds"
+                        ),
+                        "phase": phase["name"],
+                        "pairs_fed": stats.pairs,
+                        "imu_fed": stats.imu_samples,
+                        "state": {
+                            "time_ns": state.time_ns,
+                            "initialized": state.initialized,
+                            "position_m": list(state.position_m),
+                            "velocity_mps": list(state.velocity_mps),
+                            "sigma_pos_m": list(state.sigma_pos_m),
+                            "n_tracks": state.n_tracks,
+                            "t_last_visual_ns": state.t_last_visual_ns,
+                            "reset_counter": state.reset_counter,
+                        },
+                    },
+                    default=str,
+                )
+                + "\n"
+            )
+
+    def drain() -> None:
+        """Feed the estimator, record its answers, keep the telemetry folded.
+
+        No machine runs here and nothing is judged: the diagnostic's product is
+        the record, and the only stop condition is the feed itself failing.
+        """
+        nonlocal last_telemetry_sample
+        while True:
+            try:
+                record = platform.sensor_record(0.0)
+            except ProbeFailure as error:
+                observer["feed_error"] = f"the sensor stream failed: {error}"
+                return
+            if record is None:
+                try:
+                    while True:
+                        pending = pending_pairs.get_nowait()
+                        if pending.kind is Kind.PAIR and pending.pair is not None:
+                            feed_pair(pending)
+                except queue.Empty:
+                    pass
+                except loc.ProtocolError as error:
+                    observer["feed_error"] = str(error)
+                    return
+                try:
+                    state = client.poll_state()
+                except loc.ProtocolError as error:
+                    observer["feed_error"] = str(error)
+                    return
+                if state is not None:
+                    observe_state(state)
+                if time.monotonic() - last_telemetry_sample >= TELEMETRY_SAMPLE_PERIOD_S:
+                    last_telemetry_sample = time.monotonic()
+                    try:
+                        sample = platform.telemetry()
+                    except ProbeFailure as error:
+                        observer["feed_error"] = f"the telemetry stream failed: {error}"
+                        return
+                    altitude = (
+                        None
+                        if sample.local_position_ned is None
+                        else -sample.local_position_ned[2]
+                    )
+                    if altitude is not None and altitude > observer["max_altitude_m"]:
+                        observer["max_altitude_m"] = altitude
+                    with progress_log.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "at_utc": datetime.now(timezone.utc).isoformat(
+                                        timespec="milliseconds"
+                                    ),
+                                    "phase": phase["name"],
+                                    "pairs_fed": stats.pairs,
+                                    "imu_fed": stats.imu_samples,
+                                    "states_received": observer["states_received"],
+                                    "mode": sample.mode_name,
+                                    "armed": sample.armed,
+                                    "altitude_m": altitude,
+                                },
+                                default=str,
+                            )
+                            + "\n"
+                        )
+                return
+            try:
+                feed_record(record)
+            except loc.ProtocolError as error:
+                observer["feed_error"] = str(error)
+                return
+
+    session = PymavlinkSession()
+    # The carrier's parameter layers are the compatibility gate's own
+    # (``compat_estimator_params``), NOT the scored arm's: the diagnostic's arm is
+    # "the arm that can already fly" (plan sections 0.6 item 7, 0.8 item 1), and
+    # that arm was measured on the P00 gate's layer set -- GPS on, home and the
+    # EKF origin from the synthesized GPS, external nav from the bridge's truth
+    # republish. The scored arm's layer (``estimator_params``) turns the GPS off,
+    # and at this pin an origin then exists only if a GCS declares it: EKF3 sets
+    # its origin from GPS, from a beacon, or from set_ekf_origin -- never from
+    # ExternalNav data (AP_NavEKF3_Measurements.cpp:680-715, GCS_Common.cpp:3957
+    # "should only be used when there is no GPS") -- which is exactly the
+    # first flight's measured refusal ('AHRS: waiting for home' behind 2129
+    # published truth poses, 'EKF3 IMU0 is using external nav data'). The
+    # estimator-observer is unaffected either way: its input is the stereo and
+    # inertial stream, never the vehicle's parameters.
+    carrier_params = settings.compat_estimator_params
+    platform = WebotsArduPilot(
+        settings,
+        runner=SubprocessRunner(),
+        session=session,
+        gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
+        evidence=writer,
+        label="run-a",
+        extra_params=carrier_params,
+    )
+    platform.record_sink = file_record
+    log_lines: list[str] = [
+        f"E1-DIAG pose-assisted diagnostic, started {datetime.now(timezone.utc).isoformat()}",
+        DIAGNOSTIC_NON_CLAIM,
+        f"estimator pin (observer): {estimator['name']} {estimator['tag']} "
+        f"({estimator['commit']})",
+        f"excitation: {EXCITATION_MODE} takeoff to {EXCITATION_TAKEOFF_ALTITUDE_M} m, no "
+        f"lateral setpoint, LAND within {EXCITATION_MAX_AIRTIME_S} s of the arm readback",
+        f"carrier parameter layers (the P00 gate's own; GPS on, origin from GPS): "
+        f"{[str(path) for path in carrier_params]}",
+    ]
+    blockers: list[str] = []
+    motion_window: dict[str, Any] = {
+        "sensor_mode_label": DIAGNOSTIC_SENSOR_MODE_LABEL,
+        "commanded_sequence": [
+            f"request_control (GUIDED + arm, the P00 gate's arm)",
+            f"takeoff({EXCITATION_TAKEOFF_ALTITUDE_M})",
+            "drain (climb)",
+            "set_mode(LAND)",
+            "drain (descent)",
+        ],
+        "excitation": {
+            "mode": EXCITATION_MODE,
+            "takeoff_altitude_m": EXCITATION_TAKEOFF_ALTITUDE_M,
+            "max_airtime_s": EXCITATION_MAX_AIRTIME_S,
+            "lateral_setpoint": None,
+            "termination": "LAND",
+        },
+        "carrier_parameter_layers": [str(path) for path in carrier_params],
+        "carrier_note": (
+            "the P00 compatibility gate's own layers: GPS on (the synthesized GPS "
+            "sets the EKF origin and home), external nav from the bridge's truth "
+            "republish. The scored arm's GPS-off layer is NOT applied to this "
+            "carrier: at this pin an origin then needs a GCS datum declaration, "
+            "and the arm that can already fly is the P00 gate's (plan section 0.6 "
+            "item 7). The estimator-observer's input is stereo+inertial only, "
+            "untouched by the carrier's parameters"
+        ),
+    }
+    flight: dict[str, Any] = {}
+    control: Any = None
+    shutdown: Any = None
+    try:
+        platform.start()
+        platform.wait_ready(settings.step_timeout_s.startup)
+        platform.request_telemetry_streams()
+        for message_id in (MSG_ID_SYS_STATUS, MSG_ID_GPS_RAW_INT):
+            session.request_message_interval(message_id, GPS_AIDING_SAMPLE_HZ)
+        control, _attempt_at = platform.request_control(settings.pre_arm_wait_s, drain=drain)
+        log_lines.append(
+            f"control: mode_reached={control.mode_reached}, armed={control.armed}, "
+            f"attempts={control.control_attempts}, refusals={list(control.refusals)}"
+        )
+        if control.refused:
+            blockers.append(
+                "the diagnostic's truth-driven arm was refused: "
+                f"mode_reached={control.mode_reached}, armed={control.armed}, "
+                f"refusals={list(control.refusals)}; without the flight there is no "
+                "motion, so the question is not answered by this run"
+            )
+        else:
+            arm_monotonic = time.monotonic()
+            flight["armed_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            flight["pairs_fed_at_arm"] = stats.pairs
+            flight["imu_fed_at_arm"] = stats.imu_samples
+            flight["truth_pose_at_arm"] = (
+                list(stats.truth_samples[-1][1]) if stats.truth_samples else None
+            )
+            phase["name"] = "airborne"
+            session.takeoff(EXCITATION_TAKEOFF_ALTITUDE_M)
+            flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            climb_deadline = time.monotonic() + EXCITATION_CLIMB_DRAIN_S
+            while time.monotonic() < climb_deadline:
+                drain()
+                if observer["max_altitude_m"] >= (
+                    EXCITATION_TAKEOFF_ALTITUDE_M - EXCITATION_ALTITUDE_REACHED_MARGIN_M
+                ):
+                    break
+                time.sleep(0.05)
+            land_delay_s = time.monotonic() - arm_monotonic
+            flight["land_command_delay_s"] = round(land_delay_s, 3)
+            if land_delay_s > EXCITATION_MAX_AIRTIME_S:
+                blockers.append(
+                    f"the LAND command went out {land_delay_s:.3f} s after the arm "
+                    f"readback, outside the declared {EXCITATION_MAX_AIRTIME_S} s "
+                    "airtime bound"
+                )
+            session.set_mode("LAND")
+            phase["name"] = "descent"
+            flight["land_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            flight["pairs_fed_at_land"] = stats.pairs
+            flight["imu_fed_at_land"] = stats.imu_samples
+            flight["truth_pose_at_land"] = (
+                list(stats.truth_samples[-1][1]) if stats.truth_samples else None
+            )
+            descent_deadline = time.monotonic() + EXCITATION_POST_LAND_DRAIN_S
+            while time.monotonic() < descent_deadline:
+                drain()
+                time.sleep(0.05)
+    except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows
+        blockers.append(f"the platform failed during the diagnostic: {error}")
+    finally:
+        shutdown = platform.stop()
+        client.close()
+        _stop_estimator(estimator_process)
+        phase["name"] = "stopped"
+
+    if observer["feed_error"] is not None:
+        blockers.append(f"the estimator's feed failed mid-run: {observer['feed_error']}")
+    if control is not None and not control.refused and observer["max_altitude_m"] < 0.10:
+        # The arm succeeded but the airframe never measurably left the ground, so
+        # the reading rule has no motion to read: named rather than silently
+        # answered (a takeoff the autopilot refused in flight is exactly this).
+        blockers.append(
+            f"the excitation produced no measured motion: max altitude readback "
+            f"{observer['max_altitude_m']:.3f} m against the commanded "
+            f"{EXCITATION_TAKEOFF_ALTITUDE_M} m climb, so this run cannot answer "
+            "the question"
+        )
+    diagnostics = _initializer_diagnostics(writer.path("estimator.log"))
+    truth_published = platform.truth_feed_published
+    motion_window.update(
+        {
+            "flight": flight,
+            "max_altitude_readback_m": round(observer["max_altitude_m"], 3),
+            "truth_positions_extremes_m": {
+                "min": [min(p[i] for _t, p in stats.truth_samples) for i in range(3)],
+                "max": [max(p[i] for _t, p in stats.truth_samples) for i in range(3)],
+            }
+            if stats.truth_samples
+            else None,
+            "pairs_fed_total": stats.pairs,
+            "imu_fed_total": stats.imu_samples,
+            "pair_records_filed": stats.pair_records_filed,
+            "pair_records_dropped": stats.pair_records_dropped,
+            "observer_states_received": observer["states_received"],
+            "observer_first_state": {
+                "at_utc": observer["first_state_at"],
+                "phase": observer["first_state_phase"],
+                "pairs_fed_before_it": observer["first_state_after_pairs"],
+            },
+            "estimator_log_markers": {
+                "q_GtoI_tail_lines": diagnostics["q_GtoI_tail_lines"],
+                "zupt_accepted_updates": diagnostics["zupt_accepted_updates"],
+                "zupt_frames_without_imu": diagnostics["zupt_frames_without_imu"],
+                "zupt_rejected_updates": diagnostics["zupt_rejected_updates"],
+                "initializer_succeeded": diagnostics["initializer_succeeded"],
+            },
+            "bridge_truth_published": truth_published,
+            "bridge_truth_published_meaning": (
+                "positive by construction: the diagnostic arm is truth-driven, and "
+                "the number is the bridge's own count of simulator poses it sent the "
+                "autopilot. It never touches the estimator, whose protocol has no "
+                "truth field (plan section 0.7 item 7)"
+            ),
+            "non_claim": DIAGNOSTIC_NON_CLAIM,
+        }
+    )
+    writer.write_json("motion-window.json", motion_window)
+    writer.write_json("initializer-diagnostics.json", diagnostics)
+    writer.write_json("gps-aiding.json", _gps_aiding_verdict(writer.path("mavlink.jsonl")))
+    log_lines.extend(
+        [
+            f"pairs fed: {stats.pairs}, imu samples fed: {stats.imu_samples}, "
+            f"truth pose samples read (sent nowhere): {len(stats.truth_samples)}",
+            f"observer states received (each one means initialized() was true): "
+            f"{observer['states_received']}",
+            f"first observer state: {observer['first_state_at']} in phase "
+            f"{observer['first_state_phase']}, after {observer['first_state_after_pairs']} pairs",
+            f"estimator log: q_GtoI tails {diagnostics['q_GtoI_tail_lines']}, ZUPT accepted "
+            f"{diagnostics['zupt_accepted_updates']}, starved "
+            f"{diagnostics['zupt_frames_without_imu']}, declined on motion (DEBUG lines, "
+            f"visible only if printed) {diagnostics['zupt_rejected_updates']}",
+            f"max altitude readback: {observer['max_altitude_m']:.3f} m; bridge truth poses "
+            f"sent to the autopilot: {truth_published}",
+            f"shutdown: {shutdown.exits}",
+        ]
+    )
+    if blockers:
+        for blocker in blockers:
+            log_lines.append(f"UNRESOLVED: {blocker}")
+    else:
+        log_lines.append(
+            "the diagnostic completed; the reading is in motion-window.json and "
+            "initializer-diagnostics.json, never in a gate"
+        )
+    _write_log(writer, log_lines)
+    return _pose_assisted_outcome(
+        tuple(blockers),
+        {
+            "estimator_pin": estimator,
+            "excitation": motion_window["excitation"],
+            "truth_republish": settings.truth_republish,
+            "bridge_truth_published": truth_published,
+            "pairs_fed": stats.pairs,
+            "imu_samples_fed": stats.imu_samples,
+            "observer_states_received": observer["states_received"],
+            "observer_first_state_at": observer["first_state_at"],
+            "estimator_log_markers": motion_window["estimator_log_markers"],
+            "flight": flight,
+            "max_altitude_readback_m": round(observer["max_altitude_m"], 3),
+            "shutdown": {"exits": shutdown.exits},
+        },
+        (*writer.artifacts, "preflight.json"),
+    )
+
 
 
 def _wait_initialized(
