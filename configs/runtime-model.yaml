@@ -1,0 +1,68 @@
+# P04 runtime model and pilot parameters.
+#
+# Two of the three sections record decisions; the third declares the pilot's
+# engineering parameters. Every number here is a declared assumption pending
+# development-data selection (SYSTEM-SPECIFICATION 9.1:252, 16.3:492) — the
+# same standing as configs/first_indoor.yaml's declared envelopes. Nothing in
+# this file is a measurement.
+
+model:
+  provider: opencode-go
+  # Catalog-exact id for the requested route (provider opencode-go, model
+  # DeepSeek V4.1 Flash). The verbatim requested string
+  # `opencode-go/deepseek/deepseek-v4.1-flash` is NOT in the configured
+  # catalog (models-store.json / models.json, verified 2026-09-26) — recorded
+  # here, not substituted silently. If the owner rules the verbatim string
+  # must exist as typed, this stage blocks on that decision.
+  id: opencode-go/deepseek-v4.1-flash
+  requested_verbatim: opencode-go/deepseek/deepseek-v4.1-flash (not present in the configured catalog; recorded, not substituted)
+  source:
+    - Atomic catalog ~/.atomic/agent/models-store.json and ~/.atomic/agent/models.json, verified 2026-09-26
+    - work/runs/p04/plan.md section 2 (catalog verification, no model calls)
+    - design/docs/APPROVAL-RECORD.md:35,46,849 (project-measured route via commandcode)
+  declared_input: [text, image]   # declared by the catalog; live image+tool support is the probe's job
+  api: openai-completions
+  base_url: https://opencode.ai/zen/go/v1
+  image_transport: base64         # APPROVAL-RECORD.md:46 — URL fetch fails server-side; base64 measured working
+  alternates:
+    - id: commandcode/deepseek/deepseek-v4.1-flash
+      source: APPROVAL-RECORD.md:35,46,849 — project-measured image route (232+ prompt tokens, correct answers, p50 1.93s over 20 samples)
+    - id: opencode-go/mimo-v2.6-flash
+      source: catalog entry, input [text, image], $0.14/$0.28 per M tokens (declared, unverified)
+  never: deepseek-v4-pro or any pro-tier escalation (APPROVAL-RECORD.md:35; AGENTS.md)
+
+# Live-probe budget. Both keys ship absent on purpose: pilot-probe refuses a
+# live call unless an explicit --max-calls is also passed AND a ceiling is
+# recorded here. The owner records the limits when budgeting the live probe
+# (slice: no paid call beyond the kickoff budget; the recorded project context
+# is the Entry-2 $5 ceiling).
+probe:
+  max_calls:            # absent by default
+  spend_ceiling_usd:    # absent by default
+
+# Declared pilot parameters. Each is an engineering assumption chosen for
+# development, not a measured frequency or latency; workload tests must
+# validate them before any of these numbers is treated as fact.
+pilot:
+  # Scene-signature delta below which a repeated change triggers no new
+  # event (§9.1 deadband).
+  event_deadband: 0.08
+  # A static-looking but relevant scene is still reviewed at least this often.
+  max_silence_s: 6.0
+  # Anticipatory rule (§9.3): send when time-to-decision-boundary approaches
+  # the latency budget plus this guard. The budget is the measured p50 latency
+  # (1.93s) rounded up with headroom; it is not an integrated critical-path
+  # measurement (§16.1:475 — none exists yet).
+  latency_budget_s: 2.5
+  guard_margin_s: 1.0
+  # A cloud request older than this is expired; its remaining delay is never
+  # set to zero (§17.3:516).
+  response_deadline_s: 4.0
+  # Observation freshness bound: an observation older than this, at the moment
+  # a decision or a grounding uses it, is stale. It is never cited as current
+  # evidence and never grounds a fresh spatial goal; its measured age is
+  # recorded with the decision (truth-pose masking critique). Declared as
+  # 2x the latency budget plus margin; development data selects the final value.
+  observation_freshness_s: 6.0
+  # Provider retries count against the call and deadline budget (§15.3:453).
+  retry_budget: 1

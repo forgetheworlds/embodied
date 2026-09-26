@@ -1,0 +1,449 @@
+"""The provider adapter: request construction, transport and reply parsing.
+
+The cloud pilot owns request lifecycle and evidence selection; this module owns
+only the mechanics of talking to a multimodal provider. Everything timestamped
+is handed in by the caller, so offline replays and the live probe share one
+code path and no wall-clock read hides inside a latency number.
+
+The transport seam is where degradation is injected. Every arm that makes a
+cloud call at all goes through the same transport object — the deterministic
+:class:`ScriptedTransport` in tests and replays, the live transport in the
+probe — driven by the same broker, so injected delay, reordering, duplication
+and silence are a property of the shared path rather than of any one
+executive. B0 makes no cloud call, so the cloud-side injection is a no-op for
+it by construction; the observation-side injection (scripted arrival stamps
+evaluated against the shared freshness bound) applies to every arm through the
+same broker inlet.
+
+Model identity comes from ``configs/runtime-model.yaml``. Images travel as
+base64 data URIs only: the project's measured finding (APPROVAL-RECORD) is
+that this model family fails to fetch image URLs server-side.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+import json
+import os
+import urllib.error
+import urllib.request
+from typing import Any
+
+from embodied.contracts.records import (
+    ClockStamp,
+    DecisionRequest,
+    FinalReport,
+    RecordError,
+    SpatialGoal,
+    elapsed_ns,
+    from_dict,
+)
+
+
+class TransportError(Exception):
+    """The transport could not complete a call. Recorded, never raised into the broker."""
+
+
+# ---------------------------------------------------------------------------
+# Model configuration (configs/runtime-model.yaml, section ``model``)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """The configured runtime model, recorded rather than assumed."""
+
+    provider: str
+    id: str
+    base_url: str
+    api: str
+    image_transport: str
+
+    @classmethod
+    def from_config(cls, section: dict[str, Any]) -> "ModelConfig":
+        for key in ("provider", "id", "base_url", "api", "image_transport"):
+            if not isinstance(section.get(key), str) or not section[key].strip():
+                raise ValueError(f"model.{key} must be a non-empty string")
+        return cls(
+            provider=section["provider"],
+            id=section["id"],
+            base_url=section["base_url"],
+            api=section["api"],
+            image_transport=section["image_transport"],
+        )
+
+    @property
+    def identity(self) -> str:
+        return self.id
+
+
+# ---------------------------------------------------------------------------
+# Request envelope
+# ---------------------------------------------------------------------------
+
+
+def encode_image_data_uri(payload: bytes) -> str:
+    """One base64 data URI. The only image transport this project uses."""
+    import base64
+
+    return "data:image/ppm;base64," + base64.b64encode(payload).decode("ascii")
+
+
+@dataclass(frozen=True)
+class RequestPacket:
+    """The evidence packet for one cloud request (specification section 9.1).
+
+    ``image_parts`` pairs an observation id with the encoded data URI of the
+    frame actually delivered; the mapping back to sensor pixels is retained by
+    the caller that built the packet.
+    """
+
+    request: DecisionRequest
+    mission_instruction: str
+    image_parts: tuple[tuple[str, str], ...] = ()
+    target_refs: tuple[str, ...] = ()
+    navigation_status: str = "unknown"
+    uncertainty_summary: str = "none recorded"
+    explicit_question: str | None = None
+
+
+def build_request_document(
+    config: ModelConfig, packet: RequestPacket, tool_schemas: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    """One OpenAI-completions chat document carrying text and base64 images."""
+    content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_text(packet)}]
+    for observation_id, data_uri in packet.image_parts:
+        content.append({"type": "text", "text": f"image for observation {observation_id}:"})
+        content.append({"type": "image_url", "image_url": {"url": data_uri}})
+    return {
+        "model": config.id,
+        "messages": [{"role": "user", "content": content}],
+        "tools": list(tool_schemas),
+        # The correlation identity travels with the request, not only in local state.
+        "metadata": {
+            "request_id": packet.request.request_id,
+            "mission_revision": packet.request.mission_revision,
+            "base_goal_revision": packet.request.base_goal_revision,
+        },
+    }
+
+
+def _prompt_text(packet: RequestPacket) -> str:
+    lines = [
+        "You are the cloud pilot of an indoor drone. Reply with tool calls and, "
+        "when a spatial objective should change, a spatial_goal proposal. "
+        "You never command motion directly; the local supervisor owns admission.",
+        f"mission instruction: {packet.mission_instruction}",
+        f"mission revision: {packet.request.mission_revision}",
+        f"active goal revision: {packet.request.base_goal_revision}",
+        f"navigation status: {packet.navigation_status}",
+        f"target references: {', '.join(packet.target_refs) or 'none'}",
+        f"uncertainty: {packet.uncertainty_summary}",
+    ]
+    if packet.explicit_question:
+        lines.append(f"explicit question: {packet.explicit_question}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Transports
+# ---------------------------------------------------------------------------
+
+
+class LiveTransport:
+    """stdlib transport; no new dependency.
+
+    ``send`` performs the one blocking HTTP round trip and stores the result;
+    ``poll`` yields it to the caller at the caller's clock. A browser
+    User-Agent header is required by the provider edge (measured finding,
+    APPROVAL-RECORD). The API key is read from the environment at call time
+    and is never logged, returned or stored.
+    """
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        api_key_env: str,
+        timeout_s: float = 30.0,
+        opener: Callable[[urllib.request.Request], dict[str, Any]] | None = None,
+    ) -> None:
+        self.config = config
+        self._api_key_env = api_key_env
+        self._timeout_s = timeout_s
+        self._opener = opener
+        self._completed: list[tuple[ClockStamp, dict[str, Any] | TransportError]] = []
+
+    def send(self, document: dict[str, Any], sent_at: ClockStamp) -> None:
+        request = urllib.request.Request(
+            self.config.base_url.rstrip("/") + "/chat/completions",
+            data=json.dumps(document).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (embodied-pilot-probe)",
+                "Authorization": f"Bearer {os.environ.get(self._api_key_env, '')}",
+            },
+            method="POST",
+        )
+        try:
+            if self._opener is not None:
+                response = self._opener(request)
+            else:
+                with urllib.request.urlopen(request, timeout=self._timeout_s) as handle:
+                    response = json.loads(handle.read().decode("utf-8"))
+            self._completed.append((sent_at, response))
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            self._completed.append((sent_at, TransportError(f"transport failed: {error}")))
+
+    def poll(self, now: ClockStamp) -> tuple["Arrival", ...]:
+        arrivals = tuple(
+            Arrival(send_stamp=send, arrived_at=now, document=payload)
+            if isinstance(payload, dict)
+            else Arrival(send_stamp=send, arrived_at=now, error=payload)
+            for send, payload in self._completed
+        )
+        self._completed.clear()
+        return arrivals
+
+
+@dataclass(frozen=True)
+class Arrival:
+    """One reply that has arrived, or one transport failure, with its stamps."""
+
+    send_stamp: ClockStamp
+    arrived_at: ClockStamp
+    document: dict[str, Any] | None = None
+    error: TransportError | None = None
+    usage: dict[str, Any] | None = None
+
+    @property
+    def round_trip_ns(self) -> int:
+        return elapsed_ns(self.send_stamp, self.arrived_at)
+
+
+@dataclass(frozen=True)
+class ScriptedReply:
+    """One scripted outcome, applied to the send with the matching call index.
+
+    This is the shared degradation injector: delay, reordering (per-index
+    delays), duplication, silence (a missing entry) and malformed output are
+    scripted here, on the transport seam every cloud-calling arm shares.
+    """
+
+    delay_s: float = 0.0
+    document: dict[str, Any] | None = None
+    error: TransportError | None = None
+    malformed: bool = False
+    duplicate: bool = False
+    usage: dict[str, Any] | None = None
+
+
+class ScriptedTransport:
+    """The deterministic fake. No network, no thread; a reply arrives when the
+    harness's clock says it does. ``sent_documents`` and ``sent_stamps`` are
+    the audit trail tests assert against."""
+
+    def __init__(self) -> None:
+        self.script: list[ScriptedReply] = []
+        self.sent_documents: list[dict[str, Any]] = []
+        self.sent_stamps: list[ClockStamp] = []
+        self._arrivals: list[Arrival] = []
+
+    def schedule(self, *replies: ScriptedReply) -> None:
+        self.script.extend(replies)
+
+    def send(self, document: dict[str, Any], sent_at: ClockStamp) -> None:
+        index = len(self.sent_documents)
+        self.sent_documents.append(document)
+        self.sent_stamps.append(sent_at)
+        if index >= len(self.script):
+            return
+        entry = self.script[index]
+        arrival_ns = sent_at.monotonic_ns + int(entry.delay_s * 1_000_000_000)
+        arrival_stamp = ClockStamp(sent_at.host_id, sent_at.clock_id, arrival_ns)
+        payload = entry.document
+        if entry.malformed and payload is None:
+            payload = {"error": {"message": "scripted malformed reply"}}
+        if payload is not None and entry.usage is not None:
+            # Usage travels where the provider puts it: in the response body.
+            payload = {**payload, "usage": entry.usage}
+        if payload is not None or entry.error is not None:
+            arrival = Arrival(
+                send_stamp=sent_at,
+                arrived_at=arrival_stamp,
+                document=payload,
+                error=entry.error,
+                usage=entry.usage,
+            )
+            self._arrivals.append(arrival)
+            if entry.duplicate:
+                self._arrivals.append(arrival)
+
+    def poll(self, now: ClockStamp) -> tuple[Arrival, ...]:
+        due = [arrival for arrival in self._arrivals if arrival.arrived_at.monotonic_ns <= now.monotonic_ns]
+        for arrival in due:
+            self._arrivals.remove(arrival)
+        return tuple(due)
+
+
+# ---------------------------------------------------------------------------
+# Reply parsing
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParsedReply:
+    """What one provider reply carried, each part validated on its own terms.
+
+    ``malformed_reason`` records unparseable output as an outcome; the broker
+    never receives an exception from parsing. ``mission_recipe`` is B1's
+    proposed recipe as a plain document; the executive re-validates its
+    vocabulary and bounds before it becomes a MissionRecipe.
+    """
+
+    request_id: str
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    proposals: tuple[SpatialGoal, ...] = ()
+    report: FinalReport | None = None
+    mission_recipe: dict[str, Any] | None = None
+    content: str | None = None
+    usage: dict[str, Any] | None = None
+    malformed_reason: str | None = None
+
+
+def parse_reply(document: dict[str, Any], request: DecisionRequest) -> ParsedReply:
+    try:
+        choice = document["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return ParsedReply(
+            request_id=request.request_id,
+            malformed_reason="reply is not an OpenAI-completions choice document",
+        )
+    tool_calls = tuple(choice.get("tool_calls") or ())
+    content = choice.get("content")
+    proposals: list[SpatialGoal] = []
+    report: FinalReport | None = None
+    recipe: dict[str, Any] | None = None
+    malformed: list[str] = []
+    try:
+        structured = json.loads(content) if isinstance(content, str) else content
+    except json.JSONDecodeError:
+        # Free text is a valid answer: only a structured block that fails its
+        # record's own validation is malformed.
+        structured = None
+    if isinstance(structured, dict):
+        for index, candidate in enumerate(structured.get("spatial_goals") or []):
+            try:
+                proposals.append(from_dict(SpatialGoal, candidate))
+            except RecordError as error:
+                malformed.append(f"spatial_goals[{index}] refused by the record: {error}")
+        if structured.get("final_report") is not None:
+            try:
+                report = from_dict(FinalReport, structured["final_report"])
+            except RecordError as error:
+                malformed.append(f"final_report refused by the record: {error}")
+        if structured.get("mission_recipe") is not None:
+            candidate = structured["mission_recipe"]
+            if isinstance(candidate, dict) and isinstance(candidate.get("steps"), list):
+                recipe = candidate
+            else:
+                malformed.append("mission_recipe must be an object with a steps list")
+        unknown = set(structured) - {"spatial_goals", "final_report", "mission_recipe"}
+        if unknown:
+            malformed.append(f"unknown structured keys: {', '.join(sorted(unknown))}")
+    return ParsedReply(
+        request_id=request.request_id,
+        tool_calls=tool_calls,
+        proposals=tuple(proposals),
+        report=report,
+        mission_recipe=recipe,
+        content=content if isinstance(content, str) else None,
+        usage=document.get("usage") if isinstance(document.get("usage"), dict) else None,
+        malformed_reason="; ".join(malformed) if malformed else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The provider the broker drives
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SendRecord:
+    """Latency accounting for one request (specification section 16.1)."""
+
+    request_id: str
+    send_stamp: ClockStamp
+    request_bytes: int
+    call_index: int
+
+
+@dataclass(frozen=True)
+class ProviderReply:
+    """One parsed arrival correlated to its request by ``request_id``."""
+
+    parsed: ParsedReply
+    arrival: Arrival
+    request: DecisionRequest
+    response_bytes: int
+    # Client-measured round trips combine network and server work; without a
+    # provider-side breakdown the aggregate is reported as unseparated.
+    latency_unseparated: bool = True
+
+
+class Provider:
+    """Constructs, sends and parses. Owns no lifecycle policy: one-outstanding,
+    expiry and discard rules live in the broker."""
+
+    def __init__(self, config: ModelConfig, transport, tool_schemas: Sequence[dict[str, Any]]) -> None:
+        self.config = config
+        self.transport = transport
+        self.tool_schemas = tuple(tool_schemas)
+        self.send_records: list[SendRecord] = []
+        self.replies: list[ProviderReply] = []
+        self.failures: list[tuple[str, str]] = []
+        self._sent_requests: list[DecisionRequest] = []
+
+    def submit(
+        self, request: DecisionRequest, packet: RequestPacket, now: ClockStamp
+    ) -> SendRecord:
+        document = build_request_document(self.config, packet, self.tool_schemas)
+        self.transport.send(document, now)
+        record = SendRecord(
+            request_id=request.request_id,
+            send_stamp=now,
+            request_bytes=len(json.dumps(document).encode("utf-8")),
+            call_index=len(self.send_records),
+        )
+        self.send_records.append(record)
+        self._sent_requests.append(request)
+        return record
+
+    def poll(self, now: ClockStamp) -> tuple[ProviderReply, ...]:
+        replies = []
+        for arrival in self.transport.poll(now):
+            record = self._record_for(arrival.send_stamp)
+            if record is None:
+                continue
+            request = self._sent_requests[record.call_index]
+            if arrival.error is not None:
+                self.failures.append((record.request_id, str(arrival.error)))
+                continue
+            parsed = parse_reply(arrival.document or {}, request)
+            replies.append(
+                ProviderReply(
+                    parsed=parsed,
+                    arrival=arrival,
+                    request=request,
+                    response_bytes=len(json.dumps(arrival.document or {}).encode("utf-8")),
+                )
+            )
+        self.replies.extend(replies)
+        return tuple(replies)
+
+    def _record_for(self, send_stamp: ClockStamp) -> SendRecord | None:
+        for record in self.send_records:
+            if record.send_stamp == send_stamp:
+                return record
+        return None
