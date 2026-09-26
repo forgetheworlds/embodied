@@ -53,6 +53,7 @@ scenario:
     - scenarios/compat/params/compat_arming.parm
   estimator_params:
     - scenarios/compat/params/compat_ekf.parm
+    - scenarios/compat/params/p01l_sensor.parm
 
 sensors:
   stereo:
@@ -254,3 +255,68 @@ calibration:
 
   # Where the offline derivation writes its artifacts (plan section 10).
   output: work/runs/p01-calibration
+
+# ---------------------------------------------------------------------------
+# P01-L sensor-derived localization (slice P01-L, plan sections 3-6). Additive
+# section: every P00/P01-C key above is untouched. The estimator pin names one
+# maintained fixed-lag stereo-inertial implementation (OpenVINS) with the
+# version evidence a pin requires: tag, commit, tarball sha256, the build log
+# of a successful build on this host, and the built library. The bounds below
+# are the plan's predeclared values, frozen BEFORE any measurement and never
+# adjusted after seeing a run (plan section 6); the smallest declared opening
+# each bound protects is in the plan's bound table.
+#
+#   state_lost_after_ms   300 ms of silence stops transmission: the adapter
+#                         never publishes a stale estimate, and the firmware's
+#                         own healthy() window (AP_VisualOdom_Backend.cpp:32-35)
+#                         trips 300 ms after the last message.
+#   published_state_age_max_ms  20 ms behind the newest consumed IMU sample:
+#                         two IMU periods; propagation must keep up with the
+#                         stream, not lag it (F2).
+#   max_publish_gap_ms    100 ms: four missed 25 ms slots (F3); beyond this the
+#                         firmware's 300 ms health window is one skipped beat
+#                         from tripping.
+#   visual_update_warn/fail_ms  300/500 ms: three camera periods at warn; IMU-
+#                         only propagation is a degraded estimate, not a
+#                         position solution (F4).
+#   valid_fraction_min    0.99 of the scored window, outages charged whole (H1).
+#   sigma_min/max_m       0.02-1.0 m per axis (H4): below it the filter is
+#                         claiming more than this rig knows; above it the
+#                         estimate is lost. Outside the envelope: stop
+#                         transmission, never publish garbage to EKF3.
+#   disagreement_p95/max_m  0.20/0.40 m (H3): p95 sits at VISO_POS_M_NSE, the
+#                         firmware's own declared fusion noise floor
+#                         (AP_VisualOdom.cpp:93-99); max 2x the floor catches
+#                         divergence without tripping on fusion transients.
+
+localization:
+  estimator:
+    name: openvins
+    tag: v2.7
+    commit: 93adc241390d13e99232652cf05cbe18a93c7bea
+    tarball_path: work/runs/p01-localization/pin-evidence/open_vins-2.7.tar.gz
+    tarball_sha256: 0135af4acd8dc099c8b50fc51c9faf53fe69462d0e6bad9e986ad4090af02df8
+    build_log: work/runs/p01-localization/pin-evidence/build-openvins.log
+    # The build script writes this line only after the whole pinned tree
+    # (ov_core + ov_msckf) has built and installed; the pin's evidence is the
+    # line, the library below, and the unmodified tarball's sha256 above.
+    build_success_marker: OV_MSCKF BUILD OK
+    library: work/runs/p01-localization/pin-evidence/open_vins-2.7/ov_msckf/build/install/lib/libov_msckf_lib.dylib
+    executable: estimator/ov_stream
+    socket_port: 9021
+  publish:
+    period_ms: 25
+  declared:
+    viso_delay_ms: 50
+  params_file: scenarios/compat/params/p01l_sensor.parm
+  bounds:
+    state_lost_after_ms: 300
+    published_state_age_max_ms: 20
+    max_publish_gap_ms: 100
+    visual_update_warn_ms: 300
+    visual_update_fail_ms: 500
+    valid_fraction_min: 0.99
+    sigma_min_m: 0.02
+    sigma_max_m: 1.0
+    disagreement_p95_m: 0.20
+    disagreement_max_m: 0.40
