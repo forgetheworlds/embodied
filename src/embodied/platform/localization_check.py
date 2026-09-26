@@ -179,6 +179,25 @@ FAST_THRESHOLD = 20
 INITIALIZER_SUCCESS_MARKER = "[init]: successful initialization"
 ZUPT_ACCEPTED_MARKER = "[ZUPT]: accepted"
 ZUPT_STARVED_MARKER = "[ZUPT]: There are no IMU data"
+# Revision 5 (plan section 12 item 14): the per-frame decision the criterion rests on.
+# UpdaterZeroVelocity::try_update prints one disparity line and, when it reaches a
+# verdict, one accept/reject line per camera frame (UpdaterZeroVelocity.cpp:231-249).
+# The frames it declines are the only ones that reach do_feature_propagate_update,
+# where propagate_and_clone makes the clones the readiness accessor waits for
+# (VioManager.cpp:299-305, :341, :348) -- so counting them per frame turns plan
+# section 0.6 item 5's sufficiency criterion into a measurement rather than an
+# argument from the log tail.
+ZUPT_DISPARITY_PATTERN = re.compile(
+    r"\[ZUPT\]: (passed|failed) disparity \(([-\d.]+) [<>] ([-\d.]+), (\d+) features?\)"
+)
+ZUPT_VERDICT_PATTERN = re.compile(
+    r"\[ZUPT\]: (accepted|rejected) \|v_IinG\| = ([-\d.]+) \(chi2 ([-\d.]+) [<>] ([-\d.]+)\)"
+)
+ZUPT_VISUAL_PATH_DECISIONS = ("declined_motion", "declined_no_imu")
+# The artifact carries a bounded window of decisions, not the whole log: a pre-arm
+# window at the declared 10 Hz holds hundreds of frames and the summary counts above
+# carry the total.
+ZUPT_FRAME_LIMIT = 64
 
 # Revision 4: the run's own bounded static-start capture (plan section 0.3 item 4).
 # Same conditions as P00's accept-5 capture -- the vehicle at the declared start
@@ -953,6 +972,55 @@ def _scene_admission_check(
     return True, "deferred_to_arm_gate", detail
 
 
+def _zupt_frame_decisions(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """The zero-velocity updater's per-frame decision, in the order it made them.
+
+    One record per camera frame the updater was asked about, carrying the numbers it
+    decided from: the mean disparity against ``zupt_max_disparity`` with the feature
+    count, and, where the frame reached a verdict, the velocity and chi2 against their
+    limits. The decisions are the three ways out of ``UpdaterZeroVelocity::try_update``
+    the log can show: ``accepted`` (the frame is consumed, UpdaterZeroVelocity.cpp:248),
+    ``declined_motion`` (chi2 or velocity over its limit, the frame reaches the visual
+    path, :244) and ``declined_no_imu`` (no bracketing inertial data, same consequence,
+    :104). A frame whose disparity line was written but whose verdict never followed --
+    the log tail, or a process that stopped mid-frame -- keeps ``no_verdict`` rather
+    than being silently classified.
+    """
+    frames: list[dict[str, Any]] = []
+    pending: dict[str, Any] | None = None
+    for line in lines:
+        if ZUPT_STARVED_MARKER in line:
+            frames.append({"decision": "declined_no_imu"})
+            pending = None
+            continue
+        disparity = ZUPT_DISPARITY_PATTERN.search(line)
+        if disparity is not None:
+            pending = {
+                "disparity_passed": disparity.group(1) == "passed",
+                "disparity_px": float(disparity.group(2)),
+                "max_disparity_px": float(disparity.group(3)),
+                "feature_count": int(disparity.group(4)),
+            }
+            continue
+        verdict = ZUPT_VERDICT_PATTERN.search(line)
+        if verdict is not None:
+            frames.append(
+                {
+                    **(pending or {}),
+                    "decision": (
+                        "accepted" if verdict.group(1) == "accepted" else "declined_motion"
+                    ),
+                    "velocity_m_s": float(verdict.group(2)),
+                    "chi2": float(verdict.group(3)),
+                    "chi2_limit": float(verdict.group(4)),
+                }
+            )
+            pending = None
+    if pending is not None:
+        frames.append({**pending, "decision": "no_verdict"})
+    return frames
+
+
 def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
     """What the estimator itself said about initialization, from its own log.
 
@@ -961,16 +1029,16 @@ def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
     behind consumed frames means the scene's pixels gave the front end nothing to
     track, which the preflight's scene_admission check measures directly.
 
-    The last three fields exist because an empty or populated initializer_output
-    alone cannot say *why* a run blocked at H5: the pinned readiness accessor is a
-    conjunction (VioManager.h:99), and its second term is set only by a completed
-    visual update. Recording whether the initializer fired, how many zero-velocity
-    updates it accepted, and how many camera frames ZUPT had no inertial data for
-    lets a reader re-derive the verdict from the artifact instead of the log's prose.
+    Revision 5 adds the per-frame decisions themselves: the summary counts say how
+    many frames went each way, and ``zupt_frames`` carries the numbers each decision
+    was made from, so the sufficiency criterion of plan section 0.6 item 5 (the
+    accessor needs five frames that ZUPT declined before its first completed visual
+    update can write ``timelastupdate``) is measurable per frame from the artifact.
     """
     lines: list[str] = []
     if estimator_log.is_file():
         lines = estimator_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    frames = _zupt_frame_decisions(lines)
     return {
         "estimator_log_lines": len(lines),
         "initializer_output": [line for line in lines if "[init" in line][-50:],
@@ -984,13 +1052,22 @@ def _initializer_diagnostics(estimator_log: Path) -> dict[str, Any]:
         "zupt_frames_without_imu": sum(
             1 for line in lines if ZUPT_STARVED_MARKER in line
         ),
+        "zupt_rejected_updates": sum(
+            1 for frame in frames if frame["decision"] == "declined_motion"
+        ),
+        "zupt_frames_reaching_visual_path": sum(
+            1 for frame in frames if frame["decision"] in ZUPT_VISUAL_PATH_DECISIONS
+        ),
+        "zupt_frames": frames[-ZUPT_FRAME_LIMIT:],
         "note": (
             "the pinned initializer prints nothing while its feature database is empty; "
             "an empty initializer_output behind consumed frames means the scene gave "
             "the front end nothing to track. initializer_succeeded says whether the "
             "initializer's own success line is present; initialized() also needs "
             "timelastupdate, set only by a completed visual update, which the "
-            "zero-velocity updater pre-empts (VioManager.cpp:294)"
+            "zero-velocity updater pre-empts (VioManager.cpp:294). "
+            "zupt_frames_reaching_visual_path counts the frames ZUPT declined -- the "
+            "only ones that reach do_feature_propagate_update and can make a clone"
         ),
     }
 
@@ -1014,14 +1091,17 @@ def _initialization_blocker(diagnostics: dict[str, Any]) -> str:
             "(VioManager.h:99) is `is_initialized_vio && timelastupdate != -1` and "
             "timelastupdate is assigned only at the tail of do_feature_propagate_update "
             "(VioManager.cpp:651). The zero-velocity updater returned early from "
-            "track_image_and_update before that assignment (VioManager.cpp:294) on the "
-            "camera frames it accepted: "
-            f"{diagnostics['zupt_accepted_updates']} accepted zero-velocity update(s) "
-            f"against {diagnostics['zupt_frames_without_imu']} frame(s) where it had no "
-            "bracketing inertial data and the visual path ran instead. No state was "
-            "published, so no bound was measured; changing the zero-velocity "
-            "configuration or the H5 criterion is the owner's disposition, not a "
-            "worker's"
+            "track_image_and_update before that assignment (VioManager.cpp:294): "
+            f"{diagnostics['zupt_accepted_updates']} accepted zero-velocity update(s), "
+            f"{diagnostics['zupt_rejected_updates']} frame(s) declined on motion and "
+            f"{diagnostics['zupt_frames_without_imu']} frame(s) where it had no "
+            "bracketing inertial data, so "
+            f"{diagnostics['zupt_frames_reaching_visual_path']} frame(s) reached the "
+            "visual path, against the five the accessor needs before its first "
+            "completed update can write timelastupdate (VioManager.cpp:348-352). No "
+            "state was published, so no bound was measured; changing the "
+            "zero-velocity configuration or the H5 criterion is the owner's "
+            "disposition, not a worker's"
         )
     return (
         "the estimator did not initialize inside the pre-arm window (H5): the pinned "
