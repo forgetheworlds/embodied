@@ -888,6 +888,13 @@ class PlatformSettings:
     output: str
     host_id: str
     clock_id: str
+    # The truth-republish switch. Its default is the P00 gate's behaviour exactly:
+    # the compatibility probe starts the vision feed that republishes the simulator's
+    # own pose to the autopilot's external-navigation source. A configuration that
+    # declares the sensor-derived localization mode selects False, because that arm's
+    # pose must come from its estimator, and a second publisher on one estimator input
+    # is silent corruption rather than a redundant measurement (plan section 4.6).
+    truth_republish: bool = True
 
     @property
     def webots_binary(self) -> Path:
@@ -913,6 +920,17 @@ class PlatformSettings:
     def mavlink_endpoint(self) -> str:
         """The endpoint string the MAVLink session connects to."""
         return self.endpoints.sitl
+
+    @property
+    def sensor_mode(self) -> SensorMode:
+        """What the autopilot's state actually comes from, as this bridge will behave.
+
+        Read from the switch that decides the behaviour rather than written out twice,
+        so a run cannot declare one mode and fly another.
+        """
+        if self.truth_republish:
+            return SensorMode.SIMULATOR_INTERFACE
+        return SensorMode.SENSOR_DERIVED
 
     @property
     def stereo_stale_after_s(self) -> float:
@@ -953,6 +971,11 @@ class PlatformSettings:
         probe = document["probe"]
         fault = probe["estimator_fault"]
         timeouts = probe["step_timeout_s"]
+        # The truth-republish switch, read from the additive localization section the
+        # check command validates. An absent key is not an ambiguity: it is the
+        # configuration the P00 gate was measured on, and it stays republish-on.
+        mode = (document.get("localization") or {}).get("mode")
+        truth_republish = mode != SensorMode.SENSOR_DERIVED.value
         settings = PlatformSettings(
             root=base,
             stage=document["project"]["stage"],
@@ -1027,6 +1050,7 @@ class PlatformSettings:
             output=document["output"],
             host_id=socket.gethostname(),
             clock_id="monotonic",
+            truth_republish=truth_republish,
         )
         settings.check_values()
         return settings
@@ -2857,9 +2881,25 @@ class WebotsArduPilot:
         # controller's frames are read as they arrive, whether or not this thread
         # is busy elsewhere.
         self._start_reader()
-        # The pose feed starts with the reader: both run for the adapter's lifetime,
-        # and the feed publishes only what the reader has actually received.
-        self._start_vision_feed()
+        # The pose feed carries the simulator's own pose to the autopilot, so it is
+        # started only when this bridge was configured to republish it. A sensor-derived
+        # configuration starts the reader alone: the autopilot's external-navigation
+        # source then has exactly one publisher, the estimator's adapter.
+        if self.settings.truth_republish:
+            self._start_vision_feed()
+        else:
+            self.evidence.write_json(
+                "vision-pose-feed.json",
+                {
+                    "enabled": False,
+                    "published": 0,
+                    "period_s": VISION_POSE_PERIOD_S,
+                    "error": None,
+                    "reason": "localization.mode is sensor-derived: this bridge republishes "
+                    "no simulator pose, so the truth feed cannot reach the estimator's "
+                    "input",
+                },
+            )
         # AUTOPILOT_VERSION answers once, on request, and it is the only statement of
         # which firmware is being exercised.
         self._session.request_message(MSG_ID_AUTOPILOT_VERSION)
@@ -2963,6 +3003,7 @@ class WebotsArduPilot:
         self.evidence.write_json(
             "vision-pose-feed.json",
             {
+                "enabled": self.settings.truth_republish,
                 "published": self._vision_feed_published,
                 "period_s": VISION_POSE_PERIOD_S,
                 "error": None if self._vision_feed_error is None else repr(self._vision_feed_error),
@@ -3158,6 +3199,15 @@ class WebotsArduPilot:
         thread, self._reader_thread = self._reader_thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=READER_JOIN_TIMEOUT_S)
+
+    @property
+    def truth_feed_published(self) -> int:
+        """How many simulator poses this bridge has actually sent to the autopilot.
+
+        Zero whenever the truth republish is off, and the observed count — not the
+        declaration — is what a caller gates a sensor-derived arm on.
+        """
+        return self._vision_feed_published
 
     # -- vision pose feed --------------------------------------------------
 
@@ -3858,13 +3908,25 @@ class CompatibilityProbe:
                 ],
             )
         )
-        limitations = (
+        # The mode this probe declares is the mode its bridge behaves in, not a constant:
+        # a configuration that turns the truth republish off produces a run whose pose
+        # came from somewhere else, and the receipt has to say so.
+        truth_feed_limitation = (
             "sensor_mode is simulator-interface: the autopilot's attitude and position come "
             "from Webots devices through the flight-state packet, so this is compatibility "
             "evidence and not a sensor-derived result. The EKF-active parameter set feeds "
             "that same Webots pose to EKF3 as its external-navigation source "
             "(VISION_POSITION_ESTIMATE, EK3_SRC1_* 6): the estimator flies on the "
-            "simulator's own state, not on an independently sensed one",
+            "simulator's own state, not on an independently sensed one"
+            if self.settings.truth_republish
+            else "sensor_mode is sensor-derived: localization.mode declares the "
+            "sensor-derived arm, so this bridge republishes no simulator pose and no truth "
+            "reaches the autopilot's external-navigation source. This probe feeds no "
+            "estimator itself, so its own evidence covers transport, clocks and frames "
+            "only, and it is not a localization result"
+        )
+        limitations = (
+            truth_feed_limitation,
             "both runs fly the candidate parameter set, which includes the EKF-active file "
             "(AHRS_EKF_TYPE 3); run A is therefore not the pinned upstream configuration. "
             "The pinned file's simulator AHRS (AHRS_EKF_TYPE 10) was measured to diverge "
@@ -3882,7 +3944,7 @@ class CompatibilityProbe:
             "stage": self.settings.stage,
             "name": self.settings.name,
             "records_revision": RECORDS_REVISION,
-            "sensor_mode": SensorMode.SIMULATOR_INTERFACE.value,
+            "sensor_mode": self.settings.sensor_mode.value,
             "prerequisites": [
                 {"name": check.name, "detail": check.detail} for check in self._prerequisites
             ],
@@ -5650,7 +5712,7 @@ def _compat_command(args: Any, output_dir: Path) -> CommandOutcome:
                 "configuration": _configuration_document(settings),
             },
             artifacts=probe.artifacts,
-            sensor_mode=SensorMode.SIMULATOR_INTERFACE,
+            sensor_mode=settings.sensor_mode,
         )
     except ProbeFailure as error:
         return CommandOutcome(
@@ -5667,7 +5729,7 @@ def _compat_command(args: Any, output_dir: Path) -> CommandOutcome:
                 "configuration": _configuration_document(settings),
             },
             artifacts=probe.artifacts,
-            sensor_mode=SensorMode.SIMULATOR_INTERFACE,
+            sensor_mode=settings.sensor_mode,
         )
     return CommandOutcome(
         status=CommandStatus.COMPLETE,
@@ -5676,7 +5738,7 @@ def _compat_command(args: Any, output_dir: Path) -> CommandOutcome:
         limitations=result.limitations,
         manifest=result.manifest,
         artifacts=result.artifacts,
-        sensor_mode=SensorMode.SIMULATOR_INTERFACE,
+        sensor_mode=settings.sensor_mode,
     )
 
 

@@ -4,6 +4,11 @@ No simulator, no network, no paid calls; fixtures are procedural. The numbered
 tests are the plan's section 10 behaviours, and the bounds they use come from
 the configuration's frozen values, not from literals in this file wherever the
 behaviour under test is a bound.
+
+Nothing here starts a simulator: the tests that reach the check command use a
+configuration whose estimator process is deliberately absent, or one whose bridge
+would republish truth, so the claimed arm blocks in preflight exactly as a reader
+of the receipt would see it.
 """
 
 from __future__ import annotations
@@ -17,10 +22,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from embodied.cli import CommandError, build_parser
+from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
 from embodied.platform import localization_check as check
+from embodied.platform.webots_ardupilot import PlatformSettings
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +100,27 @@ def _rot_z_90() -> np.ndarray:
 def _rot_x_90() -> np.ndarray:
     return np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
 
+
+def _declared_document() -> dict:
+    return yaml.safe_load(Path("configs/first_indoor.yaml").read_text(encoding="utf-8"))
+
+
+def _config_without_the_estimator(tmp_path: Path) -> Path:
+    """The declared configuration, with the estimator process pointed at nothing."""
+    document = _declared_document()
+    document["localization"]["estimator"]["executable"] = "estimator/ov_stream-absent"
+    path = tmp_path / "config-absent-estimator.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _config_declaring(tmp_path: Path, mode: str) -> Path:
+    """The declared configuration under a different localization mode."""
+    document = _declared_document()
+    document["localization"]["mode"] = mode
+    path = tmp_path / f"config-{mode}.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return path
 
 # ---------------------------------------------------------------------------
 # T1: protocol round-trip
@@ -384,30 +413,35 @@ class TestRefusals:
         )
         assert any("cannot pass P01-L" in reason for reason in receipt["reasons"])
 
-    def test_sensor_derived_preflight_blockers_are_concrete(self, tmp_path):
-        """On a branch without the serialized integrator actions, the claimed arm
-        is blocked and the receipt names every blocker."""
+    def test_a_missing_estimator_process_blocks_with_a_concrete_reason(self, tmp_path):
+        """Prerequisites are reported before anything starts: a claimed arm whose
+        estimator binary is absent is blocked and the receipt names it, rather
+        than starting a simulator to discover that."""
+        config_path = _config_without_the_estimator(tmp_path)
         exit_code = check.main(
             [
                 "--config",
-                "configs/first_indoor.yaml",
+                str(config_path),
                 "--mode",
                 "sensor-derived",
                 "--output",
-                str(tmp_path),
+                str(tmp_path / "out"),
             ]
         )
         assert exit_code == 2
-        receipt = json.loads((tmp_path / "receipt.json").read_text(encoding="utf-8"))
+        receipt = json.loads((tmp_path / "out" / "receipt.json").read_text(encoding="utf-8"))
         assert receipt["status"] == "blocked"
         blockers = " ".join(receipt["reasons"])
         assert "localization=unresolved" in blockers
-        assert "p01l_sensor.parm" in blockers
         assert "ov_stream" in blockers
-        preflight = json.loads((tmp_path / "preflight.json").read_text(encoding="utf-8"))
+        preflight = json.loads((tmp_path / "out" / "preflight.json").read_text(encoding="utf-8"))
         assert preflight["satisfied"] is False
         unsatisfied = [row["name"] for row in preflight["checks"] if not row["satisfied"]]
         assert "estimator_seam" in unsatisfied
+        # The seam requirements themselves are met on the declared configuration,
+        # so the block above is the missing process and nothing else.
+        assert "localization_mode" not in unsatisfied
+        assert "bridge_truth_republish" not in unsatisfied
 
     def test_module_registers_the_dispatch_command(self):
         parser = build_parser()
@@ -417,3 +451,118 @@ class TestRefusals:
             if isinstance(action, argparse._SubParsersAction)
         )
         assert "localize-check" in subparsers.choices
+
+# ---------------------------------------------------------------------------
+# T5: the bridge's truth republish, machine-checked (plan section 4.6)
+# ---------------------------------------------------------------------------
+
+
+class TestTruthRepublishGate:
+    """The reviewer's recorded residual, as a checked behaviour.
+
+    Run 59d7c6e3 left one hole: "the bridge's truth-republish-off was asserted in
+    prose, not machine-checked". These tests read the switch's actual value from the
+    settings the bridge is built from, and the vehicle's own readback, so a claimed
+    arm cannot start on a promise.
+    """
+
+    def test_the_default_configuration_still_republishes_truth(self):
+        """No localization section is the configuration the P00 gate was measured on:
+        the vision feed runs, and the run declares simulator-interface."""
+        document = _declared_document()
+        document.pop("localization")
+        settings = PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert settings.truth_republish is True
+        assert settings.sensor_mode is SensorMode.SIMULATOR_INTERFACE
+
+    def test_the_sensor_derived_configuration_turns_the_truth_republish_off(self):
+        document = _declared_document()
+        settings = PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert document["localization"]["mode"] == "sensor-derived"
+        assert settings.truth_republish is False
+        assert settings.sensor_mode is SensorMode.SENSOR_DERIVED
+
+    def test_the_preflight_passes_the_gate_on_the_declared_configuration(self, tmp_path):
+        rows, _satisfied = check._preflight(
+            check._load_localization_config(Path("configs/first_indoor.yaml")),
+            tmp_path,
+            SensorMode.SENSOR_DERIVED,
+        )
+        rows = {row["name"]: row for row in rows}
+        assert rows["localization_mode"]["satisfied"] is True
+        assert rows["bridge_truth_republish"]["satisfied"] is True
+
+    def test_the_gate_refuses_while_the_truth_republish_is_on(self, tmp_path):
+        """A bridge that would republish truth cannot start a scored sensor-derived
+        arm, and the blocker names the switch rather than the symptom."""
+        settings = PlatformSettings.from_config(
+            _declared_document(), root=Path(".").resolve()
+        )
+        blockers = check._truth_republish_blockers(replace(settings, truth_republish=True))
+        assert blockers and "truth republish is ON" in blockers[0]
+
+        rows, satisfied = check._preflight(
+            check._load_localization_config(_config_declaring(tmp_path, "pose-assisted")),
+            tmp_path,
+            SensorMode.SENSOR_DERIVED,
+        )
+        rows = {row["name"]: row for row in rows}
+        assert satisfied is False
+        assert rows["localization_mode"]["satisfied"] is False
+        assert rows["bridge_truth_republish"]["satisfied"] is False
+        assert "truth republish is ON" in rows["bridge_truth_republish"]["detail"]
+
+    def test_a_gps_type_readback_that_is_not_zero_fails_the_claimed_arm(self):
+        """GPS off is confirmed from the vehicle's own readback, not from the file we
+        wrote: the synthesized GPS is simulator-truth-derived."""
+        declared = {name: expected for name, expected, _source in check.SEAM_REQUIREMENTS}
+        assert check._readback_blockers(declared) == []
+
+        with_gps = dict(declared, GPS_TYPE=1.0)
+        blockers = check._readback_blockers(with_gps)
+        assert blockers and "GPS_TYPE" in blockers[0]
+
+        unanswered = {name: value for name, value in declared.items() if name != "GPS_TYPE"}
+        assert "GPS_TYPE" in check._readback_blockers(unanswered)[0]
+
+    def test_the_declared_switch_is_read_by_the_bridge_it_configures(self):
+        """The value the gate reads is the value the bridge's own loader produces, so
+        a future edit cannot make the gate agree with a bridge that does not exist."""
+        from embodied.platform import webots_ardupilot as bridge
+
+        document = _declared_document()
+        settings = bridge.PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert settings.truth_republish is False
+        # And with the switch on, the feed is the one the gate refuses.
+        assert bridge.VISION_POSE_PERIOD_S == 0.025
+
+    def test_a_slow_estimator_is_not_a_lost_connection(self, tmp_path):
+        """A full send buffer must apply backpressure, not end the stream.
+
+        Measured 2026-09-26 in the first live sensor-derived run: the client's socket
+        was non-blocking, so writing a 614 KB stereo pair into a busy estimator raised
+        EAGAIN, which the client read as a dead link. It stopped the health machine
+        after 1061 inertial samples and no pair ever reached the estimator.
+        """
+        import socket
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            client = loc.OvStreamClient("127.0.0.1", port, timeout_s=2.0)
+            client.connect()
+            # Blocking writes: the feed waits rather than dropping or dying.
+            assert client._socket.gettimeout() is None
+            # Silence is not death: a poll with nothing to read reports nothing.
+            assert client.poll_state() is None
+            client.send(loc.encode_imu(1, (0.0, 0.0, 0.0), (0.0, 0.0, -9.81)))
+            peer, _address = listener.accept()
+            try:
+                assert peer.recv(1 << 16)  # the frame did leave
+            finally:
+                peer.close()
+            client.close()
+        finally:
+            listener.close()
