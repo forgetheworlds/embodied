@@ -28,9 +28,63 @@ import yaml
 from embodied.cli import CommandError, build_parser
 from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
+from embodied.platform import webots_ardupilot as bridge
 from embodied.platform import localization_check as check
 from embodied.platform.webots_ardupilot import EvidenceWriter as bridge_EvidenceWriter
 from embodied.platform.webots_ardupilot import PlatformSettings
+
+
+class _RecordedMessage:
+    """The minimum pymavlink message surface the bring-up link's send path uses."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    def get_type(self) -> str:
+        return self.kind
+
+
+class _RecordingMav:
+    """A stand-in for pymavlink's ``mav`` object that records what was encoded.
+
+    The bring-up link's wire discipline is part of what this slice has to be able to
+    assert -- one channel, every other field ignored, the release a zero on the same
+    field -- and the only honest way to assert it is on the values that reach the
+    encoder. A live autopilot is not part of a unit test, so the encoder records.
+    """
+
+    def __init__(self) -> None:
+        self.encoded: list[tuple[str, tuple]] = []
+        self.sent: list[Any] = []
+
+    def _message(self, kind: str, arguments: tuple) -> _RecordedMessage:
+        self.encoded.append((kind, arguments))
+        return _RecordedMessage(kind)
+
+    def rc_channels_override_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("RC_CHANNELS_OVERRIDE", arguments)
+
+    def command_long_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("COMMAND_LONG", arguments)
+
+    def param_set_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("PARAM_SET", arguments)
+
+    def set_gps_global_origin_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("SET_GPS_GLOBAL_ORIGIN", arguments)
+
+    def send(self, message: Any) -> None:
+        self.sent.append(message)
+
+
+class _RecordingConnection:
+    """A stand-in for a pymavlink connection whose ``mav`` encoder records."""
+
+    def __init__(self) -> None:
+        self.mav = _RecordingMav()
+
+    def close(self) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1540,11 +1594,17 @@ class TestOrderedBringUp:
 
         # Every window parameter is bounded: a window value, a restore value, a reason.
         rows = {row["name"]: row for row in window["parameter_window"]}
-        assert set(rows) == {"ARMING_SKIPCHK", "EK3_SRC1_POSZ"}
+        assert set(rows) == {"ARMING_SKIPCHK", "EK3_SRC1_POSZ", "MOT_IDLE_SEC"}
         assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
         assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
         assert rows["EK3_SRC1_POSZ"]["window_value"] == 1.0  # baro, its own sensor
         assert rows["EK3_SRC1_POSZ"]["restore_value"] == 6.0  # ExternalNav, the seam
+        # The third one is the window's thrust path's other half: the airframe's own
+        # post-arm idle delay holds the motors in ground idle for longer than this
+        # window's whole declared airtime once the spool state is finally asked for.
+        assert rows["MOT_IDLE_SEC"]["window_value"] == 0.0  # the firmware's own default
+        assert rows["MOT_IDLE_SEC"]["restore_value"] == 4.0  # compat_arming.parm's
+        assert "GROUND_IDLE" in rows["MOT_IDLE_SEC"]["why"]
         assert all(row["why"] for row in rows.values())
         # The check no mask can except is named, with what the window does instead.
         assert window["not_exceptable"][0]["check"].startswith("the mandatory altitude")
@@ -1553,7 +1613,18 @@ class TestOrderedBringUp:
         assert {row["name"]: row["value"] for row in window["scored_window_requires"]} == {
             "ARMING_SKIPCHK": 0.0,
             "EK3_SRC1_POSZ": 6.0,
+            "MOT_IDLE_SEC": 4.0,
         }
+
+        # The thrust path is declared as a bounded LOCAL bring-up action, with the
+        # frozen E-EXC climb target and the window's own airtime bound.
+        thrust = window["thrust_path"]
+        assert thrust["kind"] == "bounded_local_bring_up_action"
+        assert "bounded local bring-up action" in thrust["statement"]
+        assert "setpoint" in thrust["statement"]
+        assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.60
+        assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 5.0
+        assert thrust["sent_by_the_scored_arm"] is False
 
         # The excitation stays inside the frozen E-EXC envelope.
         excitation = window["window"]
@@ -1607,3 +1678,180 @@ class TestOrderedBringUp:
         # none to record for this arm.
         assert "truth republish is ON" not in window["justification"]
         assert "truth republish is still off" in window["justification"]
+
+    def test_the_window_may_send_the_bounded_throttle_override(self):
+        """One channel, derived from the vehicle's own numbers, only in this window.
+
+        The declared quantity is the pilot CLIMB RATE the position-free mode
+        consumes -- the physical quantity the window's own airtime bound is about --
+        and the channel value that produces it is derived from the vehicle's own
+        calibration through the firmware's own arithmetic. The wire discipline is
+        asserted beside it: the message carries exactly one channel and leaves every
+        other field at MAVLink's own "ignore this field", the release is a zero on
+        that same channel, and the scored arm's vocabulary has no RC message type in
+        it at all.
+        """
+        settings, window = self._settings_and_window()
+        thrust = window["thrust_path"]
+
+        # Declared, with the citations a reader needs to check it.
+        assert thrust["channel"] == check.RC_THROTTLE_CHANNEL == 3
+        assert thrust["channel_name"] == "throttle"
+        assert thrust["declared_climb_rate_ms"] == check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        assert thrust["max_climb_rate_ms"] == check.BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S
+        assert thrust["refresh_s"] == check.BRING_UP_OVERRIDE_REFRESH_S > 0.0
+        assert "zero" in thrust["release"] and "RC report" in thrust["release"]
+        assert "why_a_rate_rather_than_a_stick" in thrust
+        assert list(check.BRING_UP_THROTTLE_CALIBRATION) == [
+            "RC3_MIN",
+            "RC3_MAX",
+            "RC3_DZ",
+            "THR_DZ",
+            "PILOT_SPD_UP",
+        ]
+        assert sorted(thrust["derived_from_the_vehicle"]) == sorted(
+            check.BRING_UP_THROTTLE_CALIBRATION
+        )
+        assert "mode.cpp" in thrust["why_it_is_needed"]
+        assert "RC_CHANNELS" in thrust["confirmed_by_the_vehicle"]
+
+        # The derivation is the firmware's own arithmetic on the vehicle's own
+        # numbers: at the pinned firmware's defaults (RC3 1100/1900, RC3_DZ 30,
+        # THR_DZ 100 -- ArduCopter/radio.cpp:12-32, config.h:527 -- and
+        # PILOT_SPD_UP 2.5) it reproduces the declared rate, above the deadband.
+        defaults = {
+            "RC3_MIN": 1100.0,
+            "RC3_MAX": 1900.0,
+            "RC3_DZ": 30.0,
+            "THR_DZ": 100.0,
+            "PILOT_SPD_UP": 2.5,
+        }
+        pwm, rate = check._bring_up_throttle_pwm(
+            defaults, check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        # get_control_mid() divides by (radio_max - radio_min - dead_zone), not by the
+        # raw channel span: RC_Channel.cpp:329-340.
+        mid_stick = int(1000 * ((1100 + 1900) // 2 - (1100 + 30)) / (1900 - 1100 - 30))
+        assert mid_stick == 480, "the firmware's own mid stick for this calibration"
+        deadband_top_control = mid_stick + int(defaults["THR_DZ"])
+        deadband_top_pwm = int(
+            (1100 + 30) + (1900 - 1100 - 30) * deadband_top_control / 1000
+        )
+        assert pwm > deadband_top_pwm, "the value must be above the deadband"
+        assert rate == pytest.approx(check.BRING_UP_THROTTLE_CLIMB_RATE_M_S, abs=0.02)
+        assert 0.0 < rate <= check.BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S
+
+        # A calibration that cannot express the rate is refused, never sent: a dead
+        # zone that leaves the channel no range at all, a rate the channel's own span
+        # cannot reach, and a name the vehicle did not answer are all errors rather
+        # than a quieter climb.
+        with pytest.raises(check.ConfigError):
+            check._bring_up_throttle_pwm(
+                {**defaults, "RC3_DZ": 800.0}, check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+            )
+        with pytest.raises(check.ConfigError):
+            check._bring_up_throttle_pwm(defaults, 5.0)
+        with pytest.raises(check.ConfigError):
+            check._bring_up_throttle_pwm(
+                {name: value for name, value in defaults.items() if name != "THR_DZ"},
+                check.BRING_UP_THROTTLE_CLIMB_RATE_M_S,
+            )
+
+        # The wire: exactly one channel, every other field left alone, and the release
+        # is a zero on the same field.
+        link = check.BringUpLink("tcp:127.0.0.1:5763", source_system=255)
+        connection = _RecordingConnection()
+        link._connection = connection  # no live autopilot serves a unit test
+        link.target_system, link.target_component = 1, 1
+        assert link.source_system == 255
+        record = link.send_rc_channels_override(pwm)
+        kind, arguments = connection.mav.encoded[0]
+        assert kind == "RC_CHANNELS_OVERRIDE"
+        assert list(arguments[2:10]) == [
+            0xFFFF,
+            0xFFFF,
+            pwm,
+            0xFFFF,
+            0xFFFF,
+            0xFFFF,
+            0xFFFF,
+            0xFFFF,
+        ]
+        assert all(value == 0 for value in arguments[10:]), "chan9+ are not the throttle"
+        assert record["channel"] == 3 and record["pwm"] == pwm
+        assert record["release"] is False and link.sent == [record]
+        release = link.send_rc_channels_override(check.RC_THROTTLE_RELEASE_PWM)
+        assert release["release"] is True and release["pwm"] == 0
+
+        # The scored arm's own vocabulary carries no RC, throttle or pulse command:
+        # the override's message type is in the bring-up link's set, which the
+        # scored session cannot send from.
+        assert "RC_CHANNELS_OVERRIDE" not in bridge.ALLOWED_OUTBOUND_TYPES
+        assert "RC_CHANNELS_OVERRIDE" in bridge.BRING_UP_OUTBOUND_TYPES
+        assert settings.truth_republish is False
+
+    def test_the_scored_window_refuses_while_the_throttle_override_is_in_force(self):
+        """The thrust path is a window element, so the closure gate covers it too.
+
+        The scored window sends no RC override at all, so a window that still has
+        one is the whole refusal: an override the window never released refuses, a
+        release the vehicle never confirmed refuses (a silent vehicle cannot show
+        that a command stopped), and the vehicle's own RC report still reading the
+        override's value refuses as well. Only the vehicle's own report of the
+        channel back at its radio value clears it, and the parameter rule beside it
+        is unchanged.
+        """
+        settings, window = self._settings_and_window()
+        restored = {
+            row["name"]: row["value"] for row in window["scored_window_requires"]
+        }
+        channel = check.RC_THROTTLE_CHANNEL
+        pwm = 1644
+
+        def state(**overrides):
+            record = {
+                "sent": True,
+                "channel": channel,
+                "sent_pwm": pwm,
+                "released": False,
+                "observed_during_window": pwm,
+                "observed_after_release": None,
+            }
+            record.update(overrides)
+            return record
+
+        # Still in force: the window never released it.
+        blockers = check._bring_up_closure_blockers(dict(restored), state())
+        assert len(blockers) == 1, blockers
+        assert "never released" in blockers[0] and str(pwm) in blockers[0]
+
+        # Released on the wire, but the vehicle never said so: not shown to be lifted.
+        blockers = check._bring_up_closure_blockers(dict(restored), state(released=True))
+        assert len(blockers) == 1, blockers
+        assert "never answered" in blockers[0]
+
+        # The vehicle's own report still reads the override's value: still in force.
+        blockers = check._bring_up_closure_blockers(
+            dict(restored), state(released=True, observed_after_release=pwm)
+        )
+        assert len(blockers) == 1, blockers
+        assert "still reads" in blockers[0] and str(pwm) in blockers[0]
+
+        # The vehicle's own report of the channel back at its radio value: clear.
+        cleared = state(released=True, observed_after_release=1000)
+        assert check._bring_up_closure_blockers(dict(restored), cleared) == []
+        # A window that never sent one has nothing to close, and is not a refusal.
+        assert (
+            check._bring_up_closure_blockers(
+                dict(restored),
+                state(sent=False, sent_pwm=None, observed_during_window=None),
+            )
+            == []
+        )
+        # The override is an addition to the closure, never a replacement for it:
+        # the parameter rule and the silent-readback rule still refuse beside it.
+        assert check._bring_up_closure_blockers({}, cleared)
+        wrong = dict(restored)
+        wrong["MOT_IDLE_SEC"] = 0.0  # the window's value, not the scored arm's
+        assert check._bring_up_closure_blockers(wrong, cleared)
+        assert settings.sensor_mode is SensorMode.SENSOR_DERIVED

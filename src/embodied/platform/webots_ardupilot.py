@@ -33,6 +33,7 @@ can import the framing under whatever interpreter Webots handed it.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import IntEnum
 import json
 import math
@@ -1959,6 +1960,72 @@ ALLOWED_OUTBOUND_TYPES = frozenset(
     }
 )
 
+# The DECLARED ORDERED BRING-UP's own outbound vocabulary (plan sections 0.6 item 6
+# and 0.8 item 7, "Deliverable B"). Four message types, each one a declaration the
+# window makes and the scored arm never makes:
+#
+#   SET_GPS_GLOBAL_ORIGIN  the EKF origin DATUM: the local frame's geographic
+#                          anchor, set once. It carries no vehicle position,
+#                          attitude or velocity, and EKF3 never sets that origin
+#                          from ExternalNav data (AP_NavEKF3_Measurements.cpp:
+#                          680-715) -- only from GPS, a beacon, or this GCS
+#                          declaration (GCS_Common.cpp:3961).
+#   PARAM_SET               the window's parameter writes. Each one is restored,
+#                          and the vehicle's own readback of the restore is what
+#                          lets the scored window open at all
+#                          (`_bring_up_closure_blockers`).
+#   RC_CHANNELS_OVERRIDE    the ONE bounded thrust path (below), one channel
+#                          (throttle), while a declared window is in force only.
+#   COMMAND_LONG            already in ALLOWED_OUTBOUND_TYPES: the window's
+#                          flagged MAV_CMD_NAV_TAKEOFF and its message-interval
+#                          request for the vehicle's own RC report.
+#
+# They are NOT added to ALLOWED_OUTBOUND_TYPES on purpose. That set is the
+# declaration of what the scored arm may put on the wire, and this program's
+# scored arm has no business sending a parameter write, an origin datum or an RC
+# override: widening the shared set would widen exactly that arm, silently. The
+# only object that will send these types is the bring-up link below, which
+# nothing but the declared bring-up constructs -- so the scored window's
+# vocabulary is unchanged by construction, and the compatibility probe, which
+# drives `PymavlinkSession` and its ALLOWED_OUTBOUND_TYPES, cannot be affected.
+BRING_UP_OUTBOUND_TYPES = frozenset(
+    {
+        "SET_GPS_GLOBAL_ORIGIN",
+        "PARAM_SET",
+        "RC_CHANNELS_OVERRIDE",
+    }
+)
+
+# MAV_CMD_NAV_TAKEOFF and its documented param3 flag: "the horizontal position is
+# not required to take off" (common.xml:1005). ALT_HOLD's takeoff is a
+# manual-throttle-mode climb, not a navigation, and without the flag
+# `must_navigate` is true (GCS_Mavlink_Copter.cpp:594) and the mode refuses the
+# user takeoff outright (mode.h:512-514).
+NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED = 1
+
+# The one channel the window's override may touch, and the value that RELEASES it.
+# MAVLink's RC_CHANNELS_OVERRIDE declares UINT16_MAX as "ignore this field" for
+# chan1..chan8 (GCS_Common.cpp:4244-4249 loops only the fields that are not), and a
+# channel value of zero clears that channel's override outright -- ArduPilot stores
+# it as the override and `RC_Channel::has_override()` returns false for a zero
+# (RC_Channel.cpp:557-566). So the window sends one field and leaves the other seven
+# alone, and zero is its release.
+RC_THROTTLE_CHANNEL = 3
+RC_CHANNEL_IGNORED = 0xFFFF
+RC_THROTTLE_RELEASE_PWM = 0
+
+# The message that carries the vehicle's OWN RC input back to the window. The
+# window asks for it (MAV_CMD_SET_MESSAGE_INTERVAL through COMMAND_LONG) and reads
+# `chan3_raw`, which is `rc().get_radio_in(...)` per channel
+# (GCS_Common.cpp:2172-2205 -> RC_Channel::get_radio_in()). That accessor returns
+# the overridden value while an override is in force (RC_Channel.cpp:303-311,
+# `radio_in = override_value`), so the vehicle's own report is what shows the
+# window's override both taking effect and being lifted -- instead of the window
+# asserting, from its own send record, that it must have.
+MSG_ID_RC_CHANNELS = 65
+RC_CHANNELS_THROTTLE_FIELD = "chan3_raw"
+
+
 # How often the vision feed republishes the latest simulator pose. EKF3 rejects
 # external-navigation measurements closer together than 20 ms
 # (AP_NavEKF3.h:516, extNavIntervalMin_ms = 20, pinned commit af85259), so the
@@ -2323,6 +2390,293 @@ class PymavlinkSession:
             self._connection.close()
             self._connection = None
 
+
+# ---------------------------------------------------------------------------
+# The declared ordered bring-up's own link to the autopilot (plan sections 0.6
+# item 6 and 0.8 item 7, Deliverable B)
+# ---------------------------------------------------------------------------
+#
+# This link is the ONLY object in this program that can send the three message
+# types in BRING_UP_OUTBOUND_TYPES, and the declared bring-up is the only thing
+# that constructs it. It lives in this module rather than beside the check because
+# this module is where the project's outbound vocabulary is declared and where the
+# session that owns the scored arm's wire lives; a window-specific link next to the
+# gate that uses it would put the same declaration in two places, and the one that
+# matters is the one a reader of this file finds. `PymavlinkSession` itself is not
+# widened: see the note on BRING_UP_OUTBOUND_TYPES.
+#
+# Every send is recorded as it goes out and every reply the autopilot makes on this
+# link is kept beside it, because the receipt has to state what the window actually
+# declared rather than what it intended: a COMMAND_ACK's result is the vehicle's own
+# answer to the takeoff, a PARAM_VALUE is its answer to a write, and RC_CHANNELS is
+# its answer about the override.
+class BringUpLink:
+    """The declared ordered bring-up's own MAVLink connection to the autopilot.
+
+    The endpoint must be a port the running autopilot actually serves: the pinned
+    SITL accepts one TCP client per serial port, so a port another client owns
+    yields a connection that is accepted and never read. An unanswered heartbeat is
+    therefore a raised error, exactly as the session's is.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        source_system: int = 250,
+        source_component: int = 191,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._endpoint = endpoint
+        # The system id this link speaks as is public because it is a DECLARATION the
+        # window has to be able to compare against the vehicle's own answer: the
+        # firmware drops an RC override from any system id that is not the vehicle's
+        # declared GCS (GCS_Common.cpp:4216-4220), so "which id do we speak as" is
+        # part of the window's evidence rather than an implementation detail.
+        self.source_system = int(source_system)
+        self._source_component = source_component
+        self._clock = clock
+        self._connection: Any = None
+        self._mavutil: Any = None
+        self.target_system = 0
+        self.target_component = 0
+        self.sent: list[dict[str, Any]] = []
+        self.replies: list[dict[str, Any]] = []
+
+    def connect(self, timeout_s: float = 15.0) -> None:
+        try:
+            from pymavlink import mavutil
+        except ImportError as error:  # pragma: no cover - pinned dependency
+            raise ProbeFailure(
+                f"pymavlink is required for the bring-up link: {error}"
+            ) from error
+        self._mavutil = mavutil
+        self._connection = mavutil.mavlink_connection(
+            self._endpoint,
+            source_system=self.source_system,
+            source_component=self._source_component,
+        )
+        if self._connection.wait_heartbeat(timeout=timeout_s) is None:
+            self._connection.close()
+            self._connection = None
+            raise ProbeFailure(
+                f"no MAVLink heartbeat on {self._endpoint} within {timeout_s:.0f}s: the "
+                "autopilot does not serve this link, so the bring-up's declarations "
+                "would be a silent void (the pinned SITL accepts one TCP client per "
+                "serial port)"
+            )
+        self.target_system = self._connection.target_system
+        self.target_component = self._connection.target_component
+
+    def close(self) -> None:
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            finally:
+                self._connection = None
+
+    def _send(self, message: Any, declaration: dict[str, Any]) -> dict[str, Any]:
+        message_type = message.get_type()
+        if message_type not in BRING_UP_OUTBOUND_TYPES | {"COMMAND_LONG"}:
+            raise ProbeFailure(
+                f"refusing to send {message_type} on the bring-up link: the declared "
+                "bring-up carries the origin datum, the window's parameter writes, the "
+                "bounded takeoff and the bounded throttle override, and nothing else"
+            )
+        if self._connection is None:
+            raise ProbeFailure("the bring-up link is not connected")
+        self._connection.mav.send(message)
+        record = {"at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), **declaration}
+        self.sent.append(record)
+        return record
+
+    def declare_origin_datum(
+        self, latitude_deg: float, longitude_deg: float, altitude_m: float
+    ) -> dict[str, Any]:
+        """Declare the local frame's origin once (SET_GPS_GLOBAL_ORIGIN, msgid 48).
+
+        The message carries the frame's geographic anchor and no vehicle state:
+        ArduPilot's handler converts it to a ``Location`` and calls
+        ``set_ekf_origin``, which refuses a re-declaration
+        (``get_origin`` already set -> MAV_RESULT_FAILED), so this is a datum set
+        once per invocation. The altitude is absolute (MSL) and goes on the wire
+        in millimetres, which is the message's declared unit.
+        """
+        message = self._connection.mav.set_gps_global_origin_encode(
+            self.target_system,
+            int(round(latitude_deg * 1e7)),
+            int(round(longitude_deg * 1e7)),
+            int(round(altitude_m * 1e3)),
+            int(round(self._clock() * 1e6)),
+        )
+        return self._send(
+            message,
+            {
+                "message": "SET_GPS_GLOBAL_ORIGIN",
+                "message_id": 48,
+                "latitude_deg": latitude_deg,
+                "longitude_deg": longitude_deg,
+                "altitude_msl_m": altitude_m,
+                "meaning": (
+                    "the local frame's origin datum: a frame definition set once, "
+                    "carrying no vehicle pose"
+                ),
+            },
+        )
+
+    def set_parameter(self, name: str, value: float) -> dict[str, Any]:
+        """Write one parameter (PARAM_SET). The write is verified by readback."""
+        message = self._connection.mav.param_set_encode(
+            self.target_system,
+            self.target_component,
+            name.encode("ascii"),
+            float(value),
+            self._mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+        )
+        return self._send(
+            message, {"message": "PARAM_SET", "name": name, "value": float(value)}
+        )
+
+    def takeoff_without_horizontal_position(self, altitude_m: float) -> dict[str, Any]:
+        """The excitation's takeoff: MAV_CMD_NAV_TAKEOFF with the flag ALT_HOLD needs.
+
+        ``param3 = NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED`` is the
+        documented declaration that the climb is not a navigation
+        (common.xml:1005): it makes ``must_navigate`` false
+        (GCS_Mavlink_Copter.cpp:594), which is what lets a mode that requires no
+        position accept a user takeoff (mode.h:512-514). ``param7`` is the
+        bounded excitation's own altitude.
+        """
+        message = self._connection.mav.command_long_encode(
+            self.target_system,
+            self.target_component,
+            MAV_CMD_NAV_TAKEOFF,
+            0,
+            0.0,
+            0.0,
+            float(NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED),
+            0.0,
+            0.0,
+            0.0,
+            float(altitude_m),
+        )
+        return self._send(
+            message,
+            {
+                "message": "COMMAND_LONG",
+                "command": MAV_CMD_NAV_TAKEOFF,
+                "command_name": "MAV_CMD_NAV_TAKEOFF",
+                "param3": NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED,
+                "param3_meaning": "NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED",
+                "param7_altitude_m": float(altitude_m),
+            },
+        )
+
+    def request_message_interval(self, message_id: int, hz: float) -> dict[str, Any]:
+        """Ask the vehicle for one stream at a rate, on this link (COMMAND_LONG 511).
+
+        The window's use of this is the vehicle's own report of its RC input
+        (``MSG_ID_RC_CHANNELS``): the override's evidence has to be the vehicle's
+        answer rather than this link's send record.
+        """
+        message = self._connection.mav.command_long_encode(
+            self.target_system,
+            self.target_component,
+            MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            float(message_id),
+            float(int(1e6 / hz)) if hz > 0 else -1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+        return self._send(
+            message,
+            {
+                "message": "COMMAND_LONG",
+                "command": MAV_CMD_SET_MESSAGE_INTERVAL,
+                "command_name": "MAV_CMD_SET_MESSAGE_INTERVAL",
+                "message_id": int(message_id),
+                "hz": float(hz),
+            },
+        )
+
+    def send_rc_channels_override(self, pwm: int, *, channel: int = RC_THROTTLE_CHANNEL) -> dict[str, Any]:
+        """The window's ONE bounded thrust path: one RC channel, or its release.
+
+        Exactly one field is set and the other seven carry MAVLink's own "ignore
+        this field" (UINT16_MAX), so this cannot move anything but the channel it
+        names (GCS_Common.cpp:4244-4249). It is a bounded local bring-up action:
+        the vehicle applies it as an RC input, the firmware's own override timeout
+        (RC_OVERRIDE_TIME, 3.0 s) lapses it if it stops being refreshed, and a
+        value of zero releases it immediately (RC_Channel.cpp:557-566).
+        """
+        fields = [RC_CHANNEL_IGNORED] * 8
+        fields[channel - 1] = int(pwm)
+        message = self._connection.mav.rc_channels_override_encode(
+            self.target_system,
+            self.target_component,
+            *fields,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        return self._send(
+            message,
+            {
+                "message": "RC_CHANNELS_OVERRIDE",
+                "channel": channel,
+                "channel_name": "throttle",
+                "pwm": int(pwm),
+                "release": int(pwm) == RC_THROTTLE_RELEASE_PWM,
+                "meaning": (
+                    "a bounded local bring-up action: one RC channel, the pilot "
+                    "throttle the position-free mode needs to leave the ground"
+                ),
+            },
+        )
+
+    def drain(self) -> list[dict[str, Any]]:
+        """Every reply that has arrived since the last call, stamped as it is read."""
+        if self._connection is None:
+            return []
+        arrived: list[dict[str, Any]] = []
+        while len(arrived) < 200:
+            message = self._connection.recv_match(blocking=False)
+            if message is None:
+                break
+            document = message.to_dict()
+            document.setdefault("mavpackettype", message.get_type())
+            document["received_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            arrived.append(document)
+        self.replies.extend(arrived)
+        return arrived
+
+    def command_ack(self, command: int) -> dict[str, Any] | None:
+        """The autopilot's own answer to one command, if it has arrived."""
+        for reply in reversed(self.replies):
+            if reply.get("mavpackettype") == "COMMAND_ACK" and reply.get("command") == command:
+                return reply
+        return None
+
+    def latest_rc_throttle_raw(self) -> int | None:
+        """The vehicle's own last report of its throttle RC input, if it made one."""
+        for reply in reversed(self.replies):
+            if reply.get("mavpackettype") != "RC_CHANNELS":
+                continue
+            value = reply.get(RC_CHANNELS_THROTTLE_FIELD)
+            if value is not None:
+                return int(value)
+        return None
 
 class TcpSensorGateway:
     """The sensor stream client: one loopback connection carries records both ways."""

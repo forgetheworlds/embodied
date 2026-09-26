@@ -484,10 +484,23 @@ int main(int argc, char **argv) {
         }
         sys->feed_measurement_camera(message);
         stereo_frames += 1;
-        if (stereo_frames == 1 || stereo_frames % 25 == 0) {
-          log_line("ov_stream: %llu stereo frames, %llu imu samples, initialized=%d",
+        if (stereo_frames <= 10 || stereo_frames % 25 == 0) {
+          // Diagnostic: the frame's own timestamp, the pixel statistics of what the
+          // tracker was handed, and how many features it is carrying. Without these,
+          // "the estimator gets no visual updates" cannot be told apart from "the
+          // frames arrive stale, repeated, or blank", and all three look alike.
+          double active_time = -1.0;
+          std::unordered_map<size_t, Eigen::Vector3d> positions;
+          std::unordered_map<size_t, Eigen::Vector3d> uvd;
+          sys->get_active_tracks(active_time, positions, uvd);
+          cv::Scalar mean_l, sd_l, mean_r, sd_r;
+          cv::meanStdDev(message.images[0], mean_l, sd_l);
+          cv::meanStdDev(message.images[1], mean_r, sd_r);
+          log_line("ov_stream: %llu stereo frames, %llu imu samples, initialized=%d, "
+                   "frame_t=%.3f, tracks=%zu, left_mean=%.1f, left_sd=%.2f, right_mean=%.1f, right_sd=%.2f",
                    (unsigned long long)stereo_frames, (unsigned long long)imu_samples,
-                   (int)sys->initialized());
+                   (int)sys->initialized(), image_time, uvd.size(),
+                   mean_l[0], sd_l[0], mean_r[0], sd_r[0]);
         }
       } else if (kind == KIND_RESET) {
         // A reset is asked for, never improvised: the old state is abandoned and

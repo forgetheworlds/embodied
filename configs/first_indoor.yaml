@@ -430,6 +430,71 @@ localization:
   #              leaves VISO_TYPE alone and the Check::VISION exception covers
   #              the interval before the adapter's first publication.)
   #
+  #   the window's THROTTLE PATH, and why it is the window's: the baro element
+  #              above answers the ALTITUDE check, and it does not make the
+  #              aircraft move. With GPS off and the estimator unlatched the only
+  #              modes that can arm are the position-free ones, and every one of
+  #              them lifts on the PILOT throttle: a mode that needs a position
+  #              (GUIDED, AUTO, LOITER) cannot arm at all
+  #              (mandatory_position_checks demands position_ok(),
+  #              AP_Arming_Copter.cpp:444-470) and position arrives only from the
+  #              estimator's own publication, which does not exist before the
+  #              estimator latches. MEASURED on the SITL's own dataflash log
+  #              (work/ardupilot/logs/00000070.BIN, the previous session's third
+  #              invocation): RCIN C3 = 1000 (the pilot throttle at its minimum),
+  #              CTUN ThI ramping 0 -> 0.891 (the takeoff routine's own ramp
+  #              running to full), MOTB ThrOut 0.0 and RCOU 1000 (the motors
+  #              never leaving idle), SPOL SplDes 2 only at 15.904 s with Spl 1
+  #              from 15.908 s, LAND at 17.148 s. Two things stood between the
+  #              accepted takeoff and thrust:
+  #                * the pilot climb rate was negative
+  #                  (get_pilot_desired_climb_rate_ms with the RC throttle at
+  #                  minimum, Attitude.cpp:103-105), so the mode's own spool-state
+  #                  branch never asked for THROTTLE_UNLIMITED before the takeoff
+  #                  command arrived (mode.cpp:1047-1055) and the takeoff state
+  #                  itself sets no spool state -- the desired state stayed
+  #                  SHUT_DOWN for the window's first 2.6 s;
+  #                * MOT_IDLE_SEC 4.0 (compat_arming.parm) then held the spool in
+  #                  GROUND_IDLE for four seconds after it WAS asked for
+  #                  (_idle_time_delay_s, AP_MotorsMulticopter.cpp:684,716-719),
+  #                  which is longer than this window's whole declared airtime.
+  #              So the window declares ONE bounded local action and one more
+  #              parameter:
+  #                * the throttle: an RC_CHANNELS_OVERRIDE on RC channel 3
+  #                  (throttle) and on no other channel -- every other field left
+  #                  at MAVLink's own "ignore this field", UINT16_MAX
+  #                  (GCS_Common.cpp:4244-4249) -- for the window's duration only,
+  #                  refreshed every 0.5 s inside the firmware's own 3.0 s
+  #                  override timeout (RC_OVERRIDE_TIME), and RELEASED with a zero
+  #                  on the same channel (zero clears the override outright,
+  #                  RC_Channel.cpp:557-566) with the vehicle's own RC report as
+  #                  the evidence that it took and that it was lifted. What is
+  #                  declared is the pilot CLIMB RATE it must produce, 0.5 m/s
+  #                  (inside the frozen E-EXC envelope: a climb to 0.60 m, no
+  #                  lateral setpoint); the channel value that produces it is
+  #                  DERIVED from the vehicle's own answers for RC3_MIN, RC3_MAX,
+  #                  RC3_DZ, THR_DZ and PILOT_SPD_UP through the firmware's own
+  #                  arithmetic, and the value actually sent is recorded. It is
+  #                  sent AFTER the arm, because arm_checks refuses to arm with a
+  #                  positive pilot climb rate ("Throttle too high",
+  #                  AP_Arming_Copter.cpp:621-635), and BEFORE the takeoff command,
+  #                  because the desired spool state has to be set while the mode
+  #                  is still in its landed branch.
+  #                * MOT_IDLE_SEC: the window value 0 (the firmware's own default)
+  #                  in force for the window only, restored to the airframe's
+  #                  declared 4.0 and read back from the vehicle before the scored
+  #                  window opens. The scored run's guided takeoff depends on that
+  #                  delay (compat_arming.parm, iteration 11), so it is restored
+  #                  exactly like the mask and the height source.
+  #              THIS IS A BOUNDED LOCAL BRING-UP ACTION. It is not a cloud
+  #              command: the cloud still sends intent and the planner still owns
+  #              setpoints, and this message is neither. It is local to the
+  #              bring-up, it lives only while a declared window is in force, it
+  #              cannot outlive the window (the closure gate refuses the scored
+  #              window while it is still in force), the CLAIMED arm sends no RC,
+  #              throttle or pulse command at all, and the connection that owns the
+  #              claimed arm's wire is not the object that can send one.
+  #
   # THE EKF ORIGIN DATUM -- set_ekf_origin, a frame definition, NOT a pose feed.
   #              The window sends SET_GPS_GLOBAL_ORIGIN (msgid 48,
   #              common.xml:5487) with platform.sitl_home, the coordinate this

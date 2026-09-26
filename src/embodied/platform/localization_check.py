@@ -46,7 +46,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from embodied.cli import (
     COMMAND_REGISTRY,
     CONFIG_SCHEMA,
@@ -63,12 +63,17 @@ from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
 from embodied.platform.sensors import SensorSample, capture_latency_ns, sim_time_ns
 from embodied.platform.webots_ardupilot import (
+    BringUpLink,
     EvidenceWriter,
     Kind,
     LocalNedTarget,
+    MAV_CMD_NAV_TAKEOFF,
+    MSG_ID_RC_CHANNELS,
     PlatformSettings,
     PymavlinkSession,
     ProbeFailure,
+    RC_THROTTLE_CHANNEL,
+    RC_THROTTLE_RELEASE_PWM,
     SubprocessRunner,
     TcpSensorGateway,
     WebotsArduPilot,
@@ -96,6 +101,7 @@ SEAM_REQUIREMENTS: tuple[tuple[str, float, str], ...] = (
     ("EK3_SRC1_VELXY", 6.0, "merged compat_ekf.parm"),
     ("EK3_SRC1_POSZ", 6.0, "merged compat_ekf.parm"),
     ("EK3_SRC1_YAW", 6.0, "merged compat_ekf.parm"),
+    ("EK3_SRC1_VELZ", 6.0, "merged compat_ekf.parm"),
     ("VISO_TYPE", 1.0, "merged compat_ekf.parm"),
     ("COMPASS_USE", 0.0, "merged compat_ekf.parm"),
     ("GPS1_TYPE", 0.0, "p01l_sensor.parm"),
@@ -330,6 +336,17 @@ BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE = 6.0  # SourceZ::EXTNAV, the declared seam
 # The seam's own parameter is consequently left alone, and the Check::VISION
 # exception of the mask is what covers the interval before the adapter's first
 # publication -- which is exactly what that exception is for.
+# The window's third parameter, and the reason it is the window's: with the
+# throttle override in force the airframe is spooled to THROTTLE_UNLIMITED as soon
+# as the mode's own state machine sees it, and MOT_IDLE_SEC -- the airframe's
+# declared post-arm idle delay, 4.0 s in compat_arming.parm -- then holds the
+# motors in GROUND_IDLE for longer than this window's whole declared airtime. It
+# is a declared window parameter with a declared restore value because the scored
+# run's guided takeoff needs the delay it was added for.
+BRING_UP_MOTOR_IDLE_PARAMETER = "MOT_IDLE_SEC"
+BRING_UP_MOTOR_IDLE_WINDOW_VALUE = 0.0  # the firmware's own default
+BRING_UP_MOTOR_IDLE_RESTORE_VALUE = 4.0  # compat_arming.parm, iteration 11
+
 BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
     (
         BRING_UP_ARMING_PARAMETER,
@@ -351,7 +368,116 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
         "reference, needed only while the external navigation does not exist yet, "
         "and restored to ExternalNav before the scored window opens",
     ),
+    (
+        BRING_UP_MOTOR_IDLE_PARAMETER,
+        BRING_UP_MOTOR_IDLE_WINDOW_VALUE,
+        BRING_UP_MOTOR_IDLE_RESTORE_VALUE,
+        "the airframe's own post-arm idle delay, and the window's second measured "
+        "impediment: MOT_IDLE_SEC holds the motor library in spool state GROUND_IDLE "
+        "for that long after the desired spool state becomes THROTTLE_UNLIMITED "
+        "(`_idle_time_delay_s`, AP_MotorsMulticopter.cpp:684,716-719), which is "
+        "longer than this window's whole declared airtime. The window sets it to the "
+        "firmware's own default (0) for its duration only, and restores the "
+        "airframe's declared 4.0 before the scored window opens: the scored run's "
+        "guided takeoff needs the delay (compat_arming.parm, iteration 11)",
+    ),
 )
+
+# ---------------------------------------------------------------------------
+# The window's ONE thrust path: the bounded local RC throttle override
+# ---------------------------------------------------------------------------
+#
+# WHY IT EXISTS. With GPS off and the estimator not yet latched, the modes that
+# can arm are the position-free ones, and every one of them lifts only on a PILOT
+# throttle:
+#
+#   * a mode that requires a position estimate (GUIDED, AUTO, LOITER) cannot arm
+#     at all: `mandatory_position_checks` demands `position_ok()`
+#     (AP_Arming_Copter.cpp:444-470) and position arrives only from the
+#     estimator's own external-nav publication, which does not exist before the
+#     estimator latches -- the circle this whole bring-up exists to break;
+#   * the position-free modes lift only through `get_pilot_desired_climb_rate_ms()`
+#     (ArduCopter/Attitude.cpp:74-115), which reads the RC throttle channel.
+#
+# MEASURED, not inferred (SITL dataflash work/ardupilot/logs/00000070.BIN, the
+# third invocation of the previous session):
+#
+#   RCIN C3 = 1000            the pilot throttle sits at its minimum;
+#   CTUN ThI 0.000 -> 0.891   the takeoff routine's own ramp ran to full;
+#   MOTB ThrOut 0.0, RCOU 1000 the motors never left idle;
+#   SPOL 15.904 s SplDes 2, 15.908 s Spl 1, 16.900 s SplDes 1, LAND 17.148 s.
+#
+# So exactly two things stood between an accepted takeoff and thrust:
+#
+#   1. the pilot climb rate was negative, so the mode's own spool-state branch
+#      (`if (target_climb_rate_ms < 0.0f && !using_interlock) GROUND_IDLE else
+#      THROTTLE_UNLIMITED`, ArduCopter/mode.cpp:1047-1055) never asked for
+#      THROTTLE_UNLIMITED before the takeoff command arrived -- and the takeoff
+#      state itself never sets a spool state, so the desired state stayed
+#      SHUT_DOWN (Spl 0) for the first 2.6 s of the window;
+#   2. once it was finally asked for (SplDes 2 at 15.904 s, 2.62 s after the arm),
+#      MOT_IDLE_SEC 4.0 held the spool in GROUND_IDLE past the LAND at 17.148 s.
+#
+# This is the same structural gap the previous session named: the project has
+# never sent an RC, throttle or pulse command (ALLOWED_OUTBOUND_TYPES has none),
+# and no mode that can arm here has any other thrust path. The window therefore
+# declares one, and it is a bounded LOCAL bring-up action: it is not a cloud
+# command, it carries no setpoint, and the rule that the cloud sends intent while
+# the planner owns setpoints is untouched by it. The claimed arm sends none, and
+# the session that owns the claimed arm's wire has no such capability at all
+# (`PymavlinkSession` / ALLOWED_OUTBOUND_TYPES are unchanged; the only object
+# that can send it is the bring-up link).
+#
+# WHAT IS DECLARED IS A CLIMB RATE, NOT A STICK POSITION. The declared quantity is
+# the PILOT CLIMB RATE the override must produce (BRING_UP_THROTTLE_CLIMB_RATE_M_S),
+# because that is the physical quantity the mode consumes and the one the window's
+# own airtime bound is about. The PWM that produces it is DERIVED from the
+# vehicle's own answers -- RC3_MIN/MAX/DZ, THR_DZ and PILOT_SPD_UP, read back from
+# the running vehicle -- through the firmware's own arithmetic
+# (`get_pilot_desired_climb_rate_ms`, Attitude.cpp:98-113: deadband top =
+# get_control_mid() + THR_DZ, and the linear map to PILOT_SPD_UP above it). A
+# hard-coded PWM would silently mean a different rate on any other calibration,
+# which is the same class of defect as a parameter write under a name the vehicle
+# does not have. The PWM actually sent is recorded in the receipt, so the
+# declaration is a rate and the receipt is the measurement.
+BRING_UP_THROTTLE_CLIMB_RATE_M_S = 0.5
+# The rate the window will not exceed: the airframe's declared maximum pilot
+# climb rate is WP_SPD_UP 1.0 m/s (compat_arming.parm), and a rate above it would
+# be a faster climb than any other part of this project commands.
+BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S = 1.0
+# The vehicle's own answers the derivation is made of. Every one of them is read
+# back from the running vehicle before the window flies: nothing about the RC
+# throttle calibration is assumed.
+BRING_UP_THROTTLE_CALIBRATION: tuple[str, ...] = (
+    "RC3_MIN",
+    "RC3_MAX",
+    "RC3_DZ",
+    "THR_DZ",
+    "PILOT_SPD_UP",
+)
+# The firmware's own RC override timeout is 3.0 s (`RC_OVERRIDE_TIME`,
+# RC_Channels_VarInfo.h:90): an override that stops being refreshed lapses. The
+# window refreshes well inside it, and the release is explicit.
+BRING_UP_OVERRIDE_REFRESH_S = 0.5
+# How long the window lets the mode see the override before it commands the
+# takeoff. The override must be in force for at least one mode iteration BEFORE
+# the takeoff command: the takeoff state does not set a spool state, so the
+# desired state has to have become THROTTLE_UNLIMITED first (mode.cpp:1047-1055).
+BRING_UP_OVERRIDE_SETTLE_S = 0.3
+# How long the window waits for the vehicle's own RC report to show the release.
+BRING_UP_OVERRIDE_RELEASE_TIMEOUT_S = 5.0
+# The vehicle's own report of its RC input is requested at this rate: the
+# RC_CHANNELS message carries chan3_raw = the *effective* RC input, override
+# included (GCS_Common.cpp:2172-2205).
+BRING_UP_RC_REPORT_HZ = 5.0
+# The vehicle's own declared GCS system id, read back rather than assumed: the
+# firmware ignores an RC override from any other system id
+# (`sysid_is_gcs`, GCS_Common.cpp:4216-4220 -> GCS.cpp:727-734, whose value is
+# MAV_GCS_SYSID). The window's link speaks as this id, so the override is not a
+# silent void -- the same discipline as the parameter readback, applied to a
+# message the vehicle is entitled to ignore.
+BRING_UP_GCS_SYSTEM_PARAMETER = "MAV_GCS_SYSID"
+BRING_UP_GCS_CONNECT_TIMEOUT_S = 15.0
 # The retry cadence of the window's own arm loop. The bridge's own numbers are
 # module-private (webots_ardupilot.py ARM_SETTLE_S = 1.0, CONTROL_RETRY_S = 5.0)
 # and this loop is the window's, not the claimed arm's, so they are declared
@@ -1469,6 +1595,81 @@ def _sitl_home_origin_datum(sitl_home: str) -> tuple[float, float, float]:
     return (float(match.group(1)), float(match.group(2)), float(match.group(3)))
 
 
+def _bring_up_throttle_pwm(
+    calibration: Mapping[str, float], climb_rate_ms: float
+) -> tuple[int, float]:
+    """The RC throttle PWM that yields ``climb_rate_ms``, from the vehicle's own numbers.
+
+    The arithmetic is the pinned firmware's, not an approximation of it, because the
+    quantity being derived is exactly what the firmware will compute from the value
+    this function returns:
+
+    * ``get_control_mid()`` for a RANGE channel is
+      ``high_in * (mid_radio - radio_trim_low) / (radio_max - radio_trim_low)`` with
+      ``radio_trim_low = radio_min + dead_zone`` (RC_Channel.cpp:329-340) and
+      ``high_in`` 1000 (Copter::init_rc_in calls ``channel_throttle->set_range(1000)``,
+      ArduCopter/radio.cpp:32);
+    * ``pwm_to_range()`` (RC_Channel.cpp) maps a raw value the same way, so the
+      inversion below is the same line rearranged;
+    * above the deadband ``get_pilot_desired_climb_rate_ms`` is
+      ``PILOT_SPD_UP * (throttle_control - deadband_top) / (1000 - deadband_top)``
+      with ``deadband_top = mid_stick + THR_DZ`` (Attitude.cpp:98-113).
+
+    The integer division is mirrored with the same truncation the firmware uses, so
+    the rate reported beside the PWM is the rate the firmware computes rather than
+    the ideal one. A calibration that cannot express the rate inside the channel's
+    own range raises rather than returning a value that means something else.
+    """
+    missing = [name for name in BRING_UP_THROTTLE_CALIBRATION if name not in calibration]
+    if missing:
+        raise ConfigError(
+            "the throttle override's derivation needs the vehicle's own answers for "
+            f"{missing}: the RC throttle calibration decides what a channel value "
+            "means, and this window does not guess it"
+        )
+    radio_min = int(calibration["RC3_MIN"])
+    radio_max = int(calibration["RC3_MAX"])
+    dead_zone = int(calibration["RC3_DZ"])
+    throttle_deadzone = int(calibration["THR_DZ"])
+    speed_up_ms = float(calibration["PILOT_SPD_UP"])
+    range_low = radio_min + dead_zone
+    span = radio_max - range_low
+    if span <= 0:
+        raise ConfigError(
+            f"the throttle channel's own calibration is empty: RC3_MIN {radio_min} + "
+            f"RC3_DZ {dead_zone} leaves no range below RC3_MAX {radio_max}"
+        )
+    mid_stick = int(1000 * ((radio_min + radio_max) // 2 - range_low) / span)
+    deadband_top = mid_stick + throttle_deadzone
+    if speed_up_ms <= 0.0 or deadband_top >= 1000:
+        raise ConfigError(
+            f"the throttle channel cannot express a climb: PILOT_SPD_UP {speed_up_ms} "
+            f"m/s and deadband top {deadband_top} (mid stick {mid_stick} + THR_DZ "
+            f"{throttle_deadzone}) leave no range above the deadband"
+        )
+    target_control_in = int(
+        deadband_top + (1000 - deadband_top) * climb_rate_ms / speed_up_ms
+    )
+    pwm = int(range_low + span * target_control_in / 1000)
+    if pwm > radio_max:
+        raise ConfigError(
+            f"the declared pilot climb rate {climb_rate_ms} m/s needs {pwm} us on "
+            f"channel {RC_THROTTLE_CHANNEL}, above this vehicle's own RC3_MAX "
+            f"{radio_max}: the calibration cannot express it"
+        )
+    measured_control_in = int(1000 * (pwm - range_low) / span)
+    if measured_control_in <= deadband_top:
+        raise ConfigError(
+            f"the derived channel value {pwm} us lands at or below this vehicle's own "
+            f"throttle deadband top {deadband_top}: the declared pilot climb rate "
+            f"{climb_rate_ms} m/s would not be commanded at all"
+        )
+    measured_rate_ms = (
+        speed_up_ms * (measured_control_in - deadband_top) / (1000.0 - deadband_top)
+    )
+    return pwm, measured_rate_ms
+
+
 def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
     """The declared exception window, every element with its citation.
 
@@ -1588,6 +1789,59 @@ def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
             },
         ],
         "justification": BRING_UP_JUSTIFICATION,
+        "thrust_path": {
+            "kind": "bounded_local_bring_up_action",
+            "statement": (
+                "This is a bounded local bring-up action, and the one place in this "
+                "project where a throttle leaves the program: the window sends ONE RC "
+                "throttle channel override (RC_CHANNELS_OVERRIDE, channel "
+                f"{RC_THROTTLE_CHANNEL}) with every other field left at MAVLink's own "
+                "'ignore this field', for this window's declared duration only, and "
+                "releases it before the scored window opens. It is local: the cloud "
+                "still sends intent and the planner still owns setpoints, and nothing "
+                "about this message is a setpoint, a pose or a mode"
+            ),
+            "channel": RC_THROTTLE_CHANNEL,
+            "channel_name": "throttle",
+            "declared_climb_rate_ms": BRING_UP_THROTTLE_CLIMB_RATE_M_S,
+            "max_climb_rate_ms": BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S,
+            "climb_target_m": EXCITATION_TAKEOFF_ALTITUDE_M,
+            "max_airtime_s": EXCITATION_MAX_AIRTIME_S,
+            "refresh_s": BRING_UP_OVERRIDE_REFRESH_S,
+            "release": (
+                "a zero on the same channel (RC_THROTTLE_RELEASE_PWM) clears the "
+                "override outright, and the vehicle's own RC report has to show the "
+                "channel back at its radio value before the scored window opens"
+            ),
+            "derived_from_the_vehicle": list(BRING_UP_THROTTLE_CALIBRATION),
+            "why_a_rate_rather_than_a_stick": (
+                "the quantity the mode consumes is a pilot CLIMB RATE "
+                "(get_pilot_desired_climb_rate_ms, Attitude.cpp:74-115), and the "
+                "channel value that produces it depends on this vehicle's own RC "
+                "calibration and deadbands; the PWM is derived from the vehicle's "
+                "readback of RC3_MIN/RC3_MAX/RC3_DZ/THR_DZ/PILOT_SPD_UP and the "
+                "derivation is recorded with the value actually sent"
+            ),
+            "why_it_is_needed": (
+                "with GPS off and the estimator unlatched, a mode that needs a "
+                "position cannot arm (mandatory_position_checks, AP_Arming_Copter.cpp:"
+                "444-470) and the position-free modes lift only on a pilot throttle; "
+                "measured on work/ardupilot/logs/00000070.BIN the pilot throttle sat "
+                "at its minimum (RCIN C3 1000), so the pilot climb rate was negative "
+                "and the mode never asked for THROTTLE_UNLIMITED (SPOL Spl 0 for the "
+                "window's first 2.6 s; mode.cpp:1047-1055), then MOT_IDLE_SEC 4.0 held "
+                "the spool in GROUND_IDLE past the LAND"
+            ),
+            "confirmed_by_the_vehicle": (
+                "the window asks the vehicle for RC_CHANNELS "
+                f"(msgid {MSG_ID_RC_CHANNELS}) through COMMAND_LONG 511 and reads "
+                "chan3_raw, which is rc().get_radio_in() per channel "
+                "(GCS_Common.cpp:2172-2205) and therefore carries the override value "
+                "while one is in force: the vehicle's own report is the evidence that "
+                "the override took and that it was lifted, not this link's send record"
+            ),
+            "sent_by_the_scored_arm": False,
+        },
         "scored_window_requires": [
             {
                 "name": name,
@@ -1599,7 +1853,9 @@ def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
     }
 
 
-def _bring_up_closure_blockers(applied: dict[str, float]) -> list[str]:
+def _bring_up_closure_blockers(
+    applied: dict[str, float], rc_override: dict[str, Any] | None = None
+) -> list[str]:
     """Whether the exception window is fully closed, from the vehicle's own answer.
 
     The window is bounded in two ways and this is the second one: not only is it
@@ -1609,6 +1865,15 @@ def _bring_up_closure_blockers(applied: dict[str, float]) -> list[str]:
     one the vehicle did not answer at all -- refuses the arm. A silent readback
     confirms nothing, so it is a refusal rather than a pass, exactly as the
     claimed arm's own readback treats it.
+
+    The RC throttle override is judged the same way and on the same rule, with the
+    vehicle's own answer as the evidence: ``rc_override`` is the window's record of
+    what the vehicle reported about its own RC input -- ``sent``, ``released`` and
+    ``observed_after_release``. An override the window declared and never released
+    is in force; an override whose release the vehicle did not confirm is not shown
+    to be lifted; and a window that declared an override but has no vehicle answer
+    at all is a refusal, because a silent vehicle cannot show that a command it
+    never acknowledged has stopped.
     """
     blockers: list[str] = []
     for name, window_value, restore_value, _why in BRING_UP_WINDOW_PARAMETERS:
@@ -1630,6 +1895,36 @@ def _bring_up_closure_blockers(applied: dict[str, float]) -> list[str]:
                 f"{name} read back as {applied[name]:g} after the bring-up window; the "
                 f"scored arm's declared value is {restore_value:g}"
             )
+    if rc_override is None:
+        return blockers
+    channel = rc_override.get("channel", RC_THROTTLE_CHANNEL)
+    sent_pwm = rc_override.get("sent_pwm")
+    if not rc_override.get("sent"):
+        return blockers
+    if not rc_override.get("released"):
+        blockers.append(
+            f"the bring-up window's RC throttle override (channel {channel}, "
+            f"{sent_pwm} us) was never released: the window's thrust path is still in "
+            "force at the claimed arm, and the scored window sends no RC override, so "
+            "it does not open on a window that has one"
+        )
+        return blockers
+    observed = rc_override.get("observed_after_release")
+    if observed is None:
+        blockers.append(
+            "the bring-up window's RC throttle override was released on the wire, but "
+            "the vehicle never answered with its own RC input (RC_CHANNELS chan"
+            f"{channel}_raw) after the release: a silent vehicle cannot show that the "
+            "override stopped, and the scored window does not open on an override the "
+            "vehicle's own report still has to deny"
+        )
+    elif sent_pwm is not None and int(observed) == int(sent_pwm):
+        blockers.append(
+            f"the vehicle's own RC report still reads {observed} us on channel "
+            f"{channel} -- the bring-up window's override value -- after the window "
+            "released it, so the override is still in force and the scored window does "
+            "not open"
+        )
     return blockers
 # ---------------------------------------------------------------------------
 # Preflight: everything the claimed arm needs, reported in one pass
@@ -2244,7 +2539,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         blockers.extend(gps["blockers"])
         return blockers
 
-    bring_up_link: loc.BringUpLink | None = None
+    bring_up_link: BringUpLink | None = None
     bring_up: dict[str, Any] = {}
     try:
         platform.start()
@@ -2257,22 +2552,52 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         publisher.retarget(feed_endpoint)
         log_lines.append(f"adapter publish endpoint: {feed_endpoint}")
         # The ordered bring-up's own link, on a port of its own (the pinned SITL
-        # serves one client per serial port): the origin datum and the window's
-        # parameter writes are not message types the bridge's session sends, and
-        # widening that session's allowlist would widen what the SCORED arm can
-        # put on the wire.
+        # serves one client per serial port): the origin datum, the window's
+        # parameter writes and the window's one bounded throttle override are not
+        # message types the bridge's session sends, and widening that session's
+        # allowlist would widen what the SCORED arm can put on the wire.
         bring_up_endpoint = _autopilot_feed_endpoint(
             writer.path("sitl.log"),
             settings.mavlink_endpoint,
             already_taken=(feed_endpoint,),
         )
-        bring_up_link = loc.BringUpLink(bring_up_endpoint)
-        try:
-            bring_up_link.connect()
-            log_lines.append(f"ordered bring-up endpoint: {bring_up_endpoint}")
-        except RuntimeError as error:
-            live_blockers.append(f"the ordered bring-up's link is unavailable: {error}")
-            log_lines.append(f"UNRESOLVED: {error}")
+        # The link speaks as the vehicle's OWN declared GCS system id, read back
+        # here rather than assumed: the firmware ignores an RC channel override
+        # from any system id other than its own GCS (`sysid_is_gcs`,
+        # GCS_Common.cpp:4216-4220 -> GCS.cpp:727-734), and the window's thrust
+        # path is exactly that message. Asking first means the window cannot be a
+        # silent void: a vehicle that does not answer this gets no bring-up link
+        # and the window is not attempted at all.
+        bring_up_system_id = platform.read_parameters(
+            (BRING_UP_GCS_SYSTEM_PARAMETER,),
+            timeout_s=PARAMETER_READ_TIMEOUT_S,
+            drain=drain,
+        ).get(BRING_UP_GCS_SYSTEM_PARAMETER)
+        if bring_up_system_id is None:
+            system_reason = (
+                f"the vehicle did not answer {BRING_UP_GCS_SYSTEM_PARAMETER}: the "
+                "ordered bring-up's thrust path is an RC channel override, and "
+                "handle_rc_channels_override drops one from any system id that is not "
+                "the vehicle's own declared GCS (GCS_Common.cpp:4216-4220), so a link "
+                "built on a guessed id would be a silent void"
+            )
+            live_blockers.append(system_reason)
+            log_lines.append(f"UNRESOLVED: {system_reason}")
+        else:
+            bring_up_link = BringUpLink(
+                bring_up_endpoint, source_system=int(bring_up_system_id)
+            )
+            try:
+                bring_up_link.connect(timeout_s=BRING_UP_GCS_CONNECT_TIMEOUT_S)
+                log_lines.append(
+                    f"ordered bring-up endpoint: {bring_up_endpoint} as system id "
+                    f"{int(bring_up_system_id)}"
+                )
+            except (RuntimeError, ProbeFailure) as error:
+                live_blockers.append(
+                    f"the ordered bring-up's link is unavailable: {error}"
+                )
+                log_lines.append(f"UNRESOLVED: {error}")
         platform.request_telemetry_streams()
         # G4 needs the vehicle's own GPS status during the run, so the two status
         # streams are requested through the session's existing interval path; every
@@ -2356,11 +2681,35 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             else:
                 machine.open_window(time.monotonic_ns())
                 scored_window_open = True
+                lost_guided = False
                 for index, waypoint in enumerate(settings.waypoints_local_ned, start=1):
-                    platform.send_local_ned(LocalNedTarget(*waypoint))
-                    log_lines.append(f"waypoint {index} commanded at local-NED {waypoint}")
+                    if lost_guided:
+                        break
+                    target = tuple(waypoint)
+                    log_lines.append(f"waypoint {index} commanded at local-NED {target}")
                     hold_end = time.monotonic() + settings.hold_per_waypoint_s
                     while time.monotonic() < hold_end:
+                        # Keep the stream alive while holding: a guided target lapses
+                        # inside the autopilot, so one publication per waypoint would
+                        # hold nothing. The deadline is how long each sample stays
+                        # valid, and the platform's own probe re-sends for exactly
+                        # this reason (webots_ardupilot.py:5109-5120).
+                        sent = platform.send_local_ned(
+                            LocalNedTarget(
+                                position_ned=target,
+                                velocity_ned=(0.0, 0.0, 0.0),
+                                yaw_rad=None,
+                                deadline_s=settings.hold_per_waypoint_s,
+                                certificate_ref=None,
+                            )
+                        )
+                        if sent is None:
+                            live_blockers.append(
+                                f"Guided flight was lost while holding waypoint {index} at "
+                                f"local-NED {target}"
+                            )
+                            lost_guided = True
+                            break
                         drain()
                         time.sleep(0.05)
                     sample_disagreement(f"hold-{index}")
@@ -2526,7 +2875,7 @@ def _run_ordered_bring_up(
     settings: PlatformSettings,
     platform: WebotsArduPilot,
     session: PymavlinkSession,
-    link: loc.BringUpLink,
+    link: BringUpLink,
     writer: EvidenceWriter,
     drain: Callable[[], None],
     log_lines: list[str],
@@ -2538,16 +2887,19 @@ def _run_ordered_bring_up(
     first, because without it the aircraft has no home and the claimed arm would
     be refused however well the estimator did. Then the exception window's own
     parameter writes, each verified by the vehicle's readback before anything
-    moves. Then the bounded excitation -- ALT_HOLD, the flagged takeoff, the climb
-    inside E-EXC's envelope, LAND always. Then the restoration, verified by the
-    same readback, and the closure check that refuses the scored arm while any
-    window value is still in force.
+    moves. Then the window's ONE thrust path -- a bounded RC throttle override,
+    after the arm and before the takeoff command, so the position-free mode has a
+    pilot climb rate to leave the ground on -- and the bounded excitation:
+    ALT_HOLD, the flagged takeoff, the climb inside E-EXC's envelope, LAND always.
+    Then the override's release, the restoration of every parameter, both verified
+    by the same vehicle readbacks, and the closure check that refuses the scored
+    arm while any window element is still in force.
 
     Nothing here publishes to the autopilot's external-navigation source and
-    nothing here supplies a pose: the window's only outputs are a frame datum, two
-    parameter writes with their restores, and one bounded climb. The estimator's
-    feed, and the adapter that publishes its state, are the ones the scored arm
-    already had.
+    nothing here supplies a pose: the window's only outputs are a frame datum, a
+    bounded set of parameter writes with their restores, one bounded RC throttle
+    override with its release, and one bounded climb. The estimator's feed, and
+    the adapter that publishes its state, are the ones the scored arm already had.
 
     Returns the window's record. ``record["blockers"]`` carries anything that
     stopped it; the caller must not open the scored window with a non-empty list.
@@ -2565,6 +2917,33 @@ def _run_ordered_bring_up(
         "completed": False,
     }
     blockers: list[str] = record["blockers"]
+    # The window's ONE thrust path, recorded as what the VEHICLE answered rather
+    # than as what this link sent: the values the derivation was made of, the PWM
+    # that went out, what the vehicle's own RC report showed while the override was
+    # in force, and what it showed after the release. The closure gate reads this
+    # object and nothing else about the override.
+    override: dict[str, Any] = {
+        "declared_climb_rate_ms": BRING_UP_THROTTLE_CLIMB_RATE_M_S,
+        "channel": RC_THROTTLE_CHANNEL,
+        "channel_name": "throttle",
+        "refresh_s": BRING_UP_OVERRIDE_REFRESH_S,
+        "calibration": {},
+        "calibration_observations": [],
+        "gcs_system_id": None,
+        "link_source_system": None,
+        "sent_pwm": None,
+        "measured_climb_rate_ms": None,
+        "sent": False,
+        "sent_at_utc": None,
+        "refreshes": 0,
+        "last_refresh_monotonic": None,
+        "observed_during_window": None,
+        "observed_after_release": None,
+        "released": False,
+        "released_at_utc": None,
+        "confirmed_at_utc": None,
+    }
+    record["throttle_override"] = override
     log_lines.append(
         "ordered bring-up (plan sections 0.6 item 6, 0.8 item 7): "
         f"{BRING_UP_MODE} excitation to {EXCITATION_TAKEOFF_ALTITUDE_M} m, no lateral "
@@ -2648,6 +3027,79 @@ def _run_ordered_bring_up(
         for name in names:
             record["sent"].append(link.set_parameter(name, values[name]))
 
+    def read_vehicle_answers(
+        wanted: Sequence[str],
+    ) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        """Ask the vehicle for each name and wait for its own answers, then stop.
+
+        The same discipline as the window's parameter readback, and for the same
+        reason: the numbers the throttle derivation is made of are this vehicle's
+        own calibration, so they are asked for now and read from the vehicle's own
+        PARAM_VALUE answers. A name the vehicle does not answer stays absent, is
+        recorded as absent, and is named by the caller -- an assumed RC calibration
+        is the same class of defect as a parameter write under a name the vehicle
+        does not have.
+        """
+        reported: dict[str, float] = {}
+        observations: list[dict[str, Any]] = []
+        for name in wanted:
+            session.request_parameter(name)
+        deadline = time.monotonic() + PARAMETER_READ_TIMEOUT_S
+        while True:
+            drain()
+            link.drain()
+            reported.update(platform.telemetry().parameters)
+            snapshot = {name: reported.get(name) for name in wanted}
+            if not observations or observations[-1]["values"] != snapshot:
+                observations.append(
+                    {
+                        "at_utc": datetime.now(timezone.utc).isoformat(
+                            timespec="milliseconds"
+                        ),
+                        "values": snapshot,
+                    }
+                )
+            if all(name in reported for name in wanted) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        return reported, observations
+
+    def refresh_override() -> None:
+        """Keep the window's throttle override alive while the window is open.
+
+        The firmware's own override timeout is 3.0 s (``RC_OVERRIDE_TIME``,
+        RC_Channels_VarInfo.h:90), so an override that stops being refreshed is
+        lapsed by the vehicle itself. The window re-sends it well inside that, and
+        only while the window is open: ``released`` ends the sequence, and nothing
+        in this program sends another.
+        """
+        if not override["sent"] or override["released"] or override["sent_pwm"] is None:
+            return
+        now = time.monotonic()
+        last = override["last_refresh_monotonic"]
+        if last is not None and now - last < BRING_UP_OVERRIDE_REFRESH_S:
+            return
+        override["last_refresh_monotonic"] = now
+        record["sent"].append(link.send_rc_channels_override(int(override["sent_pwm"])))
+        override["refreshes"] += 1
+
+    def note_vehicle_rc_report() -> int | None:
+        """File the vehicle's own latest report of its throttle RC input.
+
+        ``RC_CHANNELS.chan3_raw`` is ``rc().get_radio_in()`` for the throttle
+        channel (GCS_Common.cpp:2172-2205), which is the OVERRIDDEN value while an
+        override is in force (RC_Channel.cpp:303-311), so this is the vehicle's own
+        statement about the window's thrust path: what it reads while the window is
+        open, and what it reads after the window releases it.
+        """
+        observed = link.latest_rc_throttle_raw()
+        if observed is not None:
+            if override["released"]:
+                override["observed_after_release"] = observed
+            else:
+                override["observed_during_window"] = observed
+        return observed
+
     window_values = {name: window_value for name, window_value, _r, _w in BRING_UP_WINDOW_PARAMETERS}
     restore_values = {name: restore_value for name, _w, restore_value, _r in BRING_UP_WINDOW_PARAMETERS}
 
@@ -2668,6 +3120,80 @@ def _run_ordered_bring_up(
                     f"{window_value:g}, so the aircraft would move under checks this run "
                     "has not declared"
                 )
+
+    # 2b. The window's ONE thrust path, decided from the vehicle's own numbers
+    # BEFORE anything moves: the RC throttle calibration the PWM is derived from,
+    # and the GCS system id the firmware requires an override to come from.
+    if not blockers:
+        answers, observations = read_vehicle_answers(
+            (*BRING_UP_THROTTLE_CALIBRATION, BRING_UP_GCS_SYSTEM_PARAMETER)
+        )
+        override["calibration_observations"] = observations
+        override["calibration"] = {
+            name: answers.get(name) for name in BRING_UP_THROTTLE_CALIBRATION
+        }
+        override["gcs_system_id"] = answers.get(BRING_UP_GCS_SYSTEM_PARAMETER)
+        override["link_source_system"] = link.source_system
+        silent = [
+            name
+            for name in (*BRING_UP_THROTTLE_CALIBRATION, BRING_UP_GCS_SYSTEM_PARAMETER)
+            if name not in answers
+        ]
+        if silent:
+            blockers.append(
+                f"the vehicle did not answer {silent}: the window's throttle override "
+                "is derived from the vehicle's own RC calibration and is only accepted "
+                "from its own declared GCS system id, so a window that has neither "
+                "would send a value that means something else, or a value the vehicle "
+                "ignores (sysid_is_gcs, GCS_Common.cpp:4216-4220)"
+            )
+        elif override["link_source_system"] != int(override["gcs_system_id"]):
+            blockers.append(
+                f"the bring-up link speaks as system id {override['link_source_system']} "
+                f"and this vehicle's own {BRING_UP_GCS_SYSTEM_PARAMETER} is "
+                f"{int(override['gcs_system_id'])}: handle_rc_channels_override drops an "
+                "override from any system id that is not the vehicle's GCS "
+                "(GCS_Common.cpp:4216-4220 -> sysid_is_gcs, GCS.cpp:727-734), so the "
+                "window's thrust path would be a silent void"
+            )
+        else:
+            try:
+                pwm, measured_rate_ms = _bring_up_throttle_pwm(
+                    {name: answers[name] for name in BRING_UP_THROTTLE_CALIBRATION},
+                    BRING_UP_THROTTLE_CLIMB_RATE_M_S,
+                )
+            except ConfigError as error:
+                blockers.append(
+                    "the bring-up window's throttle override cannot be expressed on "
+                    f"this vehicle: {error}"
+                )
+            else:
+                override["sent_pwm"] = pwm
+                override["measured_climb_rate_ms"] = round(measured_rate_ms, 4)
+                if not (0.0 < measured_rate_ms <= BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S):
+                    blockers.append(
+                        f"the derived throttle value {pwm} us yields a pilot climb rate "
+                        f"of {measured_rate_ms:.3f} m/s from the vehicle's own "
+                        f"calibration, outside the declared band (0, "
+                        f"{BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S:g}] m/s: the window "
+                        "would either not leave the ground or climb faster than its "
+                        "declared envelope allows"
+                    )
+        record["sent"].append(
+            link.request_message_interval(MSG_ID_RC_CHANNELS, BRING_UP_RC_REPORT_HZ)
+        )
+        log_lines.append(
+            "bring-up thrust path: "
+            + (
+                f"channel {RC_THROTTLE_CHANNEL} override {override['sent_pwm']} us for a "
+                f"declared pilot climb rate of {override['measured_climb_rate_ms']} m/s "
+                f"(derived from {override['calibration']}, "
+                f"GCS system {override['gcs_system_id']}), refreshed every "
+                f"{BRING_UP_OVERRIDE_REFRESH_S} s and released at LAND"
+                if override["sent_pwm"] is not None
+                else "no override (see the blockers below)"
+            )
+        )
 
     flight: dict[str, Any] = record["flight"]
     # The window's own motor evidence: the airframe's PWM outputs as the vehicle
@@ -2726,6 +3252,35 @@ def _run_ordered_bring_up(
         flight["mode"] = sample.mode_name
         flight["pairs_fed_at_arm"] = stats.pairs
         flight["imu_fed_at_arm"] = stats.imu_samples
+        # The window's ONE thrust path goes on here, and the order is the point:
+        #
+        #   * AFTER the arm, because `arm_checks` refuses to arm with a positive
+        #     pilot climb rate -- "Throttle too high" (AP_Arming_Copter.cpp:621-635)
+        #     -- and the arm loop above retries, so an override in force during a
+        #     retry would refuse every attempt;
+        #   * BEFORE the takeoff command, because the takeoff state does not set a
+        #     spool state at all: `get_alt_hold_state_D_ms` (mode.cpp:1042-1055)
+        #     only reaches the branch that asks for THROTTLE_UNLIMITED while the
+        #     mode is still landed and the pilot climb rate is not negative, and
+        #     with the takeoff already running that branch is never reached (the
+        #     measured SPOL trace: SplDes stayed SHUT_DOWN for 2.6 s of the window).
+        #     `takeoff.triggered_ms` also requires the spool state to BE
+        #     THROTTLE_UNLIMITED (mode.cpp:607-622), which is the other reason the
+        #     desired state has to be set first.
+        if override["sent_pwm"] is not None:
+            record["sent"].append(
+                link.send_rc_channels_override(int(override["sent_pwm"]))
+            )
+            override["sent"] = True
+            override["sent_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+            settle_until = time.monotonic() + BRING_UP_OVERRIDE_SETTLE_S
+            while time.monotonic() < settle_until:
+                drain()
+                link.drain()
+                note_vehicle_rc_report()
+                time.sleep(0.05)
         record["sent"].append(
             link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
         )
@@ -2737,7 +3292,9 @@ def _run_ordered_bring_up(
         while time.monotonic() < ack_deadline and ack is None:
             drain()
             link.drain()
-            ack = link.command_ack(loc.MAV_CMD_NAV_TAKEOFF)
+            refresh_override()
+            note_vehicle_rc_report()
+            ack = link.command_ack(MAV_CMD_NAV_TAKEOFF)
             time.sleep(0.05)
         flight["takeoff_command_ack"] = ack
         if ack is None:
@@ -2756,6 +3313,9 @@ def _run_ordered_bring_up(
         climb_deadline = time.monotonic() + EXCITATION_CLIMB_DRAIN_S
         while time.monotonic() < climb_deadline:
             drain()
+            link.drain()
+            refresh_override()
+            note_vehicle_rc_report()
             sample_motion()
             if max_altitude_m >= (
                 EXCITATION_TAKEOFF_ALTITUDE_M - EXCITATION_ALTITUDE_REACHED_MARGIN_M
@@ -2775,16 +3335,43 @@ def _run_ordered_bring_up(
         )
         flight["pairs_fed_at_land"] = stats.pairs
         flight["imu_fed_at_land"] = stats.imu_samples
+        # The window's thrust path ends here, with the window. The release is an
+        # explicit zero on the same channel, and what settles it is the vehicle's
+        # own RC report: the descent drain below keeps reading chan3_raw, and the
+        # closure gate refuses the scored window while that answer is still the
+        # override's value.
+        if override["sent"]:
+            record["sent"].append(link.send_rc_channels_override(RC_THROTTLE_RELEASE_PWM))
+            override["released"] = True
+            override["released_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
         descent_deadline = time.monotonic() + EXCITATION_POST_LAND_DRAIN_S
         while time.monotonic() < descent_deadline:
             drain()
+            link.drain()
+            note_vehicle_rc_report()
             sample_motion()
             time.sleep(0.05)
+        if override["observed_after_release"] is not None:
+            override["confirmed_at_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
         flight["max_altitude_readback_m"] = round(max_altitude_m, 3)
         flight["motor_output_max_pwm"] = motors["max_pwm"]
         flight["motor_output_samples"] = motors["samples"]
         flight["mode_after_window"] = sample.mode_name
         flight["armed_after_window"] = sample.armed
+        if override["sent"] and override["observed_during_window"] != override["sent_pwm"]:
+            blockers.append(
+                "the window's throttle override never took effect: the vehicle's own RC "
+                f"report read {override['observed_during_window']} us on channel "
+                f"{RC_THROTTLE_CHANNEL} while the window sent "
+                f"{override['sent_pwm']} us, so the excitation had no thrust path at "
+                "all. The firmware ignores an RC override whose source system id is not "
+                "the vehicle's own declared GCS (GCS_Common.cpp:4216-4220), and the "
+                "vehicle's own RC report is what says whether it accepted this one"
+            )
         if max_altitude_m < 0.10:
             blockers.append(
                 f"the excitation produced no measured motion: max altitude readback "
@@ -2802,7 +3389,7 @@ def _run_ordered_bring_up(
         restore_readback, observations = readback(names, restore_values)
         record["readback_observations"]["restored"] = observations
         record["readbacks"]["restored"] = {name: restore_readback.get(name) for name in names}
-        closure = _bring_up_closure_blockers(restore_readback)
+        closure = _bring_up_closure_blockers(restore_readback, override)
         record["closure_blockers"] = closure
         blockers.extend(closure)
         # The seam's own source set, read back after the window: the claimed arm's
@@ -2817,6 +3404,31 @@ def _run_ordered_bring_up(
             "vehicle's own readback before the claimed arm). Baro supplied no horizontal "
             "position, no attitude and no velocity, and no truth reached the estimator"
         )
+        # The one line the receipt owes a reader about the thrust path, stated in
+        # the same place as the height source it sits beside.
+        record["throttle_statement"] = (
+            "the bring-up sent a bounded local throttle: ONE RC channel override "
+            f"(channel {override['channel']}, {override['sent_pwm']} us, a declared "
+            f"pilot climb rate of {override['declared_climb_rate_ms']:g} m/s) while the "
+            "declared window was in force, refreshed and then released, with the "
+            "vehicle's own RC report as the evidence that it took and that it was "
+            "lifted; the CLAIMED arm sends none -- it issues no RC, throttle or pulse "
+            "command at all, and the session that owns its wire carries no such "
+            "capability"
+        )
+        record["window_parameters_in_force"] = {
+            "start": record.get("window_opened_at_utc"),
+            "end": record.get("window_closed_at_utc"),
+            "parameters": {
+                name: {
+                    "window": window_readback.get(name),
+                    "restore": restore_readback.get(name),
+                    "declared_window_value": window_value,
+                    "declared_restore_value": restore_value,
+                }
+                for name, window_value, restore_value, _why in BRING_UP_WINDOW_PARAMETERS
+            },
+        }
         seam_expected = {
             name: expected
             for name, expected, _source in SEAM_REQUIREMENTS
@@ -2860,6 +3472,10 @@ def _run_ordered_bring_up(
         f"refusals={record.get('refusals', [])}, "
         f"max altitude readback {record['flight'].get('max_altitude_readback_m')} m, "
         f"land delay {record['flight'].get('land_command_delay_s')} s, "
+        f"throttle override {record['throttle_override']['sent_pwm']} us, "
+        f"released={record['throttle_override']['released']}, vehicle RC report "
+        f"{record['throttle_override']['observed_during_window']} -> "
+        f"{record['throttle_override']['observed_after_release']}, "
         f"window readback {record['readbacks'].get('window')}, "
         f"restored readback {record['readbacks'].get('restored')}"
     )
@@ -2893,8 +3509,12 @@ def _bring_up_manifest(record: dict[str, Any]) -> dict[str, Any]:
         "window_opened_at_utc": record.get("window_opened_at_utc"),
         "window_closed_at_utc": record.get("window_closed_at_utc"),
         "height_source_statement": record.get("height_source_statement"),
+        "throttle_statement": record.get("throttle_statement"),
+        "throttle_override": record.get("throttle_override", {}),
+        "window_parameters_in_force": record.get("window_parameters_in_force", {}),
         "blockers": list(record["blockers"]),
     }
+
 # ---------------------------------------------------------------------------
 # E1-DIAG: the live pose-assisted diagnostic (plan sections 0.6 item 7, 0.7, 0.8)
 # ---------------------------------------------------------------------------

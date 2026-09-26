@@ -35,6 +35,15 @@ EK3_SRC1_POSXY 6
 EK3_SRC1_VELXY 6
 EK3_SRC1_POSZ 6
 EK3_SRC1_YAW 6
+# VELZ is the fifth source field, and it was the one left at its firmware default
+# (GPS, 3) while the other four were set for this arm. The pre-arm check walks
+# EVERY source set and a GPS value anywhere sets gps_required
+# (libraries/AP_NavEKF/AP_NavEKF_Source.cpp:447-452), which is then refused when
+# the vehicle has no GPS at all (:515 "EK3 sources require GPS"). Harmless while
+# the gate ran with GPS present, and fatal the moment the sensor-derived arm
+# disables it (GPS1_TYPE/GPS2_TYPE 0 in p01l_sensor.parm). Set to ExternalNav
+# like its siblings so no source set asks for a sensor this arm does not have.
+EK3_SRC1_VELZ 6
 # ExternalNav yaw aligns and fuses from the pose quaternion while stationary
 # (AP_NavEKF3_MagFusion.cpp:481-486: alignYawAngle then fuseEulerYaw(EXTNAV)), so
 # no compass is needed at any point - unlike GPS yaw, which needs motion, and
