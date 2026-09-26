@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" font-family="Helvetica, Arial, sans-serif">
+<title>Waypoint tracking residuals, two consecutive passing runs</title>
+<rect width="880" height="420" fill="white"/>
+<text x="66" y="26" font-size="15" font-weight="bold" fill="#111827">Waypoint tracking residuals — the two consecutive passing runs</text>
+<line x1="66" y1="330.0" x2="864" y2="330.0" stroke="#e5e7eb"/>
+<text x="60" y="334.0" font-size="11" fill="#374151" text-anchor="end">0</text>
+<line x1="66" y1="259.0" x2="864" y2="259.0" stroke="#e5e7eb"/>
+<text x="60" y="263.0" font-size="11" fill="#374151" text-anchor="end">1</text>
+<line x1="66" y1="188.0" x2="864" y2="188.0" stroke="#e5e7eb"/>
+<text x="60" y="192.0" font-size="11" fill="#374151" text-anchor="end">2</text>
+<line x1="66" y1="117.0" x2="864" y2="117.0" stroke="#e5e7eb"/>
+<text x="60" y="121.0" font-size="11" fill="#374151" text-anchor="end">3</text>
+<line x1="66" y1="46.0" x2="864" y2="46.0" stroke="#e5e7eb"/>
+<text x="60" y="50.0" font-size="11" fill="#374151" text-anchor="end">4</text>
+<rect x="66" y="46" width="798" height="284" fill="none" stroke="#9ca3af"/>
+<text x="14" y="188" font-size="12" fill="#374151" text-anchor="middle" transform="rotate(-90 14 188)">tracking residual at hold deadline (cm)</text>
+<rect x="90.0" y="104.5" width="60" height="225.5" fill="#1d4ed8"/>
+<text x="120.0" y="99.5" font-size="11" fill="#374151" text-anchor="middle">3.2</text>
+<rect x="164.0" y="187.5" width="60" height="142.5" fill="#93c5fd"/>
+<text x="194.0" y="182.5" font-size="11" fill="#374151" text-anchor="middle">2.0</text>
+<text x="157.0" y="348" font-size="11" fill="#374151" text-anchor="middle">extnav-it3 a</text>
+<rect x="280.0" y="138.3" width="60" height="191.7" fill="#1d4ed8"/>
+<text x="310.0" y="133.3" font-size="11" fill="#374151" text-anchor="middle">2.7</text>
+<rect x="354.0" y="188.3" width="60" height="141.7" fill="#93c5fd"/>
+<text x="384.0" y="183.3" font-size="11" fill="#374151" text-anchor="middle">2.0</text>
+<text x="347.0" y="348" font-size="11" fill="#374151" text-anchor="middle">extnav-it3 b</text>
+<rect x="470.0" y="104.7" width="60" height="225.3" fill="#1d4ed8"/>
+<text x="500.0" y="99.7" font-size="11" fill="#374151" text-anchor="middle">3.2</text>
+<rect x="544.0" y="201.0" width="60" height="129.0" fill="#93c5fd"/>
+<text x="574.0" y="196.0" font-size="11" fill="#374151" text-anchor="middle">1.8</text>
+<text x="537.0" y="348" font-size="11" fill="#374151" text-anchor="middle">extnav-it4 a</text>
+<rect x="660.0" y="102.7" width="60" height="227.3" fill="#1d4ed8"/>
+<text x="690.0" y="97.7" font-size="11" fill="#374151" text-anchor="middle">3.2</text>
+<rect x="734.0" y="187.3" width="60" height="142.7" fill="#93c5fd"/>
+<text x="764.0" y="182.3" font-size="11" fill="#374151" text-anchor="middle">2.0</text>
+<text x="727.0" y="348" font-size="11" fill="#374151" text-anchor="middle">extnav-it4 b</text>
+<rect x="76" y="50" width="196" height="40" fill="white" fill-opacity="0.9" stroke="#e5e7eb"/>
+<rect x="84" y="53" width="12" height="12" fill="#1d4ed8"/>
+<text x="102" y="64" font-size="11" fill="#374151">waypoint 1  (2, 0, 0) m</text>
+<rect x="84" y="69" width="12" height="12" fill="#93c5fd"/>
+<text x="102" y="80" font-size="11" fill="#374151">waypoint 2  (2, 1, 0) m</text>
+<text x="66" y="374" font-size="11" fill="#7f1d1d">Same probe with the failed configuration (accept-mission-12, run-a): 255.0 cm and 241.5 cm — off this scale; the aircraft crashed and disarmed before the holds.</text>
+<text x="66" y="410" font-size="12" fill="#374151">Bars are cm; every value is the tracking_residual_m field of the named run’s motion.jsonl.</text>
+</svg>
