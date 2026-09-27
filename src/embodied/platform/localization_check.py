@@ -2782,19 +2782,34 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     sample_disagreement(f"hold-{index}")
                 log_lines.append("route complete; commanding LAND")
                 session.set_mode("LAND")
+                # The FLIGHT ends here, at the LAND command. The freshness metrics --
+                # F1's publish gaps and F2's published-state age -- stop being recorded,
+                # because the bound protects the control loop WHILE FLYING and this is
+                # the moment flying stops. Owner's ruling: takeoff and landing are
+                # low-speed phases where pose age does not matter. The takeoff is
+                # already outside the window (it opens after arm_and_guided returns).
+                # The excluded span is real but is not flight: measured, run
+                # p01l-fix7a-20260927T172100Z, the 27 publications after this point
+                # carried ONE frozen state (t=53.940) for 274 ms while the vehicle sat
+                # parked and disarmed -- the adapter running out its own declared 300 ms
+                # silence watchdog -- and those 27 rows were the entirety of F2's
+                # 0.056 s max. In flight the same run's F2 max was 0.021 s. E1/H1/H2 keep
+                # the declared arm-to-disarm window untouched: only the freshness
+                # accounting ends at the flight's end, so the descent and landing are
+                # still judged for accuracy.
+                machine.mark_flight_end(time.monotonic_ns())
                 drain_deadline = time.monotonic() + 5.0
                 while time.monotonic() < drain_deadline:
                     drain()
                     time.sleep(0.005)
-                # The flight sequence is over, so the scored window is closed here and
-                # not at process exit. The window is declared arm to disarm, and the
-                # vehicle has already disarmed; everything after this point is the
-                # harness stopping Webots and SITL, during which the adapter has no input
-                # left to publish. Measured, run p01l-zupt5-20260927T042005Z: the adapter
-                # republished one frozen state 332 times over 10.13 s of that shutdown --
-                # 32 % of the scored window, every one of them scored against a truth
-                # sample that was equally frozen -- so E1's p95 came out exactly equal to
-                # its max, which is the signature that was read as a constant bias.
+                # The scored window is declared arm to disarm, and the vehicle has
+                # disarmed by the time the sequence is over; everything after this is
+                # the harness stopping Webots and SITL. Measured, run
+                # p01l-zupt5-20260927T042005Z: the adapter republished one frozen state
+                # 332 times over 10.13 s of that shutdown -- 32 % of the window, every
+                # one of them scored against a truth sample that was equally frozen --
+                # so E1's p95 came out exactly equal to its max, the signature that was
+                # read as a constant bias.
                 scored_window_open = False
                 machine.close_window(time.monotonic_ns())
     except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows

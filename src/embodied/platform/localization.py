@@ -510,6 +510,12 @@ class HealthMachine:
         self._window_open_wall_ns: int | None = None
         self._window_closed_wall_ns: int | None = None
         self._stopped_at_wall_ns: int | None = None
+        # The FLIGHT's end, distinct from the window's end. The scored window is declared
+        # arm to disarm and governs E1/H1/H2; the freshness metrics stop earlier, at the
+        # LAND command, because the owner's ruling is that the bound protects the control
+        # loop WHILE FLYING and that takeoff and landing are low-speed phases where pose
+        # age does not matter.
+        self._flight_end_wall_ns: int | None = None
         self.state_at_close: str | None = None
 
     def on_state(self, state: EstimatorState | None, now_wall_ns: int) -> bool:
@@ -573,6 +579,7 @@ class HealthMachine:
         self._window_open_wall_ns = now_wall_ns
         self._window_closed_wall_ns = None
         self.state_at_close = None
+        self._flight_end_wall_ns = None
         self._last_publish_wall_ns = None
         self.publish_gaps_s = []
         self.published_state_ages_s = []
@@ -599,6 +606,23 @@ class HealthMachine:
         # shutdown and H2/H4 read `stopped` at process exit.
         self.state_at_close = self.state
 
+
+    def mark_flight_end(self, now_wall_ns: int) -> None:
+        """End the FLIGHT. Earlier than the window's end, and only the freshness metrics.
+
+        The LAND command is where flying stops, so F1's gaps, F2's ages and F3's gaps
+        stop being recorded there. E1/H1/H2 keep the declared arm-to-disarm window: the
+        descent and landing are still judged for accuracy, and only pose AGE stops being
+        judged once the aircraft is coming down. Measured, run
+        p01l-fix7a-20260927T172100Z: the 27 publications after LAND carried ONE frozen
+        state (t=53.940) for 274 ms while the vehicle sat parked and disarmed -- the
+        adapter running out its own declared 300 ms silence watchdog -- and those 27 rows
+        were the entirety of F2's 0.056 s max. In flight the same run's F2 max was
+        0.021 s.
+        """
+        if self._window_open_wall_ns is None or now_wall_ns < self._window_open_wall_ns:
+            return
+        self._flight_end_wall_ns = now_wall_ns
     def _window_end_wall_ns(self, now_wall_ns: int) -> int:
         """The window's end: now, or the close, whichever came first."""
         if self._window_closed_wall_ns is None:
@@ -620,7 +644,10 @@ class HealthMachine:
         tail was 100 % of the run's F2 failure. H1's ``valid_fraction`` already ends
         at ``_window_end_wall_ns``; F2/F3 now do too.
         """
-        if self._window_closed_wall_ns is not None and now_wall_ns > self._window_closed_wall_ns:
+        end = self._window_end_wall_ns(now_wall_ns)
+        if self._flight_end_wall_ns is not None:
+            end = min(end, self._flight_end_wall_ns)
+        if now_wall_ns > end:
             return
         if self._last_publish_wall_ns is not None:
             self.publish_gaps_s.append((now_wall_ns - self._last_publish_wall_ns) / 1e9)
