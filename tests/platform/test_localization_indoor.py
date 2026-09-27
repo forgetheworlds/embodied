@@ -729,6 +729,7 @@ class TestHealthMachine:
         machine's silence path takes over.
         """
         machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        machine.open_window(1_000_000_000)
         now = [100.0]
         publisher = loc.ExternalNavPublisher(
             "tcp:127.0.0.1:5762",
@@ -755,6 +756,33 @@ class TestHealthMachine:
         # The recovery: the clock advances again, and transmission resumes.
         now[0] += 1.0
         publisher.offer(_state(time_ns=3_000_000_000), 3_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+    def test_a_parked_frozen_clock_does_not_stop_publication(self):
+        """Before the flight is declared, a frozen clock does not stop transmission.
+
+        The same reason the parked sigma excursion is benign: the vehicle is parked,
+        a stale-but-correct pose is harmless, and a publication stop starves the
+        firmware's VISO health window and refuses the arm (FIXER6 runs
+        p01l-fixer6-1/-2/-6, refused with 'VisOdom: not healthy' / 'Need Alt
+        Estimate'). The flight-side gate is unchanged: the window's declaration turns
+        it on (pinned above).
+        """
+        machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        publisher.offer(_state(time_ns=1_000_000_000), 1_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        now[0] += 0.100
+        publisher.offer(_state(time_ns=1_000_000_000), 1_600_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        now[0] += 1.000
+        publisher.offer(_state(time_ns=1_000_000_000), 3_000_000_000)
         assert publisher.state_for_publish(now[0] + 0.001) is not None
 
 

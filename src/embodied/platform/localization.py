@@ -606,6 +606,18 @@ class HealthMachine:
         self._stopped_at_wall_ns = now_wall_ns
         self.events.append(HealthEvent(now_wall_ns, "stopped", detail))
 
+    @property
+    def window_declared(self) -> bool:
+        """Whether the flight has been declared (``open_window`` has been called).
+
+        The publish gate's freshness bounds protect the control loop in flight; before
+        the declaration the vehicle is parked through the bring-up and the pre-arm wait,
+        where a stale-but-correct pose is harmless and a publication stop starves the
+        firmware's VISO health window and refuses the arm (FIXER6: runs
+        p01l-fixer6-1/-2/-6).
+        """
+        return self._window_declared
+
     def open_window(self, now_wall_ns: int) -> None:
         """Start the scored window (arm to disarm), discarding bring-up accounting."""
         self._window_open_wall_ns = now_wall_ns
@@ -936,7 +948,8 @@ class ExternalNavPublisher:
             self._clock_seen_ns = self._latest.time_ns
             self._clock_first_seen_s = now_s
         elif (
-            self._clock_first_seen_s is not None
+            self._machine.window_declared
+            and self._clock_first_seen_s is not None
             and now_s - self._clock_first_seen_s
             > self._machine.bounds.state_lost_after_s
         ):
