@@ -644,28 +644,6 @@ ATTITUDE_GATE_TOLERANCE_DEG = 5.0
 # to catch.
 PAIR_QUEUE_FRAMES = 16
 
-# The newest a stereo pair may be, behind the newest inertial sample already fed, and
-# still be delivered to the estimator. A pair is ~614 KB on one ordered, blocking TCP
-# connection shared with the 500 Hz inertial stream, so a pair delivered late is not
-# merely useless: the bytes sit in front of the inertial samples behind it, and under a
-# host stall the whole feed -- images, inertial samples, and the estimator's state
-# stream -- freezes together until the backlog drains. The estimator then publishes a
-# pose frozen at the last accepted image (its projection refuses, its sigma reads 0.0,
-# the health machine stops) while the vehicle keeps flying, and when the backlog clears
-# the pose steps to reality in one tick. Measured across the FIXER6 paired runs: the
-# four mid-air tumbles (p01l-fix5c/-5d/-7c/-flightscope-20260927) each began 0.5-1.5 s
-# after a 0.4-0.7 m vision-pose step delivered mid-climb, 1.9-11 s after liftoff, never
-# at a waypoint hold; the estimator's own pose was accurate whenever frames flowed
-# (published vision within ~0.2 m of the EKF through the ground phase and after the
-# thaw), so the defect is the stale delivery, not the filter. Dropping the pair instead
-# of delivering it late keeps the connection clear (the inertial samples and the state
-# stream keep flowing, and ov_stream's IMU-only projection keeps publishing a pose that
-# MOVES with the vehicle while its sigma grows honestly), and it enforces the declared
-# visual-update bounds at the input: 300 ms is visual_update_warn_ms, three camera
-# periods, so a dropped pair is one the F3 accounting was about to flag anyway. The
-# count is reported, never silent: it is the measured size of the stall it prevented.
-PAIR_MAX_LAG_S = 0.300
-
 # How long one parameter readback waits for the autopilot's own answer. A local SITL
 # answers in well under a second; this is generous enough that an answer would have to
 # be absent rather than slow, which is the distinction the gate depends on.
@@ -2191,11 +2169,6 @@ class _FeedStats:
         # between "the stream carried no pairs" and "the feed was too slow".
         self.pair_records_filed = 0
         self.pair_records_dropped = 0
-        # Pairs dropped at the drain for being older than PAIR_MAX_LAG_S behind the
-        # newest inertial sample already fed: delivered late they would freeze the
-        # ordered feed behind their bytes (see PAIR_MAX_LAG_S); dropped they leave the
-        # estimator an honest gap it bridges on inertial samples alone.
-        self.pairs_dropped_stale = 0
 
 
 def _start_estimator(estimator: dict[str, Any], root: Path, writer: EvidenceWriter):
@@ -2508,23 +2481,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 # The metadata stream is momentarily empty, so the inertial samples
                 # either side of a queued image have been fed: the sink's pairs can go
                 # now, which keeps every image behind the IMU that must precede it.
-                # A pair older than PAIR_MAX_LAG_S behind those inertial samples is
-                # dropped here rather than sent: its bytes would block the one shared
-                # connection in front of the live inertial stream, and its late fusion
-                # is the stale-pose-then-step that tumbled four flights mid-climb
-                # (see PAIR_MAX_LAG_S). The estimator bridges the gap on inertial
-                # samples, which is the declared behaviour for a degraded camera.
                 try:
                     while True:
-                        record = pending_pairs.get_nowait()
-                        if (
-                            stats.newest_imu_ns > 0
-                            and sim_time_ns(record.sim_time_s) + int(PAIR_MAX_LAG_S * 1e9)
-                            < stats.newest_imu_ns
-                        ):
-                            stats.pairs_dropped_stale += 1
-                            continue
-                        feed_record(record)
+                        feed_record(pending_pairs.get_nowait())
                 except queue.Empty:
                     pass
                 except loc.ProtocolError as error:
@@ -2878,8 +2837,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             f"pairs fed: {stats.pairs}, imu samples fed: {stats.imu_samples}, "
             f"truth pose samples read: {len(stats.truth_samples)}",
             f"pair records the reader filed with pixels: {stats.pair_records_filed}, "
-            f"dropped by a full feed queue: {stats.pair_records_dropped}, "
-            f"dropped stale at the drain: {stats.pairs_dropped_stale}",
+            f"dropped by a full feed queue: {stats.pair_records_dropped}",
             f"published: {publisher.published}, health at the scored window's end: "
             f"{machine.state_at_close or machine.state} (at process exit {machine.state}), "
             f"valid fraction: {valid_fraction:.4f}, adapter resets: {machine.reset_counter}",
@@ -2916,7 +2874,6 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "gps_aiding_blockers": gps_aiding["blockers"],
                 "pairs_filed": stats.pair_records_filed,
                 "pairs_fed": stats.pairs,
-                "pairs_dropped_stale": stats.pairs_dropped_stale,
                 "imu_samples_fed": stats.imu_samples,
                 "published": publisher.published,
                 "shutdown": {"exits": shutdown.exits},
@@ -2960,7 +2917,6 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         "truth_samples_read": len(stats.truth_samples),
         "pairs_filed": stats.pair_records_filed,
         "pairs_fed": stats.pairs,
-        "pairs_dropped_stale": stats.pairs_dropped_stale,
         "imu_samples_fed": stats.imu_samples,
         "published": publisher.published,
         "scored_publications": len(published_states),
