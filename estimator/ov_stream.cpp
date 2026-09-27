@@ -128,7 +128,7 @@ const size_t FRAME_LENGTH_OFFSET = 4;
 const double IMU_PERIOD_NS = 2e6;      // declared 500 Hz (configs/first_indoor.yaml:73)
 const double STEREO_PERIOD_NS = 1e8;   // declared 10 Hz (:65)
 const size_t STATE_PAYLOAD_SIZE = 8 + 1 + 19 * 8 + 4 + 8 + 1;  // "<QB19dIQB"
-const double PUBLISH_PERIOD_S = 0.025; // the seam's proven cadence (F1)
+const double PUBLISH_PERIOD_S = 0.010; // 100 Hz: F2's 20 ms age bound is unreachable on 25 ms ticks (FIXER5-REPORT)
 
 struct Reader {
   int fd = -1;

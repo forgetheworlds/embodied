@@ -6,8 +6,10 @@ fixed odom-to-local-NED alignment (specification section 6.3), and the
 health/freshness state machine that decides whether an estimate may be
 published at all (plan sections 4.5 and 6). Publishing rides the same
 ExternalNav discipline the P00 gate proved: ``VISION_POSITION_ESTIMATE`` and
-``VISION_SPEED_ESTIMATE`` at a 25 ms cadence on the adapter's own MAVLink
+``VISION_SPEED_ESTIMATE`` at a 10 ms cadence on the adapter's own MAVLink
 connection — never commanded by this process, never fed simulator truth.
+(25 ms until FIXER5: F2's 20 ms published-state-age bound is unreachable when
+both publish ticks are a slot and a quarter wide; see FIXER5-REPORT.md.)
 
 The estimator process receives exactly what the declared sensors carry — stereo
 pairs converted to grayscale and inertial samples — stamped in simulator time,
@@ -740,12 +742,24 @@ class OvStreamClient:
 
 
 def publish_period_s() -> float:
-    """The proven seam cadence: 25 ms, inside the filter's 20 ms minimum."""
-    return 0.025
+    """The seam cadence: 10 ms (100 Hz).
+
+    25 ms until FIXER5. The declared F2 bound (published-state age max 20 ms,
+    configs/first_indoor.yaml localization.bounds) is smaller than one 25 ms
+    publish slot on each side of the seam, so no implementation could meet it;
+    10 ms on both this tick and ov_stream's PUBLISH_PERIOD_S puts the floor at
+    one slot per side. EKF3 still fuses external navigation at most every
+    20 ms (AP_NavEKF3.h:516, extNavIntervalMin_ms) — faster sends are dropped
+    silently at the EKF's writeExtNavData gate, while the vision-position
+    health window (AP_VisualOdom_Backend.cpp:32-35) is a 300 ms timeout and is
+    unaffected. The declared localization.publish.period_ms carries the same
+    10 ms.
+    """
+    return 0.010
 
 
 class ExternalNavPublisher:
-    """Publishes the aligned estimator state to SITL at the proven cadence.
+    """Publishes the aligned estimator state to SITL at the seam's 10 ms cadence.
 
     Two message types on the adapter's own MAVLink TCP connection — the gate's
     discipline (ALLOWED_OUTBOUND_TYPES, VISION_POSE_PERIOD_S = 0.025 at the
