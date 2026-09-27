@@ -273,7 +273,10 @@ calibration:
 #   published_state_age_max_ms  20 ms behind the newest consumed IMU sample:
 #                         two IMU periods; propagation must keep up with the
 #                         stream, not lag it (F2).
-#   max_publish_gap_ms    100 ms: four missed 25 ms slots (F3); beyond this the
+#   max_publish_gap_ms    100 ms: ten missed 10 ms slots (F3; four slots at the
+#                         25 ms period this was declared with — the period was
+#                         raised to 10 ms for F2's floor, FIXER5-REPORT.md, and
+#                         this 100 ms bound is untouched); beyond this the
 #                         firmware's 300 ms health window is one skipped beat
 #                         from tripping.
 #   visual_update_warn/fail_ms  300/500 ms: three camera periods at warn; IMU-
@@ -547,7 +550,14 @@ localization:
     executable: estimator/ov_stream
     socket_port: 9021
   publish:
-    period_ms: 25
+    # Declared publish period of the estimator seam (ov_stream's STATE tick and
+    # the adapter's VISION_POSITION_ESTIMATE tick share it). 25 ms until
+    # FIXER5: F2's published_state_age_max_ms 20 is smaller than one 25 ms slot
+    # on either side, so the bound was unreachable at the declared period — an
+    # engineering change to the period, NOT a change to any bound; every bound
+    # below is untouched. This is the retry after db3153f, made after the EKF's
+    # ext-nav fusion delay was measured and corrected (FIXER5-REPORT.md).
+    period_ms: 10
   declared:
     # The EKF's fusion delay for external navigation (AP_VisualOdom::_delay_ms,
     # AP_VisualOdom.cpp:83). 50 ms until FIXER5, tuned when the pose was stale
