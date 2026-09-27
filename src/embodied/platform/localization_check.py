@@ -644,37 +644,26 @@ ATTITUDE_GATE_TOLERANCE_DEG = 5.0
 # to catch.
 PAIR_QUEUE_FRAMES = 16
 
-# The newest a stereo pair may be, behind the newest pair in the same drained batch,
-# and still be delivered to the estimator. A pair is ~614 KB on one ordered, blocking
-# TCP connection shared with the 500 Hz inertial stream, so a BACKLOG of pairs
-# delivered late is not merely useless: the bytes sit in front of the inertial samples
-# and the estimator's own state stream behind them, and under a host stall the whole
-# feed freezes together until the backlog drains. The estimator then publishes a pose
-# frozen at the last accepted image (its projection refuses, its sigma reads 0.0, the
-# health machine stops) while the vehicle keeps flying, and when the backlog clears
+# The newest a stereo pair may be, behind the newest inertial sample already fed, and
+# still be delivered to the estimator. A pair is ~614 KB on one ordered, blocking TCP
+# connection shared with the 500 Hz inertial stream, so a pair delivered late is not
+# merely useless: the bytes sit in front of the inertial samples behind it, and under a
+# host stall the whole feed -- images, inertial samples, and the estimator's state
+# stream -- freezes together until the backlog drains. The estimator then publishes a
+# pose frozen at the last accepted image (its projection refuses, its sigma reads 0.0,
+# the health machine stops) while the vehicle keeps flying, and when the backlog clears
 # the pose steps to reality in one tick. Measured across the FIXER6 paired runs: the
 # four mid-air tumbles (p01l-fix5c/-5d/-7c/-flightscope-20260927) each began 0.5-1.5 s
 # after a 0.4-0.7 m vision-pose step delivered mid-climb, 1.9-11 s after liftoff, never
 # at a waypoint hold; the estimator's own pose was accurate whenever frames flowed
 # (published vision within ~0.2 m of the EKF through the ground phase and after the
-# thaw), so the defect is the stale delivery, not the filter.
-#
-# The reference is the VISION stream's own head -- the newest pair in the batch -- and
-# NOT the newest inertial sample. The wire deliberately carries images behind the
-# inertial head by construction (the reader drains a pair only after the inertial
-# samples that precede it, and at startup it leads by ~1 s: measured, estimator.log
-# frame lines show 1020 inertial samples beside frame 1 and a steady 50 samples per
-# frame thereafter), so a bound against the inertial head drops healthy pairs for ever
-# and starved the estimator until the autopilot refused to arm ("Arm: VisOdom: not
-# healthy", run p01l-fixer6-1-20260927T192118Z: 27 drops, valid fraction 0.54 against
-# the 0.99 of the unfixed runs). Against the batch's own newest pair, a healthy drain
-# (one or two pairs per batch) drops nothing, while a stall's backlog collapses to its
-# freshest 300 ms -- three camera periods, the declared visual_update_warn_ms -- and
-# the estimator bridges the rest on inertial samples, which is the declared behaviour
-# for a degraded camera: ov_stream's IMU-only projection keeps publishing a pose that
-# MOVES with the vehicle while its sigma grows honestly, instead of a frozen pose with
-# healthy-looking sigma that later steps 0.5 m mid-climb. The count is reported, never
-# silent: it is the measured size of the stall it prevented.
+# thaw), so the defect is the stale delivery, not the filter. Dropping the pair instead
+# of delivering it late keeps the connection clear (the inertial samples and the state
+# stream keep flowing, and ov_stream's IMU-only projection keeps publishing a pose that
+# MOVES with the vehicle while its sigma grows honestly), and it enforces the declared
+# visual-update bounds at the input: 300 ms is visual_update_warn_ms, three camera
+# periods, so a dropped pair is one the F3 accounting was about to flag anyway. The
+# count is reported, never silent: it is the measured size of the stall it prevented.
 PAIR_MAX_LAG_S = 0.300
 
 # How long one parameter readback waits for the autopilot's own answer. A local SITL
@@ -2203,14 +2192,10 @@ class _FeedStats:
         self.pair_records_filed = 0
         self.pair_records_dropped = 0
         # Pairs dropped at the drain for being older than PAIR_MAX_LAG_S behind the
-        # newest pair of their own batch: delivered late they would freeze the ordered
-        # feed behind their bytes (see PAIR_MAX_LAG_S); dropped they leave the
+        # newest inertial sample already fed: delivered late they would freeze the
+        # ordered feed behind their bytes (see PAIR_MAX_LAG_S); dropped they leave the
         # estimator an honest gap it bridges on inertial samples alone.
         self.pairs_dropped_stale = 0
-        # The vision stream's own head: the newest pair sim time fed so far. The
-        # staleness bound is measured against this, never against the inertial head,
-        # because the wire carries images behind the inertial stream by construction.
-        self.newest_pair_ns = 0
 
 
 def _start_estimator(estimator: dict[str, Any], root: Path, writer: EvidenceWriter):
@@ -2470,11 +2455,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             right = loc.grayscale_rgb8(
                 pair.right_bytes, settings.stereo.width, settings.stereo.height
             )
-            pair_ns = sim_time_ns(record.sim_time_s)
-            stats.newest_pair_ns = max(stats.newest_pair_ns, pair_ns)
             client.send(
                 loc.encode_stereo(
-                    pair_ns,
+                    sim_time_ns(record.sim_time_s),
                     left,
                     right,
                     settings.stereo.width,
@@ -2525,37 +2508,28 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 # The metadata stream is momentarily empty, so the inertial samples
                 # either side of a queued image have been fed: the sink's pairs can go
                 # now, which keeps every image behind the IMU that must precede it.
-                # A pair older than PAIR_MAX_LAG_S behind the newest pair of its own
-                # batch is dropped here rather than sent: its bytes would block the
-                # one shared connection in front of the live inertial stream, and its
-                # late fusion is the stale-pose-then-step that tumbled four flights
-                # mid-climb (see PAIR_MAX_LAG_S). The reference is the batch's newest
-                # pair, never the inertial head, which legitimately leads the images
-                # by ~1 s by construction. The estimator bridges the gap on inertial
+                # A pair older than PAIR_MAX_LAG_S behind those inertial samples is
+                # dropped here rather than sent: its bytes would block the one shared
+                # connection in front of the live inertial stream, and its late fusion
+                # is the stale-pose-then-step that tumbled four flights mid-climb
+                # (see PAIR_MAX_LAG_S). The estimator bridges the gap on inertial
                 # samples, which is the declared behaviour for a degraded camera.
-                batch: list[Any] = []
                 try:
                     while True:
-                        batch.append(pending_pairs.get_nowait())
+                        record = pending_pairs.get_nowait()
+                        if (
+                            stats.newest_imu_ns > 0
+                            and sim_time_ns(record.sim_time_s) + int(PAIR_MAX_LAG_S * 1e9)
+                            < stats.newest_imu_ns
+                        ):
+                            stats.pairs_dropped_stale += 1
+                            continue
+                        feed_record(record)
                 except queue.Empty:
                     pass
-                if batch:
-                    newest = max(
-                        stats.newest_pair_ns,
-                        max(sim_time_ns(record.sim_time_s) for record in batch),
-                    )
-                    try:
-                        for record in batch:
-                            if (
-                                sim_time_ns(record.sim_time_s) + int(PAIR_MAX_LAG_S * 1e9)
-                                < newest
-                            ):
-                                stats.pairs_dropped_stale += 1
-                                continue
-                            feed_record(record)
-                    except loc.ProtocolError as error:
-                        machine.stop(time.monotonic_ns(), str(error))
-                        return
+                except loc.ProtocolError as error:
+                    machine.stop(time.monotonic_ns(), str(error))
+                    return
                 try:
                     state = client.poll_state()
                 except loc.ProtocolError as error:
