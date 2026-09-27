@@ -7,10 +7,15 @@
 # second receiver is the other route by which a global position could reach the filter.
 GPS1_TYPE 0
 GPS2_TYPE 0
-# Declared pipeline delay (capture->publish, sim time), mid-range of the measured
-# envelope; frozen from the dev-replay measurement before the scored run.
+# The EKF's fusion delay for external navigation (AP_VisualOdom::_delay_ms).
+# 50 ms until FIXER5, tuned when the pose was stale (F2 0.292 s then). Measured
+# from the dataflash VISP records of the clean runs (p01l-fix5b, p01l-fix5): the
+# published pose arrives at SITL p50 2.5-5.7 ms (sim) after its own validity
+# stamp, so 50 ms back-dated every measurement ~45 ms too far in a loop that
+# carries ext-nav yaw. 10 ms is the pin's default (AP_VisualOdom.cpp:83) and sits
+# inside the measured band (p50 3-6 ms, burst tail p90 42-200 ms).
 # Range 0-250 ms (AP_VisualOdom.cpp:77-83).
-VISO_DELAY_MS 50
+VISO_DELAY_MS 10
 # Fusion noise floors, left at firmware defaults and recorded
 # (AP_VisualOdom.cpp:85-105: VEL 0.1 m/s, POS 0.2 m, YAW 0.2 rad).
 # Quality cannot carry -1 on VISION_POSITION_ESTIMATE at af85259

@@ -106,7 +106,10 @@ SEAM_REQUIREMENTS: tuple[tuple[str, float, str], ...] = (
     ("COMPASS_USE", 0.0, "merged compat_ekf.parm"),
     ("GPS1_TYPE", 0.0, "p01l_sensor.parm"),
     ("GPS2_TYPE", 0.0, "p01l_sensor.parm"),
-    ("VISO_DELAY_MS", 50.0, "p01l_sensor.parm"),
+    # Measured, FIXER5: the pose arrives p50 2.5-5.7 ms (sim) after its own validity
+    # stamp, so the EKF's declared fusion delay is the pin's default 10 ms
+    # (AP_VisualOdom.cpp:83), not the 50 ms tuned when the pose was stale.
+    ("VISO_DELAY_MS", 10.0, "p01l_sensor.parm"),
     ("VISO_QUAL_MIN", 0.0, "p01l_sensor.parm"),
     ("FS_EKF_ACTION", 1.0, "p01l_sensor.parm"),
 )
