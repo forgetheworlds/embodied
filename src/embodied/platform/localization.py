@@ -823,6 +823,16 @@ class ExternalNavPublisher:
         covariance[0] = sigma[0] ** 2
         covariance[6] = sigma[1] ** 2
         covariance[11] = sigma[2] ** 2
+        # The reset counter rides the wire as one unsigned byte (MAVLink's
+        # reset_counter field); a run whose health machine cycles stop/recover
+        # more than 255 times overflows it and raises struct.error inside
+        # pymavlink's packer, killing this thread -- measured in run
+        # p01l-fix2l-20260927T033814Z, where the ZUPT defect produced 292
+        # recoveries and the publisher died with "'B' format requires 0 <=
+        # number <= 255". The counter's meaning on the wire is a change
+        # detector, so wrapping it keeps the semantics while making the
+        # transmission impossible to overflow; the machine's own count stays
+        # exact and is what the receipts report.
         self._connection.mav.vision_position_estimate_send(
             usec,
             position[0],
@@ -832,7 +842,7 @@ class ExternalNavPublisher:
             rpy[1],
             rpy[2],
             covariance,
-            self._machine.reset_counter,
+            self._machine.reset_counter % 256,
         )
         self._connection.mav.vision_speed_estimate_send(
             usec, velocity[0], velocity[1], velocity[2]
