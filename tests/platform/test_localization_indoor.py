@@ -561,6 +561,26 @@ class TestHealthMachine:
         assert machine.publish_gaps_s == pytest.approx([0.025], abs=1e-9)
         assert machine.published_state_ages_s == pytest.approx([0.005, 0.030], abs=1e-9)
 
+    def test_publications_after_the_window_close_are_not_scored(self):
+        """F2 and F3 score the flight, not the harness teardown after it.
+
+        Measured, run p01l-fix5-20260927T163256Z: after ``close_window`` the drain
+        loop has exited, no new offer can arrive, and the publisher re-sent the last
+        offered state 28 times at a constant 0.214 s age for 316 ms until its thread
+        stopped — while the flight's own 1878 publications had aged at most ~0.019 s.
+        That teardown tail was 100 % of the run's F2 failure, the same frozen-tail
+        pathology b48b44d removed from E1's accounting; H1's valid_fraction already
+        ends at the window's close.
+        """
+        machine = loc.HealthMachine(_bounds())
+        base = 1_000_000_000
+        machine.open_window(base)
+        machine.on_published(_state(time_ns=base - 5_000_000), base, base)
+        machine.close_window(base + 25_000_000)
+        machine.on_published(_state(time_ns=base - 200_000_000), base + 300_000_000, base)
+        assert machine.published_state_ages_s == pytest.approx([0.005], abs=1e-9)
+        assert machine.publish_gaps_s == []
+
     def test_valid_fraction_charges_outages_whole(self):
         machine = loc.HealthMachine(_bounds(valid_fraction_min=0.99))
         second = 1_000_000_000

@@ -608,7 +608,22 @@ class HealthMachine:
         return min(now_wall_ns, self._window_closed_wall_ns)
 
     def on_published(self, state: EstimatorState, now_wall_ns: int, newest_imu_ns: int) -> None:
-        """Record one publication for the freshness accounting (F2, F3)."""
+        """Record one publication for the freshness accounting (F2, F3).
+
+        Only inside the scored window. Publications after ``close_window`` are the
+        harness's teardown, not the flight: the drain loop has exited, so no new
+        offer can arrive, and the publisher keeps re-sending the last offered state
+        against a frozen newest-IMU stamp — exactly the frozen-tail pathology the
+        window's declared end (arm to the flight's end) exists to exclude, and the
+        same one E1's accounting was fixed for in b48b44d. Measured, run
+        p01l-fix5-20260927T163256Z: the flight's own 1878 publications aged at most
+        ~0.019 s, then 28 teardown publications carried one frozen state (t=54.030)
+        at a constant 0.214 s for 316 ms until the thread stopped, and that teardown
+        tail was 100 % of the run's F2 failure. H1's ``valid_fraction`` already ends
+        at ``_window_end_wall_ns``; F2/F3 now do too.
+        """
+        if self._window_closed_wall_ns is not None and now_wall_ns > self._window_closed_wall_ns:
+            return
         if self._last_publish_wall_ns is not None:
             self.publish_gaps_s.append((now_wall_ns - self._last_publish_wall_ns) / 1e9)
         self._last_publish_wall_ns = now_wall_ns
