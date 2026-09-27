@@ -282,6 +282,23 @@ void build_options(ov_msckf::VioManagerOptions &params) {
   // zero-velocity updater the initializer requires an acceleration jerk, which
   // a stationary launch interval never supplies.
   params.try_zupt = true;
+  // The pin's zero-velocity accept gate bypasses chi2 and the velocity bound
+  // entirely once the image disparity test passes (UpdaterZeroVelocity.cpp:241
+  // keys on !disparity_passed first; the override flag is a hardcoded local at
+  // :113, not a parameter), and a vehicle that is physically near-stationary
+  // while fighting a wrong pose shows sub-pixel disparity: measured in runs
+  // p01l-fix2-20260927T020445Z ("accepted |v_IinG| = 0.065 (chi2 10489.080 <
+  // 84.595)", 790 accepts, state frozen ~1.5 m from truth, E1 1.517 m) and
+  // p01l-fix2l-20260927T033814Z (749 accepts, the covariance corrupted until a
+  // published sigma read 0.0, 291 stop/recover cycles). The pin's own lever is
+  // zupt_only_at_beginning (VioManagerOptions.h:95): it gates all three ZUPT
+  // feed sites (VioManager.cpp:186/221/294) on !has_moved_since_zupt, which
+  // latches at the first completed visual update (VioManager.cpp:360, past the
+  // five-clone window). The static start is untouched: the initializer is fed
+  // independently (:180-182) and the updater only ever runs once
+  // is_initialized_vio, so the excitation's motion both initializes and latches
+  // ZUPT off before the scored window opens.
+  params.zupt_only_at_beginning = true;
 }
 
 // ---------------------------------------------------------------------------
