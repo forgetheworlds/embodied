@@ -2751,6 +2751,17 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 while time.monotonic() < drain_deadline:
                     drain()
                     time.sleep(0.005)
+                # The flight sequence is over, so the scored window is closed here and
+                # not at process exit. The window is declared arm to disarm, and the
+                # vehicle has already disarmed; everything after this point is the
+                # harness stopping Webots and SITL, during which the adapter has no input
+                # left to publish. Measured, run p01l-zupt5-20260927T042005Z: the adapter
+                # republished one frozen state 332 times over 10.13 s of that shutdown --
+                # 32 % of the scored window, every one of them scored against a truth
+                # sample that was equally frozen -- so E1's p95 came out exactly equal to
+                # its max, which is the signature that was read as a constant bias.
+                scored_window_open = False
+                machine.close_window(time.monotonic_ns())
     except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows
         live_blockers.append(f"the platform failed during the run: {error}")
     finally:

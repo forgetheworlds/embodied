@@ -483,6 +483,7 @@ class HealthMachine:
         self._last_state_wall_ns: int | None = None
         self._last_publish_wall_ns: int | None = None
         self._window_open_wall_ns: int | None = None
+        self._window_closed_wall_ns: int | None = None
         self._stopped_at_wall_ns: int | None = None
 
     def on_state(self, state: EstimatorState | None, now_wall_ns: int) -> bool:
@@ -544,10 +545,32 @@ class HealthMachine:
     def open_window(self, now_wall_ns: int) -> None:
         """Start the scored window (arm to disarm), discarding bring-up accounting."""
         self._window_open_wall_ns = now_wall_ns
+        self._window_closed_wall_ns = None
         self._last_publish_wall_ns = None
         self.publish_gaps_s = []
         self.published_state_ages_s = []
         self.outages_s = []
+
+    def close_window(self, now_wall_ns: int) -> None:
+        """End the scored window: the flight is over and the harness is shutting down.
+
+        The window is declared arm to disarm, and the vehicle has already disarmed by
+        the time the flight sequence ends; everything after this point is the harness
+        stopping Webots and SITL. Measured, run p01l-zupt5-20260927T042005Z: the adapter
+        republished one frozen state 332 times over 10.13 s of that shutdown -- 32 % of
+        the scored window -- and every one of them was scored against a truth sample that
+        was equally frozen, so the scored window's p95 was pinned to the pose of a
+        vehicle that had already crashed. Freezing here keeps the window the flight.
+        """
+        if self._window_open_wall_ns is None or now_wall_ns < self._window_open_wall_ns:
+            return
+        self._window_closed_wall_ns = now_wall_ns
+
+    def _window_end_wall_ns(self, now_wall_ns: int) -> int:
+        """The window's end: now, or the close, whichever came first."""
+        if self._window_closed_wall_ns is None:
+            return now_wall_ns
+        return min(now_wall_ns, self._window_closed_wall_ns)
 
     def on_published(self, state: EstimatorState, now_wall_ns: int, newest_imu_ns: int) -> None:
         """Record one publication for the freshness accounting (F2, F3)."""
@@ -569,12 +592,13 @@ class HealthMachine:
         """The healthy fraction of the scored window so far (H1), outages charged whole."""
         if self._window_open_wall_ns is None:
             return 1.0
-        window_s = (now_wall_ns - self._window_open_wall_ns) / 1e9
+        end_wall_ns = self._window_end_wall_ns(now_wall_ns)
+        window_s = (end_wall_ns - self._window_open_wall_ns) / 1e9
         if window_s <= 0.0:
             return 1.0
         stopped_s = sum(self.outages_s)
-        if self._stopped_at_wall_ns is not None:
-            stopped_s += (now_wall_ns - self._stopped_at_wall_ns) / 1e9
+        if self._stopped_at_wall_ns is not None and self._stopped_at_wall_ns < end_wall_ns:
+            stopped_s += (end_wall_ns - self._stopped_at_wall_ns) / 1e9
         return max(0.0, 1.0 - stopped_s / window_s)
 
 
@@ -718,6 +742,7 @@ class ExternalNavPublisher:
         self._clock = clock
         self._on_publish = on_publish
         self._latest: EstimatorState | None = None
+        self._latest_offer_s: float | None = None
         self._newest_imu_ns = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -740,7 +765,27 @@ class ExternalNavPublisher:
     def offer(self, state: EstimatorState, newest_imu_ns: int) -> None:
         """Hand one candidate state to the publisher's loop."""
         self._latest = state
+        self._latest_offer_s = self._clock()
         self._newest_imu_ns = max(self._newest_imu_ns, newest_imu_ns)
+
+    def state_for_publish(self, now_s: float) -> EstimatorState | None:
+        """The state the machine may act on, or None once the feed has gone silent.
+
+        ``state_lost_after_ms`` is a declared bound -- "300 ms of silence stops
+        transmission: the adapter never publishes a stale estimate" -- and the machine's
+        watchdog (``HealthMachine._timeout_if_silent``) is the only thing that enforces
+        it. That watchdog runs on ``on_state(None, ...)``, so a publisher that always
+        hands over its last state leaves the bound unreachable and keeps a frozen pose on
+        the wire for as long as the process lives. Measured, run
+        p01l-zupt5-20260927T042005Z: 332 identical publications over 10.13 s after the
+        simulator had stopped, 32 % of the scored window. Staleness is measured from the
+        newest OFFER, so a live feed at any rate is unaffected.
+        """
+        if self._latest is None or self._latest_offer_s is None:
+            return None
+        if now_s - self._latest_offer_s > self._machine.bounds.state_lost_after_s:
+            return None
+        return self._latest
 
     def start(self, heartbeat_timeout_s: float = 15.0) -> None:
         """Open the adapter's own autopilot link and start publishing.
@@ -791,7 +836,7 @@ class ExternalNavPublisher:
                     return
                 continue
             next_send = now + publish_period_s()
-            state = self._latest
+            state = self.state_for_publish(now)
             if not self._machine.on_state(state, int(now * 1e9)):
                 continue
             # The epoch's one-time rotation: the first state the machine accepts as

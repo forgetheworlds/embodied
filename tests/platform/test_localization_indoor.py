@@ -513,6 +513,51 @@ class TestHealthMachine:
         machine.on_published(_state(), now + 1_025_000_000, now + 1_025_000_000)
         assert machine.publish_gaps_s == []
 
+    def test_closing_the_scored_window_freezes_the_accounting(self):
+        """The window is arm to disarm: the harness shutdown is not part of it.
+
+        Measured, run p01l-zupt5-20260927T042005Z: the adapter republished one frozen
+        state 332 times over 10.13 s while Webots and SITL were being killed, 32 % of the
+        scored window, and the machine's silence stop in that tail would otherwise be
+        charged as an outage of a flight that had already ended.
+        """
+        machine = loc.HealthMachine(_bounds())
+        second = 1_000_000_000
+        machine.open_window(second)
+        machine.on_state(_state(), second)
+        machine.stop(second + 10_000_000_000, "test stop inside the window")
+        machine._recover(_state(), second + 10_200_000_000)
+        machine.close_window(second + 20_000_000_000)
+        machine.stop(second + 21_000_000_000, "the flight is over: the tail is not scored")
+        fraction = machine.valid_fraction(second + 40_000_000_000)
+        # The in-window outage is charged whole over the 20 s window; the post-window stop
+        # is charged nothing, and the denominator stops growing at the close.
+        assert fraction == pytest.approx(1.0 - 0.200 / 20.0, abs=1e-6)
+
+    def test_a_silent_feed_stops_transmission_at_the_declared_bound(self):
+        """``state_lost_after_ms: 300`` is a declared bound, not prose.
+
+        The machine's silence watchdog is reachable only when the publisher hands it
+        None, and the publisher previously always handed it its last state, so a dead
+        feed kept a frozen pose on the wire indefinitely (measured: 332 identical
+        publications over 10.13 s, run p01l-zupt5-20260927T042005Z).
+        """
+        machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        publisher.offer(_state(), 1_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.250) is not None
+        assert publisher.state_for_publish(now[0] + 0.301) is None
+        # A new offer re-arms it: silence, not the passage of time, is what stops it.
+        now[0] += 1.0
+        publisher.offer(_state(time_ns=2_000_000_000), 2_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
 
 # ---------------------------------------------------------------------------
 # T4: refusals
