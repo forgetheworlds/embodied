@@ -288,6 +288,8 @@ void build_options(ov_msckf::VioManagerOptions &params) {
 // One STATE frame (must match localization.py's decode_state)
 // ---------------------------------------------------------------------------
 
+void log_line(const char *format, ...);
+
 std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &sys,
                                   uint8_t reset_counter, double newest_imu_time) {
   auto state = sys->get_state();
@@ -296,7 +298,10 @@ std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &s
   // The filter's own timestamp is the last camera/ZUPT update; between updates
   // the newest consumed inertial sample is ahead of it. Publish the projection
   // to that sample when the propagator can cover the interval, and the state
-  // as-is otherwise (a one-tick fallback while the stream stalls).
+  // as-is otherwise. A refusal is diagnostically interesting -- it is the
+  // difference between a current pose and a stale one -- so the first one and
+  // every 200th after it are logged rather than swallowed silently.
+  static uint64_t refusals = 0;
   Eigen::Vector4d q_GtoI;
   Eigen::Vector3d position, velocity;
   double sigma[3] = {0.0, 0.0, 0.0};
@@ -314,6 +319,12 @@ std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &s
     for (int i = 0; i < 3; ++i) {
       double variance = cov_plus(3 + i, 3 + i);
       sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+    }
+  } else if (newest_imu_time > state->_timestamp) {
+    refusals += 1;
+    if (refusals == 1 || refusals % 200 == 0) {
+      log_line("ov_stream: projection refused (%llu so far): state_t=%.3f newest_imu=%.3f",
+               (unsigned long long)refusals, state->_timestamp, newest_imu_time);
     }
   } else {
     q_GtoI = imu->quat();

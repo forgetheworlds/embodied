@@ -2705,37 +2705,52 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                         f"hover altitude {settings.hover_altitude_m})"
                     )
                     hold_end = time.monotonic() + settings.hold_per_waypoint_s
+                    # The estimator's published pose can only be as current as
+                    # the newest inertial sample it has CONSUMED, and it consumes
+                    # what this loop feeds it. Measured on run
+                    # p01l-fix2-20260927T020445Z: draining once per 50 ms left
+                    # 1416 of 1767 publications carrying an unchanged state
+                    # timestamp (the pose stale by the burst gap, F2 max
+                    # 0.232 s), because the estimator saw inertial data only in
+                    # 50 ms bursts. Draining every 5 ms keeps its newest
+                    # consumed sample within ~one Webots step of "now", while
+                    # the guided target itself keeps its proven 50 ms re-send
+                    # cadence (webots_ardupilot.py's own probe re-sends).
+                    next_target_send = 0.0
                     while time.monotonic() < hold_end:
-                        # Keep the stream alive while holding: a guided target lapses
-                        # inside the autopilot, so one publication per waypoint would
-                        # hold nothing. The deadline is how long each sample stays
-                        # valid, and the platform's own probe re-sends for exactly
-                        # this reason (webots_ardupilot.py:5109-5120).
-                        sent = platform.send_local_ned(
-                            LocalNedTarget(
-                                position_ned=target,
-                                velocity_ned=(0.0, 0.0, 0.0),
-                                yaw_rad=None,
-                                deadline_s=settings.hold_per_waypoint_s,
-                                certificate_ref=None,
+                        now = time.monotonic()
+                        if now >= next_target_send:
+                            # Keep the stream alive while holding: a guided target lapses
+                            # inside the autopilot, so one publication per waypoint would
+                            # hold nothing. The deadline is how long each sample stays
+                            # valid, and the platform's own probe re-sends for exactly
+                            # this reason (webots_ardupilot.py:5109-5120).
+                            next_target_send = now + 0.05
+                            sent = platform.send_local_ned(
+                                LocalNedTarget(
+                                    position_ned=target,
+                                    velocity_ned=(0.0, 0.0, 0.0),
+                                    yaw_rad=None,
+                                    deadline_s=settings.hold_per_waypoint_s,
+                                    certificate_ref=None,
+                                )
                             )
-                        )
-                        if sent is None:
-                            live_blockers.append(
-                                f"Guided flight was lost while holding waypoint {index} at "
-                                f"local-NED {target}"
-                            )
-                            lost_guided = True
-                            break
+                            if sent is None:
+                                live_blockers.append(
+                                    f"Guided flight was lost while holding waypoint {index} at "
+                                    f"local-NED {target}"
+                                )
+                                lost_guided = True
+                                break
                         drain()
-                        time.sleep(0.05)
+                        time.sleep(0.005)
                     sample_disagreement(f"hold-{index}")
                 log_lines.append("route complete; commanding LAND")
                 session.set_mode("LAND")
                 drain_deadline = time.monotonic() + 5.0
                 while time.monotonic() < drain_deadline:
                     drain()
-                    time.sleep(0.05)
+                    time.sleep(0.005)
     except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows
         live_blockers.append(f"the platform failed during the run: {error}")
     finally:
