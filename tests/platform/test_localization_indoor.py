@@ -523,14 +523,47 @@ class TestHealthMachine:
         assert machine.state == "stopped"
         assert machine.on_state(_state(), now + 1_000_000) is True
 
-    def test_sigma_outside_envelope_stops_transmission(self):
+    def test_sigma_outside_envelope_stops_transmission_in_flight(self):
+        """In the declared window the sigma bound stops transmission exactly as declared."""
         machine = loc.HealthMachine(_bounds())
         now = 1_000_000_000
+        machine.open_window(now)
         assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now) is True
         assert machine.on_state(_state(sigma=(0.05, 0.05, 1.5)), now + 1_000_000) is False
         assert machine.state == "stopped"
         stopped = [event for event in machine.events if event.event == "stopped"]
         assert len(stopped) == 1 and "sigma" in stopped[0].detail
+
+    def test_a_parked_sigma_excursion_is_recorded_but_publishes(self):
+        """The parked phase is not flight: its ZUPT-walk sigma excursions are benign.
+
+        A stationary launch initializes through the pin's zero-velocity walk, which
+        corrupts the covariance until a published sigma reads exactly 0.0 while the
+        pose stays accurate (FIXER3: 1 mm p95 parked against truth). Stopping
+        publication for it starves the firmware's VISO health window and the arm is
+        refused with 'VisOdom: not healthy' (FIXER6: three of four launches dead at
+        the arm, valid fraction 0.54/0.70 against the 0.99 of healthy runs). The
+        excursion is recorded as an event and publication continues; once the window
+        is declared, the same excursion stops transmission.
+        """
+        machine = loc.HealthMachine(_bounds())
+        now = 1_000_000_000
+        assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now) is True
+        # The excursion while parked: recorded once, publication continues.
+        assert machine.on_state(_state(sigma=(0.0, 0.0, 0.0)), now + 1_000_000) is True
+        assert machine.on_state(_state(sigma=(0.0, 0.0, 0.0)), now + 2_000_000) is True
+        assert machine.state == "healthy"
+        excursion = [event for event in machine.events if event.event == "parked sigma excursion"]
+        assert len(excursion) == 1 and "benign" in excursion[0].detail
+        # Cleared, also once.
+        assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now + 3_000_000) is True
+        cleared = [event for event in machine.events if event.event == "parked sigma excursion cleared"]
+        assert len(cleared) == 1
+        # The same excursion after the window is declared stops transmission.
+        machine.open_window(now + 4_000_000)
+        assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now + 4_000_000) is True
+        assert machine.on_state(_state(sigma=(0.0, 0.0, 0.0)), now + 5_000_000) is False
+        assert machine.state == "stopped"
 
     def test_no_publish_between_stop_and_recovery(self):
         machine = loc.HealthMachine(_bounds())

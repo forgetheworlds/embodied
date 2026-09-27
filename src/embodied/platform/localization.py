@@ -509,6 +509,11 @@ class HealthMachine:
         self._last_publish_wall_ns: int | None = None
         self._window_open_wall_ns: int | None = None
         self._window_closed_wall_ns: int | None = None
+        # Whether ``open_window`` has declared the flight. The sigma bound protects
+        # the control loop in flight; before the declaration (the parked bring-up and
+        # pre-arm wait) a sigma excursion is recorded but does not stop publication.
+        self._window_declared = False
+        self._parked_sigma_excursion = False
         self._stopped_at_wall_ns: int | None = None
         # The FLIGHT's end, distinct from the window's end. The scored window is declared
         # arm to disarm and governs E1/H1/H2; the freshness metrics stop earlier, at the
@@ -541,12 +546,39 @@ class HealthMachine:
             self.events.append(HealthEvent(state.time_ns, "initialized", ""))
         sigma = state.sigma_pos_m
         if min(sigma) < self.bounds.sigma_min_m or max(sigma) > self.bounds.sigma_max_m:
-            self.stop(
-                now_wall_ns,
-                f"sigma {tuple(sigma)} is outside the declared envelope "
-                f"[{self.bounds.sigma_min_m}, {self.bounds.sigma_max_m}] m",
-            )
-            return False
+            if self._window_declared:
+                self.stop(
+                    now_wall_ns,
+                    f"sigma {tuple(sigma)} is outside the declared envelope "
+                    f"[{self.bounds.sigma_min_m}, {self.bounds.sigma_max_m}] m",
+                )
+                return False
+            # The parked phase is not flight, and the excursion there is measured
+            # benign: the ZUPT walk that initializes a stationary launch corrupts
+            # the covariance until a published sigma reads exactly 0.0 (FIXER3:
+            # the pose error while parked stayed 1 mm p95 against truth, with up to
+            # 16,000 chi2-accepted zero-velocity updates), while stopping
+            # publication for it starves the firmware's VISO health window and the
+            # arm is refused with 'VisOdom: not healthy' -- a self-inflicted refusal
+            # (FIXER6 runs p01l-fixer6-1/-2: valid fraction 0.54/0.70 against the
+            # 0.99 of healthy runs, three of four launches dead at the arm). The
+            # excursion is recorded, never silent; once the window is declared the
+            # bound binds exactly as declared and an in-flight excursion stops
+            # transmission.
+            if not self._parked_sigma_excursion:
+                self._parked_sigma_excursion = True
+                self.events.append(
+                    HealthEvent(
+                        state.time_ns,
+                        "parked sigma excursion",
+                        f"sigma {tuple(sigma)} is outside the declared envelope while "
+                        "parked (declared benign: publication continues)",
+                    )
+                )
+            return True
+        if self._parked_sigma_excursion:
+            self._parked_sigma_excursion = False
+            self.events.append(HealthEvent(state.time_ns, "parked sigma excursion cleared", ""))
         return True
 
     def _timeout_if_silent(self, now_wall_ns: int) -> None:
@@ -577,6 +609,8 @@ class HealthMachine:
     def open_window(self, now_wall_ns: int) -> None:
         """Start the scored window (arm to disarm), discarding bring-up accounting."""
         self._window_open_wall_ns = now_wall_ns
+        self._window_declared = True
+        self._parked_sigma_excursion = False
         self._window_closed_wall_ns = None
         self.state_at_close = None
         self._flight_end_wall_ns = None

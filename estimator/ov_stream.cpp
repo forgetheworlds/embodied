@@ -343,6 +343,24 @@ std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &s
       sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
     }
   } else if (newest_imu_time > state->_timestamp) {
+    // The propagator cannot cover the interval, so the honest publication is the
+    // filter's own state at its own timestamp -- the same values the branch below
+    // publishes -- never the uninitialised locals this branch used to leave in
+    // place. Measured, runs p01l-fix5c/-7c-20260927: the refusal states' sigma of
+    // 0.0 kept them off the wire, but with the parked-phase sigma excursion
+    // declared benign (FIXER6) these frames are published while parked, and
+    // publishing uninitialised memory would inject a garbage pose instead.
+    q_GtoI = imu->quat();
+    position = imu->pos();
+    velocity = imu->vel();
+    {
+      std::vector<std::shared_ptr<ov_type::Type>> variables{imu};
+      Eigen::MatrixXd cov = ov_msckf::StateHelper::get_marginal_covariance(state, variables);
+      for (int i = 0; i < 3; i++) {
+        double variance = cov(3 + i, 3 + i);
+        sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+      }
+    }
     refusals += 1;
     if (refusals == 1 || refusals % 200 == 0) {
       log_line("ov_stream: projection refused (%llu so far): state_t=%.3f newest_imu=%.3f",
