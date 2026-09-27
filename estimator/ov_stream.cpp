@@ -337,7 +337,6 @@ std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &s
   double t_last_visual_s = state->_timestamp + state->_calib_dt_CAMtoIMU->value()(0);
 
   std::vector<uint8_t> frame;
-  std::vector<uint8_t> frame;
   write_header(frame, KIND_STATE, (uint32_t)STATE_PAYLOAD_SIZE);
   write_u64(frame, (uint64_t)std::llround(publish_time * 1e9));
   write_u8(frame, (uint8_t)(sys->initialized() ? 1 : 0));
