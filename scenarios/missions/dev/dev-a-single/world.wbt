@@ -50,6 +50,23 @@ Solid {
     size 8.2 4.2
   }
 }
+# Ceiling: the rooms are enclosed. Without one, a climbing camera leaves the walls
+# and sees the uniform Background sky, where a visual-inertial estimator loses every
+# feature it is tracking: the P01-L run measured standard deviation 4.7 out of 255
+# on such a frame, lost all 36 tracks, dead-reckoned, and tripped the EKF variance
+# failsafe. A textured ceiling keeps surfaces in view through the climb. Thin box,
+# like the walls, so it is visible from below.
+Solid {
+  name "ceiling"
+  translation 2 0 2.55
+  children [
+    Shape {
+      appearance Plaster {}
+      geometry Box { size 8.2 4.2 0.1 }
+    }
+  ]
+  boundingObject Box { size 8.2 4.2 0.1 }
+}
 # --- Walls (thickness 0.1, interior height 2.5, doorway gap top at 2.0) --------------
 # Shared wall at x = 0 with the 1.00 m centred doorway: two segments and a lintel.
 Solid {
