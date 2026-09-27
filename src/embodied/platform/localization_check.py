@@ -2466,8 +2466,30 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
 
         The health machine is driven only by the publisher's tick; this loop
         feeds, and stops the machine only when the feed itself fails.
+
+        The estimator's state is polled BEFORE this call feeds any record, and the
+        offer pairs it with the newest-IMU stamp as of the same instant. Feeding
+        first and polling after — the previous order — hands the publisher a state
+        the estimator published before the burst alongside the post-burst stamp, so
+        one publication per production burst is charged the burst's socket transit,
+        a lag no estimator can remove because the samples are not in the estimator
+        yet. Measured, run p01l-fix5b-20260927T164758Z (10 ms ticks, the flight's
+        own publications otherwise p50 1.0 ms / p95 11.4 ms): a ~54 ms record burst
+        in the final drain cycles froze the offered state at t=58.510 while
+        newest_sent reached 58.564 — the last 23 publications carried a constant
+        0.054 s age and that alone failed F2's 20 ms bound; run
+        p01l-fix5-20260927T163256Z showed the same skew at 0.214 s. Polling before
+        feeding measures what the declared bound names: how far the published state
+        lags the stream the estimator has actually been given.
         """
         nonlocal last_telemetry_sample
+        try:
+            state = client.poll_state()
+        except loc.ProtocolError as error:
+            machine.stop(time.monotonic_ns(), str(error))
+            return
+        if state is not None:
+            publisher.offer(state, stats.newest_imu_ns)
         while True:
             try:
                 record = platform.sensor_record(0.0)
@@ -2486,13 +2508,6 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 except loc.ProtocolError as error:
                     machine.stop(time.monotonic_ns(), str(error))
                     return
-                try:
-                    state = client.poll_state()
-                except loc.ProtocolError as error:
-                    machine.stop(time.monotonic_ns(), str(error))
-                    return
-                if state is not None:
-                    publisher.offer(state, stats.newest_imu_ns)
                 if time.monotonic() - last_telemetry_sample >= TELEMETRY_SAMPLE_PERIOD_S:
                     last_telemetry_sample = time.monotonic()
                     # G4's evidence is the run's own record: folding the telemetry here
