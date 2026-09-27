@@ -213,6 +213,34 @@ EXCITATION_CLIMB_DRAIN_S = 3.5
 EXCITATION_POST_LAND_DRAIN_S = 10.0
 EXCITATION_ALTITUDE_REACHED_MARGIN_M = 0.05
 
+# The yaw the scored window's position targets carry, as a commanded angle.
+# The frozen route is a position command (plan section 5, "the frozen route is
+# unchanged as a command -- hover 1.5 m through waypoints local-NED [2,0,0] and
+# [2,1,0] with 8 s holds"); it declares no yaw, and the vehicle spawns at rest
+# yaw 0 in the vestibule facing the doorway (plan section 0.3 item 1,
+# dev-a-single/world.wbt), so the declared route's own heading is the spawn
+# heading. Leaving yaw out of the mask does NOT leave the vehicle at that
+# heading: a yaw-ignored SET_POSITION_TARGET in GUIDED calls
+# set_yaw_state_rad(use_yaw=false) -> AutoYaw::set_mode_to_default
+# (mode_guided.cpp), which at this pin's default WP_YAW_BEHAVIOR 2
+# (LOOK_AT_NEXT_WP_EXCEPT_RTL) takes the yaw target from the position
+# controller's velocity-heading alignment (AC_PosControl.cpp:1658-1669,
+# "if vehicle is moving significantly, align yaw to velocity vector") -- and
+# that firmware-invented maneuver is what tumbles the vehicle at the end of the
+# route. Measured, four runs (dataflash 00000085, 00000105, 00000106,
+# 00000107): the second leg's eastward motion slews yaw 0 -> ~51 deg at up to
+# ~67 deg/s (the first yaw maneuver of every flight); the yaw rate loop then
+# overshoots, develops a growing ~3-4 Hz roll-yaw oscillation during the
+# waypoint-2 hold (achieved rates +-30..60 deg/s against single-digit commands,
+# with the EKF attitude estimate tracking dataflash truth to ~0.2 deg the
+# whole time), saturates the motor mix, tumbles from 1.5 m and crash-disarms
+# inside the scored window ("Crash: Disarming: AngErr=93>30"). Commanding the
+# declared heading keeps the flown route equal to the declared one: position
+# only, no yaw maneuver. This rig's yaw-rate loop remains marginally stable
+# (ATC_RAT_YAW_P 0.18, compat_base.parm -- not this stage's owned path) and is
+# recorded as an open airframe item.
+ROUTE_YAW_HOLD_RAD = 0.0
+
 # The diagnostic's labels, at full strength (plan sections 0.7 item 7, 0.8 item 5).
 DIAGNOSTIC_SENSOR_MODE_LABEL = "pose-assisted-diagnostic"
 DIAGNOSTIC_NON_CLAIM = (
@@ -2724,13 +2752,17 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                             # inside the autopilot, so one publication per waypoint would
                             # hold nothing. The deadline is how long each sample stays
                             # valid, and the platform's own probe re-sends for exactly
-                            # this reason (webots_ardupilot.py:5109-5120).
+                            # this reason (webots_ardupilot.py:5109-5120). The yaw is
+                            # the declared route heading (ROUTE_YAW_HOLD_RAD above):
+                            # yaw-ignored targets would hand the heading to the
+                            # firmware's velocity-alignment behavior, which slews the
+                            # vehicle into the end-of-route tumble measured above.
                             next_target_send = now + 0.05
                             sent = platform.send_local_ned(
                                 LocalNedTarget(
                                     position_ned=target,
                                     velocity_ned=(0.0, 0.0, 0.0),
-                                    yaw_rad=None,
+                                    yaw_rad=ROUTE_YAW_HOLD_RAD,
                                     deadline_s=settings.hold_per_waypoint_s,
                                     certificate_ref=None,
                                 )

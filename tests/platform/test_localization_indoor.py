@@ -659,6 +659,39 @@ class TestHealthMachine:
         assert publisher.state_for_publish(now[0] + 0.001) is not None
 
 
+class TestRouteYaw:
+    def test_the_scored_route_commands_the_declared_spawn_heading(self):
+        """The frozen route is a position command over a vehicle that spawns at
+        rest yaw 0 facing the doorway (plan section 0.3 item 1), and it declares
+        no yaw of its own. A yaw-IGNORED target hands the heading to the
+        firmware's default behavior -- WP_YAW_BEHAVIOR 2 aligns yaw with the
+        position controller's desired velocity -- and that firmware-invented
+        yaw slew, the first yaw maneuver of every flight, is the measured seed
+        of the end-of-route tumble (dataflash 00000085, 00000105, 00000106,
+        00000107: yaw 0 -> ~51 deg on the second leg, then a growing ~3-4 Hz
+        roll-yaw oscillation, motor saturation, tumble from 1.5 m, crash
+        disarm inside the scored window). The scored window therefore commands
+        the declared heading as an angle, and the wire mask must carry it as a
+        yaw command, not an ignored field."""
+        assert check.ROUTE_YAW_HOLD_RAD == 0.0
+        target = bridge.LocalNedTarget(
+            position_ned=(2.0, 0.0, -1.5),
+            velocity_ned=(0.0, 0.0, 0.0),
+            yaw_rad=check.ROUTE_YAW_HOLD_RAD,
+            deadline_s=8.0,
+            certificate_ref=None,
+        )
+        motion = bridge.MotionTarget(
+            position_ned=target.position_ned,
+            velocity_ned=target.velocity_ned,
+            acceleration_ned=None,
+            yaw_rad=target.yaw_rad,
+            yaw_rate_rad_s=None,
+        )
+        mask = bridge.mask_for_target(motion)
+        assert mask & bridge.TYPE_MASK_YAW_IGNORE == 0
+        assert mask & bridge.TYPE_MASK_YAW_RATE_IGNORE != 0
+
 # ---------------------------------------------------------------------------
 # T4: refusals
 # ---------------------------------------------------------------------------
