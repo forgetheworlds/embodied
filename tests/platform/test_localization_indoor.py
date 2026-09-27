@@ -678,6 +678,52 @@ class TestHealthMachine:
         publisher.offer(_state(time_ns=2_000_000_000), 2_000_000_000)
         assert publisher.state_for_publish(now[0] + 0.001) is not None
 
+    def test_a_frozen_state_clock_stops_transmission_at_the_declared_bound(self):
+        """A state whose own clock stops advancing is a stalled feed, not a pose.
+
+        The silence watchdog covers a feed that stops OFFERING; this bound covers the
+        worse half of the same defect, measured on the four mid-climb tumbles of
+        2026-09-27 (p01l-fix5c/-5d/-7c/-flightscope): ov_stream kept publishing at
+        its 100 Hz tick while its state clock was frozen -- the estimator could not
+        consume inertial samples behind a burst of stereo bytes on the one shared
+        connection, so its published state carried a healthy sigma and a pose frozen
+        at the last accepted image while the vehicle climbed. The adapter republished
+        that confident frozen pose until the backlog cleared and the pose stepped
+        0.4-0.7 m mid-air, and the yaw excursion and roll-yaw flip followed within
+        1.5 s. A clock that has not advanced for the declared state_lost_after_s is
+        the same "stale estimate" that bound already forbids, so it stops
+        transmission the same way: the state is handed over as None, and the
+        machine's silence path takes over.
+        """
+        machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        # A live feed offers states whose clock advances with every sample.
+        publisher.offer(_state(time_ns=1_000_000_000), 1_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        # The stall: offers keep arriving fresh on the wall clock -- the silence
+        # watchdog alone would never trip -- but the state's own clock is frozen.
+        now[0] += 0.100
+        publisher.offer(_state(time_ns=1_000_000_000), 1_200_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        # 0.25 s after the clock first appeared: still within the declared bound.
+        now[0] += 0.150
+        publisher.offer(_state(time_ns=1_000_000_000), 1_600_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        # 0.41 s after the clock first appeared: the bound has tripped.
+        now[0] += 0.160
+        publisher.offer(_state(time_ns=1_000_000_000), 2_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is None
+        # The recovery: the clock advances again, and transmission resumes.
+        now[0] += 1.0
+        publisher.offer(_state(time_ns=3_000_000_000), 3_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
 
 class TestRouteYaw:
     def test_the_scored_route_commands_the_declared_spawn_heading(self):

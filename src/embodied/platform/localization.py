@@ -836,6 +836,11 @@ class ExternalNavPublisher:
         self._on_publish = on_publish
         self._latest: EstimatorState | None = None
         self._latest_offer_s: float | None = None
+        # The state clock's freeze watch: the wall time the current state clock was
+        # first seen, so a clock that stops advancing is detected by the same declared
+        # bound that governs a silent feed (see ``state_for_publish``).
+        self._clock_first_seen_s: float | None = None
+        self._clock_seen_ns: int | None = None
         self._newest_imu_ns = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -873,10 +878,34 @@ class ExternalNavPublisher:
         p01l-zupt5-20260927T042005Z: 332 identical publications over 10.13 s after the
         simulator had stopped, 32 % of the scored window. Staleness is measured from the
         newest OFFER, so a live feed at any rate is unaffected.
+
+        The same declared bound also governs the state's OWN clock, because a feed can
+        keep offering while the estimate behind it is frozen. Measured on the four
+        mid-climb tumbles of 2026-09-27 (p01l-fix5c/-5d/-7c/-flightscope): ov_stream
+        kept publishing at its 100 Hz tick while its state clock stood still -- a burst
+        of ~614 KB stereo frames on the one shared, ordered, blocking connection kept
+        the inertial samples behind it unconsumed, so the published state carried a
+        healthy sigma and a pose frozen at the last accepted image while the vehicle
+        climbed. The adapter republished that confident frozen pose for whole seconds
+        until the backlog cleared and the pose stepped 0.4-0.7 m mid-air; the yaw
+        excursion and the roll-yaw flip followed within 1.5 s. A clock that has not
+        advanced for ``state_lost_after_s`` is the same stale estimate the bound
+        already forbids, so it hands the machine None the same way, and the declared
+        silence path takes over. A live feed advances its clock with every inertial
+        sample (2 ms at the declared 500 Hz), so only a stalled estimator can trip it.
         """
         if self._latest is None or self._latest_offer_s is None:
             return None
         if now_s - self._latest_offer_s > self._machine.bounds.state_lost_after_s:
+            return None
+        if self._clock_seen_ns != self._latest.time_ns:
+            self._clock_seen_ns = self._latest.time_ns
+            self._clock_first_seen_s = now_s
+        elif (
+            self._clock_first_seen_s is not None
+            and now_s - self._clock_first_seen_s
+            > self._machine.bounds.state_lost_after_s
+        ):
             return None
         return self._latest
 
