@@ -64,11 +64,16 @@
 //    extrinsic below is that rotation, derived in the code from the record's
 //    declared translations rather than typed in as a matrix.
 //
-// 3. Reported attitude. The adapter (OdomAlignment) consumes a quaternion that
-//    takes a point in the body frame and expresses it in the odometry frame,
-//    and applies the fixed ENU->NED axis swap itself. OpenVINS's quat() is
-//    q_GtoI, i.e. R_GtoI in its (x, y, z, w) JPL order, so the state reported
-//    here is its inverse: body->odom in (w, x, y, z).
+// 3. Reported attitude. The adapter (OdomAlignment) applies the fixed
+//    ENU->NED axis swap itself and needs body->odom. OpenVINS's quat() is
+//    q_GtoI in its (x, y, z, w) JPL order, whose quat_2_Rot is the JPL form
+//    (the negative skew term), so the conjugated (w, x, y, z) numbers packed
+//    below read, under the adapter's HAMILTON quat_to_rotmat, as ODOM->BODY:
+//    conjugating in JPL and re-reading as Hamilton cancel. Measured, run
+//    p01l-fix3b-20260927T050042Z: reading them as body->odom published the
+//    inverse rotation on every axis. The adapter therefore transposes its
+//    read (localization.py _delivered_body_to_odom); do not "fix" that
+//    transpose away without re-measuring against dataflash truth.
 //
 // 4. Position and velocity need no rotation: the estimator's global frame is
 //    z-up and its origin is the initialization point, which is exactly what the

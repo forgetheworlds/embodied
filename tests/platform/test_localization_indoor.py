@@ -152,6 +152,13 @@ def _state_frame(state: loc.EstimatorState) -> bytes:
 def _rot_z_90() -> np.ndarray:
     return np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
 
+def _rot_z(degrees: float) -> np.ndarray:
+    angle = math.radians(degrees)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    return np.array(
+        [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]]
+    )
+
 
 def _rot_x_90() -> np.ndarray:
     return np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
@@ -309,6 +316,7 @@ class TestConventions:
         assert alignment.aligned_attitude_rpy((1.0, 0.0, 0.0, 0.0)) == pytest.approx(
             (0.0, 0.0, math.pi / 2), abs=1e-9
         )
+
     def test_a_pitch_stays_a_pitch_under_every_sealed_initial_yaw(self):
         """The measured departure mechanism, kept as a regression: the pinned
         estimator reports its attitude with the initialization frame's yaw
@@ -320,26 +328,94 @@ class TestConventions:
         published as vision roll -0.112/-0.439/-1.557 with pitch near zero;
         204753Z sealed epoch yaw 89.62 degrees and departed on the first
         pitch). The published attitude must be the rotation since the sealed
-        start conjugated into FRD: a pitch is a pitch for every branch."""
+        start conjugated into FRD: a pitch is a pitch for every branch.
+
+        The estimator's reported quaternion is modelled as the wire carries it
+        (measured, run p01l-fix3b-20260927T050042Z): ov_stream conjugates the
+        pinned state quaternion's JPL vector part and packs it (w, x, y, z), so
+        this module's Hamilton read of the delivered numbers is the odom->body
+        rotation -- the transpose of the body->odom rotation the alignment
+        needs, which it applies itself."""
         pitch_nose_up = 0.30
         for odom_yaw_deg in (0.0, 90.0, 180.0, -90.0):
             half = math.radians(odom_yaw_deg) / 2.0
             q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
             alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
             alignment.seal(q_init)
-            # What the pinned estimator reports after rotating since start: the
-            # relative rotation (a nose-up pitch in the FLU body, which is a
-            # rotation by -pitch about the FLU y-left axis) composed on the
-            # LEFT of its initialization attitude.
+            # What the pinned estimator delivers after rotating since start:
+            # the body(0)-frame rotation composed on the right of its
+            # initialization attitude, transposed into the delivered
+            # odom->body direction.
             since_start = loc.rotmat_from_rpy((0.0, -pitch_nose_up, 0.0))
-            reported = loc.rotmat_to_quat(since_start @ loc.quat_to_rotmat(q_init))
-            roll, pitch, yaw = alignment.aligned_attitude_rpy(reported)
+            body_to_odom = loc.quat_to_rotmat(q_init).T @ since_start
+            delivered = loc.rotmat_to_quat(body_to_odom.T)
+            roll, pitch, yaw = alignment.aligned_attitude_rpy(delivered)
             assert roll == pytest.approx(0.0, abs=1e-9), (
                 f"odom yaw {odom_yaw_deg} deg: a physical pitch was published as roll"
             )
             assert pitch == pytest.approx(pitch_nose_up, abs=1e-9)
             assert yaw == pytest.approx(0.0, abs=1e-9)
 
+    def test_the_published_attitude_is_the_true_rotation_not_its_inverse(self):
+        """The fix3b regression, measured end to end (run
+        p01l-fix3b-20260927T050042Z): through the whole flight the published
+        attitude_rpy carried the OPPOSITE SIGN on every axis to the dataflash
+        SIM truth (published pitch +12.86 deg against truth -13.99 at the
+        takeoff; published roll -13.2 against truth +13.25, published yaw -16.3
+        against truth +16.4 during the excursion), and transposing the
+        published rotation recovers truth to a transport lag. The composition
+        must publish the vehicle's true rotation for every gram_schmidt yaw the
+        initializer's noise can pick, not its inverse."""
+        cases = {
+            "roll": (0.22, 0.0, 0.0),
+            "pitch": (0.0, -0.24, 0.0),
+            "yaw": (0.0, 0.0, 0.28),
+            "combined": (0.17, -0.14, 0.52),
+        }
+        for odom_yaw_deg in (0.0, 89.62, -89.62, 180.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            for name, true_rpy in cases.items():
+                # The delivered quaternion for a true NED attitude: the frame
+                # chain of the pinned rig, transposed into the delivered
+                # odom->body direction (see the pitch regression above).
+                body_to_odom = (
+                    _rot_z(-odom_yaw_deg)
+                    @ loc.WORLD_TO_NED_AXES
+                    @ loc.rotmat_from_rpy(true_rpy)
+                    @ loc.FLU_TO_FRD_AXES
+                )
+                delivered = loc.rotmat_to_quat(body_to_odom.T)
+                published = alignment.aligned_attitude_rpy(delivered)
+                assert published == pytest.approx(true_rpy, abs=1e-9), (
+                    f"odom yaw {odom_yaw_deg} deg, {name}: published "
+                    f"{published} is not the true rotation {true_rpy}"
+                )
+
+    def test_a_true_north_displacement_publishes_north_for_every_odom_yaw(self):
+        """The seal's epoch rotation must map odom displacements through the
+        measured frame chain for every initializer yaw, not only the yaw the
+        good runs happened to seal: at a sealed yaw of +/-90 degrees the
+        pre-fix epoch rotated true displacements by the double yaw (unexposed
+        only because every route-completing run sealed a yaw near zero)."""
+        for odom_yaw_deg in (0.0, 90.0, -90.0, 180.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            # One true metre north: the odom displacement the estimator would
+            # report for it, through the same frame chain.
+            true_delta_ned = np.array([1.0, 0.0, 0.0])
+            odom_delta = (
+                _rot_z(-odom_yaw_deg) @ loc.WORLD_TO_NED_AXES @ true_delta_ned
+            )
+            published = alignment.aligned_position_ned(odom_delta)
+            assert published == pytest.approx((1.0, 0.0, 0.0), abs=1e-9), (
+                f"odom yaw {odom_yaw_deg} deg: a true north displacement "
+                f"published {published}"
+            )
     def test_the_seal_is_idempotent_once_taken(self):
         """The epoch rotation is fixed: a later call must not move it, or drift
         would be absorbed instead of published."""
@@ -396,18 +472,28 @@ class TestConventions:
         assert loc.quat_to_rotmat(quat) == pytest.approx(np.eye(3), abs=1e-12)
 
     def test_aligned_rotation_moves_points_consistently(self):
-        """An estimator-body point maps as published(R @ FLU->FRD @ v): the sealed
-        epoch rotation and the body convention each act once."""
+        """The published rotation maps body-FRD directions into NED exactly as
+        the vehicle's true attitude does, for a delivered quaternion of a real
+        rotation since the seal -- the odom frame's arbitrary yaw and the body
+        convention each cancel once."""
         alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        level_yaw_90 = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))
-        alignment.seal(level_yaw_90)
-        quat_ned = alignment.aligned_quat_ned_wxyz(level_yaw_90)
-        point_body = np.array([1.0, 0.0, 0.0])
-        expected = alignment.epoch_rotation @ _rot_z_90() @ (
-            loc.FLU_TO_FRD_AXES @ point_body
+        half = math.pi / 8  # the seal's gram_schmidt yaw: 45 degrees
+        q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+        alignment.seal(q_init)
+        true_rpy = (0.0, 0.0, math.pi / 6)  # a true 30-degree yaw since start
+        body_to_odom = (
+            _rot_z(-45.0)
+            @ loc.WORLD_TO_NED_AXES
+            @ loc.rotmat_from_rpy(true_rpy)
+            @ loc.FLU_TO_FRD_AXES
         )
+        delivered = loc.rotmat_to_quat(body_to_odom.T)
+        quat_ned = alignment.aligned_quat_ned_wxyz(delivered)
+        point_body = np.array([1.0, 0.0, 0.0])
         rotated_ned = loc.quat_to_rotmat(quat_ned) @ point_body
-        assert rotated_ned == pytest.approx(expected, abs=1e-12)
+        assert rotated_ned == pytest.approx(
+            loc.rotmat_from_rpy(true_rpy) @ point_body, abs=1e-9
+        )
 
     def test_estimated_body_is_the_declared_imu_frame(self):
         """The estimator's body frame is the declared IMU frame; the feed never
@@ -1287,9 +1373,11 @@ class TestAttitudeGate:
             (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
         )
         assert record["state"] == "measured_pass"
-        # The unobservable yaw is recorded, not gated: this run's estimator yawed
-        # 90 degrees at initialization and the seal absorbed exactly that.
-        assert record["epoch_yaw_deg"] == pytest.approx(90.0, abs=1e-6)
+        # The unobservable yaw is recorded, not gated: this run's delivered
+        # quaternion reads (as the wire carries it, odom->body) as a +90 degree
+        # z rotation, so the odom frame initialized yawed -90 degrees from the
+        # declared start attitude, and the seal absorbed exactly that.
+        assert record["epoch_yaw_deg"] == pytest.approx(-90.0, abs=1e-6)
 
     def test_a_composition_that_misses_the_declared_start_refuses_the_arm(self, tmp_path):
         blocker = check._attitude_gate(

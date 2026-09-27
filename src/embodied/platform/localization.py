@@ -298,6 +298,26 @@ def rotmat_from_rpy(rpy: Sequence[float]) -> np.ndarray:
     )
 
 
+def _delivered_body_to_odom(quat_wxyz: Sequence[float]) -> np.ndarray:
+    """The body->odom rotation of one STATE quaternion as the wire delivers it.
+
+    ov_stream conjugates the pinned state quaternion's JPL vector part and packs
+    it (w, x, y, z) intending body->odom (estimator/ov_stream.cpp "Convention
+    3"). The pin's quat_2_Rot, however, is the JPL form -- the negative skew
+    term, quat_ops.h:142-152 of the pinned tarball -- which is the transpose of
+    this module's Hamilton quat_to_rotmat for the same four numbers, so the
+    delivered numbers read as Hamilton are the ODOM->BODY rotation. Measured,
+    run p01l-fix3b-20260927T050042Z: the published attitude carried the
+    opposite sign to the dataflash SIM truth on every axis through the whole
+    flight, and transposing the published rotation recovers truth to a
+    transport lag; positions stayed correct only because that run's
+    gram_schmidt yaw sealed near zero (epoch yaw 179.54 deg), which the epoch
+    derivation absorbs -- at a +/-90 degree seal the pre-fix epoch rotated
+    true displacements by the double yaw. The alignment therefore transposes
+    the delivered read itself: what it composes is the body->odom rotation.
+    """
+    return quat_to_rotmat(quat_wxyz).T
+
 class OdomAlignment:
     """The fixed odom→local-NED transform of one nav_epoch.
 
@@ -347,7 +367,7 @@ class OdomAlignment:
         """Derive and freeze the epoch rotation from the first initialized state.
 
         Position and velocity are published as ``A · p_odom`` and ``A · v_odom``
-        with ``A = R_declared_start · FLU→FRD · q_odom(start)⁻¹``: one fixed
+        with ``A = R_declared_start · FLU→FRD · R_body→odom(start)⁻¹``: one fixed
         odom→NED rotation per epoch, the estimator's own initialization frame
         related to the autopilot's frame by the two things known at the declared
         stationary start. Idempotent: the first seal wins and the rotation never
@@ -355,31 +375,34 @@ class OdomAlignment:
         """
         if self._epoch_rotation is not None:
             return
-        initial = quat_to_rotmat(initial_quat_odom_wxyz)
+        initial = _delivered_body_to_odom(initial_quat_odom_wxyz)
         declared = rotmat_from_rpy(self._declared_start_rpy)
         self._epoch_rotation = declared @ FLU_TO_FRD_AXES @ initial.T
         # Why the attitude is not composed through the epoch rotation: the
-        # pinned estimator reports its attitude with the initialization frame's
-        # yaw carried on the right of the relative rotation, so
-        # epoch @ R_odom(t) @ FLU->FRD conjugates the rotation since start by
-        # the initializer's noise-decided gram_schmidt yaw
-        # (ov_init/src/utils/helper.h:138-157) and permutes pitch into roll
-        # whenever that yaw is near +/-90 degrees. Measured: run
-        # p01l-bringup-20260926T202549Z published a physical pitch sequence of
-        # (0.117, 0.414, 1.52) rad nose down as roll (0.112, 0.439, 1.557)
-        # with pitch near zero, value for value, and the 204753Z bring-up
-        # (sealed epoch yaw 89.62 degrees) shows the same permutation from the
-        # first degree of rotation. aligned_attitude_rpy therefore publishes
-        # declared @ FLU->FRD @ R_odom(t) @ R_odom(start)^-1 @ FLU->FRD and
-        # keeps the epoch rotation on position and velocity only. Validated
-        # against the recorded publications of 202549Z itself (SITL pitch of
-        # 0.414 rad nose down at sim 38.81 comes out as published pitch 0.439
-        # under this composition instead of roll 0.439 under the old one) and
-        # against the pinned binary offline, where steering the initializer to
-        # the +/-90 degree branch reproduces the permutation through this
-        # module and this composition recovers the axis for both branches.
+        # epoch rotation carries the initializer's noise-decided gram_schmidt
+        # yaw (ov_init/src/utils/helper.h:138-157), and composing the attitude
+        # through it conjugates the rotation since start by that yaw, which
+        # permutes pitch into roll whenever the yaw is near +/-90 degrees.
+        # Measured: run p01l-bringup-20260926T202549Z published a physical
+        # pitch sequence of (0.117, 0.414, 1.52) rad nose down as roll
+        # (0.112, 0.439, 1.557) with pitch near zero, value for value, and the
+        # 204753Z bring-up (sealed epoch yaw 89.62 degrees) shows the same
+        # permutation from the first degree of rotation. aligned_attitude_rpy
+        # therefore publishes
+        #   declared @ FLU→FRD @ (R_body→odom(start)⁻¹ @ R_body→odom(t)) @ FLU→FRD
+        # -- the rotation since the sealed start taken in the BODY frame at the
+        # seal, conjugated into FRD and composed onto the declared start -- and
+        # keeps the epoch rotation on position and velocity only. The order is
+        # load-bearing: the product the other way round is the same rotation in
+        # the odom WORLD frame, and composing that conjugates by the
+        # gram_schmidt yaw, which is the b477ee7 permutation. Validated against
+        # the recorded publications of 202549Z itself and, for the composition
+        # settled here, against run p01l-fix3b-20260927T050042Z end to end:
+        # transposing the pre-fix published rotation recovers the dataflash SIM
+        # truth to a transport lag through the whole flight (test file,
+        # TestConventions::test_the_published_attitude_is_the_true_rotation_not_its_inverse).
         self._declared_rotation = declared
-        self._initial_odom_rotation_inv = initial.T
+        self._initial_body_to_odom = initial
 
     def _require_sealed(self) -> None:
         if self._epoch_rotation is None:
@@ -399,11 +422,13 @@ class OdomAlignment:
         return (float(ned[0]), float(ned[1]), float(ned[2]))
 
     def _aligned_attitude_rotation(self, quat_odom_wxyz: Sequence[float]) -> np.ndarray:
-        # See seal(): the rotation since the sealed start, conjugated into FRD
-        # and composed onto the declared start attitude. The epoch rotation
-        # stays on position and velocity only.
+        # See seal(): the rotation since the sealed start -- taken in the body
+        # frame at the seal, R(start)⁻¹ @ R(t) -- conjugated into FRD and
+        # composed onto the declared start attitude. The epoch rotation stays
+        # on position and velocity only.
         self._require_sealed()
-        since_start = quat_to_rotmat(quat_odom_wxyz) @ self._initial_odom_rotation_inv
+        current = _delivered_body_to_odom(quat_odom_wxyz)
+        since_start = self._initial_body_to_odom.T @ current
         return self._declared_rotation @ FLU_TO_FRD_AXES @ since_start @ FLU_TO_FRD_AXES
 
     def aligned_quat_ned_wxyz(
