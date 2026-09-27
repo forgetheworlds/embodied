@@ -528,11 +528,25 @@ class TestHealthMachine:
         machine.stop(second + 10_000_000_000, "test stop inside the window")
         machine._recover(_state(), second + 10_200_000_000)
         machine.close_window(second + 20_000_000_000)
+        # H2/H4 is read at the window's close, so the flight's own end is what is scored
+        # and the declared silence stop that follows it is not a fault.
+        assert machine.state_at_close == "healthy"
         machine.stop(second + 21_000_000_000, "the flight is over: the tail is not scored")
+        assert machine.state_at_close == "healthy"
         fraction = machine.valid_fraction(second + 40_000_000_000)
         # The in-window outage is charged whole over the 20 s window; the post-window stop
         # is charged nothing, and the denominator stops growing at the close.
         assert fraction == pytest.approx(1.0 - 0.200 / 20.0, abs=1e-6)
+
+    def test_a_window_that_closes_stopped_is_recorded_as_stopped(self):
+        """A machine stopped when the flight ends must still fail H2/H4."""
+        machine = loc.HealthMachine(_bounds())
+        second = 1_000_000_000
+        machine.open_window(second)
+        machine.on_state(_state(), second)
+        machine.stop(second + 1_000_000_000, "an estimator fault during the flight")
+        machine.close_window(second + 2_000_000_000)
+        assert machine.state_at_close == "stopped"
 
     def test_a_silent_feed_stops_transmission_at_the_declared_bound(self):
         """``state_lost_after_ms: 300`` is a declared bound, not prose.

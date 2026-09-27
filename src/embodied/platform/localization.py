@@ -485,6 +485,7 @@ class HealthMachine:
         self._window_open_wall_ns: int | None = None
         self._window_closed_wall_ns: int | None = None
         self._stopped_at_wall_ns: int | None = None
+        self.state_at_close: str | None = None
 
     def on_state(self, state: EstimatorState | None, now_wall_ns: int) -> bool:
         """Feed one consumed STATE (or None) on the wall clock; report publishability.
@@ -546,6 +547,7 @@ class HealthMachine:
         """Start the scored window (arm to disarm), discarding bring-up accounting."""
         self._window_open_wall_ns = now_wall_ns
         self._window_closed_wall_ns = None
+        self.state_at_close = None
         self._last_publish_wall_ns = None
         self.publish_gaps_s = []
         self.published_state_ages_s = []
@@ -565,6 +567,12 @@ class HealthMachine:
         if self._window_open_wall_ns is None or now_wall_ns < self._window_open_wall_ns:
             return
         self._window_closed_wall_ns = now_wall_ns
+        # H2/H4 read "final machine state healthy", and the flight's own end is where
+        # that must be read: after this point the adapter's input is gone, so the
+        # declared 300 ms silence stop is the correct behaviour and not a fault.
+        # Measured, run p01l-fix3-20260927T045304Z: the machine stopped on silence in the
+        # shutdown and H2/H4 read `stopped` at process exit.
+        self.state_at_close = self.state
 
     def _window_end_wall_ns(self, now_wall_ns: int) -> int:
         """The window's end: now, or the close, whichever came first."""

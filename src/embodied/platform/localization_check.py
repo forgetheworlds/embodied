@@ -2788,7 +2788,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             f"truth pose samples read: {len(stats.truth_samples)}",
             f"pair records the reader filed with pixels: {stats.pair_records_filed}, "
             f"dropped by a full feed queue: {stats.pair_records_dropped}",
-            f"published: {publisher.published}, final health: {machine.state}, "
+            f"published: {publisher.published}, health at the scored window's end: "
+            f"{machine.state_at_close or machine.state} (at process exit {machine.state}), "
             f"valid fraction: {valid_fraction:.4f}, adapter resets: {machine.reset_counter}",
             f"bridge truth poses sent over the whole run: {truth_published}",
             f"scored-window publications compared against truth: {len(published_states)}",
@@ -4600,11 +4601,20 @@ def _score(
         )
     else:
         checks.append({"name": "H3", "status": "fail", "detail": disagreement_summary["reason"]})
+    # H2/H4 is the machine's state at the END OF THE SCORED WINDOW, which is where the
+    # window's declared end (arm to disarm) puts it. Reading the process's final state
+    # instead makes the declared 300 ms silence stop -- the correct behaviour once the
+    # adapter's input is gone -- look like a fault: measured, run
+    # p01l-fix3-20260927T045304Z, whose shutdown left the machine stopped after a flight
+    # whose own window closed healthy. A machine that is stopped at the close still fails.
+    closed_state = machine.state_at_close
+    final_state = machine.state if closed_state is None else closed_state
     checks.append(
         {
             "name": "H2/H4",
-            "status": "pass" if machine.state == "healthy" else "fail",
-            "detail": f"final machine state {machine.state}; events "
+            "status": "pass" if final_state == "healthy" else "fail",
+            "detail": f"machine state at the end of the scored window {final_state} "
+            f"(at process exit {machine.state}); events "
             f"{[event.event for event in machine.events]}; adapter resets "
             f"{machine.reset_counter}",
         }
