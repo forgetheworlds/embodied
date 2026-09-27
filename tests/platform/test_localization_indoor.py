@@ -28,9 +28,63 @@ import yaml
 from embodied.cli import CommandError, build_parser
 from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
+from embodied.platform import webots_ardupilot as bridge
 from embodied.platform import localization_check as check
 from embodied.platform.webots_ardupilot import EvidenceWriter as bridge_EvidenceWriter
 from embodied.platform.webots_ardupilot import PlatformSettings
+
+
+class _RecordedMessage:
+    """The minimum pymavlink message surface the bring-up link's send path uses."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    def get_type(self) -> str:
+        return self.kind
+
+
+class _RecordingMav:
+    """A stand-in for pymavlink's ``mav`` object that records what was encoded.
+
+    The bring-up link's wire discipline is part of what this slice has to be able to
+    assert -- one channel, every other field ignored, the release a zero on the same
+    field -- and the only honest way to assert it is on the values that reach the
+    encoder. A live autopilot is not part of a unit test, so the encoder records.
+    """
+
+    def __init__(self) -> None:
+        self.encoded: list[tuple[str, tuple]] = []
+        self.sent: list[Any] = []
+
+    def _message(self, kind: str, arguments: tuple) -> _RecordedMessage:
+        self.encoded.append((kind, arguments))
+        return _RecordedMessage(kind)
+
+    def rc_channels_override_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("RC_CHANNELS_OVERRIDE", arguments)
+
+    def command_long_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("COMMAND_LONG", arguments)
+
+    def param_set_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("PARAM_SET", arguments)
+
+    def set_gps_global_origin_encode(self, *arguments: Any) -> _RecordedMessage:
+        return self._message("SET_GPS_GLOBAL_ORIGIN", arguments)
+
+    def send(self, message: Any) -> None:
+        self.sent.append(message)
+
+
+class _RecordingConnection:
+    """A stand-in for a pymavlink connection whose ``mav`` encoder records."""
+
+    def __init__(self) -> None:
+        self.mav = _RecordingMav()
+
+    def close(self) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +151,13 @@ def _state_frame(state: loc.EstimatorState) -> bytes:
 
 def _rot_z_90() -> np.ndarray:
     return np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+
+def _rot_z(degrees: float) -> np.ndarray:
+    angle = math.radians(degrees)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    return np.array(
+        [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]]
+    )
 
 
 def _rot_x_90() -> np.ndarray:
@@ -256,6 +317,105 @@ class TestConventions:
             (0.0, 0.0, math.pi / 2), abs=1e-9
         )
 
+    def test_a_pitch_stays_a_pitch_under_every_sealed_initial_yaw(self):
+        """The measured departure mechanism, kept as a regression: the pinned
+        estimator reports its attitude with the initialization frame's yaw
+        composed on the right of the rotation since start, so publishing through
+        the epoch rotation conjugates the relative rotation by the initializer's
+        gram_schmidt yaw and turns a physical pitch into a published roll
+        whenever that yaw is near +/-90 degrees (run
+        p01l-bringup-20260926T202549Z: SITL pitch -0.117/-0.414/-1.52 rad
+        published as vision roll -0.112/-0.439/-1.557 with pitch near zero;
+        204753Z sealed epoch yaw 89.62 degrees and departed on the first
+        pitch). The published attitude must be the rotation since the sealed
+        start conjugated into FRD: a pitch is a pitch for every branch.
+
+        The estimator's reported quaternion is modelled as the wire carries it
+        (measured, run p01l-fix3b-20260927T050042Z): ov_stream conjugates the
+        pinned state quaternion's JPL vector part and packs it (w, x, y, z), so
+        this module's Hamilton read of the delivered numbers is the odom->body
+        rotation -- the transpose of the body->odom rotation the alignment
+        needs, which it applies itself."""
+        pitch_nose_up = 0.30
+        for odom_yaw_deg in (0.0, 90.0, 180.0, -90.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            # What the pinned estimator delivers after rotating since start:
+            # the body(0)-frame rotation composed on the right of its
+            # initialization attitude, transposed into the delivered
+            # odom->body direction.
+            since_start = loc.rotmat_from_rpy((0.0, -pitch_nose_up, 0.0))
+            body_to_odom = loc.quat_to_rotmat(q_init).T @ since_start
+            delivered = loc.rotmat_to_quat(body_to_odom.T)
+            roll, pitch, yaw = alignment.aligned_attitude_rpy(delivered)
+            assert roll == pytest.approx(0.0, abs=1e-9), (
+                f"odom yaw {odom_yaw_deg} deg: a physical pitch was published as roll"
+            )
+            assert pitch == pytest.approx(pitch_nose_up, abs=1e-9)
+            assert yaw == pytest.approx(0.0, abs=1e-9)
+
+    def test_the_published_attitude_is_the_true_rotation_not_its_inverse(self):
+        """The fix3b regression, measured end to end (run
+        p01l-fix3b-20260927T050042Z): through the whole flight the published
+        attitude_rpy carried the OPPOSITE SIGN on every axis to the dataflash
+        SIM truth (published pitch +12.86 deg against truth -13.99 at the
+        takeoff; published roll -13.2 against truth +13.25, published yaw -16.3
+        against truth +16.4 during the excursion), and transposing the
+        published rotation recovers truth to a transport lag. The composition
+        must publish the vehicle's true rotation for every gram_schmidt yaw the
+        initializer's noise can pick, not its inverse."""
+        cases = {
+            "roll": (0.22, 0.0, 0.0),
+            "pitch": (0.0, -0.24, 0.0),
+            "yaw": (0.0, 0.0, 0.28),
+            "combined": (0.17, -0.14, 0.52),
+        }
+        for odom_yaw_deg in (0.0, 89.62, -89.62, 180.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            for name, true_rpy in cases.items():
+                # The delivered quaternion for a true NED attitude: the frame
+                # chain of the pinned rig, transposed into the delivered
+                # odom->body direction (see the pitch regression above).
+                body_to_odom = (
+                    _rot_z(-odom_yaw_deg)
+                    @ loc.WORLD_TO_NED_AXES
+                    @ loc.rotmat_from_rpy(true_rpy)
+                    @ loc.FLU_TO_FRD_AXES
+                )
+                delivered = loc.rotmat_to_quat(body_to_odom.T)
+                published = alignment.aligned_attitude_rpy(delivered)
+                assert published == pytest.approx(true_rpy, abs=1e-9), (
+                    f"odom yaw {odom_yaw_deg} deg, {name}: published "
+                    f"{published} is not the true rotation {true_rpy}"
+                )
+
+    def test_a_true_north_displacement_publishes_north_for_every_odom_yaw(self):
+        """The seal's epoch rotation must map odom displacements through the
+        measured frame chain for every initializer yaw, not only the yaw the
+        good runs happened to seal: at a sealed yaw of +/-90 degrees the
+        pre-fix epoch rotated true displacements by the double yaw (unexposed
+        only because every route-completing run sealed a yaw near zero)."""
+        for odom_yaw_deg in (0.0, 90.0, -90.0, 180.0):
+            half = math.radians(odom_yaw_deg) / 2.0
+            q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+            alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
+            alignment.seal(q_init)
+            # One true metre north: the odom displacement the estimator would
+            # report for it, through the same frame chain.
+            true_delta_ned = np.array([1.0, 0.0, 0.0])
+            odom_delta = (
+                _rot_z(-odom_yaw_deg) @ loc.WORLD_TO_NED_AXES @ true_delta_ned
+            )
+            published = alignment.aligned_position_ned(odom_delta)
+            assert published == pytest.approx((1.0, 0.0, 0.0), abs=1e-9), (
+                f"odom yaw {odom_yaw_deg} deg: a true north displacement "
+                f"published {published}"
+            )
     def test_the_seal_is_idempotent_once_taken(self):
         """The epoch rotation is fixed: a later call must not move it, or drift
         would be absorbed instead of published."""
@@ -312,18 +472,28 @@ class TestConventions:
         assert loc.quat_to_rotmat(quat) == pytest.approx(np.eye(3), abs=1e-12)
 
     def test_aligned_rotation_moves_points_consistently(self):
-        """An estimator-body point maps as published(R @ FLU->FRD @ v): the sealed
-        epoch rotation and the body convention each act once."""
+        """The published rotation maps body-FRD directions into NED exactly as
+        the vehicle's true attitude does, for a delivered quaternion of a real
+        rotation since the seal -- the odom frame's arbitrary yaw and the body
+        convention each cancel once."""
         alignment = loc.OdomAlignment((0.0, 0.0, 0.0))
-        level_yaw_90 = (math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))
-        alignment.seal(level_yaw_90)
-        quat_ned = alignment.aligned_quat_ned_wxyz(level_yaw_90)
-        point_body = np.array([1.0, 0.0, 0.0])
-        expected = alignment.epoch_rotation @ _rot_z_90() @ (
-            loc.FLU_TO_FRD_AXES @ point_body
+        half = math.pi / 8  # the seal's gram_schmidt yaw: 45 degrees
+        q_init = (math.cos(half), 0.0, 0.0, math.sin(half))
+        alignment.seal(q_init)
+        true_rpy = (0.0, 0.0, math.pi / 6)  # a true 30-degree yaw since start
+        body_to_odom = (
+            _rot_z(-45.0)
+            @ loc.WORLD_TO_NED_AXES
+            @ loc.rotmat_from_rpy(true_rpy)
+            @ loc.FLU_TO_FRD_AXES
         )
+        delivered = loc.rotmat_to_quat(body_to_odom.T)
+        quat_ned = alignment.aligned_quat_ned_wxyz(delivered)
+        point_body = np.array([1.0, 0.0, 0.0])
         rotated_ned = loc.quat_to_rotmat(quat_ned) @ point_body
-        assert rotated_ned == pytest.approx(expected, abs=1e-12)
+        assert rotated_ned == pytest.approx(
+            loc.rotmat_from_rpy(true_rpy) @ point_body, abs=1e-9
+        )
 
     def test_estimated_body_is_the_declared_imu_frame(self):
         """The estimator's body frame is the declared IMU frame; the feed never
@@ -353,14 +523,47 @@ class TestHealthMachine:
         assert machine.state == "stopped"
         assert machine.on_state(_state(), now + 1_000_000) is True
 
-    def test_sigma_outside_envelope_stops_transmission(self):
+    def test_sigma_outside_envelope_stops_transmission_in_flight(self):
+        """In the declared window the sigma bound stops transmission exactly as declared."""
         machine = loc.HealthMachine(_bounds())
         now = 1_000_000_000
+        machine.open_window(now)
         assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now) is True
         assert machine.on_state(_state(sigma=(0.05, 0.05, 1.5)), now + 1_000_000) is False
         assert machine.state == "stopped"
         stopped = [event for event in machine.events if event.event == "stopped"]
         assert len(stopped) == 1 and "sigma" in stopped[0].detail
+
+    def test_a_parked_sigma_excursion_is_recorded_but_publishes(self):
+        """The parked phase is not flight: its ZUPT-walk sigma excursions are benign.
+
+        A stationary launch initializes through the pin's zero-velocity walk, which
+        corrupts the covariance until a published sigma reads exactly 0.0 while the
+        pose stays accurate (FIXER3: 1 mm p95 parked against truth). Stopping
+        publication for it starves the firmware's VISO health window and the arm is
+        refused with 'VisOdom: not healthy' (FIXER6: three of four launches dead at
+        the arm, valid fraction 0.54/0.70 against the 0.99 of healthy runs). The
+        excursion is recorded as an event and publication continues; once the window
+        is declared, the same excursion stops transmission.
+        """
+        machine = loc.HealthMachine(_bounds())
+        now = 1_000_000_000
+        assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now) is True
+        # The excursion while parked: recorded once, publication continues.
+        assert machine.on_state(_state(sigma=(0.0, 0.0, 0.0)), now + 1_000_000) is True
+        assert machine.on_state(_state(sigma=(0.0, 0.0, 0.0)), now + 2_000_000) is True
+        assert machine.state == "healthy"
+        excursion = [event for event in machine.events if event.event == "parked sigma excursion"]
+        assert len(excursion) == 1 and "benign" in excursion[0].detail
+        # Cleared, also once.
+        assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now + 3_000_000) is True
+        cleared = [event for event in machine.events if event.event == "parked sigma excursion cleared"]
+        assert len(cleared) == 1
+        # The same excursion after the window is declared stops transmission.
+        machine.open_window(now + 4_000_000)
+        assert machine.on_state(_state(sigma=(0.05, 0.05, 0.08)), now + 4_000_000) is True
+        assert machine.on_state(_state(sigma=(0.0, 0.0, 0.0)), now + 5_000_000) is False
+        assert machine.state == "stopped"
 
     def test_no_publish_between_stop_and_recovery(self):
         machine = loc.HealthMachine(_bounds())
@@ -390,6 +593,26 @@ class TestHealthMachine:
         machine.on_published(_state(time_ns=second - 30_000_000), second, second)
         assert machine.publish_gaps_s == pytest.approx([0.025], abs=1e-9)
         assert machine.published_state_ages_s == pytest.approx([0.005, 0.030], abs=1e-9)
+
+    def test_publications_after_the_window_close_are_not_scored(self):
+        """F2 and F3 score the flight, not the harness teardown after it.
+
+        Measured, run p01l-fix5-20260927T163256Z: after ``close_window`` the drain
+        loop has exited, no new offer can arrive, and the publisher re-sent the last
+        offered state 28 times at a constant 0.214 s age for 316 ms until its thread
+        stopped — while the flight's own 1878 publications had aged at most ~0.019 s.
+        That teardown tail was 100 % of the run's F2 failure, the same frozen-tail
+        pathology b48b44d removed from E1's accounting; H1's valid_fraction already
+        ends at the window's close.
+        """
+        machine = loc.HealthMachine(_bounds())
+        base = 1_000_000_000
+        machine.open_window(base)
+        machine.on_published(_state(time_ns=base - 5_000_000), base, base)
+        machine.close_window(base + 25_000_000)
+        machine.on_published(_state(time_ns=base - 200_000_000), base + 300_000_000, base)
+        assert machine.published_state_ages_s == pytest.approx([0.005], abs=1e-9)
+        assert machine.publish_gaps_s == []
 
     def test_valid_fraction_charges_outages_whole(self):
         machine = loc.HealthMachine(_bounds(valid_fraction_min=0.99))
@@ -429,6 +652,172 @@ class TestHealthMachine:
         machine.on_published(_state(), now + 1_025_000_000, now + 1_025_000_000)
         assert machine.publish_gaps_s == []
 
+    def test_closing_the_scored_window_freezes_the_accounting(self):
+        """The window is arm to disarm: the harness shutdown is not part of it.
+
+        Measured, run p01l-zupt5-20260927T042005Z: the adapter republished one frozen
+        state 332 times over 10.13 s while Webots and SITL were being killed, 32 % of the
+        scored window, and the machine's silence stop in that tail would otherwise be
+        charged as an outage of a flight that had already ended.
+        """
+        machine = loc.HealthMachine(_bounds())
+        second = 1_000_000_000
+        machine.open_window(second)
+        machine.on_state(_state(), second)
+        machine.stop(second + 10_000_000_000, "test stop inside the window")
+        machine._recover(_state(), second + 10_200_000_000)
+        machine.close_window(second + 20_000_000_000)
+        # H2/H4 is read at the window's close, so the flight's own end is what is scored
+        # and the declared silence stop that follows it is not a fault.
+        assert machine.state_at_close == "healthy"
+        machine.stop(second + 21_000_000_000, "the flight is over: the tail is not scored")
+        assert machine.state_at_close == "healthy"
+        fraction = machine.valid_fraction(second + 40_000_000_000)
+        # The in-window outage is charged whole over the 20 s window; the post-window stop
+        # is charged nothing, and the denominator stops growing at the close.
+        assert fraction == pytest.approx(1.0 - 0.200 / 20.0, abs=1e-6)
+
+    def test_a_window_that_closes_stopped_is_recorded_as_stopped(self):
+        """A machine stopped when the flight ends must still fail H2/H4."""
+        machine = loc.HealthMachine(_bounds())
+        second = 1_000_000_000
+        machine.open_window(second)
+        machine.on_state(_state(), second)
+        machine.stop(second + 1_000_000_000, "an estimator fault during the flight")
+        machine.close_window(second + 2_000_000_000)
+        assert machine.state_at_close == "stopped"
+
+    def test_a_silent_feed_stops_transmission_at_the_declared_bound(self):
+        """``state_lost_after_ms: 300`` is a declared bound, not prose.
+
+        The machine's silence watchdog is reachable only when the publisher hands it
+        None, and the publisher previously always handed it its last state, so a dead
+        feed kept a frozen pose on the wire indefinitely (measured: 332 identical
+        publications over 10.13 s, run p01l-zupt5-20260927T042005Z).
+        """
+        machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        publisher.offer(_state(), 1_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.250) is not None
+        assert publisher.state_for_publish(now[0] + 0.301) is None
+        # A new offer re-arms it: silence, not the passage of time, is what stops it.
+        now[0] += 1.0
+        publisher.offer(_state(time_ns=2_000_000_000), 2_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+    def test_a_frozen_state_clock_stops_transmission_at_the_declared_bound(self):
+        """A state whose own clock stops advancing is a stalled feed, not a pose.
+
+        The silence watchdog covers a feed that stops OFFERING; this bound covers the
+        worse half of the same defect, measured on the four mid-climb tumbles of
+        2026-09-27 (p01l-fix5c/-5d/-7c/-flightscope): ov_stream kept publishing at
+        its 100 Hz tick while its state clock was frozen -- the estimator could not
+        consume inertial samples behind a burst of stereo bytes on the one shared
+        connection, so its published state carried a healthy sigma and a pose frozen
+        at the last accepted image while the vehicle climbed. The adapter republished
+        that confident frozen pose until the backlog cleared and the pose stepped
+        0.4-0.7 m mid-air, and the yaw excursion and roll-yaw flip followed within
+        1.5 s. A clock that has not advanced for the declared state_lost_after_s is
+        the same "stale estimate" that bound already forbids, so it stops
+        transmission the same way: the state is handed over as None, and the
+        machine's silence path takes over.
+        """
+        machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        machine.open_window(1_000_000_000)
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        # A live feed offers states whose clock advances with every sample.
+        publisher.offer(_state(time_ns=1_000_000_000), 1_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        # The stall: offers keep arriving fresh on the wall clock -- the silence
+        # watchdog alone would never trip -- but the state's own clock is frozen.
+        now[0] += 0.100
+        publisher.offer(_state(time_ns=1_000_000_000), 1_200_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        # 0.25 s after the clock first appeared: still within the declared bound.
+        now[0] += 0.150
+        publisher.offer(_state(time_ns=1_000_000_000), 1_600_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        # 0.41 s after the clock first appeared: the bound has tripped.
+        now[0] += 0.160
+        publisher.offer(_state(time_ns=1_000_000_000), 2_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is None
+        # The recovery: the clock advances again, and transmission resumes.
+        now[0] += 1.0
+        publisher.offer(_state(time_ns=3_000_000_000), 3_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+    def test_a_parked_frozen_clock_does_not_stop_publication(self):
+        """Before the flight is declared, a frozen clock does not stop transmission.
+
+        The same reason the parked sigma excursion is benign: the vehicle is parked,
+        a stale-but-correct pose is harmless, and a publication stop starves the
+        firmware's VISO health window and refuses the arm (FIXER6 runs
+        p01l-fixer6-1/-2/-6, refused with 'VisOdom: not healthy' / 'Need Alt
+        Estimate'). The flight-side gate is unchanged: the window's declaration turns
+        it on (pinned above).
+        """
+        machine = loc.HealthMachine(_bounds(state_lost_after_s=0.300))
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        publisher.offer(_state(time_ns=1_000_000_000), 1_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        now[0] += 0.100
+        publisher.offer(_state(time_ns=1_000_000_000), 1_600_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        now[0] += 1.000
+        publisher.offer(_state(time_ns=1_000_000_000), 3_000_000_000)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+
+class TestRouteYaw:
+    def test_the_scored_route_commands_the_declared_spawn_heading(self):
+        """The frozen route is a position command over a vehicle that spawns at
+        rest yaw 0 facing the doorway (plan section 0.3 item 1), and it declares
+        no yaw of its own. A yaw-IGNORED target hands the heading to the
+        firmware's default behavior -- WP_YAW_BEHAVIOR 2 aligns yaw with the
+        position controller's desired velocity -- and that firmware-invented
+        yaw slew, the first yaw maneuver of every flight, is the measured seed
+        of the end-of-route tumble (dataflash 00000085, 00000105, 00000106,
+        00000107: yaw 0 -> ~51 deg on the second leg, then a growing ~3-4 Hz
+        roll-yaw oscillation, motor saturation, tumble from 1.5 m, crash
+        disarm inside the scored window). The scored window therefore commands
+        the declared heading as an angle, and the wire mask must carry it as a
+        yaw command, not an ignored field."""
+        assert check.ROUTE_YAW_HOLD_RAD == 0.0
+        target = bridge.LocalNedTarget(
+            position_ned=(2.0, 0.0, -1.5),
+            velocity_ned=(0.0, 0.0, 0.0),
+            yaw_rad=check.ROUTE_YAW_HOLD_RAD,
+            deadline_s=8.0,
+            certificate_ref=None,
+        )
+        motion = bridge.MotionTarget(
+            position_ned=target.position_ned,
+            velocity_ned=target.velocity_ned,
+            acceleration_ned=None,
+            yaw_rad=target.yaw_rad,
+            yaw_rate_rad_s=None,
+        )
+        mask = bridge.mask_for_target(motion)
+        assert mask & bridge.TYPE_MASK_YAW_IGNORE == 0
+        assert mask & bridge.TYPE_MASK_YAW_RATE_IGNORE != 0
 
 # ---------------------------------------------------------------------------
 # T4: refusals
@@ -457,10 +846,16 @@ class TestRefusals:
         assert "already exists" in capsys.readouterr().err
 
     def test_pose_assisted_receipt_is_labelled_and_not_applicable(self, tmp_path, capsys):
+        """The pose-assisted arm is now the live E1-DIAG diagnostic; a preflight
+        that cannot be satisfied must block BEFORE anything starts, labelled. The
+        config here has no estimator process, so the diagnostic blocks in its own
+        preflight and the test stays hermetic -- the declared configuration would
+        otherwise attempt a real flight on a host that has the simulator."""
+        config_path = _config_without_the_estimator(tmp_path)
         exit_code = check.main(
             [
                 "--config",
-                "configs/first_indoor.yaml",
+                str(config_path),
                 "--mode",
                 "pose-assisted",
                 "--output",
@@ -476,6 +871,8 @@ class TestRefusals:
             for limitation in receipt["limitations"]
         )
         assert any("cannot pass P01-L" in reason for reason in receipt["reasons"])
+        # The diagnostic blocks, it never resolves or unresolves the stage claim.
+        assert "localization=unresolved" not in receipt["reasons"]
 
     def test_a_missing_estimator_process_blocks_with_a_concrete_reason(self, tmp_path):
         """Prerequisites are reported before anything starts: a claimed arm whose
@@ -1152,9 +1549,11 @@ class TestAttitudeGate:
             (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
         )
         assert record["state"] == "measured_pass"
-        # The unobservable yaw is recorded, not gated: this run's estimator yawed
-        # 90 degrees at initialization and the seal absorbed exactly that.
-        assert record["epoch_yaw_deg"] == pytest.approx(90.0, abs=1e-6)
+        # The unobservable yaw is recorded, not gated: this run's delivered
+        # quaternion reads (as the wire carries it, odom->body) as a +90 degree
+        # z rotation, so the odom frame initialized yawed -90 degrees from the
+        # declared start attitude, and the seal absorbed exactly that.
+        assert record["epoch_yaw_deg"] == pytest.approx(-90.0, abs=1e-6)
 
     def test_a_composition_that_misses_the_declared_start_refuses_the_arm(self, tmp_path):
         blocker = check._attitude_gate(
@@ -1358,3 +1757,454 @@ class TestZuftFrameDecisions:
         assert diagnostics["zupt_frames_reaching_visual_path"] == (
             diagnostics["zupt_rejected_updates"] + diagnostics["zupt_frames_without_imu"]
         )
+
+
+# ---------------------------------------------------------------------------
+# T12/T13 (E1-DIAG, plan sections 0.7 item 5, 0.8 item 3): the diagnostic's
+# labels, and the sensor-derived arm's unchanged behaviour beside it
+# ---------------------------------------------------------------------------
+
+
+class TestPoseAssistedDiagnostic:
+    """E1-DIAG's two named behaviours: labelled beyond misreading, and the
+    sensor-derived arm untouched by it.
+
+    The diagnostic flies the bounded excitation on the truth-driven arm while the
+    pinned estimator observes (plan sections 0.6 item 7, 0.8). Its result can
+    never be read as a scored one, and the arm that CAN be scored must come out
+    of the build exactly as it went in: truth republish off, nothing published by
+    the bridge.
+    """
+
+    def test_the_diagnostic_is_labelled_and_refuses_to_be_read_as_a_scored_result(
+        self, tmp_path
+    ):
+        """Every shape the diagnostic's outcome can take carries the labels.
+
+        A completed diagnostic is COMPLETE -- its measurement is a result -- and
+        that is exactly the outcome a reader could mistake for a pass, so the
+        labels must make the mistake impossible: gate not applicable,
+        localization not applicable, the never-pool non-claim, and no
+        predeclared bound judged.
+        """
+        completed = check._pose_assisted_outcome(())
+        assert completed.status.value == "complete"
+        assert completed.gate_status.value == "not_applicable"
+        assert completed.manifest["sensor_mode_label"] == "pose-assisted-diagnostic"
+        assert completed.manifest["localization"] == "not_applicable"
+        limitations = " ".join(completed.limitations)
+        assert "NOT a sensor-derived result" in limitations
+        assert "never be pooled" in limitations
+        assert "no predeclared E/F/H bound is judged" in limitations
+        assert "truth republish" in limitations  # the exemption is stated, not silent
+        assert any("cannot pass P01-L" in reason for reason in completed.reasons)
+
+        blocked = check._pose_assisted_outcome(("a blocker",), {"pairs_fed": 3})
+        assert blocked.status.value == "blocked"
+        assert blocked.gate_status.value == "not_applicable"
+        assert blocked.manifest["localization"] == "not_applicable"
+        assert blocked.manifest["pairs_fed"] == 3
+        assert "localization=unresolved" not in blocked.reasons
+
+        # And the diagnostic's own preflight rows declare, rather than hide, the
+        # two things a scored preflight would refuse: the per-run arm override
+        # and the truth-republish exemption.
+        document = check._load_localization_config(Path("configs/first_indoor.yaml"))
+        rows, satisfied = check._diagnostic_preflight(document, tmp_path)
+        rows = {row["name"]: row for row in rows}
+        assert rows["diagnostic_arm_override"]["satisfied"] is True
+        assert "sensor-derived" in rows["diagnostic_arm_override"]["detail"]
+        assert rows["bridge_truth_republish"]["state"] == "declared_exemption"
+        assert rows["bridge_truth_republish"]["satisfied"] is True
+        assert "truth republish is ON" in rows["bridge_truth_republish"]["detail"]
+        # The declared configuration's scored preflight is unchanged by all this.
+        scored_rows, scored_satisfied = check._preflight(
+            document, tmp_path, SensorMode.SENSOR_DERIVED
+        )
+        scored_rows = {row["name"]: row for row in scored_rows}
+        assert scored_rows["localization_mode"]["satisfied"] is True
+        assert scored_rows["bridge_truth_republish"]["satisfied"] is True
+        assert "exactly one publisher" in scored_rows["bridge_truth_republish"]["detail"]
+
+    def test_the_sensor_derived_arm_is_unchanged_truth_republish_off_published_zero(
+        self, tmp_path
+    ):
+        """The diagnostic's per-run arm override never leaks into the scored arm.
+
+        The scored arm's settings are built with no override, so the bridge's
+        truth republish stays off however the diagnostic asks for its own; and
+        the recorded scored runs' own artifact answers the same question from
+        the vehicle side: the bridge published zero simulator poses.
+        """
+        root = Path(check.__file__).resolve().parents[3]
+        document = check._load_localization_config(Path("configs/first_indoor.yaml"))
+        assert document["localization"]["mode"] == "sensor-derived"
+        scored = check._platform_settings(document, root)
+        assert scored.truth_republish is False
+        assert scored.sensor_mode is SensorMode.SENSOR_DERIVED
+        # The override exists only when the diagnostic passes it explicitly.
+        diagnostic = check._platform_settings(
+            document, root, arm=SensorMode.POSE_ASSISTED.value
+        )
+        assert diagnostic.truth_republish is True
+        assert scored.truth_republish is False  # unchanged by the diagnostic's ask
+
+        # The recorded scored arm's own artifact, when this host has one: the
+        # bridge's vision-pose feed recorded enabled false and published 0.
+        recorded = sorted(
+            (
+                path
+                for path in (root / "work/runs/p01-localization").glob(
+                    "*/run-a/vision-pose-feed.json"
+                )
+                if path.is_file()
+            ),
+            key=lambda path: path.stat().st_mtime,
+        )
+        scored_artifacts = []
+        for path in reversed(recorded):
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("enabled") is False:
+                scored_artifacts.append((path, record))
+                break
+        if not scored_artifacts:
+            pytest.skip("no recorded sensor-derived run artifact is on this host")
+        path, record = scored_artifacts[0]
+        assert record["published"] == 0, f"{path} records {record['published']}"
+
+
+# ---------------------------------------------------------------------------
+# T14/T15 (the declared ordered bring-up, plan sections 0.6 item 6, 0.8 item 7):
+# the exception window is declared and applied, and it is BOUNDED -- the scored
+# window refuses to open while it is still in force
+# ---------------------------------------------------------------------------
+
+
+class TestOrderedBringUp:
+    """The two named behaviours that make the exception a declaration, not a bypass.
+
+    The bring-up exists because the sensor-derived arm cannot move: the estimator
+    latches only under motion (E1-DIAG), and the arm gate forbids motion until the
+    vision source is healthy, which is the estimator's own adapter. What makes
+    that legitimate rather than a silent disable is that (a) every element of the
+    window is declared with the pinned source that requires it, and (b) the window
+    cannot still be in force when the scored window opens -- the vehicle's own
+    readback is what says so.
+    """
+
+    def _settings_and_window(self):
+        root = Path(check.__file__).resolve().parents[3]
+        document = check._load_localization_config(Path("configs/first_indoor.yaml"))
+        settings = check._platform_settings(document, root)
+        return settings, check._bring_up_window(settings)
+
+    def test_the_window_applies_the_declared_exception_and_the_origin_datum(self):
+        """The window is the declared one: mask, cited checks, and a datum.
+
+        The mask is asserted bit by bit against the pinned firmware's own
+        enumeration, because that is the whole content of the exception: a SET bit
+        skips exactly that check (AP_Arming.cpp:329-332). The origin is asserted to
+        be a DATUM -- a frame definition carrying no pose -- because that is the
+        difference between declaring the local frame's anchor and feeding the
+        autopilot a position, which no part of this run may do with truth.
+        """
+        settings, window = self._settings_and_window()
+
+        # The mask: exactly the two declared exceptions, each cited -- and the
+        # PINNED name, because the plan's ARMING_CHECK does not resolve at this pin
+        # (AP_Arming.cpp:199-205 renames it; the first invocation of the live run
+        # measured the old name answering nothing).
+        mask = window["arming_skip"]
+        assert mask["name"] == check.BRING_UP_ARMING_PARAMETER == "ARMING_SKIPCHK"
+        assert mask["window_value"] == (
+            check.ARMING_CHECK_BIT_GPS | check.ARMING_CHECK_BIT_VISION
+        )
+        assert mask["window_value"] == 8 | (1 << 18)
+        assert mask["restore_value"] == check.BRING_UP_ARMING_ALL_CHECKS_ENABLED == 0
+        assert "SET bit SKIPS" in mask["bit_semantics"]
+        assert "ARMING_SKIPCHK" in mask["bit_semantics"]
+        excepted = {row["check"]: row for row in window["excepted_arming_checks"]}
+        assert set(excepted) == {"Check::VISION", "Check::GPS (the home requirement)"}
+        assert excepted["Check::VISION"]["bit"] == 1 << 18
+        assert excepted["Check::GPS (the home requirement)"]["bit"] == 1 << 3
+        for row in excepted.values():
+            assert "AP_Arming" in row["citation"] and row["why"]
+
+        # The datum: the configured home's own coordinate, a frame definition.
+        datum = window["origin_datum"]
+        assert datum["message_id"] == 48
+        assert datum["is_a_pose_feed"] is False
+        assert "DATUM" in datum["is"] and "no vehicle" in datum["is"]
+        assert (datum["latitude_deg"], datum["longitude_deg"], datum["altitude_msl_m"]) == (
+            pytest.approx(-35.363261),
+            pytest.approx(149.165230),
+            pytest.approx(584.0),
+        )
+        assert datum["source"] == (
+            "platform.sitl_home, the coordinate the autopilot is launched with"
+        )
+        assert "ExternalNav" in datum["why_it_must_be_declared"]
+
+        # Every window parameter is bounded: a window value, a restore value, a reason.
+        rows = {row["name"]: row for row in window["parameter_window"]}
+        assert set(rows) == {"ARMING_SKIPCHK", "EK3_SRC1_POSZ", "MOT_IDLE_SEC"}
+        assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
+        assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
+        assert rows["EK3_SRC1_POSZ"]["window_value"] == 1.0  # baro, its own sensor
+        assert rows["EK3_SRC1_POSZ"]["restore_value"] == 6.0  # ExternalNav, the seam
+        # The third one is the window's thrust path's other half: the airframe's own
+        # post-arm idle delay holds the motors in ground idle for longer than this
+        # window's whole declared airtime once the spool state is finally asked for.
+        assert rows["MOT_IDLE_SEC"]["window_value"] == 0.0  # the firmware's own default
+        assert rows["MOT_IDLE_SEC"]["restore_value"] == 4.0  # compat_arming.parm's
+        assert "GROUND_IDLE" in rows["MOT_IDLE_SEC"]["why"]
+        assert all(row["why"] for row in rows.values())
+        # The check no mask can except is named, with what the window does instead.
+        assert window["not_exceptable"][0]["check"].startswith("the mandatory altitude")
+        assert "mandatory_checks" in window["not_exceptable"][0]["citation"]
+        # And the scored-window requirement is the restore column, exactly.
+        assert {row["name"]: row["value"] for row in window["scored_window_requires"]} == {
+            "ARMING_SKIPCHK": 0.0,
+            "EK3_SRC1_POSZ": 6.0,
+            "MOT_IDLE_SEC": 4.0,
+        }
+
+        # The thrust path is declared as a bounded LOCAL bring-up action, with the
+        # frozen E-EXC climb target and the window's own airtime bound.
+        thrust = window["thrust_path"]
+        assert thrust["kind"] == "bounded_local_bring_up_action"
+        assert "bounded local bring-up action" in thrust["statement"]
+        assert "setpoint" in thrust["statement"]
+        assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.60
+        assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 5.0
+        assert thrust["sent_by_the_scored_arm"] is False
+
+        # The excitation stays inside the frozen E-EXC envelope.
+        excitation = window["window"]
+        assert excitation["mode"] == check.BRING_UP_MODE
+        assert excitation["takeoff_altitude_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M
+        assert excitation["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S
+        assert excitation["lateral_setpoint"] is None
+        assert "LAND" in excitation["ends_with"]
+
+    def test_the_scored_window_refuses_to_open_while_the_exception_is_in_force(
+        self,
+    ):
+        """Bounded means it cannot still be in force: the readback decides.
+
+        The closure check reads the vehicle's own answers, so a window value
+        surviving to the claimed arm -- or a parameter the vehicle never answered,
+        which confirms nothing -- is a blocker, and the scored window does not
+        open. Beside it, the scored arm's own settings are asserted: the bridge's
+        truth republish is off, because the exception is about WHEN the aircraft
+        may move and never about what carries truth into the estimate.
+        """
+        settings, window = self._settings_and_window()
+        in_force = {row["name"]: row["window_value"] for row in window["parameter_window"]}
+        restored = {row["name"]: row["value"] for row in window["scored_window_requires"]}
+
+        # Still in force: every window parameter is named, with what it should be.
+        blockers = check._bring_up_closure_blockers(dict(in_force))
+        assert len(blockers) == len(in_force)
+        for name, window_value in in_force.items():
+            matching = [blocker for blocker in blockers if blocker.startswith(name)]
+            assert matching, f"{name} in force must be named: {blockers}"
+            assert f"{window_value:g}" in matching[0]
+            assert "restored" in matching[0] or "declared" in matching[0]
+
+        # A silent readback is a refusal, not a pass: it cannot show the lift.
+        assert check._bring_up_closure_blockers({})
+
+        # Restored exactly: the window is closed and the scored arm may proceed.
+        assert check._bring_up_closure_blockers(dict(restored)) == []
+
+        # A third value -- neither the window's nor the declared one -- is a refusal.
+        wrong = dict(restored)
+        wrong["ARMING_SKIPCHK"] = -1.0  # "skip all", neither the window's nor the declared
+        assert check._bring_up_closure_blockers(wrong)
+
+        # The scored arm's own settings: truth republish off, sensor-derived mode.
+        assert settings.truth_republish is False
+        assert settings.sensor_mode is SensorMode.SENSOR_DERIVED
+        # And it is the exception, not the arm, that carries the reason: the
+        # declared exception records the truth exemption nowhere, because there is
+        # none to record for this arm.
+        assert "truth republish is ON" not in window["justification"]
+        assert "truth republish is still off" in window["justification"]
+
+    def test_the_window_may_send_the_bounded_throttle_override(self):
+        """One channel, derived from the vehicle's own numbers, only in this window.
+
+        The declared quantity is the pilot CLIMB RATE the position-free mode
+        consumes -- the physical quantity the window's own airtime bound is about --
+        and the channel value that produces it is derived from the vehicle's own
+        calibration through the firmware's own arithmetic. The wire discipline is
+        asserted beside it: the message carries exactly one channel and leaves every
+        other field at MAVLink's own "ignore this field", the release is a zero on
+        that same channel, and the scored arm's vocabulary has no RC message type in
+        it at all.
+        """
+        settings, window = self._settings_and_window()
+        thrust = window["thrust_path"]
+
+        # Declared, with the citations a reader needs to check it.
+        assert thrust["channel"] == check.RC_THROTTLE_CHANNEL == 3
+        assert thrust["channel_name"] == "throttle"
+        assert thrust["declared_climb_rate_ms"] == check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        assert thrust["max_climb_rate_ms"] == check.BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S
+        assert thrust["refresh_s"] == check.BRING_UP_OVERRIDE_REFRESH_S > 0.0
+        assert "zero" in thrust["release"] and "RC report" in thrust["release"]
+        assert "why_a_rate_rather_than_a_stick" in thrust
+        assert list(check.BRING_UP_THROTTLE_CALIBRATION) == [
+            "RC3_MIN",
+            "RC3_MAX",
+            "RC3_DZ",
+            "THR_DZ",
+            "PILOT_SPD_UP",
+        ]
+        assert sorted(thrust["derived_from_the_vehicle"]) == sorted(
+            check.BRING_UP_THROTTLE_CALIBRATION
+        )
+        assert "mode.cpp" in thrust["why_it_is_needed"]
+        assert "RC_CHANNELS" in thrust["confirmed_by_the_vehicle"]
+
+        # The derivation is the firmware's own arithmetic on the vehicle's own
+        # numbers: at the pinned firmware's defaults (RC3 1100/1900, RC3_DZ 30,
+        # THR_DZ 100 -- ArduCopter/radio.cpp:12-32, config.h:527 -- and
+        # PILOT_SPD_UP 2.5) it reproduces the declared rate, above the deadband.
+        defaults = {
+            "RC3_MIN": 1100.0,
+            "RC3_MAX": 1900.0,
+            "RC3_DZ": 30.0,
+            "THR_DZ": 100.0,
+            "PILOT_SPD_UP": 2.5,
+        }
+        pwm, rate = check._bring_up_throttle_pwm(
+            defaults, check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        # get_control_mid() divides by (radio_max - radio_min - dead_zone), not by the
+        # raw channel span: RC_Channel.cpp:329-340.
+        mid_stick = int(1000 * ((1100 + 1900) // 2 - (1100 + 30)) / (1900 - 1100 - 30))
+        assert mid_stick == 480, "the firmware's own mid stick for this calibration"
+        deadband_top_control = mid_stick + int(defaults["THR_DZ"])
+        deadband_top_pwm = int(
+            (1100 + 30) + (1900 - 1100 - 30) * deadband_top_control / 1000
+        )
+        assert pwm > deadband_top_pwm, "the value must be above the deadband"
+        assert rate == pytest.approx(check.BRING_UP_THROTTLE_CLIMB_RATE_M_S, abs=0.02)
+        assert 0.0 < rate <= check.BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S
+
+        # A calibration that cannot express the rate is refused, never sent: a dead
+        # zone that leaves the channel no range at all, a rate the channel's own span
+        # cannot reach, and a name the vehicle did not answer are all errors rather
+        # than a quieter climb.
+        with pytest.raises(check.ConfigError):
+            check._bring_up_throttle_pwm(
+                {**defaults, "RC3_DZ": 800.0}, check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+            )
+        with pytest.raises(check.ConfigError):
+            check._bring_up_throttle_pwm(defaults, 5.0)
+        with pytest.raises(check.ConfigError):
+            check._bring_up_throttle_pwm(
+                {name: value for name, value in defaults.items() if name != "THR_DZ"},
+                check.BRING_UP_THROTTLE_CLIMB_RATE_M_S,
+            )
+
+        # The wire: exactly one channel, every other field left alone, and the release
+        # is a zero on the same field.
+        link = check.BringUpLink("tcp:127.0.0.1:5763", source_system=255)
+        connection = _RecordingConnection()
+        link._connection = connection  # no live autopilot serves a unit test
+        link.target_system, link.target_component = 1, 1
+        assert link.source_system == 255
+        record = link.send_rc_channels_override(pwm)
+        kind, arguments = connection.mav.encoded[0]
+        assert kind == "RC_CHANNELS_OVERRIDE"
+        assert list(arguments[2:10]) == [
+            0xFFFF,
+            0xFFFF,
+            pwm,
+            0xFFFF,
+            0xFFFF,
+            0xFFFF,
+            0xFFFF,
+            0xFFFF,
+        ]
+        assert all(value == 0 for value in arguments[10:]), "chan9+ are not the throttle"
+        assert record["channel"] == 3 and record["pwm"] == pwm
+        assert record["release"] is False and link.sent == [record]
+        release = link.send_rc_channels_override(check.RC_THROTTLE_RELEASE_PWM)
+        assert release["release"] is True and release["pwm"] == 0
+
+        # The scored arm's own vocabulary carries no RC, throttle or pulse command:
+        # the override's message type is in the bring-up link's set, which the
+        # scored session cannot send from.
+        assert "RC_CHANNELS_OVERRIDE" not in bridge.ALLOWED_OUTBOUND_TYPES
+        assert "RC_CHANNELS_OVERRIDE" in bridge.BRING_UP_OUTBOUND_TYPES
+        assert settings.truth_republish is False
+
+    def test_the_scored_window_refuses_while_the_throttle_override_is_in_force(self):
+        """The thrust path is a window element, so the closure gate covers it too.
+
+        The scored window sends no RC override at all, so a window that still has
+        one is the whole refusal: an override the window never released refuses, a
+        release the vehicle never confirmed refuses (a silent vehicle cannot show
+        that a command stopped), and the vehicle's own RC report still reading the
+        override's value refuses as well. Only the vehicle's own report of the
+        channel back at its radio value clears it, and the parameter rule beside it
+        is unchanged.
+        """
+        settings, window = self._settings_and_window()
+        restored = {
+            row["name"]: row["value"] for row in window["scored_window_requires"]
+        }
+        channel = check.RC_THROTTLE_CHANNEL
+        pwm = 1644
+
+        def state(**overrides):
+            record = {
+                "sent": True,
+                "channel": channel,
+                "sent_pwm": pwm,
+                "released": False,
+                "observed_during_window": pwm,
+                "observed_after_release": None,
+            }
+            record.update(overrides)
+            return record
+
+        # Still in force: the window never released it.
+        blockers = check._bring_up_closure_blockers(dict(restored), state())
+        assert len(blockers) == 1, blockers
+        assert "never released" in blockers[0] and str(pwm) in blockers[0]
+
+        # Released on the wire, but the vehicle never said so: not shown to be lifted.
+        blockers = check._bring_up_closure_blockers(dict(restored), state(released=True))
+        assert len(blockers) == 1, blockers
+        assert "never answered" in blockers[0]
+
+        # The vehicle's own report still reads the override's value: still in force.
+        blockers = check._bring_up_closure_blockers(
+            dict(restored), state(released=True, observed_after_release=pwm)
+        )
+        assert len(blockers) == 1, blockers
+        assert "still reads" in blockers[0] and str(pwm) in blockers[0]
+
+        # The vehicle's own report of the channel back at its radio value: clear.
+        cleared = state(released=True, observed_after_release=1000)
+        assert check._bring_up_closure_blockers(dict(restored), cleared) == []
+        # A window that never sent one has nothing to close, and is not a refusal.
+        assert (
+            check._bring_up_closure_blockers(
+                dict(restored),
+                state(sent=False, sent_pwm=None, observed_during_window=None),
+            )
+            == []
+        )
+        # The override is an addition to the closure, never a replacement for it:
+        # the parameter rule and the silent-readback rule still refuse beside it.
+        assert check._bring_up_closure_blockers({}, cleared)
+        wrong = dict(restored)
+        wrong["MOT_IDLE_SEC"] = 0.0  # the window's value, not the scored arm's
+        assert check._bring_up_closure_blockers(wrong, cleared)
+        assert settings.sensor_mode is SensorMode.SENSOR_DERIVED

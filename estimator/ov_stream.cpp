@@ -27,6 +27,21 @@
 //   -> "<QB19dIQB", 174 bytes, matching localization.py's _STATE_PAYLOAD.
 //
 // CONVENTIONS, each pinned rather than guessed (plan section 3.4's T2):
+// 0. Inertial cadence and published-state currency. Every inertial sample is
+//    fed to the manager the moment its frame is parsed, never held for the
+//    next image: feeding only queues inside the manager (propagator,
+//    initializer, ZUPT feeder) and never advances state->_timestamp, so an
+//    image arriving after newer inertial samples is still in order -- the
+//    pin's out-of-order drop and propagate_and_clone exits key on
+//    state->_timestamp, which only camera/ZUPT updates move, and
+//    select_imu_readings then interpolates its final segment to the image
+//    time instead of extrapolating it (its case 3.4 fallback). The published
+//    STATE is the pin's fast_state_propagate projection of the current state
+//    to the newest consumed inertial sample -- the between-frames odometry
+//    path the pin's own ROS driver publishes -- so the pose the autopilot
+//    fuses is current rather than pinned to the last image. The filter's
+//    state, its clone structure and the stereo update semantics are
+//    untouched by the projection.
 //
 // 1. Inertial input. The declared transport delivers inertial data in the
 //    autopilot's body frame (x forward, y right, z down): the controller
@@ -49,11 +64,16 @@
 //    extrinsic below is that rotation, derived in the code from the record's
 //    declared translations rather than typed in as a matrix.
 //
-// 3. Reported attitude. The adapter (OdomAlignment) consumes a quaternion that
-//    takes a point in the body frame and expresses it in the odometry frame,
-//    and applies the fixed ENU->NED axis swap itself. OpenVINS's quat() is
-//    q_GtoI, i.e. R_GtoI in its (x, y, z, w) JPL order, so the state reported
-//    here is its inverse: body->odom in (w, x, y, z).
+// 3. Reported attitude. The adapter (OdomAlignment) applies the fixed
+//    ENU->NED axis swap itself and needs body->odom. OpenVINS's quat() is
+//    q_GtoI in its (x, y, z, w) JPL order, whose quat_2_Rot is the JPL form
+//    (the negative skew term), so the conjugated (w, x, y, z) numbers packed
+//    below read, under the adapter's HAMILTON quat_to_rotmat, as ODOM->BODY:
+//    conjugating in JPL and re-reading as Hamilton cancel. Measured, run
+//    p01l-fix3b-20260927T050042Z: reading them as body->odom published the
+//    inverse rotation on every axis. The adapter therefore transposes its
+//    read (localization.py _delivered_body_to_odom); do not "fix" that
+//    transpose away without re-measuring against dataflash truth.
 //
 // 4. Position and velocity need no rotation: the estimator's global frame is
 //    z-up and its origin is the initialization point, which is exactly what the
@@ -83,6 +103,7 @@
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
 #include "state/State.h"
+#include "state/Propagator.h"
 #include "state/StateHelper.h"
 #include "types/IMU.h"
 #include "utils/sensor_data.h"
@@ -107,7 +128,7 @@ const size_t FRAME_LENGTH_OFFSET = 4;
 const double IMU_PERIOD_NS = 2e6;      // declared 500 Hz (configs/first_indoor.yaml:73)
 const double STEREO_PERIOD_NS = 1e8;   // declared 10 Hz (:65)
 const size_t STATE_PAYLOAD_SIZE = 8 + 1 + 19 * 8 + 4 + 8 + 1;  // "<QB19dIQB"
-const double PUBLISH_PERIOD_S = 0.025; // the seam's proven cadence (F1)
+const double PUBLISH_PERIOD_S = 0.010; // 100 Hz: F2's 20 ms bound is unreachable on 25 ms ticks (FIXER5)
 
 struct Reader {
   int fd = -1;
@@ -266,30 +287,101 @@ void build_options(ov_msckf::VioManagerOptions &params) {
   // zero-velocity updater the initializer requires an acceleration jerk, which
   // a stationary launch interval never supplies.
   params.try_zupt = true;
+  // The pin's zero-velocity accept gate bypasses chi2 and the velocity bound
+  // entirely once the image disparity test passes (UpdaterZeroVelocity.cpp:241
+  // keys on !disparity_passed first; the override flag is a hardcoded local at
+  // :113, not a parameter), and a vehicle that is physically near-stationary
+  // while fighting a wrong pose shows sub-pixel disparity: measured in runs
+  // p01l-fix2-20260927T020445Z ("accepted |v_IinG| = 0.065 (chi2 10489.080 <
+  // 84.595)", 790 accepts, state frozen ~1.5 m from truth, E1 1.517 m) and
+  // p01l-fix2l-20260927T033814Z (749 accepts, the covariance corrupted until a
+  // published sigma read 0.0, 291 stop/recover cycles). The pin's own lever is
+  // zupt_only_at_beginning (VioManagerOptions.h:95): it gates all three ZUPT
+  // feed sites (VioManager.cpp:186/221/294) on !has_moved_since_zupt, which
+  // latches at the first completed visual update (VioManager.cpp:360, past the
+  // five-clone window). The static start is untouched: the initializer is fed
+  // independently (:180-182) and the updater only ever runs once
+  // is_initialized_vio, so the excitation's motion both initializes and latches
+  // ZUPT off before the scored window opens.
+  params.zupt_only_at_beginning = true;
 }
 
 // ---------------------------------------------------------------------------
 // One STATE frame (must match localization.py's decode_state)
 // ---------------------------------------------------------------------------
 
+void log_line(const char *format, ...);
+
 std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &sys,
-                                  uint8_t reset_counter) {
+                                  uint8_t reset_counter, double newest_imu_time) {
   auto state = sys->get_state();
   auto imu = state->_imu;
 
-  // Convention 3: body->odom, which is the inverse of OpenVINS's q_GtoI.
-  Eigen::Vector4d q_GtoI = imu->quat();  // (x, y, z, w)
-  Eigen::Vector4d q_ItoG(-q_GtoI(0), -q_GtoI(1), -q_GtoI(2), q_GtoI(3));
-
-  // Per-axis position sigma: the marginal covariance of the IMU state in
-  // [q(3), p(3), v(3), bg(3), ba(3)] order, so position is rows/cols 3..5.
-  std::vector<std::shared_ptr<ov_type::Type>> variables{imu};
-  Eigen::MatrixXd cov = ov_msckf::StateHelper::get_marginal_covariance(state, variables);
+  // The filter's own timestamp is the last camera/ZUPT update; between updates
+  // the newest consumed inertial sample is ahead of it. Publish the projection
+  // to that sample when the propagator can cover the interval, and the state
+  // as-is otherwise. A refusal is diagnostically interesting -- it is the
+  // difference between a current pose and a stale one -- so the first one and
+  // every 200th after it are logged rather than swallowed silently.
+  static uint64_t refusals = 0;
+  Eigen::Vector4d q_GtoI;
+  Eigen::Vector3d position, velocity;
   double sigma[3] = {0.0, 0.0, 0.0};
-  for (int i = 0; i < 3; ++i) {
-    double variance = cov(3 + i, 3 + i);
-    sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+  double publish_time = state->_timestamp;
+  Eigen::Matrix<double, 13, 1> state_plus;
+  Eigen::Matrix<double, 12, 12> cov_plus;
+  if (newest_imu_time > state->_timestamp &&
+      sys->get_propagator()->fast_state_propagate(state, newest_imu_time, state_plus, cov_plus)) {
+    publish_time = newest_imu_time;
+    q_GtoI = state_plus.block(0, 0, 4, 1);
+    position = state_plus.block(4, 0, 3, 1);
+    // state_plus carries the body-frame velocity (R_GtoI * v_G); the payload's
+    // contract is the estimator's global frame, so rotate it back.
+    velocity = ov_core::quat_2_Rot(q_GtoI).transpose() * state_plus.block(7, 0, 3, 1);
+    for (int i = 0; i < 3; ++i) {
+      double variance = cov_plus(3 + i, 3 + i);
+      sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+    }
+  } else if (newest_imu_time > state->_timestamp) {
+    // The propagator cannot cover the interval, so the honest publication is the
+    // filter's own state at its own timestamp -- the same values the branch below
+    // publishes -- never the uninitialised locals this branch used to leave in
+    // place. Measured, runs p01l-fix5c/-7c-20260927: the refusal states' sigma of
+    // 0.0 kept them off the wire, but with the parked-phase sigma excursion
+    // declared benign (FIXER6) these frames are published while parked, and
+    // publishing uninitialised memory would inject a garbage pose instead.
+    q_GtoI = imu->quat();
+    position = imu->pos();
+    velocity = imu->vel();
+    {
+      std::vector<std::shared_ptr<ov_type::Type>> variables{imu};
+      Eigen::MatrixXd cov = ov_msckf::StateHelper::get_marginal_covariance(state, variables);
+      for (int i = 0; i < 3; i++) {
+        double variance = cov(3 + i, 3 + i);
+        sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+      }
+    }
+    refusals += 1;
+    if (refusals == 1 || refusals % 200 == 0) {
+      log_line("ov_stream: projection refused (%llu so far): state_t=%.3f newest_imu=%.3f",
+               (unsigned long long)refusals, state->_timestamp, newest_imu_time);
+    }
+  } else {
+    q_GtoI = imu->quat();
+    position = imu->pos();
+    velocity = imu->vel();
+    // Per-axis position sigma: the marginal covariance of the IMU state in
+    // [q(3), p(3), v(3), bg(3), ba(3)] order, so position is rows/cols 3..5.
+    std::vector<std::shared_ptr<ov_type::Type>> variables{imu};
+    Eigen::MatrixXd cov = ov_msckf::StateHelper::get_marginal_covariance(state, variables);
+    for (int i = 0; i < 3; ++i) {
+      double variance = cov(3 + i, 3 + i);
+      sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+    }
   }
+
+  // Convention 3: body->odom, which is the inverse of OpenVINS's q_GtoI.
+  Eigen::Vector4d q_ItoG(-q_GtoI(0), -q_GtoI(1), -q_GtoI(2), q_GtoI(3));
 
   // The camera-clock time of the last update, taken into the IMU clock by the
   // declared cam-imu offset (zero here, so the two are equal).
@@ -297,14 +389,14 @@ std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &s
 
   std::vector<uint8_t> frame;
   write_header(frame, KIND_STATE, (uint32_t)STATE_PAYLOAD_SIZE);
-  write_u64(frame, (uint64_t)std::llround(state->_timestamp * 1e9));
+  write_u64(frame, (uint64_t)std::llround(publish_time * 1e9));
   write_u8(frame, (uint8_t)(sys->initialized() ? 1 : 0));
   write_f64(frame, q_ItoG(3));  // w
   write_f64(frame, q_ItoG(0));  // x
   write_f64(frame, q_ItoG(1));  // y
   write_f64(frame, q_ItoG(2));  // z
-  for (int i = 0; i < 3; ++i) write_f64(frame, imu->pos()(i));
-  for (int i = 0; i < 3; ++i) write_f64(frame, imu->vel()(i));
+  for (int i = 0; i < 3; ++i) write_f64(frame, position(i));
+  for (int i = 0; i < 3; ++i) write_f64(frame, velocity(i));
   for (int i = 0; i < 3; ++i) write_f64(frame, imu->bias_g()(i));
   for (int i = 0; i < 3; ++i) write_f64(frame, imu->bias_a()(i));
   for (int i = 0; i < 3; ++i) write_f64(frame, sigma[i]);
@@ -381,7 +473,7 @@ int main(int argc, char **argv) {
   // for this process to be ready -- must cost nothing: its connection is one of
   // these, and the next one carries the stream. Only a malformed frame or a dead
   // listener ends the process.
-  std::vector<ov_core::ImuData> imu_queue;
+  double newest_imu_time = 0.0;
   uint64_t stereo_frames = 0;
   uint64_t imu_samples = 0;
   uint64_t published = 0;
@@ -401,6 +493,7 @@ int main(int argc, char **argv) {
     Reader reader;
     reader.fd = client;
     auto last_publish = std::chrono::steady_clock::now();
+    newest_imu_time = 0.0;
 
     while (true) {
     fd_set readable;
@@ -415,9 +508,10 @@ int main(int argc, char **argv) {
       break;
     }
 
-    // Drain whole frames. Camera frames are fed only after the inertial samples
-    // that precede them, which is the ordering OpenVINS requires: an image the
-    // propagator cannot reach is dropped inside the manager with a warning.
+    // Drain whole frames. Inertial samples are fed the moment they are parsed
+    // (convention 0): the wire carries every sample older than an image before
+    // that image, so the ordering OpenVINS requires holds by construction, and
+    // samples newer than the pending image are harmless to the filter.
     while (reader.buffer.size() >= FRAME_HEADER_SIZE) {
       uint16_t magic = read_u16(reader.buffer.data());
       uint8_t kind = reader.buffer[2];
@@ -442,7 +536,8 @@ int main(int argc, char **argv) {
         message.timestamp = (double)time_ns / 1e9;
         message.wm = to_estimator_frame(values);
         message.am = to_estimator_frame(values + 3);
-        imu_queue.push_back(message);
+        sys->feed_measurement_imu(message);
+        newest_imu_time = message.timestamp;
         imu_samples += 1;
       } else if (kind == KIND_STEREO) {
         if (length < 16) {
@@ -461,13 +556,6 @@ int main(int argc, char **argv) {
           return 1;
         }
         double image_time = (double)time_ns / 1e9;
-        // Every inertial sample up to the image instant is fed first.
-        size_t consumed = 0;
-        while (consumed < imu_queue.size() && imu_queue[consumed].timestamp < image_time) {
-          sys->feed_measurement_imu(imu_queue[consumed]);
-          consumed += 1;
-        }
-        imu_queue.erase(imu_queue.begin(), imu_queue.begin() + consumed);
 
         ov_core::CameraData message;
         message.timestamp = image_time;
@@ -484,10 +572,23 @@ int main(int argc, char **argv) {
         }
         sys->feed_measurement_camera(message);
         stereo_frames += 1;
-        if (stereo_frames == 1 || stereo_frames % 25 == 0) {
-          log_line("ov_stream: %llu stereo frames, %llu imu samples, initialized=%d",
+        if (stereo_frames <= 10 || stereo_frames % 25 == 0) {
+          // Diagnostic: the frame's own timestamp, the pixel statistics of what the
+          // tracker was handed, and how many features it is carrying. Without these,
+          // "the estimator gets no visual updates" cannot be told apart from "the
+          // frames arrive stale, repeated, or blank", and all three look alike.
+          double active_time = -1.0;
+          std::unordered_map<size_t, Eigen::Vector3d> positions;
+          std::unordered_map<size_t, Eigen::Vector3d> uvd;
+          sys->get_active_tracks(active_time, positions, uvd);
+          cv::Scalar mean_l, sd_l, mean_r, sd_r;
+          cv::meanStdDev(message.images[0], mean_l, sd_l);
+          cv::meanStdDev(message.images[1], mean_r, sd_r);
+          log_line("ov_stream: %llu stereo frames, %llu imu samples, initialized=%d, "
+                   "frame_t=%.3f, tracks=%zu, left_mean=%.1f, left_sd=%.2f, right_mean=%.1f, right_sd=%.2f",
                    (unsigned long long)stereo_frames, (unsigned long long)imu_samples,
-                   (int)sys->initialized());
+                   (int)sys->initialized(), image_time, uvd.size(),
+                   mean_l[0], sd_l[0], mean_r[0], sd_r[0]);
         }
       } else if (kind == KIND_RESET) {
         // A reset is asked for, never improvised: the old state is abandoned and
@@ -495,7 +596,7 @@ int main(int argc, char **argv) {
         // again, so the adapter sees silence rather than a jump (plan section
         // 4.4); its own reset counter is what rides the published messages.
         reset_counter += 1;
-        imu_queue.clear();
+        newest_imu_time = 0.0;
         sys = std::make_shared<ov_msckf::VioManager>(params);
         log_line("ov_stream: reset %u: fresh filter", (unsigned)reset_counter);
       } else {
@@ -511,7 +612,7 @@ int main(int argc, char **argv) {
     if (since_publish >= PUBLISH_PERIOD_S) {
       last_publish = now;
       if (sys->initialized()) {
-        std::vector<uint8_t> frame = encode_state(sys, reset_counter);
+        std::vector<uint8_t> frame = encode_state(sys, reset_counter, newest_imu_time);
         if (!send_all(client, frame)) {
           log_line("ov_stream: the host is gone while publishing");
           break;

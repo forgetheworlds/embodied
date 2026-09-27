@@ -6,7 +6,7 @@ fixed odom-to-local-NED alignment (specification section 6.3), and the
 health/freshness state machine that decides whether an estimate may be
 published at all (plan sections 4.5 and 6). Publishing rides the same
 ExternalNav discipline the P00 gate proved: ``VISION_POSITION_ESTIMATE`` and
-``VISION_SPEED_ESTIMATE`` at a 25 ms cadence on the adapter's own MAVLink
+``VISION_SPEED_ESTIMATE`` at a 10 ms cadence on the adapter's own MAVLink
 connection — never commanded by this process, never fed simulator truth.
 
 The estimator process receives exactly what the declared sensors carry — stereo
@@ -29,7 +29,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -298,6 +298,26 @@ def rotmat_from_rpy(rpy: Sequence[float]) -> np.ndarray:
     )
 
 
+def _delivered_body_to_odom(quat_wxyz: Sequence[float]) -> np.ndarray:
+    """The body->odom rotation of one STATE quaternion as the wire delivers it.
+
+    ov_stream conjugates the pinned state quaternion's JPL vector part and packs
+    it (w, x, y, z) intending body->odom (estimator/ov_stream.cpp "Convention
+    3"). The pin's quat_2_Rot, however, is the JPL form -- the negative skew
+    term, quat_ops.h:142-152 of the pinned tarball -- which is the transpose of
+    this module's Hamilton quat_to_rotmat for the same four numbers, so the
+    delivered numbers read as Hamilton are the ODOM->BODY rotation. Measured,
+    run p01l-fix3b-20260927T050042Z: the published attitude carried the
+    opposite sign to the dataflash SIM truth on every axis through the whole
+    flight, and transposing the published rotation recovers truth to a
+    transport lag; positions stayed correct only because that run's
+    gram_schmidt yaw sealed near zero (epoch yaw 179.54 deg), which the epoch
+    derivation absorbs -- at a +/-90 degree seal the pre-fix epoch rotated
+    true displacements by the double yaw. The alignment therefore transposes
+    the delivered read itself: what it composes is the body->odom rotation.
+    """
+    return quat_to_rotmat(quat_wxyz).T
+
 class OdomAlignment:
     """The fixed odom→local-NED transform of one nav_epoch.
 
@@ -346,8 +366,8 @@ class OdomAlignment:
     def seal(self, initial_quat_odom_wxyz: Sequence[float]) -> None:
         """Derive and freeze the epoch rotation from the first initialized state.
 
-        ``published = A · q_odom(t) · FLU→FRD`` with
-        ``A = R_declared_start · FLU→FRD · q_odom(start)⁻¹``: one fixed
+        Position and velocity are published as ``A · p_odom`` and ``A · v_odom``
+        with ``A = R_declared_start · FLU→FRD · R_body→odom(start)⁻¹``: one fixed
         odom→NED rotation per epoch, the estimator's own initialization frame
         related to the autopilot's frame by the two things known at the declared
         stationary start. Idempotent: the first seal wins and the rotation never
@@ -355,9 +375,34 @@ class OdomAlignment:
         """
         if self._epoch_rotation is not None:
             return
-        initial = quat_to_rotmat(initial_quat_odom_wxyz)
+        initial = _delivered_body_to_odom(initial_quat_odom_wxyz)
         declared = rotmat_from_rpy(self._declared_start_rpy)
         self._epoch_rotation = declared @ FLU_TO_FRD_AXES @ initial.T
+        # Why the attitude is not composed through the epoch rotation: the
+        # epoch rotation carries the initializer's noise-decided gram_schmidt
+        # yaw (ov_init/src/utils/helper.h:138-157), and composing the attitude
+        # through it conjugates the rotation since start by that yaw, which
+        # permutes pitch into roll whenever the yaw is near +/-90 degrees.
+        # Measured: run p01l-bringup-20260926T202549Z published a physical
+        # pitch sequence of (0.117, 0.414, 1.52) rad nose down as roll
+        # (0.112, 0.439, 1.557) with pitch near zero, value for value, and the
+        # 204753Z bring-up (sealed epoch yaw 89.62 degrees) shows the same
+        # permutation from the first degree of rotation. aligned_attitude_rpy
+        # therefore publishes
+        #   declared @ FLU→FRD @ (R_body→odom(start)⁻¹ @ R_body→odom(t)) @ FLU→FRD
+        # -- the rotation since the sealed start taken in the BODY frame at the
+        # seal, conjugated into FRD and composed onto the declared start -- and
+        # keeps the epoch rotation on position and velocity only. The order is
+        # load-bearing: the product the other way round is the same rotation in
+        # the odom WORLD frame, and composing that conjugates by the
+        # gram_schmidt yaw, which is the b477ee7 permutation. Validated against
+        # the recorded publications of 202549Z itself and, for the composition
+        # settled here, against run p01l-fix3b-20260927T050042Z end to end:
+        # transposing the pre-fix published rotation recovers the dataflash SIM
+        # truth to a transport lag through the whole flight (test file,
+        # TestConventions::test_the_published_attitude_is_the_true_rotation_not_its_inverse).
+        self._declared_rotation = declared
+        self._initial_body_to_odom = initial
 
     def _require_sealed(self) -> None:
         if self._epoch_rotation is None:
@@ -376,15 +421,23 @@ class OdomAlignment:
         ned = self.epoch_rotation @ np.asarray(velocity_odom_mps, dtype=np.float64)
         return (float(ned[0]), float(ned[1]), float(ned[2]))
 
+    def _aligned_attitude_rotation(self, quat_odom_wxyz: Sequence[float]) -> np.ndarray:
+        # See seal(): the rotation since the sealed start -- taken in the body
+        # frame at the seal, R(start)⁻¹ @ R(t) -- conjugated into FRD and
+        # composed onto the declared start attitude. The epoch rotation stays
+        # on position and velocity only.
+        self._require_sealed()
+        current = _delivered_body_to_odom(quat_odom_wxyz)
+        since_start = self._initial_body_to_odom.T @ current
+        return self._declared_rotation @ FLU_TO_FRD_AXES @ since_start @ FLU_TO_FRD_AXES
+
     def aligned_quat_ned_wxyz(
         self, quat_odom_wxyz: Sequence[float]
     ) -> tuple[float, float, float, float]:
-        rotation = self.epoch_rotation @ quat_to_rotmat(quat_odom_wxyz) @ FLU_TO_FRD_AXES
-        return rotmat_to_quat(rotation)
+        return rotmat_to_quat(self._aligned_attitude_rotation(quat_odom_wxyz))
 
     def aligned_attitude_rpy(self, quat_odom_wxyz: Sequence[float]) -> tuple[float, float, float]:
-        rotation = self.epoch_rotation @ quat_to_rotmat(quat_odom_wxyz) @ FLU_TO_FRD_AXES
-        return rotmat_to_rpy(rotation)
+        return rotmat_to_rpy(self._aligned_attitude_rotation(quat_odom_wxyz))
 
     def aligned_state(self, state: EstimatorState) -> dict[str, object]:
         """One aligned state: NED position, NED attitude RPY and velocity."""
@@ -455,7 +508,20 @@ class HealthMachine:
         self._last_state_wall_ns: int | None = None
         self._last_publish_wall_ns: int | None = None
         self._window_open_wall_ns: int | None = None
+        self._window_closed_wall_ns: int | None = None
+        # Whether ``open_window`` has declared the flight. The sigma bound protects
+        # the control loop in flight; before the declaration (the parked bring-up and
+        # pre-arm wait) a sigma excursion is recorded but does not stop publication.
+        self._window_declared = False
+        self._parked_sigma_excursion = False
         self._stopped_at_wall_ns: int | None = None
+        # The FLIGHT's end, distinct from the window's end. The scored window is declared
+        # arm to disarm and governs E1/H1/H2; the freshness metrics stop earlier, at the
+        # LAND command, because the owner's ruling is that the bound protects the control
+        # loop WHILE FLYING and that takeoff and landing are low-speed phases where pose
+        # age does not matter.
+        self._flight_end_wall_ns: int | None = None
+        self.state_at_close: str | None = None
 
     def on_state(self, state: EstimatorState | None, now_wall_ns: int) -> bool:
         """Feed one consumed STATE (or None) on the wall clock; report publishability.
@@ -480,12 +546,39 @@ class HealthMachine:
             self.events.append(HealthEvent(state.time_ns, "initialized", ""))
         sigma = state.sigma_pos_m
         if min(sigma) < self.bounds.sigma_min_m or max(sigma) > self.bounds.sigma_max_m:
-            self.stop(
-                now_wall_ns,
-                f"sigma {tuple(sigma)} is outside the declared envelope "
-                f"[{self.bounds.sigma_min_m}, {self.bounds.sigma_max_m}] m",
-            )
-            return False
+            if self._window_declared:
+                self.stop(
+                    now_wall_ns,
+                    f"sigma {tuple(sigma)} is outside the declared envelope "
+                    f"[{self.bounds.sigma_min_m}, {self.bounds.sigma_max_m}] m",
+                )
+                return False
+            # The parked phase is not flight, and the excursion there is measured
+            # benign: the ZUPT walk that initializes a stationary launch corrupts
+            # the covariance until a published sigma reads exactly 0.0 (FIXER3:
+            # the pose error while parked stayed 1 mm p95 against truth, with up to
+            # 16,000 chi2-accepted zero-velocity updates), while stopping
+            # publication for it starves the firmware's VISO health window and the
+            # arm is refused with 'VisOdom: not healthy' -- a self-inflicted refusal
+            # (FIXER6 runs p01l-fixer6-1/-2: valid fraction 0.54/0.70 against the
+            # 0.99 of healthy runs, three of four launches dead at the arm). The
+            # excursion is recorded, never silent; once the window is declared the
+            # bound binds exactly as declared and an in-flight excursion stops
+            # transmission.
+            if not self._parked_sigma_excursion:
+                self._parked_sigma_excursion = True
+                self.events.append(
+                    HealthEvent(
+                        state.time_ns,
+                        "parked sigma excursion",
+                        f"sigma {tuple(sigma)} is outside the declared envelope while "
+                        "parked (declared benign: publication continues)",
+                    )
+                )
+            return True
+        if self._parked_sigma_excursion:
+            self._parked_sigma_excursion = False
+            self.events.append(HealthEvent(state.time_ns, "parked sigma excursion cleared", ""))
         return True
 
     def _timeout_if_silent(self, now_wall_ns: int) -> None:
@@ -513,16 +606,95 @@ class HealthMachine:
         self._stopped_at_wall_ns = now_wall_ns
         self.events.append(HealthEvent(now_wall_ns, "stopped", detail))
 
+    @property
+    def window_declared(self) -> bool:
+        """Whether the flight has been declared (``open_window`` has been called).
+
+        The publish gate's freshness bounds protect the control loop in flight; before
+        the declaration the vehicle is parked through the bring-up and the pre-arm wait,
+        where a stale-but-correct pose is harmless and a publication stop starves the
+        firmware's VISO health window and refuses the arm (FIXER6: runs
+        p01l-fixer6-1/-2/-6).
+        """
+        return self._window_declared
+
     def open_window(self, now_wall_ns: int) -> None:
         """Start the scored window (arm to disarm), discarding bring-up accounting."""
         self._window_open_wall_ns = now_wall_ns
+        self._window_declared = True
+        self._parked_sigma_excursion = False
+        self._window_closed_wall_ns = None
+        self.state_at_close = None
+        self._flight_end_wall_ns = None
         self._last_publish_wall_ns = None
         self.publish_gaps_s = []
         self.published_state_ages_s = []
         self.outages_s = []
 
+    def close_window(self, now_wall_ns: int) -> None:
+        """End the scored window: the flight is over and the harness is shutting down.
+
+        The window is declared arm to disarm, and the vehicle has already disarmed by
+        the time the flight sequence ends; everything after this point is the harness
+        stopping Webots and SITL. Measured, run p01l-zupt5-20260927T042005Z: the adapter
+        republished one frozen state 332 times over 10.13 s of that shutdown -- 32 % of
+        the scored window -- and every one of them was scored against a truth sample that
+        was equally frozen, so the scored window's p95 was pinned to the pose of a
+        vehicle that had already crashed. Freezing here keeps the window the flight.
+        """
+        if self._window_open_wall_ns is None or now_wall_ns < self._window_open_wall_ns:
+            return
+        self._window_closed_wall_ns = now_wall_ns
+        # H2/H4 read "final machine state healthy", and the flight's own end is where
+        # that must be read: after this point the adapter's input is gone, so the
+        # declared 300 ms silence stop is the correct behaviour and not a fault.
+        # Measured, run p01l-fix3-20260927T045304Z: the machine stopped on silence in the
+        # shutdown and H2/H4 read `stopped` at process exit.
+        self.state_at_close = self.state
+
+
+    def mark_flight_end(self, now_wall_ns: int) -> None:
+        """End the FLIGHT. Earlier than the window's end, and only the freshness metrics.
+
+        The LAND command is where flying stops, so F1's gaps, F2's ages and F3's gaps
+        stop being recorded there. E1/H1/H2 keep the declared arm-to-disarm window: the
+        descent and landing are still judged for accuracy, and only pose AGE stops being
+        judged once the aircraft is coming down. Measured, run
+        p01l-fix7a-20260927T172100Z: the 27 publications after LAND carried ONE frozen
+        state (t=53.940) for 274 ms while the vehicle sat parked and disarmed -- the
+        adapter running out its own declared 300 ms silence watchdog -- and those 27 rows
+        were the entirety of F2's 0.056 s max. In flight the same run's F2 max was
+        0.021 s.
+        """
+        if self._window_open_wall_ns is None or now_wall_ns < self._window_open_wall_ns:
+            return
+        self._flight_end_wall_ns = now_wall_ns
+    def _window_end_wall_ns(self, now_wall_ns: int) -> int:
+        """The window's end: now, or the close, whichever came first."""
+        if self._window_closed_wall_ns is None:
+            return now_wall_ns
+        return min(now_wall_ns, self._window_closed_wall_ns)
+
     def on_published(self, state: EstimatorState, now_wall_ns: int, newest_imu_ns: int) -> None:
-        """Record one publication for the freshness accounting (F2, F3)."""
+        """Record one publication for the freshness accounting (F2, F3).
+
+        Only inside the scored window. Publications after ``close_window`` are the
+        harness's teardown, not the flight: the drain loop has exited, so no new
+        offer can arrive, and the publisher keeps re-sending the last offered state
+        against a frozen newest-IMU stamp — exactly the frozen-tail pathology the
+        window's declared end (arm to the flight's end) exists to exclude, and the
+        same one E1's accounting was fixed for in b48b44d. Measured, run
+        p01l-fix5-20260927T163256Z: the flight's own 1878 publications aged at most
+        ~0.019 s, then 28 teardown publications carried one frozen state (t=54.030)
+        at a constant 0.214 s for 316 ms until the thread stopped, and that teardown
+        tail was 100 % of the run's F2 failure. H1's ``valid_fraction`` already ends
+        at ``_window_end_wall_ns``; F2/F3 now do too.
+        """
+        end = self._window_end_wall_ns(now_wall_ns)
+        if self._flight_end_wall_ns is not None:
+            end = min(end, self._flight_end_wall_ns)
+        if now_wall_ns > end:
+            return
         if self._last_publish_wall_ns is not None:
             self.publish_gaps_s.append((now_wall_ns - self._last_publish_wall_ns) / 1e9)
         self._last_publish_wall_ns = now_wall_ns
@@ -541,12 +713,13 @@ class HealthMachine:
         """The healthy fraction of the scored window so far (H1), outages charged whole."""
         if self._window_open_wall_ns is None:
             return 1.0
-        window_s = (now_wall_ns - self._window_open_wall_ns) / 1e9
+        end_wall_ns = self._window_end_wall_ns(now_wall_ns)
+        window_s = (end_wall_ns - self._window_open_wall_ns) / 1e9
         if window_s <= 0.0:
             return 1.0
         stopped_s = sum(self.outages_s)
-        if self._stopped_at_wall_ns is not None:
-            stopped_s += (now_wall_ns - self._stopped_at_wall_ns) / 1e9
+        if self._stopped_at_wall_ns is not None and self._stopped_at_wall_ns < end_wall_ns:
+            stopped_s += (end_wall_ns - self._stopped_at_wall_ns) / 1e9
         return max(0.0, 1.0 - stopped_s / window_s)
 
 
@@ -655,12 +828,30 @@ class OvStreamClient:
 
 
 def publish_period_s() -> float:
-    """The proven seam cadence: 25 ms, inside the filter's 20 ms minimum."""
-    return 0.025
+    """The seam cadence: 10 ms (100 Hz), with the EKF delay corrected.
+
+    25 ms through FIXER5's first four flights. The declared F2 bound
+    (published-state age max 20 ms) is smaller than one 25 ms publish slot on
+    both this tick and ov_stream's PUBLISH_PERIOD_S puts the floor at one slot
+    per side. This is the retry after the first attempt (db3153f, 2026-09-27)
+    flew clean twice and then lost two runs mid-route: FIXER5 then measured the
+    EKF's ext-nav fusion delay and found it declared 50 ms against a pose that
+    arrives p50 2.5-5.7 ms after its own validity stamp, and set VISO_DELAY_MS
+    to the pin's default 10 ms (commit 03e1213). The rate and the delay are one
+    coupled choice: at 100 Hz with the old 50 ms delay several updates contended
+    for the same back-dated IMU window.
+
+    EKF3 still fuses external navigation at most every 20 ms
+    (AP_NavEKF3.h:516, extNavIntervalMin_ms) — faster sends are dropped silently
+    at the EKF's writeExtNavData gate, while the vision-position health window
+    (AP_VisualOdom_Backend.cpp:32-35) is a 300 ms timeout and is unaffected. The
+    declared localization.publish.period_ms carries the same 10 ms.
+    """
+    return 0.010
 
 
 class ExternalNavPublisher:
-    """Publishes the aligned estimator state to SITL at the proven cadence.
+    """Publishes the aligned estimator state to SITL at the seam's 10 ms cadence.
 
     Two message types on the adapter's own MAVLink TCP connection — the gate's
     discipline (ALLOWED_OUTBOUND_TYPES, VISION_POSE_PERIOD_S = 0.025 at the
@@ -690,6 +881,12 @@ class ExternalNavPublisher:
         self._clock = clock
         self._on_publish = on_publish
         self._latest: EstimatorState | None = None
+        self._latest_offer_s: float | None = None
+        # The state clock's freeze watch: the wall time the current state clock was
+        # first seen, so a clock that stops advancing is detected by the same declared
+        # bound that governs a silent feed (see ``state_for_publish``).
+        self._clock_first_seen_s: float | None = None
+        self._clock_seen_ns: int | None = None
         self._newest_imu_ns = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -712,7 +909,52 @@ class ExternalNavPublisher:
     def offer(self, state: EstimatorState, newest_imu_ns: int) -> None:
         """Hand one candidate state to the publisher's loop."""
         self._latest = state
+        self._latest_offer_s = self._clock()
         self._newest_imu_ns = max(self._newest_imu_ns, newest_imu_ns)
+
+    def state_for_publish(self, now_s: float) -> EstimatorState | None:
+        """The state the machine may act on, or None once the feed has gone silent.
+
+        ``state_lost_after_ms`` is a declared bound -- "300 ms of silence stops
+        transmission: the adapter never publishes a stale estimate" -- and the machine's
+        watchdog (``HealthMachine._timeout_if_silent``) is the only thing that enforces
+        it. That watchdog runs on ``on_state(None, ...)``, so a publisher that always
+        hands over its last state leaves the bound unreachable and keeps a frozen pose on
+        the wire for as long as the process lives. Measured, run
+        p01l-zupt5-20260927T042005Z: 332 identical publications over 10.13 s after the
+        simulator had stopped, 32 % of the scored window. Staleness is measured from the
+        newest OFFER, so a live feed at any rate is unaffected.
+
+        The same declared bound also governs the state's OWN clock, because a feed can
+        keep offering while the estimate behind it is frozen. Measured on the four
+        mid-climb tumbles of 2026-09-27 (p01l-fix5c/-5d/-7c/-flightscope): ov_stream
+        kept publishing at its 100 Hz tick while its state clock stood still -- a burst
+        of ~614 KB stereo frames on the one shared, ordered, blocking connection kept
+        the inertial samples behind it unconsumed, so the published state carried a
+        healthy sigma and a pose frozen at the last accepted image while the vehicle
+        climbed. The adapter republished that confident frozen pose for whole seconds
+        until the backlog cleared and the pose stepped 0.4-0.7 m mid-air; the yaw
+        excursion and the roll-yaw flip followed within 1.5 s. A clock that has not
+        advanced for ``state_lost_after_s`` is the same stale estimate the bound
+        already forbids, so it hands the machine None the same way, and the declared
+        silence path takes over. A live feed advances its clock with every inertial
+        sample (2 ms at the declared 500 Hz), so only a stalled estimator can trip it.
+        """
+        if self._latest is None or self._latest_offer_s is None:
+            return None
+        if now_s - self._latest_offer_s > self._machine.bounds.state_lost_after_s:
+            return None
+        if self._clock_seen_ns != self._latest.time_ns:
+            self._clock_seen_ns = self._latest.time_ns
+            self._clock_first_seen_s = now_s
+        elif (
+            self._machine.window_declared
+            and self._clock_first_seen_s is not None
+            and now_s - self._clock_first_seen_s
+            > self._machine.bounds.state_lost_after_s
+        ):
+            return None
+        return self._latest
 
     def start(self, heartbeat_timeout_s: float = 15.0) -> None:
         """Open the adapter's own autopilot link and start publishing.
@@ -763,7 +1005,7 @@ class ExternalNavPublisher:
                     return
                 continue
             next_send = now + publish_period_s()
-            state = self._latest
+            state = self.state_for_publish(now)
             if not self._machine.on_state(state, int(now * 1e9)):
                 continue
             # The epoch's one-time rotation: the first state the machine accepts as
@@ -795,6 +1037,16 @@ class ExternalNavPublisher:
         covariance[0] = sigma[0] ** 2
         covariance[6] = sigma[1] ** 2
         covariance[11] = sigma[2] ** 2
+        # The reset counter rides the wire as one unsigned byte (MAVLink's
+        # reset_counter field); a run whose health machine cycles stop/recover
+        # more than 255 times overflows it and raises struct.error inside
+        # pymavlink's packer, killing this thread -- measured in run
+        # p01l-fix2l-20260927T033814Z, where the ZUPT defect produced 292
+        # recoveries and the publisher died with "'B' format requires 0 <=
+        # number <= 255". The counter's meaning on the wire is a change
+        # detector, so wrapping it keeps the semantics while making the
+        # transmission impossible to overflow; the machine's own count stays
+        # exact and is what the receipts report.
         self._connection.mav.vision_position_estimate_send(
             usec,
             position[0],
@@ -804,7 +1056,7 @@ class ExternalNavPublisher:
             rpy[1],
             rpy[2],
             covariance,
-            self._machine.reset_counter,
+            self._machine.reset_counter % 256,
         )
         self._connection.mav.vision_speed_estimate_send(
             usec, velocity[0], velocity[1], velocity[2]
