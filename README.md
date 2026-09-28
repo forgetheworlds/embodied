@@ -23,7 +23,7 @@ Works today:
 |---|---|
 | Webots/ArduPilot compatibility gate closed: two consecutive invocations, 16/16 checks each, both guided-motion checks green, waypoint holds within 1.8-3.2 cm | receipts for `extnav-it3` and `extnav-it4`, described below |
 | Sensor-derived arm: GPS off at runtime, both waypoints flown and held on a pose from the onboard estimator, landed; E1 accuracy p95 0.086 m / max 0.118 m against 0.10 m / 0.15 m | `work/runs/p01-localization/p01l-rel10-4-20260927T201628Z/run-a/checks.json`, merged to `main` in `0fc5d95`, described below |
-| Test suite: 334 tests collected on `main`; 308 pass and 26 fail on one known mismatch, explained under Reproduce it | `python -m pytest -q`, see Reproduce it |
+| Test suite: **334 tests, all passing** on `main` | `python -m pytest -q`, see Reproduce it |
 | Measurement instrument: recorder, referee and grader with structural truth isolation, tested against hand-checkable episodes | `tests/bench/`, `tests/fixtures/bench/` |
 | Stereo calibration pipeline runs end to end; rectification gate (B1) passed; the floor-depth gate (B3) failed its pre-registered criterion and the stage is recorded as blocked rather than passed | `work/runs/p01-calibration/` (local evidence store) |
 
@@ -248,24 +248,25 @@ Then run the suite and one gate invocation:
 
 ```sh
 .venv/bin/python -m pytest -q
-# expected: 334 collected, 308 passed, 26 failed (7-8 minutes). See the note
-# below; the 26 failures are one known mismatch, not flakiness.
+# expected: 334 passed, in 7-15 minutes. The spread is host load: this suite is
+# timing-sensitive and the machine swaps under contention. A failure with no
+# assertion text usually means the run was starved, not that the code is wrong.
 
 .venv/bin/python -m embodied compat --config configs/first_indoor.yaml \
     --output work/runs/compat-check-1
 ```
 
-The 26 failures are one cause, and it is recorded rather than hidden: the
-probe's startup read-back compares the parameters the files declare against
+The suite is green on `main`. For the record it was red for a period, and the
+cause is worth knowing because it is a failure mode this project keeps hitting:
+the probe's startup read-back compares the parameters the files declare against
 what the vehicle reports, and `tests/platform/test_webots_ardupilot.py`
-transcribes `scenarios/compat/params/compat_ekf.parm` **by hand** so the check
-has a source independent of the product's parser. `EK3_SRC1_VELZ 6` was added
-to the real parameter file on 2026-09-26 (commit `86d3523`, the GPS-off arm
-needed it) and the transcription was not updated in the same change, so the
-scripted vehicle reports nothing for that key and every check downstream of
-the read-back is skipped. The fix is a one-line fixture update; it is not made
-here, because this README describes `main` as it stands at `c44c3aa`. The
-localization module's own 99 tests pass.
+transcribes `scenarios/compat/params/compat_ekf.parm` **by hand** so that check
+has a source independent of the product's parser. `EK3_SRC1_VELZ 6` was added to
+the real parameter file on 2026-09-26 (commit `86d3523`; the GPS-off arm needed
+it) and the transcription was not updated in the same change — so one assertion
+failed and every check downstream of it was silently never reported. **A declared
+check had stopped checking, and the documents went on claiming it passed.** Fixed
+in `b87c07f`; that module alone went from 26 failed to 89 passed.
 
 Success looks like: exit code 0; `work/runs/compat-check-1/receipt.json` with
 `"status": "complete"` and `"gate_status": "pass"`; `checks.json` with all 16
