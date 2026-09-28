@@ -185,7 +185,7 @@ FAST_THRESHOLD = 20
 #
 #   height    <= 0.60 m, the commanded takeoff altitude -- half the declared 1.5 m
 #               hover altitude and well under the 2.0 m doorway lintel;
-#   airtime   <= 5.0 s from the arm readback to the LAND command;
+#   airtime   <= 6.0 s from the arm readback to the LAND command;
 #   post-LAND drain 10.0 s, so the descent's frames are fed too -- still motion,
 #               still inside the same flight event, still terminated by LAND.
 #
@@ -199,8 +199,26 @@ FAST_THRESHOLD = 20
 # the accelerometer read other than gravity (the chi2 residual of the
 # zero-velocity hypothesis) and, at the rig's 554 px focal length, ~2.7 mm of
 # translation is ~1 px of mean disparity -- so >= 0.5 s of climb at the declared
-# 10 Hz stereo rate is >= 5 declining frames, and the 5.0 s bound carries a
-# factor of ten over a criterion read from the code.
+# 10 Hz stereo rate is >= 5 declining frames, and the 6.0 s bound carries more
+# than a factor of ten over a criterion read from the code.
+#
+# RE-DECLARED BY THE OWNER, 2026-09-28 (the operator's ruling: "just run the sim
+# longer"; recorded here as a criterion change, not a quiet bump). The 5.0 s
+# airtime bound and the 3.5 s climb window were frozen before any measurement of
+# the vehicle's own pre-thrust time existed, and that time is now measured: the
+# airframe holds its motor interlock down for its own 2.0 s `ap.in_arming_delay`
+# after arming (`ARMING_DELAY_SEC`, ArduCopter/motors.cpp:59,75 -- the
+# MOTORS_INTERLOCK_ENABLED event, at arm+2.004 s in logs 00000139/00000140/
+# 00000142), the takeoff's own slew reaches TKOFF_THR_MAX 0.9 at 0.5/s
+# (`do_pilot_takeoff_ms`, measured as the NOT_LANDED event at command+1.735 s in
+# 00000142), and the declared 0.60 m climb at the declared 0.5 m/s is 1.2 s. A
+# window that must contain a climb therefore cannot be shorter than
+# 2.0 + 1.8 + 1.2 = 5.0 s, and the airtime bound that must contain that window
+# plus the 0.3 s override settle cannot be shorter than 5.3 s: hence
+# EXCITATION_CLIMB_DRAIN_S = 5.0 and EXCITATION_MAX_AIRTIME_S = 6.0. The ordering
+# defect fixed beside this (the takeoff command is held until the airframe's own
+# thrust path is open) is what makes those seconds reachable at all; see
+# `_run_ordered_bring_up` and work/runs/p01-localization/THRUST-ORDER-REPORT.md.
 #
 # The envelope is carried as constants, not a localization.excitation
 # configuration key, because the shared cli.py schema rejects unknown
@@ -229,8 +247,8 @@ FAST_THRESHOLD = 20
 # `_sim_window_wall_ceiling_s` derives from the declared realtime envelope.
 EXCITATION_MODE = "GUIDED"
 EXCITATION_TAKEOFF_ALTITUDE_M = 0.60
-EXCITATION_MAX_AIRTIME_S = 5.0
-EXCITATION_CLIMB_DRAIN_S = 3.5
+EXCITATION_MAX_AIRTIME_S = 6.0  # re-declared from 5.0, see above
+EXCITATION_CLIMB_DRAIN_S = 5.0  # re-declared from 3.5, see above
 EXCITATION_POST_LAND_DRAIN_S = 10.0
 EXCITATION_ALTITUDE_REACHED_MARGIN_M = 0.05
 
@@ -599,7 +617,7 @@ BRING_UP_JUSTIFICATION = (
     "The exception changes only WHEN the aircraft may move, never what supplies "
     "the scored pose. The estimator is the same pinned build, fed the same "
     "declared stereo and inertial stream; the exception is a bounded window "
-    "(<= 5.0 s from the arm readback to LAND, no lateral setpoint, LAND always) "
+    "(<= 6.0 s from the arm readback to LAND, no lateral setpoint, LAND always) "
     "that lets the airframe move so the estimator CAN latch, and every element "
     "of it is restored -- with the vehicle's own parameter readback -- before "
     "the scored window opens. The scored window's pose source is unchanged: the "
@@ -3748,7 +3766,7 @@ def _run_ordered_bring_up(
         # bounded by the excitation's own climb window, which therefore opens here rather
         # than at the command, and no declared budget changes -- the settle, the climb
         # window and the airtime bound are the declared ones, and the wait costs the climb
-        # window part of its own 3.5 s instead of the airtime bound the LAND command must
+        # window part of its own 5.0 s instead of the airtime bound the LAND command must
         # stay inside.
         climb_window = window(EXCITATION_CLIMB_DRAIN_S, "the excitation's climb drain")
 

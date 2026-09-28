@@ -339,9 +339,15 @@ localization:
   #              length ~2.7 mm of translation is ~1 px of disparity, so >= 0.5 s
   #              of climb at the declared 10 Hz stereo rate is >= 5 declining
   #              frames (plan section 0.6 item 5).
-  #   duration:  <= 5.0 s from the arm readback to the LAND command (a factor of
-  #              ten over that criterion), termination LAND always, plus a
-  #              bounded post-LAND drain so the descent's frames are fed too.
+  #   duration:  <= 6.0 s from the arm readback to the LAND command (more than a
+  #              factor of ten over that criterion), termination LAND always,
+  #              plus a bounded post-LAND drain so the descent's frames are fed
+  #              too. 6.0 s and the bring-up's 5.0 s climb window are the OWNER's
+  #              re-declaration of 2026-09-28 ("just run the sim longer"): the
+  #              window has to contain the airframe's own pre-thrust time (2.0 s
+  #              motor-interlock delay, measured), the takeoff's own 1.8 s slew
+  #              to TKOFF_THR_MAX 0.9, and the declared 0.60 m climb at the
+  #              declared 0.5 m/s.
   #   carrier:   the pose-assisted diagnostic arm (GUIDED, truth republish ON for
   #              that run only, via the bridge's per-run arm= override): it is a
   #              DIAGNOSTIC, never a sensor-derived result, never pooled with one,
@@ -371,8 +377,13 @@ localization:
   # ordering that breaks exactly that circle, and nothing else.
   #
   # THE WINDOW -- bounded, declared, restored.
-  #   duration:  <= 5.0 s (EXCITATION_MAX_AIRTIME_S) from the arm readback to
-  #              the LAND command; termination LAND, always; then a bounded
+  #   duration:  <= 6.0 s (EXCITATION_MAX_AIRTIME_S) from the arm readback to
+  #              the LAND command, containing the 5.0 s climb window
+  #              (EXCITATION_CLIMB_DRAIN_S) and the 0.3 s override settle both
+  #              re-declared by the owner on 2026-09-28 (the derivation, and the
+  #              airframe's own measurements behind it, are beside the constants
+  #              in src/embodied/platform/localization_check.py); termination
+  #              LAND, always; then a bounded
   #              post-LAND drain (EXCITATION_POST_LAND_DRAIN_S = 10 s) so the
   #              descent's frames are fed too. What ENDS it is not only the
   #              clock: every parameter it writes is restored and read back
@@ -390,9 +401,10 @@ localization:
   #              same amount of the aircraft's time whatever the host is doing.
   #              Measured on this host while loaded
   #              (run-2026-09-28T02-43-27-442Z): the simulator ran at 0.40-0.92
-  #              simulated seconds per wall second, the 3.5 s climb window
-  #              bought 2.20 simulated seconds, and the airtime was 2.34
-  #              simulated seconds against this 5.0 s bound -- the excitation
+  #              simulated seconds per wall second, the then-declared 3.5 s climb
+  #              window bought 2.20 simulated seconds, and the airtime was 2.34
+  #              simulated seconds against the then-declared 5.0 s bound -- the
+  #              excitation
   #              was cut off 0.80 simulated seconds before the thrust path's
   #              first motor output. The clock is the simulator's own (the
   #              controller's robot.getTime(), carried on every sensor frame);

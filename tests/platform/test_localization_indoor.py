@@ -1976,7 +1976,10 @@ class TestOrderedBringUp:
         assert "bounded local bring-up action" in thrust["statement"]
         assert "setpoint" in thrust["statement"]
         assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.60
-        assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 5.0
+        # Re-declared by the owner on 2026-09-28 (from 5.0 s): the owner's ruling was
+        # "just run the sim longer", and the derivation the constant now carries is in
+        # localization_check.py beside it. The re-declaration itself is asserted here.
+        assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 6.0
         assert thrust["sent_by_the_scored_arm"] is False
 
         # The excitation stays inside the frozen E-EXC envelope.
@@ -2361,6 +2364,36 @@ class TestTheTakeoffWaitsForTheThrustPath:
         )
         assert opened is not None, "a floor learned late must still open on a rise"
         assert motors["floor_pwm"] == 1000
+
+    def test_the_declared_windows_contain_the_airframes_own_pre_thrust_time(self):
+        """The re-declared window is the one the airframe's own clock requires.
+
+        The owner re-declared the excitation on 2026-09-28 ("just run the sim longer")
+        from 5.0 s airtime / 3.5 s climb. The numbers here come from the airframe's own
+        logs, not from the constants: the motor interlock comes up 2.0 s after the arm
+        (ARMING_DELAY_SEC, the MOTORS_INTERLOCK_ENABLED event at arm+2.004 s in
+        logs 00000139/00000140/00000142), the takeoff's own slew reaches
+        TKOFF_THR_MAX 0.9 at the measured 0.5 per second (the NOT_LANDED event at
+        command+1.735 s in 00000142), and the declared 0.60 m climb at the declared
+        0.5 m/s is 1.2 s. A climb window shorter than their sum cannot contain the
+        climb it declares, whatever the ordering does; an airtime bound shorter than
+        the settle plus that window cannot contain the window.
+        """
+        interlock_delay_s = 2.0  # ARMING_DELAY_SEC, measured at arm+2.004 s
+        ramp_to_full_slew_s = 0.9 / 0.5  # TKOFF_THR_MAX at the measured 0.5/s
+        declared_climb_s = (
+            check.EXCITATION_TAKEOFF_ALTITUDE_M / check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        assert check.EXCITATION_CLIMB_DRAIN_S >= (
+            interlock_delay_s + ramp_to_full_slew_s + declared_climb_s
+        )
+        assert check.EXCITATION_MAX_AIRTIME_S >= (
+            check.BRING_UP_OVERRIDE_SETTLE_S + check.EXCITATION_CLIMB_DRAIN_S
+        )
+        # And the re-declared climb window is what the wait is bounded by, so the LAND
+        # command still goes out inside the airtime bound even if the path never opens.
+        assert check.EXCITATION_CLIMB_DRAIN_S == 5.0
+        assert check.EXCITATION_MAX_AIRTIME_S == 6.0
 
 
 # ---------------------------------------------------------------------------
