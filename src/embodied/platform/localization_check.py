@@ -2257,17 +2257,43 @@ class _SimWindow:
         self.started_sim_s = clock.newest_s
         self.started_wall_s = wall_clock()
         self.ended_by: str | None = None
+        # What the window cost, frozen when it ended. The readings have to be taken
+        # THEN and not when the receipt is written: every window of one bring-up is
+        # documented together at the end, so a live reading would report each window as
+        # lasting until the last one closed -- measured on the first run with this code
+        # (run-a/bring-up.json in work/runs/p01-localization/
+        # p01l-clockfix-20260928T041129Z), where the 0.3 s override settle reported
+        # 14.092 s because the clock was read after the descent.
+        self.ended_sim_s: float | None = None
+        self.ended_wall_s: float | None = None
+
+    def _freeze(self) -> None:
+        """Take this window's final readings, once."""
+        if self.ended_wall_s is None:
+            self.ended_wall_s = self._wall_clock()
+            self.ended_sim_s = self.clock.newest_s
 
     def elapsed_simulator_s(self) -> float | None:
-        """Simulated seconds spent, or None while no simulator reading exists."""
+        """Simulated seconds this window cost, frozen once it has ended."""
+        if self.ended_wall_s is not None:
+            return self._span(self.ended_sim_s)
+        return self._span(self.clock.newest_s)
+
+    def _span(self, now_s: float | None) -> float | None:
         if self.started_sim_s is None:
             self.started_sim_s = self.clock.newest_s
-        if self.started_sim_s is None or self.clock.newest_s is None:
+        if self.started_sim_s is None or now_s is None:
             return None
-        return max(0.0, self.clock.newest_s - self.started_sim_s)
+        return max(0.0, now_s - self.started_sim_s)
 
     def elapsed_wall_s(self) -> float:
-        return max(0.0, self._wall_clock() - self.started_wall_s)
+        """Host seconds this window cost, frozen once it has ended."""
+        end = (
+            self.ended_wall_s
+            if self.ended_wall_s is not None
+            else self._wall_clock()
+        )
+        return max(0.0, end - self.started_wall_s)
 
     def expired(self) -> bool:
         """Whether the window is over, recording which clock ended it.
@@ -2283,9 +2309,11 @@ class _SimWindow:
             return True
         elapsed = self.elapsed_simulator_s()
         if elapsed is not None and elapsed >= self.budget_s - SIM_WINDOW_TOLERANCE_S:
+            self._freeze()
             self.ended_by = "simulator"
             return True
         if self.elapsed_wall_s() >= self.wall_ceiling_s:
+            self._freeze()
             self.ended_by = "wall_ceiling"
             return True
         return False
@@ -2293,8 +2321,8 @@ class _SimWindow:
     def close(self, reason: str) -> None:
         """Record how a window ended when something other than the clocks ended it."""
         if self.ended_by is None:
+            self._freeze()
             self.ended_by = reason
-
     def document(self) -> dict[str, Any]:
         """A JSON-ready view: the budget, what it cost in each clock, and what ended it."""
         elapsed = self.elapsed_simulator_s()
@@ -3730,6 +3758,10 @@ def _run_ordered_bring_up(
                 climb_window.close("altitude_reached")
                 break
             time.sleep(0.05)
+        # The airtime is read and closed here, at the LAND command, because that is
+        # what it measures: the window is never polled to expiry, so it would otherwise
+        # report the time until the whole bring-up was documented.
+        airtime.close("land_commanded")
         land_delay_s = airtime.elapsed_simulator_s()
         land_delay_wall_s = time.monotonic() - arm_monotonic
         flight["land_command_delay_s"] = (
@@ -4483,6 +4515,7 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
                     climb_window.close("altitude_reached")
                     break
                 time.sleep(0.05)
+            airtime.close("land_commanded")
             land_delay_s = airtime.elapsed_simulator_s()
             flight["land_command_delay_s"] = (
                 None if land_delay_s is None else round(land_delay_s, 3)

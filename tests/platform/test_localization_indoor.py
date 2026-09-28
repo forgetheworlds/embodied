@@ -2241,8 +2241,15 @@ class TestDeclaredBudgetsAreSpentInTheirOwnUnits:
 
     @staticmethod
     def _clock(sim_step_s: float, wall_step_s: float):
-        """A simulator clock and a wall clock that advance together, by injected steps."""
+        """A simulator clock and a wall clock that advance together, by injected steps.
+
+        The clock is seeded with one reading, because a window opens on a running
+        scene in every real use: a window whose start is latched lazily (the fallback
+        for a clock that has not delivered a reading yet) would count its own start
+        from its first poll, which is not what it measures.
+        """
         clock = check._SimulatorClock()
+        clock.observe(0.0)
         wall = {"now": 0.0}
 
         def drain() -> None:
@@ -2407,6 +2414,52 @@ class TestDeclaredBudgetsAreSpentInTheirOwnUnits:
         document = window.document()
         assert document["ended_by"] == "simulator"
         assert document["elapsed_simulator_s"] >= 3.5
+
+    def test_a_window_reports_what_it_cost_and_not_what_the_run_took(self):
+        """Each window's cost is frozen when it ends, not read when the receipt is written.
+
+        Found on the first flight of the change
+        (work/runs/p01-localization/p01l-clockfix-20260928T041129Z): every window of one
+        bring-up is documented together at the end, and a live reading made the 0.3 s
+        override settle report 14.092 simulated seconds -- the time from the settle to
+        the end of the descent drain. The measured airtime was correct there only because
+        it is read at the LAND command, which is exactly what this pins.
+        """
+        clock, wall, _ = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+
+        def advance(steps: int, *, simulator: bool = True) -> None:
+            for _ in range(steps):
+                wall["now"] += 0.1
+                if simulator:
+                    clock.observe((clock.newest_s or 0.0) + 0.05)
+
+        settle = check._SimWindow(
+            clock, 0.3, label="the override settle", wall_ceiling_s=1.0,
+            wall_clock=lambda: wall["now"],
+        )
+        advance(6)
+        assert settle.expired() is True
+        assert settle.document()["ended_by"] == "simulator"
+        cost = settle.document()["elapsed_simulator_s"]
+        assert cost == pytest.approx(0.3, abs=0.05)
+        # Ten more simulated seconds of run, and the settle's cost does not move.
+        advance(200)
+        assert settle.document()["elapsed_simulator_s"] == cost
+        assert settle.document()["elapsed_wall_s"] == pytest.approx(0.6, abs=0.05)
+
+        # A window that a command closes (the airtime window ends at the LAND command)
+        # freezes at the close, and does not wait for the run to finish either.
+        airtime = check._SimWindow(
+            clock, 5.0, label="the airtime", wall_ceiling_s=10.0,
+            wall_clock=lambda: wall["now"],
+        )
+        advance(20)
+        airtime.close("land_commanded")
+        assert airtime.document()["ended_by"] == "land_commanded"
+        assert airtime.document()["elapsed_simulator_s"] == pytest.approx(1.0, abs=0.05)
+        advance(40)
+        assert airtime.document()["elapsed_simulator_s"] == pytest.approx(1.0, abs=0.05)
+
 
     def test_the_bring_up_declares_the_clock_its_windows_are_spent_against(self):
         """The receipt owes a reader the unit: the simulator's own clock, and its source."""
