@@ -345,9 +345,11 @@ localization:
   #              too. 6.0 s and the bring-up's 5.0 s climb window are the OWNER's
   #              re-declaration of 2026-09-28 ("just run the sim longer"): the
   #              window has to contain the airframe's own pre-thrust time (2.0 s
-  #              motor-interlock delay, measured), the takeoff's own 1.8 s slew
-  #              to TKOFF_THR_MAX 0.9, and the declared 0.60 m climb at the
-  #              declared 0.5 m/s.
+  #              motor-interlock delay, measured), the takeoff's own slew to its
+  #              ramp cap (1.8 s to the firmware-default TKOFF_THR_MAX 0.9 at the
+  #              measured 0.5/s; 1.1 s to the window's own bounded cap 0.55 --
+  #              see the bring-up's TKOFF_THR_MAX element below), and the
+  #              declared 0.60 m climb at the declared 0.5 m/s.
   #   carrier:   the pose-assisted diagnostic arm (GUIDED, truth republish ON for
   #              that run only, via the bridge's per-run arm= override): it is a
   #              DIAGNOSTIC, never a sensor-derived result, never pooled with one,
@@ -540,6 +542,61 @@ localization:
   #                  window opens. The scored run's guided takeoff depends on that
   #                  delay (compat_arming.parm, iteration 11), so it is restored
   #                  exactly like the mask and the height source.
+  #                * TKOFF_THR_MAX: the takeoff's own OPEN-LOOP RAMP, bounded at
+  #                  the airframe's own hover. OWNER-RATIFIED CRITERION CHANGE of
+  #                  2026-09-28 (the climb-fix brief), recorded the way the window
+  #                  re-declaration above was. `do_pilot_takeoff_ms` ramps the
+  #                  throttle with no altitude feedback while `land_complete`
+  #                  holds (ArduCopter/takeoff.cpp:76-118), and its only exit
+  #                  that needs no motion is the cap `throttle >=
+  #                  MIN(TKOFF_THR_MAX, 0.9)` -- so the cap is where the
+  #                  open-loop ramp ends on this airframe. The firmware default
+  #                  0.9 is ~2.2x the hover the airframe itself holds (the P00
+  #                  accept runs measured the hover hold at 1419 us,
+  #                  compat_arming.parm iteration 11; through the motors' own
+  #                  MOT_SPIN_MIN 0.15 mapping that is a throttle of ~0.316, and
+  #                  the ramp's own accel exit at 0.5 * PILOT_ACC_Z 2.5 = 1.25
+  #                  m/s^2 needs ~1.13x that). The measured consequence
+  #                  (00000143.BIN): the ramp ran 1.7 s to RCOU 1867 us (~2x
+  #                  weight) before the vehicle left the ground, the aircraft
+  #                  climbed through 3.7 m/s, and its centre of gravity reached
+  #                  2.39 m -- the room's own 2.5 m ceiling -- before LAND could
+  #                  arrest it: roll +-180 deg, Crash: Disarming at arm+10.19 s.
+  #                  The window value 0.55 clears the hover and the accel exit
+  #                  with headroom, bounds the thrust at unstick to ~1.5x hover,
+  #                  and reaches its cap EARLIER (1.1 s against 1.8 s at 0.5/s),
+  #                  so the same declared 5.0 s window and 6.0 s airtime contain
+  #                  it with more room than they contained the default. Restored
+  #                  to the firmware's own default 0.9 (parameters.cpp:1057; no
+  #                  parm file this project applies sets it) and read back before
+  #                  the scored window opens -- the scored run's guided takeoff
+  #                  keeps the ramp the P00 gate was accepted with.
+  #                * PILOT_SPD_UP: the climb rate the MODE may command, bounded
+  #                  at the rate the window itself declares -- the second
+  #                  owner-ratified criterion change of the climb-fix brief
+  #                  (2026-09-28). The position loop shapes its desired
+  #                  trajectory inside PILOT_SPEED_UP (`_vel_max_up_ms`,
+  #                  AC_PosControl.cpp:1002-1033, set from it every ALT_HOLD
+  #                  iteration), and the throttle's collapse after the unstick
+  #                  burn begins only when the velocity estimate crosses that
+  #                  target. Both climb-fix logs (00000143/00000144) measure
+  #                  this airframe leaving the ground only at commanded throttle
+  #                  ~0.87-0.93, releasing ~2x hover thrust for the ~0.4 s the
+  #                  estimate needs to catch up; at the firmware default 2.5 m/s
+  #                  (config.h:531-532, unset by any parm file here) the shaped
+  #                  target ran to 2.2-2.4 m/s while the aircraft was already
+  #                  ballistic, and both flights coasted to the room's 2.5 m
+  #                  ceiling. The window value is the declared pilot climb rate
+  #                  itself (0.5 m/s, BRING_UP_THROTTLE_CLIMB_RATE_M_S): the
+  #                  declaration now bounds the feed-forward, the Flying state's
+  #                  rising target, and the takeoff ramp's own velocity exit
+  #                  (0.25 m/s, takeoff.cpp:96-98) -- closing the defect the
+  #                  thrust-order report named: "the declared +0.494 m/s pilot
+  #                  climb rate is unbounded in ALT_HOLD". The override's PWM is
+  #                  derived from the vehicle's own answers with this value in
+  #                  force, so full stick expresses the declared 0.5 m/s.
+  #                  Restored to the firmware's own default 2.5 before the scored
+  #                  window opens.
   #              THIS IS A BOUNDED LOCAL BRING-UP ACTION. It is not a cloud
   #              command: the cloud still sends intent and the planner still owns
   #              setpoints, and this message is neither. It is local to the

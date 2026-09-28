@@ -220,6 +220,15 @@ FAST_THRESHOLD = 20
 # thrust path is open) is what makes those seconds reachable at all; see
 # `_run_ordered_bring_up` and work/runs/p01-localization/THRUST-ORDER-REPORT.md.
 #
+# AMENDED BY THE OWNER-RATIFIED RAMP BOUND, 2026-09-28 (the climb-fix brief; the
+# derivation is beside BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE below): the window
+# now bounds the takeoff's open-loop ramp at TKOFF_THR_MAX 0.55, so the slew the
+# window has to contain is 1.1 s to that cap -- SHORTER than the 1.8 s this
+# derivation measured at the firmware-default cap 0.9, which the containment
+# above still covers: bounding the ramp did not need, and did not get, a longer
+# window. A test asserts both containments (the default cap's and the window's)
+# so the two declarations cannot drift apart again.
+#
 # The envelope is carried as constants, not a localization.excitation
 # configuration key, because the shared cli.py schema rejects unknown
 # localization keys (cli.py:446-448) and the compatibility probe loads this
@@ -413,6 +422,87 @@ BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE = 6.0  # SourceZ::EXTNAV, the declared seam
 BRING_UP_MOTOR_IDLE_PARAMETER = "MOT_IDLE_SEC"
 BRING_UP_MOTOR_IDLE_WINDOW_VALUE = 0.0  # the firmware's own default
 BRING_UP_MOTOR_IDLE_RESTORE_VALUE = 4.0  # compat_arming.parm, iteration 11
+# The window's fourth parameter: the takeoff's own open-loop ramp, bounded at
+# the airframe's own hover. OWNER-RATIFIED CRITERION CHANGE of 2026-09-28 (the
+# climb-fix brief authorises a declared-value change "recorded as an
+# owner-ratified criterion change with the airframe's own numbers behind it",
+# the way the window extension of 16192e1 was recorded).
+#
+# THE MEASURED DEFECT (work/ardupilot/logs/00000143.BIN, the thrust-order
+# flight). `_TakeOff::do_pilot_takeoff_ms` (ArduCopter/takeoff.cpp:76-118)
+# ramps the throttle OPEN-LOOP -- `get_throttle_in() + G_Dt /
+# takeoff_throttle_slew_time`, the measured 0.5/s -- for as long as
+# `land_complete` holds, with no altitude feedback. Every exit condition but
+# one needs motion the aircraft cannot have while still on the ground
+# (estimated accel >= 0.5 * PILOT_ACC_Z, velocity, altitude); the one
+# motion-free exit is the ramp's own cap `throttle >= MIN(TKOFF_THR_MAX,
+# 0.9)` (takeoff.cpp:92). On this airframe the firmware's default cap 0.9 is
+# roughly twice the hover it actually holds, so the ramp ran 1.7 s to ThO 0.875
+# (RCOU 1867 us, ~2x weight; the vehicle still at 0.00-0.01 m of truth),
+# NOT_LANDED fired on the throttle condition at arm+3.995, and the aircraft
+# then climbed through 3.7 m/s and put its centre of gravity at 2.39 m -- the
+# room's own 2.5 m ceiling (dev-a-single/world.wbt: interior height 2.5) --
+# before the closed loop or the LAND (arm+4.651) could arrest it: roll +-180
+# deg, `Crash: Disarming: AngErr=164>30` at arm+10.19. The closed loop itself
+# was never the driver: the commanded climb-rate target (CTUN.DCRt) peaked at
+# 0.69 m/s and the throttle was cut to the floor 0.6 s after the loop closed.
+#
+# THE VALUE, FROM THE AIRFRAME'S OWN NUMBERS. The P00 accept runs measured this
+# airframe's hover hold at 1419 us (compat_arming.parm, iteration 11's own
+# record). Through the motors' own mapping -- actuator = (PWM - MOT_PWM_MIN) /
+# (MOT_PWM_MAX - MOT_PWM_MIN) = 0.419, throttle = (actuator - MOT_SPIN_MIN
+# 0.15) / (1 - MOT_SPIN_MIN) -- that is a hover throttle of ~0.316 (the flown
+# RCOU floor 1150-1151 in every log is that same MOT_SPIN_MIN). The ramp's own
+# accel exit needs thrust ~ weight * (1 + 0.5 * PILOT_ACC_Z 2.5 / g) = 1.13x
+# hover, throttle ~0.357. A window value of 0.55 clears both with headroom for
+# the unstick transient while bounding the thrust the ramp may command at
+# unstick to ~1.5x the hover (actuator 0.6175) against the default's ~2.2x
+# (actuator 0.915) -- and because the ramp now reaches the cap in 0.55 / 0.5 =
+# 1.1 s against the default's 1.8 s, liftoff arrives EARLIER, inside the same
+# declared 5.0 s climb window and 6.0 s airtime (asserted in a test against
+# the pin's own default cap as well, so the bound is not a change the airtime
+# only affords because the ramp got shorter). The scored run's guided takeoff
+# is untouched: the window writes this for its own takeoff only and restores
+# the pin's default before the scored window opens.
+BRING_UP_TAKEOFF_RAMP_MAX_PARAMETER = "TKOFF_THR_MAX"
+BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE = 0.55
+BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE = 0.9  # the pin's own default
+
+# The window's fifth parameter, and the second OWNER-RATIFIED CRITERION CHANGE of
+# the climb-fix brief (2026-09-28): the climb rate the MODE may command, bounded
+# at the rate the window itself declares.
+#
+# THE MEASURED DEFECT (work/ardupilot/logs/00000143.BIN and 00000144.BIN, the
+# thrust-order flight and the first ramp-bounded flight). Both flights measure
+# this airframe leaving the ground only at commanded throttle ~0.87-0.93 -- at or
+# above the firmware's own takeoff cap -- so the unstick releases roughly twice
+# the hover thrust for the ~0.4 s it takes the controller's state estimate to
+# catch up. What decides how long that burn lasts is the velocity TARGET the
+# position loop is chasing: `input_pos_vel_accel_D_m` shapes the desired
+# trajectory inside `_vel_max_up_ms` = PILOT_SPEED_UP, and the throttle collapse
+# begins only when the velocity ESTIMATE crosses that target. At the firmware
+# default 2.5 m/s (config.h:531-532; no parameter file this project applies sets
+# it) the shaped target ran to 2.2-2.4 m/s while the aircraft was already
+# ballistic (CTUN.DCRt in 00000143), the collapse came ~0.4 s after unstick, and
+# the aircraft coasted to the room's 2.5 m ceiling both times.
+#
+# THE VALUE. The window declares a pilot climb rate of 0.5 m/s
+# (BRING_UP_THROTTLE_CLIMB_RATE_M_S); ALT_HOLD's own maximum is a declaration
+# nobody made. Setting PILOT_SPD_UP to the declared rate bounds everything the
+# mode can command -- the shaped trajectory's feed-forward, the Flying state's
+# target rise, and the ramp's own velocity exit (which drops to 0.25 m/s,
+# `constrain(pilot_climb_rate, 0.1*max_up, 0.5*max_up)` at takeoff.cpp:96-98) --
+# at the rate the envelope already declares. The predecessor's own words name
+# the defect this closes: "the declared +0.494 m/s pilot climb rate is unbounded
+# in ALT_HOLD". The stick override's PWM is derived AFTER this parameter is in
+# force, so the derivation sees the vehicle's own 0.5 and expresses the declared
+# rate at the top of the channel's own range -- full stick is now the declared
+# 0.5 m/s, not an unbounded climb. Restored to the firmware's own default 2.5
+# before the scored window opens.
+BRING_UP_CLIMB_RATE_PARAMETER = "PILOT_SPD_UP"
+BRING_UP_CLIMB_RATE_WINDOW_VALUE = 0.5
+BRING_UP_CLIMB_RATE_RESTORE_VALUE = 2.5  # the pin's own default
+
 
 BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
     (
@@ -447,6 +537,49 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
         "firmware's own default (0) for its duration only, and restores the "
         "airframe's declared 4.0 before the scored window opens: the scored run's "
         "guided takeoff needs the delay (compat_arming.parm, iteration 11)",
+    ),
+    (
+        BRING_UP_TAKEOFF_RAMP_MAX_PARAMETER,
+        BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE,
+        BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE,
+        "the takeoff's own open-loop ramp, bounded at the airframe's own hover: "
+        "`do_pilot_takeoff_ms` ramps the throttle with no altitude feedback for as "
+        "long as `land_complete` holds (ArduCopter/takeoff.cpp:76-118), and the only "
+        "exit that needs no motion is the cap `throttle >= MIN(TKOFF_THR_MAX, 0.9)` "
+        "(takeoff.cpp:92) -- so the cap is where an open-loop ramp ends on this "
+        "airframe. The firmware default 0.9 is ~2.2x the hover the airframe itself "
+        "holds: the P00 accept runs measured the hover hold at 1419 us "
+        "(compat_arming.parm iteration 11), which through the motors' own "
+        "MOT_SPIN_MIN 0.15 mapping is a throttle of ~0.316, and the ramp's own accel "
+        "exit (0.5 * PILOT_ACC_Z 2.5 = 1.25 m/s^2) needs ~1.13x that. The window "
+        "value 0.55 clears both and bounds the thrust at unstick to ~1.5x hover; the "
+        "measured alternative (00000143.BIN) was the ramp to RCOU 1867 us at 2x "
+        "weight, a 3.7 m/s climb, and the aircraft's centre of gravity at the room's "
+        "own 2.5 m ceiling. Restored to the firmware's own default 0.9 "
+        "(parameters.cpp:1057; no parm file this project applies sets it) before the "
+        "scored window opens -- the scored run's guided takeoff keeps the ramp the "
+        "P00 gate was accepted with",
+    ),
+    (
+        BRING_UP_CLIMB_RATE_PARAMETER,
+        BRING_UP_CLIMB_RATE_WINDOW_VALUE,
+        BRING_UP_CLIMB_RATE_RESTORE_VALUE,
+        "the climb rate the MODE may command, bounded at the rate this window "
+        "itself declares: `input_pos_vel_accel_D_m` shapes the desired trajectory "
+        "inside `_vel_max_up_ms` = PILOT_SPEED_UP (AC_PosControl.cpp:1002-1033, set "
+        "from it every ALT_HOLD iteration by `set_max_speed_accel_z`, mode_althold.cpp), "
+        "and the throttle's collapse after the unstick burn begins only when the "
+        "velocity estimate crosses that target. At the firmware default 2.5 m/s "
+        "(config.h:531-532, unset by every parameter file this project applies) the "
+        "shaped target ran to 2.2-2.4 m/s while the aircraft was already ballistic "
+        "(CTUN.DCRt, logs 00000143/00000144), and both flights coasted to the room's "
+        "2.5 m ceiling. The window value is the declared pilot climb rate itself "
+        "(BRING_UP_THROTTLE_CLIMB_RATE_M_S): the declaration now bounds the "
+        "feed-forward, the Flying state's rising target, and the takeoff ramp's own "
+        "velocity exit (which drops to 0.25 m/s, takeoff.cpp:96-98). The override's "
+        "PWM is derived from the vehicle's own answers with this value in force, so "
+        "full stick expresses the declared 0.5 m/s. Restored to the firmware's own "
+        "default 2.5 before the scored window opens",
     ),
 )
 
@@ -1920,6 +2053,32 @@ def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
     }
 
 
+def _vehicle_parameter_matches(reported: float | None, declared: float) -> bool:
+    """Whether a vehicle's parameter answer equals the declared value it stores.
+
+    The vehicle answers in its own storage precision, a 32-bit float: the first
+    climb-fix launch (work/runs/p01-localization/p01l-climbfix-20260928T171500Z)
+    wrote the declared TKOFF_THR_MAX 0.55, the write took, and the vehicle read
+    it back as 0.550000011920929 -- which an exact comparison of Python floats
+    refuses, stopping the window before the arm over a write that had succeeded.
+    The window's earlier values (0.0, 1.0, 4.0, 6.0 and the integer mask) are all
+    exactly representable, which is the only reason the machinery had not met
+    this yet.
+
+    The comparison is therefore made at the vehicle's own precision: both sides
+    packed to the same four bytes. A value that really is different remains
+    different (a neighbouring float32 is a refusal, not a rounding), the same
+    stored value reads equal however it was written, and a parameter the vehicle
+    never answered is never a match -- silence stays a refusal.
+    """
+    if reported is None:
+        return False
+    try:
+        return struct.pack("!f", float(reported)) == struct.pack("!f", float(declared))
+    except (OverflowError, ValueError):
+        return False
+
+
 def _bring_up_closure_blockers(
     applied: dict[str, float], rc_override: dict[str, Any] | None = None
 ) -> list[str]:
@@ -1950,14 +2109,14 @@ def _bring_up_closure_blockers(
                 "silent readback cannot show that the declared exception was lifted, so "
                 "the scored window does not open"
             )
-        elif applied[name] == window_value:
+        elif _vehicle_parameter_matches(applied[name], window_value):
             blockers.append(
                 f"{name} is still {window_value:g} -- its declared bring-up window value -- "
                 f"at the claimed arm; the window must be restored to {restore_value:g} and "
                 "read back before the scored window opens (plan sections 0.6 item 6, 0.8 "
                 "item 7)"
             )
-        elif applied[name] != restore_value:
+        elif not _vehicle_parameter_matches(applied[name], restore_value):
             blockers.append(
                 f"{name} read back as {applied[name]:g} after the bring-up window; the "
                 f"scored arm's declared value is {restore_value:g}"
@@ -3421,7 +3580,7 @@ def _run_ordered_bring_up(
                         "values": snapshot,
                     }
                 )
-            if all(reported.get(name) == expected[name] for name in names):
+            if all(_vehicle_parameter_matches(reported.get(name), expected[name]) for name in names):
                 break
             if time.monotonic() >= deadline:
                 break
@@ -3528,7 +3687,7 @@ def _run_ordered_bring_up(
         record["readbacks"]["window"] = {name: window_readback.get(name) for name in names}
         record["readback_observations"] = {"window": observations}
         for name, window_value, _restore, _why in BRING_UP_WINDOW_PARAMETERS:
-            if window_readback.get(name) != window_value:
+            if not _vehicle_parameter_matches(window_readback.get(name), window_value):
                 blockers.append(
                     f"the bring-up window's {name} did not take effect: the vehicle read "
                     f"back {window_readback.get(name)} against the declared window value "

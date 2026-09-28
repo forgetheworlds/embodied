@@ -1947,7 +1947,13 @@ class TestOrderedBringUp:
 
         # Every window parameter is bounded: a window value, a restore value, a reason.
         rows = {row["name"]: row for row in window["parameter_window"]}
-        assert set(rows) == {"ARMING_SKIPCHK", "EK3_SRC1_POSZ", "MOT_IDLE_SEC"}
+        assert set(rows) == {
+            "ARMING_SKIPCHK",
+            "EK3_SRC1_POSZ",
+            "MOT_IDLE_SEC",
+            "TKOFF_THR_MAX",
+            "PILOT_SPD_UP",
+        }
         assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
         assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
         assert rows["EK3_SRC1_POSZ"]["window_value"] == 1.0  # baro, its own sensor
@@ -1958,6 +1964,19 @@ class TestOrderedBringUp:
         assert rows["MOT_IDLE_SEC"]["window_value"] == 0.0  # the firmware's own default
         assert rows["MOT_IDLE_SEC"]["restore_value"] == 4.0  # compat_arming.parm's
         assert "GROUND_IDLE" in rows["MOT_IDLE_SEC"]["why"]
+        # The fourth one bounds the takeoff's open-loop ramp (see the class below for
+        # the derivation): a window value below the pin's own default, restored to it.
+        assert rows["TKOFF_THR_MAX"]["window_value"] == (
+            check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
+        )
+        assert rows["TKOFF_THR_MAX"]["restore_value"] == 0.9
+        # The fifth one bounds the climb rate the MODE may command at the rate the
+        # window itself declares (the class below carries the derivation).
+        assert rows["PILOT_SPD_UP"]["window_value"] == (
+            check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        assert check.BRING_UP_CLIMB_RATE_WINDOW_VALUE == 0.5
+        assert rows["PILOT_SPD_UP"]["restore_value"] == 2.5  # the pin's own default
         assert all(row["why"] for row in rows.values())
         # The check no mask can except is named, with what the window does instead.
         assert window["not_exceptable"][0]["check"].startswith("the mandatory altitude")
@@ -1967,6 +1986,8 @@ class TestOrderedBringUp:
             "ARMING_SKIPCHK": 0.0,
             "EK3_SRC1_POSZ": 6.0,
             "MOT_IDLE_SEC": 4.0,
+            "TKOFF_THR_MAX": 0.9,
+            "PILOT_SPD_UP": 2.5,
         }
 
         # The thrust path is declared as a bounded LOCAL bring-up action, with the
@@ -2372,21 +2393,27 @@ class TestTheTakeoffWaitsForTheThrustPath:
         from 5.0 s airtime / 3.5 s climb. The numbers here come from the airframe's own
         logs, not from the constants: the motor interlock comes up 2.0 s after the arm
         (ARMING_DELAY_SEC, the MOTORS_INTERLOCK_ENABLED event at arm+2.004 s in
-        logs 00000139/00000140/00000142), the takeoff's own slew reaches
-        TKOFF_THR_MAX 0.9 at the measured 0.5 per second (the NOT_LANDED event at
-        command+1.735 s in 00000142), and the declared 0.60 m climb at the declared
-        0.5 m/s is 1.2 s. A climb window shorter than their sum cannot contain the
-        climb it declares, whatever the ordering does; an airtime bound shorter than
-        the settle plus that window cannot contain the window.
+        logs 00000139/00000140/00000142), the takeoff's own slew runs at the measured
+        0.5 per second to whatever TKOFF_THR_MAX is in force (the NOT_LANDED event at
+        command+1.735 s in 00000142 was the 0.9 default reaching its cap), and the
+        declared 0.60 m climb at the declared 0.5 m/s is 1.2 s. A climb window shorter
+        than their sum cannot contain the climb it declares, whatever the ordering
+        does; an airtime bound shorter than the settle plus that window cannot contain
+        the window. The ramp bound the window declares is the SHORTER one, so the
+        containment is asserted against the pin's own default too: bounding the ramp
+        must not be a change the airtime only affords because the ramp got shorter.
         """
         interlock_delay_s = 2.0  # ARMING_DELAY_SEC, measured at arm+2.004 s
-        ramp_to_full_slew_s = 0.9 / 0.5  # TKOFF_THR_MAX at the measured 0.5/s
+        ramp_rate_per_s = 0.5  # 1 / TKOFF_SLEW_TIME 2.0 s, measured in 00000142/43
+        pin_default_cap = check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE  # 0.9
         declared_climb_s = (
             check.EXCITATION_TAKEOFF_ALTITUDE_M / check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
         )
-        assert check.EXCITATION_CLIMB_DRAIN_S >= (
-            interlock_delay_s + ramp_to_full_slew_s + declared_climb_s
-        )
+        # The containment holds for the pin's own default cap and for the window's.
+        for cap in (pin_default_cap, check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE):
+            assert check.EXCITATION_CLIMB_DRAIN_S >= (
+                interlock_delay_s + cap / ramp_rate_per_s + declared_climb_s
+            )
         assert check.EXCITATION_MAX_AIRTIME_S >= (
             check.BRING_UP_OVERRIDE_SETTLE_S + check.EXCITATION_CLIMB_DRAIN_S
         )
@@ -2394,6 +2421,221 @@ class TestTheTakeoffWaitsForTheThrustPath:
         # command still goes out inside the airtime bound even if the path never opens.
         assert check.EXCITATION_CLIMB_DRAIN_S == 5.0
         assert check.EXCITATION_MAX_AIRTIME_S == 6.0
+
+
+# ---------------------------------------------------------------------------
+# T18: the takeoff's open-loop ramp is bounded by the airframe's own hover.
+# `_TakeOff::do_pilot_takeoff_ms` (ArduCopter/takeoff.cpp:76-118) ramps the
+# throttle open-loop -- `get_throttle_in() + G_Dt / takeoff_throttle_slew_time`,
+# no altitude feedback -- for as long as `land_complete` holds, and every exit
+# condition except one needs motion the aircraft cannot have while it is still
+# on the ground: estimated accel >= 0.5 * PILOT_ACC_Z, or velocity, or altitude.
+# The one motion-free exit is the ramp's own cap, `throttle >= MIN(TKOFF_THR_MAX,
+# 0.9)`. On this airframe (Iris proto: 1.5 kg body plus children, propellers
+# 0.0012 * omega^2, maxVelocity 100 rad/s -- thrust-to-weight about 2.3) the
+# firmware's default cap 0.9 is roughly twice the hover the airframe actually
+# holds, so the measured flight (00000143.BIN) ramped to ThO 0.875 (RCOU 1867,
+# ~2x weight) before the vehicle left the ground at arm+4.0, and the aircraft
+# then climbed to 3.7 m/s and put its centre of gravity at 2.39 m -- the room's
+# own 2.5 m ceiling (dev-a-single/world.wbt) -- before LAND could arrest it.
+#
+# The window therefore declares its own TKOFF_THR_MAX for the takeoff it
+# commands, derived from the airframe's own numbers: the P00 accept runs
+# measured this airframe's hover hold at 1419 us (compat_arming.parm iteration
+# 11), which through the motors' own MOT_SPIN_MIN 0.15 mapping (the flown floor
+# RCOU 1150-1151 in every log) is a hover throttle of ~0.316, and the firmware's
+# accel exit at 0.5 * PILOT_ACC_Z 2.5 = 1.25 m/s^2 needs about 1.13x that. A cap
+# above both, below the pin's default, and restoring to the pin's own default
+# before the scored window opens, is the ramp bounded rather than loosened.
+# ---------------------------------------------------------------------------
+
+
+class TestTheTakeoffRampIsBoundedByTheAirframesOwnHover:
+    """The open-loop ramp the window's takeoff rides is bounded at the hover it needs.
+
+    The declared cap has to clear two of the airframe's own numbers or the takeoff
+    cannot even happen: the measured hover throttle (below it, the vehicle never
+    leaves the ground) and the firmware's own accel-based ramp exit (below it, the
+    loop cannot close until the cap itself is reached, which is the default's
+    measured behaviour). And it has to sit below the pin's own default, or the
+    bound is looser than the one the airframe flew into its ceiling.
+    """
+
+    def test_the_cap_clears_the_hover_and_the_ramps_own_accel_exit(self):
+        # The airframe's own numbers, each from a measurement, none from the
+        # constant under test: the hover hold the P00 accept runs measured, the
+        # motors' own PWM floor and spin-min mapping the flown logs show, and the
+        # firmware's own pilot accel default.
+        hover_pwm_us = 1419.0  # compat_arming.parm iteration 11's own record
+        pwm_floor, pwm_ceiling = 1000.0, 2000.0  # MOT_PWM_MIN/MAX, the flown floor 1150
+        spin_min = 0.15  # MOT_SPIN_MIN, the flown RCOU floor 1150-1151
+        pilot_accel_z = 2.5  # PILOT_ACC_Z default (config.h:535), unset by any parm
+        gravity = 9.81
+        hover_actuator = (hover_pwm_us - pwm_floor) / (pwm_ceiling - pwm_floor)
+        hover_throttle = (hover_actuator - spin_min) / (1.0 - spin_min)
+        accel_exit_throttle = hover_throttle * (
+            1.0 + 0.5 * pilot_accel_z / gravity
+        )
+        cap = check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
+        # The vehicle can leave the ground under the cap...
+        assert cap > hover_throttle
+        # ...the ramp's own accel exit is reachable under the cap, so the loop can
+        # close on motion rather than on the cap...
+        assert cap > accel_exit_throttle
+        # ...and the cap is below the pin's default: a bound, not a loosening.
+        assert cap < check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE == 0.9
+
+    def test_the_cap_bounds_the_thrust_at_unstick_to_below_twice_the_hover(self):
+        """The whole point of the cap: what the motors may command at unstick.
+
+        The default 0.9 let the ramp command ~2.2x the hover thrust while the
+        aircraft was still on the ground (RCOU 1867 against the 1419 us hover);
+        the window's cap has to hold that below twice the hover, or the measured
+        ceiling shot survives the change in principle.
+        """
+        hover_pwm_us = 1419.0
+        pwm_floor, pwm_ceiling = 1000.0, 2000.0
+        spin_min = 0.15
+
+        def actuator_at(throttle: float) -> float:
+            return spin_min + (1.0 - spin_min) * throttle
+
+        hover_actuator = (hover_pwm_us - pwm_floor) / (pwm_ceiling - pwm_floor)
+        cap_actuator = actuator_at(check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE)
+        default_actuator = actuator_at(check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE)
+        assert cap_actuator / hover_actuator < 2.0
+        assert default_actuator / hover_actuator > 2.0  # the measured defect
+        assert cap_actuator < default_actuator
+
+    def test_the_window_declares_the_ramp_bound_with_its_derivation(self):
+        """The bound is a declared window element: a value, a restore, a reason.
+
+        The restore is the pin's own default (parameters.cpp:1057, unset by every
+        parm file this project applies), the why carries the open-loop ramp it
+        bounds, and the scored window requires the restore exactly as it does for
+        the window's other parameters.
+        """
+        row = next(
+            row for row in check.BRING_UP_WINDOW_PARAMETERS if row[0] == "TKOFF_THR_MAX"
+        )
+        assert row[1] == check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
+        assert row[2] == check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE
+        why = row[3]
+        assert "open-loop" in why
+        assert "1419" in why  # the airframe's own measured hover
+        assert "parameters.cpp:1057" in why  # the restore's provenance
+
+    def test_the_readback_is_judged_at_the_vehicles_own_storage_precision(self):
+        """The vehicle answers parameters in its own 32-bit float, not ours.
+
+        Measured at the first climb-fix launch
+        (work/runs/p01-localization/p01l-climbfix-20260928T171500Z): the vehicle
+        read the declared TKOFF_THR_MAX 0.55 back as 0.550000011920929 and the
+        window's exact-equality readback refused a write that had taken -- the
+        run stopped before the arm, no flight happened. The same equality also
+        decides the closure gate's still-in-force direction, so a naive compare
+        would clear a window whose 0.55 was still in force: the comparison has
+        to happen at the vehicle's own precision, and a value that really is
+        different must still read as different.
+        """
+        # float32(0.55) and float32(0.9), as the vehicle answers them
+        assert check._vehicle_parameter_matches(0.550000011920929, 0.55)
+        assert check._vehicle_parameter_matches(0.8999999761581421, 0.9)
+        # the window's float32-exact values compare exactly as before
+        assert check._vehicle_parameter_matches(4.0, 4.0)
+        assert check._vehicle_parameter_matches(0.0, 0.0)
+        # a real difference survives the packing, and silence is not a match
+        assert not check._vehicle_parameter_matches(0.6, 0.55)
+        assert not check._vehicle_parameter_matches(0.5500000715255737, 0.55)  # the next float32
+        assert not check._vehicle_parameter_matches(None, 0.55)
+
+        # The closure gate, both directions, with the vehicle's own answers.
+        no_override = {
+            "sent": False,
+            "channel": check.RC_THROTTLE_CHANNEL,
+            "sent_pwm": None,
+            "released": False,
+            "observed_during_window": None,
+            "observed_after_release": None,
+        }
+        restored = {
+            "ARMING_SKIPCHK": 0.0,
+            "EK3_SRC1_POSZ": 6.0,
+            "MOT_IDLE_SEC": 4.0,
+            "TKOFF_THR_MAX": 0.8999999761581421,  # the vehicle's float32(0.9)
+            "PILOT_SPD_UP": 2.5,
+        }
+        assert check._bring_up_closure_blockers(restored, no_override) == []
+        still_in_force = dict(restored)
+        still_in_force["TKOFF_THR_MAX"] = 0.550000011920929  # float32(0.55)
+        blockers = check._bring_up_closure_blockers(still_in_force, no_override)
+        assert any("TKOFF_THR_MAX" in b and "still" in b for b in blockers), blockers
+
+
+class TestTheModeClimbRateIsBoundedAtTheDeclaredRate:
+    """The declared pilot climb rate is the bound the mode actually flies inside.
+
+    Measured in both climb-fix logs (00000143/00000144): the position loop shapes
+    its desired trajectory inside PILOT_SPEED_UP, the firmware default 2.5 m/s let
+    the velocity target run to 2.2-2.4 m/s while the aircraft was already
+    ballistic past it, and the throttle's collapse -- which waits for the velocity
+    estimate to cross that target -- came ~0.4 s after the aircraft left the
+    ground. The window therefore bounds the mode's own maximum at the rate it
+    declares, and the stick derivation must still express that rate on the
+    vehicle's own channel.
+    """
+
+    def test_the_window_bounds_the_mode_at_the_declared_rate(self):
+        row = next(
+            row for row in check.BRING_UP_WINDOW_PARAMETERS if row[0] == "PILOT_SPD_UP"
+        )
+        # The window value IS the declared pilot climb rate: the declaration and
+        # the mode's own ceiling are the same number, so the envelope the receipt
+        # declares is the envelope the aircraft can fly in.
+        assert row[1] == check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        # The restore is the pin's own default (config.h:531-532), which no
+        # parameter file this project applies sets.
+        assert row[2] == 2.5
+        assert "config.h:531-532" in row[3]
+
+    def test_the_stick_derivation_expresses_the_declared_rate_at_full_deflection(self):
+        """With the bound in force, full stick is the declared rate -- and derivable.
+
+        The override's PWM is derived from the vehicle's own calibration AFTER the
+        window parameter is in force, so the derivation sees PILOT_SPD_UP 0.5 and
+        must place the declared 0.5 m/s at the very top of the channel's own range.
+        The guard is `pwm > radio_max` and the arithmetic is integer, so the
+        boundary lands exactly on the vehicle's own RC3_MAX and passes.
+        """
+        calibration = {
+            "RC3_MIN": 1102.0,
+            "RC3_MAX": 2000.0,
+            "RC3_DZ": 0.0,
+            "THR_DZ": 0.0,
+            "PILOT_SPD_UP": check.BRING_UP_CLIMB_RATE_WINDOW_VALUE,
+        }
+        pwm, measured_rate = check._bring_up_throttle_pwm(
+            calibration, check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        assert pwm == 2000  # the vehicle's own RC3_MAX, exactly
+        assert measured_rate == pytest.approx(check.BRING_UP_THROTTLE_CLIMB_RATE_M_S)
+        assert 0.0 < measured_rate <= check.BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S
+
+    def test_the_ramps_own_velocity_exit_closes_the_loop_earlier_under_the_bound(self):
+        """Phase 1's velocity exit is `constrain(pilot_rate, 0.1*max, 0.5*max)`.
+
+        With the mode's maximum at the declared rate, that exit fires at 0.25 m/s
+        of climb instead of the default's 0.5 -- the open-loop ramp hands over to
+        the closed loop earlier, which is the direction the measurement asks for.
+        """
+        pilot_rate = check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        max_up = check.BRING_UP_CLIMB_RATE_WINDOW_VALUE
+        default_max_up = check.BRING_UP_CLIMB_RATE_RESTORE_VALUE
+        bounded_exit = min(max(pilot_rate, 0.1 * max_up), 0.5 * max_up)
+        default_exit = min(max(pilot_rate, 0.1 * default_max_up), 0.5 * default_max_up)
+        assert bounded_exit == 0.25
+        assert default_exit == 0.5
+        assert bounded_exit < default_exit
 
 
 # ---------------------------------------------------------------------------
