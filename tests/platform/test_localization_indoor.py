@@ -2208,6 +2208,161 @@ class TestOrderedBringUp:
         wrong["MOT_IDLE_SEC"] = 0.0  # the window's value, not the scored arm's
         assert check._bring_up_closure_blockers(wrong, cleared)
         assert settings.sensor_mode is SensorMode.SENSOR_DERIVED
+
+# ---------------------------------------------------------------------------
+# T17: the ordering of the window's thrust path. The takeoff command is what pins
+# the mode's alt-hold state machine into AltHoldModeState::Takeoff, and that state
+# sets no spool state at all (`get_alt_hold_state_D_ms`, mode.cpp:1030-1068, tests
+# `takeoff.running()` before the branch at :1041-1055 that asks for one). Commanded
+# while the airframe's motor interlock is still down -- Copter holds it down for its
+# 2.0 s `ap.in_arming_delay` (motors.cpp:59,75) -- the takeoff therefore freezes the
+# desired spool state at SHUT_DOWN, which the motors library forces while the
+# interlock is down (`set_desired_spool_state`/`output_logic`,
+# AP_MotorsMulticopter.cpp:619-638), for the rest of the arm.
+#
+# Measured (work/ardupilot/logs/00000142.BIN, the clock-fix flight): CTUN.ThO
+# (= motors->get_throttle(), Log.cpp:58) ramped to 1.000 inside the window, MOTB.ThrOut
+# (= _throttle_out) stayed 0.000 and RCOU stayed 1000 us for the whole 4.1 s; the first
+# SPOL entry of the run is (Spl=0, SplDes=2) at the LAND mode change, 16 ms before the
+# motors finally left the floor. The command is therefore held until the VEHICLE's own
+# report of its motor outputs leaves the floor it read at the arm readback.
+# ---------------------------------------------------------------------------
+
+
+class TestTheTakeoffWaitsForTheThrustPath:
+    """The ordering that lets the declared excitation actually fly."""
+
+    @staticmethod
+    def _clock(
+        sim_step_s: float = 0.05, wall_step_s: float = 0.1
+    ) -> tuple[Any, dict, Any]:
+        clock = check._SimulatorClock()
+        clock.observe(0.0)
+        wall = {"now": 0.0}
+
+        def step() -> None:
+            wall["now"] += wall_step_s
+            clock.observe((clock.newest_s or 0.0) + sim_step_s)
+
+        return clock, wall, step
+
+    @staticmethod
+    def _window(clock, wall, budget_s: float = 3.5) -> Any:
+        return check._SimWindow(
+            clock,
+            budget_s,
+            label="the excitation's climb drain",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(budget_s, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+
+    def test_the_wait_ends_the_moment_the_motors_leave_the_floor(self):
+        """The gate is the airframe's own report, and it opens the takeoff with it.
+
+        The floor is what the vehicle reported while no spool-up was requested; the
+        thrust path is open when that same report rises above it. Anything later --
+        a fixed settle, a wall deadline -- is a guess about when the vehicle's own
+        interlock will be up, which is the quantity that caused the defect.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1000}
+
+        def poll():
+            step()
+            return (1150,) * 4 if (clock.newest_s or 0.0) >= 2.0 else (1000,) * 4
+
+        wait = self._window(clock, wall)
+        opened = check._wait_for_thrust_path(poll, wait, motors, clock, poll_s=0.0)
+        assert opened is not None, "the wait did not see the motors leave the floor"
+        assert opened >= 2.0
+        assert motors["left_floor_at_simulator_s"] == opened
+        assert motors["floor_pwm"] == 1000
+        # The window is not consumed by the wait: it is the climb window, and the
+        # climb is what happens after the thrust path opens.
+        assert wait.expired() is False
+        assert wait.ended_by is None
+
+    def test_the_floor_is_the_vehicles_own_number_not_a_literal(self):
+        """An airframe whose floor is not 1000 us is waited on the same way.
+
+        The window has no PWM value of its own: MOT_PWM_MIN is the airframe's, and the
+        report at the arm readback is what says where its motors sit. A gate written
+        against a literal 1000 would open this airframe's takeoff while its motors were
+        still shut down.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1100}
+
+        def poll():
+            step()
+            return (1150,) * 4 if (clock.newest_s or 0.0) >= 1.0 else (1100,) * 4
+
+        opened = check._wait_for_thrust_path(
+            poll, self._window(clock, wall), motors, clock, poll_s=0.0
+        )
+        assert opened is not None and opened >= 1.0
+        assert motors["floor_pwm"] == 1100
+
+    def test_a_vehicle_that_never_leaves_its_floor_spends_the_declared_window(self):
+        """The failure side: the wait ends with the declared budget spent, and says so.
+
+        A vehicle whose motors never leave the floor has no thrust path, and the run
+        owes that fact rather than a takeoff command that looks the same as a working
+        one. The declared climb window is what bounds the wait, so the LAND command
+        still goes out inside the declared airtime bound.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1000}
+
+        def poll():
+            step()
+            return (1000,) * 4
+
+        wait = self._window(clock, wall)
+        assert check._wait_for_thrust_path(poll, wait, motors, clock, poll_s=0.0) is None
+        document = wait.document()
+        assert document["ended_by"] == "simulator"
+        assert document["elapsed_simulator_s"] >= 3.5
+        assert document["budget_simulator_s"] == 3.5
+        assert "left_floor_at_simulator_s" not in motors
+
+    def test_a_vehicle_that_never_reports_its_motor_outputs_cannot_open_the_path(self):
+        """Silence is not a thrust path: an unreported output keeps the wait honest.
+
+        The window has no other statement about the motors, so a vehicle that never
+        reports them ends on the declared budget, exactly like a vehicle whose motors
+        never moved -- which is what its own evidence says.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1000}
+
+        def poll():
+            step()
+            return None
+
+        assert (
+            check._wait_for_thrust_path(
+                poll, self._window(clock, wall), motors, clock, poll_s=0.0
+            )
+            is None
+        )
+
+    def test_a_floor_read_late_is_taken_from_the_first_report(self):
+        """When the arm readback carried no servo report, the first one is the floor."""
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": None}
+
+        def poll():
+            step()
+            return (1050,) * 4 if (clock.newest_s or 0.0) >= 1.0 else (1000,) * 4
+
+        opened = check._wait_for_thrust_path(
+            poll, self._window(clock, wall), motors, clock, poll_s=0.0
+        )
+        assert opened is not None, "a floor learned late must still open on a rise"
+        assert motors["floor_pwm"] == 1000
+
+
 # ---------------------------------------------------------------------------
 # T16: a declared budget is spent in the units it is declared in. The ordered
 # bring-up's windows are windows of the AIRCRAFT's time, and the simulator's own

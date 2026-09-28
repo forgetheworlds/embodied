@@ -3594,10 +3594,17 @@ def _run_ordered_bring_up(
 
     flight: dict[str, Any] = record["flight"]
     # The window's own motor evidence: the airframe's PWM outputs as the vehicle
-    # reports them. A takeoff the autopilot accepted but the motors never answered
-    # is a different finding from a takeoff it refused, and only the outputs say
-    # which happened.
-    motors = {"max_pwm": 0, "samples": 0}
+    # reports them, and -- because that is the quantity the takeoff command below
+    # waits on -- the floor those outputs sit at while no spool-up has been
+    # requested. A takeoff the autopilot accepted but the motors never answered is
+    # a different finding from a takeoff it refused, and only the outputs say which
+    # happened.
+    motors: dict[str, Any] = {
+        "max_pwm": 0,
+        "samples": 0,
+        "floor_pwm": None,
+        "floor_at_arm_readback": None,
+    }
     if not blockers:
         # 3. The window's own arm: ALT_HOLD, retried, every refusal kept.
         record["arm_attempts"] = 0
@@ -3670,21 +3677,25 @@ def _run_ordered_bring_up(
         flight["mode"] = sample.mode_name
         flight["pairs_fed_at_arm"] = stats.pairs
         flight["imu_fed_at_arm"] = stats.imu_samples
+        # The airframe's own PWM floor, as the vehicle reports it while the thrust
+        # path is still off: a motor output sits at the airframe's own minimum until
+        # a spool state has been asked for and accepted (`output_to_pwm`,
+        # AP_MotorsMulticopter.cpp:439-450, SHUT_DOWN). "The motors left the floor"
+        # below is therefore a comparison between two of the VEHICLE's own readings,
+        # and this window supplies no PWM value of its own for it.
+        if sample.servo_outputs is not None:
+            motors["floor_pwm"] = max(sample.servo_outputs[:4])
+            motors["floor_at_arm_readback"] = motors["floor_pwm"]
         # The window's ONE thrust path goes on here, and the order is the point:
         #
         #   * AFTER the arm, because `arm_checks` refuses to arm with a positive
         #     pilot climb rate -- "Throttle too high" (AP_Arming_Copter.cpp:621-635)
         #     -- and the arm loop above retries, so an override in force during a
         #     retry would refuse every attempt;
-        #   * BEFORE the takeoff command, because the takeoff state does not set a
-        #     spool state at all: `get_alt_hold_state_D_ms` (mode.cpp:1042-1055)
-        #     only reaches the branch that asks for THROTTLE_UNLIMITED while the
-        #     mode is still landed and the pilot climb rate is not negative, and
-        #     with the takeoff already running that branch is never reached (the
-        #     measured SPOL trace: SplDes stayed SHUT_DOWN for 2.6 s of the window).
-        #     `takeoff.triggered_ms` also requires the spool state to BE
-        #     THROTTLE_UNLIMITED (mode.cpp:607-622), which is the other reason the
-        #     desired state has to be set first.
+        #   * and the takeoff command it feeds is held until the vehicle's own report
+        #     of its motor outputs shows the thrust path open (see the block below the
+        #     settle). Commanding the takeoff earlier loses the excitation entirely,
+        #     and that is the measured defect this ordering fixes.
         if override["sent_pwm"] is not None:
             record["sent"].append(
                 link.send_rc_channels_override(int(override["sent_pwm"]))
@@ -3702,11 +3713,106 @@ def _run_ordered_bring_up(
                 link.drain()
                 note_vehicle_rc_report()
                 time.sleep(0.05)
+        # THE ORDERING, and why the takeoff command cannot be sent above.
+        #
+        # The takeoff command is what pins the mode into AltHoldModeState::Takeoff, and
+        # that state asks for no spool state at all: `get_alt_hold_state_D_ms`
+        # (mode.cpp:1030-1068) returns Takeoff on its second test -- `takeoff.running()
+        # || takeoff.triggered_ms(...)` -- BEFORE the landed branch at :1041-1055 that
+        # asks for THROTTLE_UNLIMITED, and `AltHold::run()`'s Takeoff case
+        # (mode_althold.cpp:63-74) asks for none either. The desired spool state is a
+        # latch, so the takeoff freezes whichever state was last accepted.
+        #
+        # Commanded one settle after the arm, that latch is SHUT_DOWN, and the run
+        # therefore produces no thrust at all. The motors library FORCES SHUT_DOWN while
+        # `!get_interlock()` (`set_desired_spool_state` and `output_logic`,
+        # AP_MotorsMulticopter.cpp:619-638), and Copter holds the interlock down for its
+        # own 2.0 s `ap.in_arming_delay` after arming (motors.cpp:59,75 -- the
+        # MOTORS_INTERLOCK_ENABLED event). The 0.3 s settle is spent entirely inside that
+        # delay, the THROTTLE_UNLIMITED the landed branch asks for is discarded, and the
+        # takeoff then pins the latch: nothing in ALT_HOLD asks again for as long as
+        # `takeoff.running()`.
+        #
+        # Measured in this window's own airframe log (work/ardupilot/logs/00000142.BIN):
+        # CTUN.ThO (= motors->get_throttle(), Log.cpp:58) ramped to 1.000 as the
+        # takeoff's own slew, while MOTB.ThrOut (= _throttle_out) stayed 0.000 and RCOU
+        # stayed 1000 us for the whole 4.1 s; the run's first SPOL entry is
+        # (Spl=0, SplDes=2) at the LAND mode change, 16 ms before the motors finally left
+        # the floor. The counter-case is in the same file: the GUIDED flight of
+        # 00000139.BIN asks for THROTTLE_UNLIMITED on every iteration, and SPOL records
+        # it as accepted at exactly arm+2.001 s -- the interlock, not the request, is
+        # what both flights waited on.
+        #
+        # So the takeoff waits for the vehicle's OWN report that the thrust path is open:
+        # the motors above the floor they sat at before the override went on. The wait is
+        # bounded by the excitation's own climb window, which therefore opens here rather
+        # than at the command, and no declared budget changes -- the settle, the climb
+        # window and the airtime bound are the declared ones, and the wait costs the climb
+        # window part of its own 3.5 s instead of the airtime bound the LAND command must
+        # stay inside.
+        climb_window = window(EXCITATION_CLIMB_DRAIN_S, "the excitation's climb drain")
+
+        def poll_while_waiting() -> Any:
+            """One iteration of the wait: feed, keep the override alive, read the vehicle."""
+            drain()
+            link.drain()
+            refresh_override()
+            note_vehicle_rc_report()
+            sample_motion()
+            return sample.servo_outputs
+
+        thrust_path: dict[str, Any] = {
+            "floor_pwm": motors["floor_pwm"],
+            "floor_at_arm_readback_pwm": motors["floor_at_arm_readback"],
+            "opened_at_simulator_s": None,
+            "opened_after_arm_simulator_s": None,
+            "waited_within": "the excitation's climb drain (EXCITATION_CLIMB_DRAIN_S)",
+            "why": (
+                "the takeoff command is held until the vehicle's own report of its motor "
+                "outputs leaves the floor it read at the arm readback: with the takeoff "
+                "running, Mode::get_alt_hold_state_D_ms() (mode.cpp:1030-1068) returns "
+                "Takeoff before the branch that asks for a spool state, and the takeoff "
+                "state sets none, so a takeoff commanded while the airframe's motor "
+                "interlock is still down (motors.cpp:59,75, the 2.0 s in_arming_delay) "
+                "pins the desired spool state at SHUT_DOWN for the rest of the window "
+                "(AP_MotorsMulticopter.cpp:619-638)"
+            ),
+        }
+        record["thrust_path"] = thrust_path
+        opened_at = _wait_for_thrust_path(
+            poll_while_waiting, climb_window, motors, stats.sim_clock
+        )
+        thrust_path["opened_at_simulator_s"] = (
+            None if opened_at is None else round(opened_at, 3)
+        )
+        thrust_path["floor_pwm"] = motors["floor_pwm"]
+        arm_simulator_s = flight["simulator_time_at_arm_s"]
+        thrust_path["opened_after_arm_simulator_s"] = (
+            None
+            if opened_at is None or arm_simulator_s is None
+            else round(opened_at - arm_simulator_s, 3)
+        )
+        if opened_at is None and override["sent_pwm"] is not None:
+            blockers.append(
+                "the excitation had no thrust path: the vehicle's own report of its four "
+                f"motor outputs never rose above the floor it read before the window "
+                f"({motors['floor_pwm']} us at the arm readback, {motors['max_pwm']} us "
+                f"maximum over {motors['samples']} samples) within the excitation's "
+                f"declared {EXCITATION_CLIMB_DRAIN_S:g} s climb window, so the takeoff "
+                "command that follows is the takeoff of an airframe whose motors are "
+                "still shut down. The vehicle's own log records which spool state it "
+                "was held in (SPOL Spl/SplDes) beside the mode changes"
+            )
         record["sent"].append(
             link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
         )
         flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
             timespec="milliseconds"
+        )
+        flight["takeoff_commanded_after_arm_simulator_s"] = (
+            None
+            if stats.sim_clock.newest_s is None or arm_simulator_s is None
+            else round(stats.sim_clock.newest_s - arm_simulator_s, 3)
         )
         # A liveness wait, and the wall clock is its right unit: what it asks is whether
         # the autopilot answers this command AT ALL, not whether the scene has had time
@@ -3735,17 +3841,16 @@ def _run_ordered_bring_up(
                 f"{ack.get('result')} (0 is MAV_RESULT_ACCEPTED); the window's climb "
                 "did not start"
             )
-        # The excitation's own climb window, in the aircraft's seconds. Its declared job
-        # is to keep feeding while the climb happens -- the estimator latches on the
-        # frames the climb produces -- so a wall deadline makes the excitation's length
-        # depend on how loaded the host is. Measured both ways on this same host: 3.3
+        # The rest of the excitation's climb window -- the part left after the thrust path
+        # opened. Its declared job is to keep feeding while the climb happens (the
+        # estimator latches on the frames the climb produces) so a wall deadline would
+        # make the excitation's length depend on how loaded the host is; it was opened
+        # above, before the takeoff command, because the climb cannot start until the
+        # airframe's own thrust path is open. Measured both ways on this same host: 3.3
         # simulated seconds of window lifted the aircraft 0.27 m on run
         # p01l-rel10-4-20260927T201628Z at low load, and the 2.20 simulated seconds the
         # wall clock bought on run-2026-09-28T02-43-27-442Z lifted it 0.03 m, because
         # the LAND command arrived before the thrust path's first motor output.
-        climb_window = window(
-            EXCITATION_CLIMB_DRAIN_S, "the excitation's climb drain"
-        )
         while not climb_window.expired():
             drain()
             link.drain()
@@ -4684,6 +4789,54 @@ def _wait_initialized(
             return True
         time.sleep(poll_s)
     return False
+
+
+def _wait_for_thrust_path(
+    poll: Callable[[], Sequence[int] | None],
+    wait: _SimWindow,
+    motors: dict[str, Any],
+    clock: _SimulatorClock,
+    *,
+    poll_s: float = SIM_WINDOW_POLL_S,
+) -> float | None:
+    """Wait, inside the declared window, for the airframe's own thrust path to open.
+
+    The gate is the VEHICLE's own report of its motor outputs, compared against the
+    floor the same report read while no spool-up had been requested: the four outputs
+    sit at the airframe's own minimum until a spool state has been asked for and
+    accepted, so "the motors left the floor" is a comparison between two of the
+    vehicle's own readings and this window supplies no PWM value of its own for it.
+
+    Why the takeoff has to wait for it: the takeoff is what pins the mode's alt-hold
+    state machine into its Takeoff state, and that state asks for no spool state at
+    all (``get_alt_hold_state_D_ms``, mode.cpp:1030-1068, tests ``takeoff.running()``
+    before the branch that asks), so the desired spool state it freezes is whichever
+    one was last accepted -- SHUT_DOWN while the motors library is forcing it
+    (AP_MotorsMulticopter.cpp:619-638), which is the whole of Copter's 2.0 s
+    ``ap.in_arming_delay`` after the arm (motors.cpp:59,75).
+
+    Returns the simulator time at which the vehicle's own report first rose above the
+    floor, or ``None`` if ``wait`` ended first -- the caller owes the reader the
+    difference. ``wait`` carries its own wall ceiling, so a stalled simulator ends the
+    wait instead of hanging it.
+    """
+    floor = motors.get("floor_pwm")
+    while not wait.expired():
+        observed = poll()
+        if observed is not None:
+            top = max(observed[:4])
+            if floor is None:
+                # The arm readback carried no servo report, so the first one the window
+                # can compare against is this one -- taken while the thrust path is
+                # still off, which is what makes it a floor rather than a sample.
+                floor = top
+            elif top > floor:
+                motors["floor_pwm"] = floor
+                motors["left_floor_at_simulator_s"] = clock.newest_s
+                return clock.newest_s
+        time.sleep(poll_s)
+    motors["floor_pwm"] = floor
+    return None
 
 def _scene_capture_gate(
     writer: EvidenceWriter,
