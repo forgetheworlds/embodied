@@ -2208,3 +2208,214 @@ class TestOrderedBringUp:
         wrong["MOT_IDLE_SEC"] = 0.0  # the window's value, not the scored arm's
         assert check._bring_up_closure_blockers(wrong, cleared)
         assert settings.sensor_mode is SensorMode.SENSOR_DERIVED
+# ---------------------------------------------------------------------------
+# T16: a declared budget is spent in the units it is declared in. The ordered
+# bring-up's windows are windows of the AIRCRAFT's time, and the simulator's own
+# clock -- the controller's robot.getTime(), carried on every sensor frame the
+# feed reads (sensors.py:55, webots_ardupilot.py FrameHeader.sim_time_s) -- is
+# what has to spend them.
+#
+# Measured defect (run-2026-09-28T02-43-27-442Z, receipt
+# work/runs/p01-localization/receipt-p01l-2026-09-28T02-43-27-442Z.json): the
+# windows were wall-clock deadlines, this host ran the simulator at 0.40-0.92
+# simulated seconds per wall second, the declared 3.5 s climb window bought 2.20
+# simulated seconds, and the LAND command went out 0.80 simulated seconds BEFORE
+# the thrust path's first motor output. The airframe's own log for the same run
+# (work/ardupilot/logs/00000141.BIN) puts the first motor output at 18.923 s of
+# autopilot time, 29 ms after the LAND mode was applied and the throttle override
+# released: the excitation was cut off by the host's pace, not by its physics.
+# ---------------------------------------------------------------------------
+
+
+class TestDeclaredBudgetsAreSpentInTheirOwnUnits:
+    """A budget declared in simulator seconds is spent in simulator seconds.
+
+    The configuration declares those windows in simulated time and says so
+    ("a window measured in simulated time is comparable between the realtime and
+    fast modes", configs/first_indoor.yaml probe section), the excitation's
+    declaration reasons in the same units as the firmware's own MOT_IDLE_SEC
+    (BRING_UP_JUSTIFICATION, localization_check.py), and a climb rate times a
+    window is a distance the aircraft has to fly. A wall-clock deadline makes all
+    of that depend on how loaded the host happens to be.
+    """
+
+    @staticmethod
+    def _clock(sim_step_s: float, wall_step_s: float):
+        """A simulator clock and a wall clock that advance together, by injected steps."""
+        clock = check._SimulatorClock()
+        wall = {"now": 0.0}
+
+        def drain() -> None:
+            wall["now"] += wall_step_s
+            clock.observe((clock.newest_s or 0.0) + sim_step_s)
+
+        return clock, wall, drain
+
+    def test_the_wall_ceiling_is_derived_from_the_declared_realtime_envelope(self):
+        """Inside its declared envelope a simulated budget cannot outlast N/floor wall.
+
+        probe.realtime_ratio_envelope declares the simulator's rate as simulated
+        seconds per wall second, so its floor is the worst pace the run admits; the
+        ceiling exists only to stop a stalled simulator from hanging the run, which
+        is a finding rather than a reason to hang (the bridge's own
+        AT_REST_WALL_CLOCK_LIMIT_S states the same rule for its sim-time window).
+        """
+        assert check._sim_window_wall_ceiling_s(3.5, 0.5) == pytest.approx(7.0)
+        assert check._sim_window_wall_ceiling_s(60.0, 0.5) == pytest.approx(120.0)
+        # A slower admitted pace gives a longer ceiling: the factor is the declared
+        # floor, never a literal of this module's own.
+        assert check._sim_window_wall_ceiling_s(3.5, 0.25) == pytest.approx(14.0)
+
+    def test_a_slow_simulator_still_gets_the_declared_budget_in_its_own_seconds(self):
+        """At the envelope's floor the window closes on simulated time, not on wall.
+
+        The pace here is the declared floor (0.5 simulated seconds per wall
+        second), which is the worst a run may admit. The old wall-clock deadline
+        would have declared this 3.5 s window over after 3.5 wall seconds, with
+        only 1.75 simulated seconds spent -- which is the measured defect.
+        """
+        clock, wall, drain = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the excitation's climb drain",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        for _ in range(34):  # 3.4 wall seconds: 1.7 simulated seconds
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+            wall["now"] += 0.1
+            assert not window.expired(), window.document()
+        assert window.elapsed_simulator_s() == pytest.approx(1.7, abs=0.05)
+        assert window.ended_by is None
+
+        for _ in range(40):  # on to 7.4 wall seconds / 3.7 simulated seconds
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+            wall["now"] += 0.1
+            if window.expired():
+                break
+        document = window.document()
+        assert document["ended_by"] == "simulator", document
+        assert document["elapsed_simulator_s"] >= 3.5
+        assert document["budget_simulator_s"] == 3.5
+        assert document["elapsed_wall_s"] > 3.5  # the wall clock was not the deadline
+        assert document["wall_ceiling_s"] == pytest.approx(7.0)
+
+    def test_a_simulator_outside_its_envelope_is_ended_by_the_wall_ceiling(self):
+        """Outside the declared envelope the ceiling ends the window, and says so.
+
+        A simulator slower than the declared floor makes the run timing-invalid
+        (the probe's realtime evidence already reports those windows); the ceiling
+        is what stops the run from waiting forever for time that is not arriving.
+        It is recorded as the wall ceiling, never as the declared budget honoured.
+        """
+        clock, wall, drain = self._clock(sim_step_s=0.02, wall_step_s=0.1)
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the excitation's climb drain",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        for _ in range(200):
+            drain()
+            if window.expired():
+                break
+        document = window.document()
+        assert document["ended_by"] == "wall_ceiling", document
+        assert document["elapsed_simulator_s"] < document["budget_simulator_s"]
+        assert document["elapsed_wall_s"] >= document["wall_ceiling_s"]
+
+    def test_a_stalled_simulator_does_not_hang_the_wait(self):
+        """A clock that never advances ends on the ceiling, and never on the budget."""
+        clock = check._SimulatorClock()
+        wall = {"now": 0.0}
+        window = check._SimWindow(
+            clock,
+            60.0,
+            label="the bring-up's wait for the vehicle's own pre-arm checks to clear",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(60.0, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        assert not window.expired()
+        clock.observe(12.0)
+        for _ in range(700):
+            wall["now"] += 0.2
+            if window.expired():
+                break
+        document = window.document()
+        assert document["ended_by"] == "wall_ceiling"
+        assert document["elapsed_simulator_s"] == pytest.approx(0.0)
+
+    def test_the_initialization_wait_is_spent_in_simulator_seconds(self):
+        """H5's wait: the estimator's readiness is work in simulated time too.
+
+        The estimator latches on frames, and frames arrive in the scene's time, so
+        the declared pre_arm_wait_s ("all of which take simulated time") cannot be a
+        wall-clock deadline either. On a host running at the envelope's floor the
+        estimator that latches at 3.0 simulated seconds would be missed by a 3.5 s
+        wall deadline and is found by a 3.5 s simulated one.
+        """
+
+        class _Machine:
+            state = "warming"
+
+        machine = _Machine()
+        clock, wall, _ = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+
+        def drain() -> None:
+            wall["now"] += 0.1
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+            if clock.newest_s >= 3.0:
+                machine.state = "healthy"
+
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the declared wait for the estimator to initialize (pre_arm_wait_s)",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        assert check._wait_initialized(machine, drain, window) is True
+        document = window.document()
+        assert document["ended_by"] == "estimator_initialized"
+        assert document["elapsed_simulator_s"] >= 3.0
+        # The old wall deadline would have declared this over at 3.5 wall seconds,
+        # with 1.75 simulated seconds spent and a still-warming estimator.
+        assert document["elapsed_wall_s"] > 3.5
+
+    def test_an_estimator_that_never_latches_spends_the_declared_budget(self):
+        """The failure side: the wait ends with the declared budget spent, and says so."""
+
+        class _Machine:
+            state = "warming"
+
+        clock, wall, _ = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+
+        def drain() -> None:
+            wall["now"] += 0.1
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the declared wait for the estimator to initialize (pre_arm_wait_s)",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        assert check._wait_initialized(_Machine(), drain, window) is False
+        document = window.document()
+        assert document["ended_by"] == "simulator"
+        assert document["elapsed_simulator_s"] >= 3.5
+
+    def test_the_bring_up_declares_the_clock_its_windows_are_spent_against(self):
+        """The receipt owes a reader the unit: the simulator's own clock, and its source."""
+        settings, window = TestOrderedBringUp()._settings_and_window()
+        envelope = settings.realtime_ratio_envelope
+        assert envelope == (0.5, 1.5)
+        assert check.SIMULATOR_CLOCK_SOURCE
+        assert "robot.getTime()" in check.SIMULATOR_CLOCK_SOURCE
+        assert (
+            check._sim_window_wall_ceiling_s(settings.pre_arm_wait_s, envelope[0])
+            == settings.pre_arm_wait_s / envelope[0]
+        )

@@ -379,6 +379,27 @@ localization:
   #              from the vehicle itself, and the scored window refuses to
   #              open while any window value is still in force
   #              (`_bring_up_closure_blockers`).
+  #
+  #              THE UNIT OF EVERY ONE OF THESE WINDOWS IS THE SIMULATOR'S
+  #              SECOND, NOT THE HOST'S (corrected 2026-09-28; the code spent
+  #              them on the wall clock until then). The airtime bound is a
+  #              quantity of the aircraft's own time -- "from the arm readback
+  #              to the LAND command", weighed below against the firmware's own
+  #              MOT_IDLE_SEC -- and a climb rate times a window is a distance
+  #              the aircraft has to fly, so the same declaration must cost the
+  #              same amount of the aircraft's time whatever the host is doing.
+  #              Measured on this host while loaded
+  #              (run-2026-09-28T02-43-27-442Z): the simulator ran at 0.40-0.92
+  #              simulated seconds per wall second, the 3.5 s climb window
+  #              bought 2.20 simulated seconds, and the airtime was 2.34
+  #              simulated seconds against this 5.0 s bound -- the excitation
+  #              was cut off 0.80 simulated seconds before the thrust path's
+  #              first motor output. The clock is the simulator's own (the
+  #              controller's robot.getTime(), carried on every sensor frame);
+  #              the wall clock keeps only a ceiling derived from the declared
+  #              realtime envelope, so a stalled simulator ends the wait instead
+  #              of hanging the run. The same unit applies to the declared probe
+  #              windows above, and to hold_per_waypoint_s for the scored route.
   #   excitation: ALT_HOLD, one takeoff command to 0.60 m (<= half the declared
   #              1.5 m hover altitude), NO lateral setpoint, LAND always --
   #              the same E-EXC envelope the diagnostic flew, in the mode that
