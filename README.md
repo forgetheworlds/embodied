@@ -8,10 +8,12 @@ R2025a with ArduPilot SITL (ArduCopter) through one adapter that owns both
 sides, and every result is produced by code that records its own evidence and
 can be re-run from a clean checkout.
 
-Everything here is simulator-only. The one flown claim this repository makes
-today is a closed compatibility gate, described under Results. There is no
-claim of localization from onboard sensing, no obstacle avoidance, no
-autonomy, and no real flight.
+Everything here is simulator-only. Two flown claims are made today, both under
+Results: the closed compatibility gate, and **localization from onboard
+sensing** — the vehicle arms with GPS off and flies its two-waypoint route on
+a pose produced by its own onboard estimator, holding both waypoints and
+landing. There is still no obstacle avoidance, no autonomy, and no real
+flight.
 
 ## Status
 
@@ -20,7 +22,8 @@ Works today:
 | Item | Evidence |
 |---|---|
 | Webots/ArduPilot compatibility gate closed: two consecutive invocations, 16/16 checks each, both guided-motion checks green, waypoint holds within 1.8-3.2 cm | receipts for `extnav-it3` and `extnav-it4`, described below |
-| Test suite: 146 tests pass on `main` | `python -m pytest -q`, see Reproduce it |
+| Sensor-derived arm: GPS off at runtime, both waypoints flown and held on a pose from the onboard estimator, landed; E1 accuracy p95 0.086 m / max 0.118 m against 0.10 m / 0.15 m | `work/runs/p01-localization/p01l-rel10-4-20260927T201628Z/run-a/checks.json`, merged to `main` in `0fc5d95`, described below |
+| Test suite: 334 tests collected on `main`; 308 pass and 26 fail on one known mismatch, explained under Reproduce it | `python -m pytest -q`, see Reproduce it |
 | Measurement instrument: recorder, referee and grader with structural truth isolation, tested against hand-checkable episodes | `tests/bench/`, `tests/fixtures/bench/` |
 | Stereo calibration pipeline runs end to end; rectification gate (B1) passed; the floor-depth gate (B3) failed its pre-registered criterion and the stage is recorded as blocked rather than passed | `work/runs/p01-calibration/` (local evidence store) |
 
@@ -28,7 +31,8 @@ Not proven yet, stated plainly:
 
 | Gap | Why |
 |---|---|
-| Sensor-derived localization | the estimator in the green runs flies on the simulator's own pose, fed to EKF3 as external navigation |
+| Scoring and robustness of the sensor-derived arm | the arm has flown this route and passed E1, but nothing held-out has been scored against it, and an intermittent load-induced tumble is attributed rather than cured — the merged fix for it has not been proven in flight |
+| The re-declared freshness bound | F2, the published-state age max, was re-declared 20 ms → 40 ms on the owner's ruling (a criterion change with a structural justification, commit `c44c3aa`); no flight has been re-run against the new bound since the merge |
 | Floor-plane metric depth | 5.4% of floor samples within the declared tolerance against a declared 95% minimum; the criterion itself may be ill-posed for a textureless plane |
 | Autonomy, obstacle avoidance, cloud pilot | not built; the current stage is the airframe-and-transport foundation they need |
 | Real flight | no hardware has been flown |
@@ -57,9 +61,12 @@ What the gate proves, in the receipt's own words: transport, clocks and
 frames, under a simulator-interface configuration. What it does not prove:
 the estimator's position and attitude come from the simulator's ground-truth
 pose, delivered to EKF3 through MAVLink `VISION_POSITION_ESTIMATE` with
-`EK3_SRC1_*` set to ExternalNav. That is deliberate for this stage, it is
-recorded as a limitation in every receipt, and replacing it with
-visual-inertial navigation over the same interface is the next stage.
+`EK3_SRC1_*` set to ExternalNav. That is deliberate for this gate, and it is
+recorded as a limitation in every receipt. Replacing it with visual-inertial
+navigation over the same interface was the next stage when this was written,
+and it is now done: the sensor-derived arm below flies on a pose from its own
+onboard estimator, delivered over exactly that interface. The gate keeps the
+truth pose because it is a transport check, not a localization one.
 
 ### The figures
 
@@ -81,9 +88,51 @@ manoeuvre with a decaying wobble on the first transit.
 Every plotted number comes from the log file named in `assets/README.md`,
 which also states the channels and their limits.
 
+### The sensor-derived arm
+
+This is the second flown claim, and it is a different claim from the gate's.
+The adapter runs a separate estimator process (`estimator/ov_stream.cpp`
+builds the pinned OpenVINS), fed the scene's stereo pairs and inertial samples,
+publishing a pose over a local socket; the adapter forwards that pose to the
+autopilot's EKF3 as external navigation. Nothing else feeds the autopilot's
+position: the bridge's own truth republish is off for the run, and the receipt
+records `bridge truth poses sent over the whole run: 0`.
+
+In `work/runs/p01-localization/p01l-rel10-4-20260927T201628Z` (merged to
+`main` as `0fc5d95`) the aircraft armed with GPS off, flew both waypoints on
+that pose — commanded at local-NED (2.0, 0.0, -1.5) and (2.0, 1.0, -1.5) —
+held them and landed:
+
+| Check | Result |
+|---|---|
+| E1 accuracy, scored against the simulator's own pose (read in-process for scoring only, sent to nothing) | p95 horizontal 0.086 m, max 0.118 m against 0.10 / 0.15 m; p95 vertical 0.055 m, max 0.132 m against 0.15 / 0.30 m |
+| GPS off at runtime | 91 `SYS_STATUS` samples without the GPS-present bit, no `GPS_RAW_INT` without a fix |
+| Estimator health across the scored window | valid fraction 1.0000 against 0.99; 0 adapter resets; final health healthy |
+| Bridge truth republish | off; 0 poses sent for the whole run |
+
+Two honest qualifiers. The route is open-loop — this arm has no obstacle
+avoidance, because that is a later stage. And the one bound that failed was
+F2, the published-state age max: it was re-declared from 20 ms to 40 ms by the
+owner as a criterion change with a structural justification rather than a run
+result — the pose seam publishes on a 10 ms tick, so 20 ms sat exactly on the
+two-tick floor any implementation can reach, and a second declared number (the
+adapter's 300 ms silence watchdog) had never been reconciled with it. The full
+reasoning sits in the comment beside the value in `configs/first_indoor.yaml`
+(commit `c44c3aa`): never a quiet relaxation, and the change is in the public
+tree.
+
+One more thing worth stating, because it is in the evidence and not in this
+summary: an intermittent end-of-route tumble was traced to host load. A stalled
+host starves the shared inertial stream, the estimator's state clock freezes
+while the adapter keeps publishing its last pose, and EKF3 receives a stale
+pose followed by a step mid-climb. The fix is merged and is **not yet proven in
+flight** — at low load the baseline already flies, so proving the fix requires
+deliberately induced load, which has not been run. Failing runs are kept: the
+receipts and the reasoning are on disk under `work/runs/p01-localization/`.
+
 ## How it is built
 
-Four ideas carry the design.
+Five ideas carry the design.
 
 **One adapter between simulator and autopilot.**
 `src/embodied/platform/webots_ardupilot.py` starts both processes, owns their
@@ -95,6 +144,17 @@ throttle curve into PWM microseconds, publishes guided
 `SET_POSITION_TARGET_LOCAL_NED` setpoints, and feeds EKF3's external-nav input
 at 25 ms. Nothing on the Webots side knows about MAVLink; nothing on the
 autopilot side knows about Webots.
+
+**The estimator is its own process, behind one seam.**
+`src/embodied/platform/localization.py` receives the pose over a TCP seam and
+publishes it to the autopilot as external navigation, and
+`src/embodied/platform/localization_check.py` is the gate that judges the arm
+against declared bounds — publish rate and gaps, published-state age, estimator
+health, agreement with the autopilot's own estimate, GPS-off at runtime, and
+accuracy against the simulator's pose when that is available for scoring. The
+estimator binary is built out of tree by `estimator/build-openvins.sh` against
+a pinned OpenVINS tarball and kept out of the repository, so the arm runs the
+same way in a fresh checkout as it does here: nothing is vendored into `src/`.
 
 **Records are frozen and missing stays missing.**
 `src/embodied/contracts/records.py` defines each record once. Fields have no
@@ -126,10 +186,12 @@ passed, floor-plane depth failed its own pre-registered criterion, and the
 stage is recorded as blocked. The failure is kept, not edited away.
 
 ```
-src/embodied/            platform adapter, contracts, CLI, bench, perception
+src/embodied/            platform adapter and the estimator seam, contracts, CLI,
+                         bench, perception, navigation, pilot, memory
 configs/                 one YAML per stage; every number is configuration
 scenarios/compat/        Webots world, the scene's controller, parameter files, vehicle model
-tests/                   the suite (146 tests), including hand-checkable bench episodes
+estimator/               ov_stream.cpp, the pose seam's source, and its build script
+tests/                   the suite (334 tests), including hand-checkable bench episodes
 scripts/                 bootstrap.sh and repository checks
 assets/                  the figures in this README, with captions
 ```
@@ -186,11 +248,24 @@ Then run the suite and one gate invocation:
 
 ```sh
 .venv/bin/python -m pytest -q
-# expected: 146 passed (8-10 minutes)
+# expected: 334 collected, 308 passed, 26 failed (7-8 minutes). See the note
+# below; the 26 failures are one known mismatch, not flakiness.
 
 .venv/bin/python -m embodied compat --config configs/first_indoor.yaml \
     --output work/runs/compat-check-1
 ```
+
+The 26 failures are one cause, and it is recorded rather than hidden: the
+probe's startup read-back compares the parameters the files declare against
+what the vehicle reports, and `tests/platform/test_webots_ardupilot.py`
+transcribes `scenarios/compat/params/compat_ekf.parm` **by hand** so the check
+has a source independent of the product's parser. `EK3_SRC1_VELZ 6` was added
+to the real parameter file on 2026-09-26 (commit `86d3523`, the GPS-off arm
+needed it) and the transcription was not updated in the same change, so the
+scripted vehicle reports nothing for that key and every check downstream of
+the read-back is skipped. The fix is a one-line fixture update; it is not made
+here, because this README describes `main` as it stands at `c44c3aa`. The
+localization module's own 99 tests pass.
 
 Success looks like: exit code 0; `work/runs/compat-check-1/receipt.json` with
 `"status": "complete"` and `"gate_status": "pass"`; `checks.json` with all 16
@@ -277,9 +352,9 @@ of those failures.
 
 ## Roadmap
 
-1. Replace the truth pose feed with sensor-derived visual-inertial
-   navigation, over the same `VISION_POSITION_ESTIMATE` interface, so the
-   estimator flies on what the cameras and IMU sense.
+1. Score the sensor-derived arm: hold-out episodes and mission integration
+   with the bench, so localization from onboard sensing is measured under the
+   benchmark rather than on one flown route.
 2. Re-validate floor-plane metric depth from flown viewpoints, or re-declare
    the criterion with justification, so the calibration stage can close.
 3. Bench campaigns with the recorder/referee/grader instrument on
