@@ -183,14 +183,16 @@ FAST_THRESHOLD = 20
 # motion measurement existed (plan sections 0.6 item 5, 0.7 item 4, 0.8 item 3).
 # Carrier GUIDED, no lateral setpoint at all, termination LAND always:
 #
-#   height    <= 0.60 m, the commanded takeoff altitude -- half the declared 1.5 m
-#               hover altitude and well under the 2.0 m doorway lintel;
+#   height    <= 0.30 m, the commanded takeoff altitude -- a fifth of the
+#               declared 1.5 m hover altitude and well under the 2.0 m doorway
+#               lintel (re-declared from 0.60 m, see the 2026-09-29 amendment);
 #   airtime   <= 6.0 s from the arm readback to the LAND command;
 #   post-LAND drain 10.0 s, so the descent's frames are fed too -- still motion,
 #               still inside the same flight event, still terminated by LAND.
 #
-# Why a 0.60 m climb excites feature propagation, read from the pinned source
-# (plan section 0.6 item 5) rather than hoped: VioManager::initialized() needs
+# Why a climb excites feature propagation, read from the pinned source
+# (plan section 0.6 item 5) rather than hoped -- and why 0.30 m still carries
+# it after the 2026-09-29 re-declaration: VioManager::initialized() needs
 # timelastupdate written once (VioManager.cpp:651), which needs
 # do_feature_propagate_update past the clone gate (VioManager.cpp:348), which
 # needs >= 5 frames the zero-velocity updater declined
@@ -199,8 +201,11 @@ FAST_THRESHOLD = 20
 # the accelerometer read other than gravity (the chi2 residual of the
 # zero-velocity hypothesis) and, at the rig's 554 px focal length, ~2.7 mm of
 # translation is ~1 px of mean disparity -- so >= 0.5 s of climb at the declared
-# 10 Hz stereo rate is >= 5 declining frames, and the 6.0 s bound carries more
-# than a factor of ten over a criterion read from the code.
+# 10 Hz stereo rate is >= 5 declining frames. The 0.60 m climb bought 1.2 s of
+# that at the declared 0.5 m/s; the 0.30 m re-declaration still buys 0.6 s --
+# above the criterion, with the margin now carried by the unstick-to-LAND
+# descent the post-LAND drain feeds -- and the 6.0 s bound carries more than a
+# factor of ten over a criterion read from the code.
 #
 # RE-DECLARED BY THE OWNER, 2026-09-28 (the operator's ruling: "just run the sim
 # longer"; recorded here as a criterion change, not a quiet bump). The 5.0 s
@@ -229,6 +234,37 @@ FAST_THRESHOLD = 20
 # window. A test asserts both containments (the default cap's and the window's)
 # so the two declarations cannot drift apart again.
 #
+# RE-DECLARED FOR THE RELEASE-ENERGY FIX, 2026-09-29 (step `release-energy-fix`
+# of the P01-L phase plan; one hypothesis, applied per the ground-hold verdict's
+# ranked lever 1). The ground-hold bench measured the floor-to-body contact pair
+# holding the vehicle at rest height for ~2.0 s after the spool's first nonzero
+# command -- independent of thrust level across 1.045x-1.369x weight -- and then
+# releasing (work/runs/p01-localization/ground-hold-20260929T150956Z,
+# verdict.json: hold_time_s 2.008; the flights' own unstick instants replayed to
+# +/-0.02 s). The stuck phase is real thrust time, so the climb window has to
+# contain it, and the release energy -- what the vehicle does with the demand
+# the loop has wound up by the moment the hold expires -- is the loop-side lever
+# the verdict owns: halve the commanded takeoff target 0.60 -> 0.30 m. The
+# derivation the two window constants must satisfy is therefore, in simulator
+# seconds: 2.0 s interlock (in_arming_delay, unchanged) + ~0.2 s slew to the
+# spool's first nonzero command (measured: 2.1-2.2 s after arm in
+# 00000143/144/145) + 2.0 s contact hold (measured, above) + the declared climb
+# 0.30 m at the declared 0.5 m/s = 0.6 s -- 4.8 s, inside the declared 5.0 s
+# climb window; and the airtime bound must still contain that window plus the
+# 0.3 s override settle = 5.3 s, inside the declared 6.0 s. Both constants keep
+# their 2026-09-28 values; what changed is the chain they must contain (the
+# measured hold replaces the slew-to-cap term as the binding pre-climb element)
+# and the climb term halves with the target. A test asserts the new chain
+# against the measured numbers beside the old containment.
+#
+# AMENDED BY THE SECOND REPAIR, 2026-09-29 (the same step, after repair 1's
+# flight failed its falsifiers): the declared pilot climb rate moves to 0.3 m/s
+# with the pacing repair, so the climb term is 0.30/0.3 = 1.0 s and the chain
+# the window must contain is 2.0 + 0.2 + 2.0 + 1.0 = 5.2 s -- hence
+# EXCITATION_CLIMB_DRAIN_S = 5.5. The airtime bound still contains that window
+# plus the 0.3 s settle = 5.8 s, inside the declared 6.0 s, which keeps its
+# value. A test asserts both containments against the measured numbers.
+#
 # The envelope is carried as constants, not a localization.excitation
 # configuration key, because the shared cli.py schema rejects unknown
 # localization keys (cli.py:446-448) and the compatibility probe loads this
@@ -255,9 +291,9 @@ FAST_THRESHOLD = 20
 # with `_SimWindow` against the simulator's clock, with the wall ceiling
 # `_sim_window_wall_ceiling_s` derives from the declared realtime envelope.
 EXCITATION_MODE = "GUIDED"
-EXCITATION_TAKEOFF_ALTITUDE_M = 0.60
+EXCITATION_TAKEOFF_ALTITUDE_M = 0.30  # re-declared from 0.60, see above
 EXCITATION_MAX_AIRTIME_S = 6.0  # re-declared from 5.0, see above
-EXCITATION_CLIMB_DRAIN_S = 5.0  # re-declared from 3.5, see above
+EXCITATION_CLIMB_DRAIN_S = 5.5  # re-declared from 5.0 by the second repair, see above
 EXCITATION_POST_LAND_DRAIN_S = 10.0
 EXCITATION_ALTITUDE_REACHED_MARGIN_M = 0.05
 
@@ -468,6 +504,33 @@ BRING_UP_TAKEOFF_RAMP_MAX_PARAMETER = "TKOFF_THR_MAX"
 BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE = 0.55
 BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE = 0.9  # the pin's own default
 
+# The window's sixth parameter, added by the release-energy fix's second repair
+# (2026-09-29): the PACING of the open-loop ramp, not its cap. The repair-1
+# flight (work/runs/p01-localization/p01l-release-20260929T204914Z, dataflash
+# 00000146.BIN) measured the halved 0.30 m target leaving the unstick demand
+# UNCHANGED -- C1 1783 us at unstick, actuator 0.783, against the
+# cap-plus-velocity-chase model 0.15 + 0.85 x (TKOFF_THR_MAX 0.55 + 0.37 x
+# PILOT_SPD_UP 0.5) = 0.775 -- and peak truth altitude 2.39 m against 145's
+# 2.11 m at the 0.60 m target: the altitude error is not in the stuck-phase
+# demand. What the same log's timeline shows is that the closed loop takes over
+# at NOT_LANDED -- the ramp's own cap exit, fired at ~1.4 s of ramp -- and
+# chases the shaped velocity target for the remaining ~0.6 s of the contact
+# hold. The measured countermeasure keeps the closed loop out of the stuck
+# phase entirely: pace the ramp with TKOFF_SLEW_TIME (ArduCopter/Parameters.cpp:978,
+# `G_Dt / copter.g2.takeoff_throttle_slew_time`, takeoff.cpp:83) so the ramp
+# crosses the release band -- ~1.3-1.5x the PHYSICS hover the ground-hold bench
+# measured (actuator 0.307; thrust 48 f N against weight 14.715 N) -- at the
+# hold's own expiry, ~2.0 s after the spool's first nonzero command. At the
+# window value 6.0 s the ramp sits at 2.0/6.0 = 0.333 throttle = actuator 0.433
+# = 1.41x physics weight at hold expiry, every motion exit is still absent
+# while held, and the cap 0.55 is not reached until 3.3 s -- after the
+# release -- so NOT_LANDED fires on real motion at the unstick itself and the
+# wind-up never runs. Restored to the firmware's own default 2.0 (unset by
+# every parm file this project applies) before the scored window opens.
+BRING_UP_TAKEOFF_SLEW_PARAMETER = "TKOFF_SLEW_TIME"
+BRING_UP_TAKEOFF_SLEW_WINDOW_VALUE = 6.0
+BRING_UP_TAKEOFF_SLEW_RESTORE_VALUE = 2.0  # Parameters.cpp:978, the pin's default
+
 # The window's fifth parameter, and the second OWNER-RATIFIED CRITERION CHANGE of
 # the climb-fix brief (2026-09-28): the climb rate the MODE may command, bounded
 # at the rate the window itself declares.
@@ -499,8 +562,22 @@ BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE = 0.9  # the pin's own default
 # rate at the top of the channel's own range -- full stick is now the declared
 # 0.5 m/s, not an unbounded climb. Restored to the firmware's own default 2.5
 # before the scored window opens.
+#
+# RE-DECLARED BY THE RELEASE-ENERGY FIX'S SECOND REPAIR, 2026-09-29. The
+# repair-1 flight (00000146.BIN) measured the stuck-phase demand riding the
+# 0.5 m/s shaped target to the cap-plus-chase model's own number (actuator 0.783
+# at unstick against the model 0.775), so the declared rate the window bounds
+# the mode at moves to 0.3 m/s: the chase term (~0.37 actuator per m/s) halves,
+# the throttle collapse now waits for the velocity estimate to cross 0.3 m/s
+# instead of 0.5 -- a shorter burn at a lower demand -- and the ramp's own
+# velocity exit drops to 0.15 m/s (constrain(pilot, 0.1 max, 0.5 max),
+# takeoff.cpp:96-98), so the open-loop ramp hands over to the closed loop on
+# real motion at the release itself, which is the pacing repair's design. The
+# override's declared rate moves with it (BRING_UP_THROTTLE_CLIMB_RATE_M_S
+# below); full stick now expresses the declared 0.3 m/s. Restored to the
+# firmware's own default 2.5 before the scored window opens.
 BRING_UP_CLIMB_RATE_PARAMETER = "PILOT_SPD_UP"
-BRING_UP_CLIMB_RATE_WINDOW_VALUE = 0.5
+BRING_UP_CLIMB_RATE_WINDOW_VALUE = 0.3  # re-declared from 0.5, see the 2026-09-29 note above
 BRING_UP_CLIMB_RATE_RESTORE_VALUE = 2.5  # the pin's own default
 
 
@@ -575,11 +652,33 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
         "(CTUN.DCRt, logs 00000143/00000144), and both flights coasted to the room's "
         "2.5 m ceiling. The window value is the declared pilot climb rate itself "
         "(BRING_UP_THROTTLE_CLIMB_RATE_M_S): the declaration now bounds the "
-        "feed-forward, the Flying state's rising target, and the takeoff ramp's own "
-        "velocity exit (which drops to 0.25 m/s, takeoff.cpp:96-98). The override's "
-        "PWM is derived from the vehicle's own answers with this value in force, so "
-        "full stick expresses the declared 0.5 m/s. Restored to the firmware's own "
+        "full stick expresses the declared 0.3 m/s (re-declared from 0.5 by the "
+        "release-energy fix's second repair, 2026-09-29: the 0.5 chase target is "
+        "what the stuck-phase demand rode to actuator 0.783 in 00000146.BIN). "
+        "Restored to the firmware's own "
         "default 2.5 before the scored window opens",
+    ),
+    (
+        BRING_UP_TAKEOFF_SLEW_PARAMETER,
+        BRING_UP_TAKEOFF_SLEW_WINDOW_VALUE,
+        BRING_UP_TAKEOFF_SLEW_RESTORE_VALUE,
+        "the open-loop ramp's own PACING, the release-energy fix's second repair "
+        "(2026-09-29): `do_pilot_takeoff_ms` ramps `get_throttle_in() + G_Dt / "
+        "takeoff_throttle_slew_time` while `land_complete` holds "
+        "(ArduCopter/takeoff.cpp:83, the parameter at Parameters.cpp:978, default "
+        "2.0), and the ground-hold bench measured the floor-to-body contact pair "
+        "holding the vehicle ~2.0 s past the spool's first nonzero command at any "
+        "thrust in 1.045x-1.369x weight (verdict.json hold_time_s 2.008). At the "
+        "default pacing the ramp reaches the TKOFF_THR_MAX cap at ~1.1 s, "
+        "NOT_LANDED fires on the cap, and the closed loop chases the shaped "
+        "velocity target for the rest of the hold -- the measured 0.78 actuator "
+        "(~2.5x the physics hover) at the release, 00000146.BIN. At the window "
+        "value 6.0 s the ramp crosses 1.3-1.5x the PHYSICS hover (actuator "
+        "0.40-0.46, throttle 0.29-0.37) exactly at the hold's expiry, the cap 0.55 "
+        "is not reached until 3.3 s, so every exit that fires is a REAL-motion "
+        "exit at the unstick itself and the closed-loop wind-up never runs while "
+        "stuck. Restored to the firmware's own default 2.0 before the scored "
+        "window opens",
     ),
 )
 
@@ -640,7 +739,7 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
 # which is the same class of defect as a parameter write under a name the vehicle
 # does not have. The PWM actually sent is recorded in the receipt, so the
 # declaration is a rate and the receipt is the measurement.
-BRING_UP_THROTTLE_CLIMB_RATE_M_S = 0.5
+BRING_UP_THROTTLE_CLIMB_RATE_M_S = 0.3  # re-declared from 0.5, see BRING_UP_CLIMB_RATE_WINDOW_VALUE above
 # The rate the window will not exceed: the airframe's declared maximum pilot
 # climb rate is WP_SPD_UP 1.0 m/s (compat_arming.parm), and a rate above it would
 # be a faster climb than any other part of this project commands.

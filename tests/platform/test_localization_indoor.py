@@ -2127,6 +2127,7 @@ class TestOrderedBringUp:
             "MOT_IDLE_SEC",
             "TKOFF_THR_MAX",
             "PILOT_SPD_UP",
+            "TKOFF_SLEW_TIME",
         }
         assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
         assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
@@ -2149,9 +2150,17 @@ class TestOrderedBringUp:
         assert rows["PILOT_SPD_UP"]["window_value"] == (
             check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
         )
-        assert check.BRING_UP_CLIMB_RATE_WINDOW_VALUE == 0.5
+        assert check.BRING_UP_CLIMB_RATE_WINDOW_VALUE == 0.3
         assert rows["PILOT_SPD_UP"]["restore_value"] == 2.5  # the pin's own default
         assert all(row["why"] for row in rows.values())
+        # The sixth one paces the open-loop ramp itself (the release-energy fix's
+        # second repair, 2026-09-29): the ground-hold bench measured the contact
+        # pair holding the vehicle ~2.0 s past the spool's first nonzero command
+        # at any thrust, so the ramp crosses ~1.4x the physics hover at the
+        # hold's own expiry and the closed loop never runs while stuck.
+        assert rows["TKOFF_SLEW_TIME"]["window_value"] == 6.0
+        assert rows["TKOFF_SLEW_TIME"]["restore_value"] == 2.0  # Parameters.cpp:978
+        assert "takeoff.cpp:83" in rows["TKOFF_SLEW_TIME"]["why"]
         # The check no mask can except is named, with what the window does instead.
         assert window["not_exceptable"][0]["check"].startswith("the mandatory altitude")
         assert "mandatory_checks" in window["not_exceptable"][0]["citation"]
@@ -2162,18 +2171,19 @@ class TestOrderedBringUp:
             "MOT_IDLE_SEC": 4.0,
             "TKOFF_THR_MAX": 0.9,
             "PILOT_SPD_UP": 2.5,
+            "TKOFF_SLEW_TIME": 2.0,
         }
-
         # The thrust path is declared as a bounded LOCAL bring-up action, with the
         # frozen E-EXC climb target and the window's own airtime bound.
         thrust = window["thrust_path"]
         assert thrust["kind"] == "bounded_local_bring_up_action"
         assert "bounded local bring-up action" in thrust["statement"]
         assert "setpoint" in thrust["statement"]
-        assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.60
-        # Re-declared by the owner on 2026-09-28 (from 5.0 s): the owner's ruling was
-        # "just run the sim longer", and the derivation the constant now carries is in
-        # localization_check.py beside it. The re-declaration itself is asserted here.
+        # Re-declared from 0.60 on 2026-09-29 (the release-energy fix, per the
+        # ground-hold verdict's ranked lever 1); the derivation is beside the
+        # constant in localization_check.py and asserted in
+        # test_the_declared_windows_contain_the_airframes_own_pre_thrust_time.
+        assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.30
         assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 6.0
         assert thrust["sent_by_the_scored_arm"] is False
 
@@ -2563,27 +2573,45 @@ class TestTheTakeoffWaitsForTheThrustPath:
     def test_the_declared_windows_contain_the_airframes_own_pre_thrust_time(self):
         """The re-declared window is the one the airframe's own clock requires.
 
-        The owner re-declared the excitation on 2026-09-28 ("just run the sim longer")
-        from 5.0 s airtime / 3.5 s climb. The numbers here come from the airframe's own
-        logs, not from the constants: the motor interlock comes up 2.0 s after the arm
+        The numbers here come from the airframe's own measurements, not from the
+        constants. The 2026-09-28 re-declaration ("just run the sim longer") fixed
+        the pre-thrust chain: the motor interlock comes up 2.0 s after the arm
         (ARMING_DELAY_SEC, the MOTORS_INTERLOCK_ENABLED event at arm+2.004 s in
-        logs 00000139/00000140/00000142), the takeoff's own slew runs at the measured
-        0.5 per second to whatever TKOFF_THR_MAX is in force (the NOT_LANDED event at
-        command+1.735 s in 00000142 was the 0.9 default reaching its cap), and the
-        declared 0.60 m climb at the declared 0.5 m/s is 1.2 s. A climb window shorter
-        than their sum cannot contain the climb it declares, whatever the ordering
-        does; an airtime bound shorter than the settle plus that window cannot contain
-        the window. The ramp bound the window declares is the SHORTER one, so the
-        containment is asserted against the pin's own default too: bounding the ramp
-        must not be a change the airtime only affords because the ramp got shorter.
+        logs 00000139/00000140/00000142) and the takeoff's own slew runs at the
+        measured 0.5 per second to whatever TKOFF_THR_MAX is in force (the
+        NOT_LANDED event at command+1.735 s in 00000142 was the 0.9 default
+        reaching its cap). The 2026-09-29 re-declaration (the release-energy fix,
+        per the ground-hold verdict's ranked lever 1) added the measured stuck
+        phase and halved the climb: the floor-to-body contact pair holds the
+        vehicle ~2.0 s after the spool's first nonzero command, independent of
+        thrust across 1.045x-1.369x weight (verdict.json hold_time_s 2.008; the
+        flights unstick at 2.1-2.2 s of spool + 1.9-2.0 s, replayed to +/-0.02 s),
+        and the declared climb is now 0.30 m at the declared 0.5 m/s = 0.6 s. A
+        climb window shorter than the chain it must contain -- interlock, slew to
+        the first nonzero command, the contact hold, the climb -- cannot contain
+        the climb it declares, whatever the ordering does; an airtime bound
+        shorter than the settle plus that window cannot contain the window. The
+        ramp bound the window declares is the SHORTER slew, so the slew
+        containment is asserted against the pin's own default cap too: bounding
+        the ramp must not be a change the airtime only affords because the ramp
+        got shorter.
         """
         interlock_delay_s = 2.0  # ARMING_DELAY_SEC, measured at arm+2.004 s
+        slew_to_first_nonzero_s = 0.2  # first nonzero at 2.1-2.2 s, 143/144/145
+        contact_hold_s = 2.0  # ground-hold verdict.json: hold_time_s 2.008
         ramp_rate_per_s = 0.5  # 1 / TKOFF_SLEW_TIME 2.0 s, measured in 00000142/43
         pin_default_cap = check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE  # 0.9
         declared_climb_s = (
             check.EXCITATION_TAKEOFF_ALTITUDE_M / check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
         )
-        # The containment holds for the pin's own default cap and for the window's.
+        # The stuck-phase chain the window must contain, from the measured numbers.
+        assert check.EXCITATION_CLIMB_DRAIN_S >= (
+            interlock_delay_s
+            + slew_to_first_nonzero_s
+            + contact_hold_s
+            + declared_climb_s
+        )
+        # The slew containment holds for the pin's own default cap and the window's.
         for cap in (pin_default_cap, check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE):
             assert check.EXCITATION_CLIMB_DRAIN_S >= (
                 interlock_delay_s + cap / ramp_rate_per_s + declared_climb_s
@@ -2591,10 +2619,28 @@ class TestTheTakeoffWaitsForTheThrustPath:
         assert check.EXCITATION_MAX_AIRTIME_S >= (
             check.BRING_UP_OVERRIDE_SETTLE_S + check.EXCITATION_CLIMB_DRAIN_S
         )
-        # And the re-declared climb window is what the wait is bounded by, so the LAND
-        # command still goes out inside the airtime bound even if the path never opens.
-        assert check.EXCITATION_CLIMB_DRAIN_S == 5.0
+        # And the re-declared climb window is what the wait is bounded by, so the
+        # LAND command still goes out inside the airtime bound even if the path
+        # never opens. The pacing repair (2026-09-29) pins the window's own ramp:
+        # paced by TKOFF_SLEW_TIME, its throttle at the hold's own expiry sits in
+        # the release band, ~1.3-1.5x the PHYSICS hover the ground-hold bench
+        # measured (actuator 0.307: thrust 48 f N against weight 14.715 N), and
+        # the TKOFF_THR_MAX cap is not reached before that expiry -- so
+        # NOT_LANDED fires on real motion at the unstick itself and the
+        # closed-loop wind-up never runs while the vehicle is held.
+        assert check.EXCITATION_CLIMB_DRAIN_S == 5.5
         assert check.EXCITATION_MAX_AIRTIME_S == 6.0
+        spin_min, pwm_floor, pwm_ceiling = 0.15, 1000.0, 2000.0
+        physics_hover_actuator = 0.307  # the bench's static threshold, 48 f = weight
+        slew_s = check.BRING_UP_TAKEOFF_SLEW_WINDOW_VALUE
+        ramp_throttle_at_expiry = contact_hold_s / slew_s  # ramp rate = 1 / slew
+        ramp_actuator_at_expiry = spin_min + (1.0 - spin_min) * ramp_throttle_at_expiry
+        assert 1.3 * physics_hover_actuator <= ramp_actuator_at_expiry
+        assert ramp_actuator_at_expiry <= 1.5 * physics_hover_actuator
+        assert (
+            check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE * slew_s
+            > slew_to_first_nonzero_s + contact_hold_s
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2738,6 +2784,7 @@ class TestTheTakeoffRampIsBoundedByTheAirframesOwnHover:
             "MOT_IDLE_SEC": 4.0,
             "TKOFF_THR_MAX": 0.8999999761581421,  # the vehicle's float32(0.9)
             "PILOT_SPD_UP": 2.5,
+            "TKOFF_SLEW_TIME": 2.0,
         }
         assert check._bring_up_closure_blockers(restored, no_override) == []
         still_in_force = dict(restored)
@@ -2798,17 +2845,21 @@ class TestTheModeClimbRateIsBoundedAtTheDeclaredRate:
     def test_the_ramps_own_velocity_exit_closes_the_loop_earlier_under_the_bound(self):
         """Phase 1's velocity exit is `constrain(pilot_rate, 0.1*max, 0.5*max)`.
 
-        With the mode's maximum at the declared rate, that exit fires at 0.25 m/s
-        of climb instead of the default's 0.5 -- the open-loop ramp hands over to
-        the closed loop earlier, which is the direction the measurement asks for.
+        With the mode's maximum at the declared rate (0.3 m/s since the
+        release-energy fix's second repair; 0.5 before it), that exit fires at
+        0.15 m/s of climb instead of the restore state's 0.3 -- the open-loop
+        ramp hands over to the closed loop earlier, which is the direction the
+        measurement asks for: the handover happens on real motion at the
+        release, not on the cap while the contact still holds the vehicle.
         """
         pilot_rate = check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
         max_up = check.BRING_UP_CLIMB_RATE_WINDOW_VALUE
         default_max_up = check.BRING_UP_CLIMB_RATE_RESTORE_VALUE
         bounded_exit = min(max(pilot_rate, 0.1 * max_up), 0.5 * max_up)
         default_exit = min(max(pilot_rate, 0.1 * default_max_up), 0.5 * default_max_up)
-        assert bounded_exit == 0.25
-        assert default_exit == 0.5
+        assert bounded_exit == pytest.approx(0.5 * max_up)
+        assert bounded_exit == pytest.approx(0.15)
+        assert default_exit == pytest.approx(pilot_rate)
         assert bounded_exit < default_exit
 
 

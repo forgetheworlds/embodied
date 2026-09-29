@@ -328,9 +328,11 @@ localization:
   # key here would break `python -m embodied compat`, the P00 gate's own command
   # (work/runs/p01-localization/plan.md section 0.8 item 3, Correction C). The
   # declaration, and the reason it should excite feature propagation:
-  #   distance:  one vertical takeoff command to 0.60 m, NO lateral setpoint --
-  #              half the declared 1.5 m hover altitude, well under the 2.0 m
-  #              doorway lintel. A climb is deliberate estimator excitation:
+  #   distance:  one vertical takeoff command to 0.30 m, NO lateral setpoint --
+  #              a fifth of the declared 1.5 m hover altitude, well under the
+  #              2.0 m doorway lintel (re-declared from 0.60 m on 2026-09-29, see
+  #              the duration note below). A climb is deliberate estimator
+  #              excitation:
   #              VioManager::initialized() needs timelastupdate (VioManager.cpp:651),
   #              which needs >= 5 camera frames the zero-velocity updater DECLINED
   #              (UpdaterZeroVelocity.cpp:246: disparity >= 1.0 px together with a
@@ -343,13 +345,19 @@ localization:
   #              factor of ten over that criterion), termination LAND always,
   #              plus a bounded post-LAND drain so the descent's frames are fed
   #              too. 6.0 s and the bring-up's 5.0 s climb window are the OWNER's
-  #              re-declaration of 2026-09-28 ("just run the sim longer"): the
-  #              window has to contain the airframe's own pre-thrust time (2.0 s
-  #              motor-interlock delay, measured), the takeoff's own slew to its
-  #              ramp cap (1.8 s to the firmware-default TKOFF_THR_MAX 0.9 at the
-  #              measured 0.5/s; 1.1 s to the window's own bounded cap 0.55 --
-  #              see the bring-up's TKOFF_THR_MAX element below), and the
-  #              declared 0.60 m climb at the declared 0.5 m/s.
+  #              re-declaration of 2026-09-28 ("just run the sim longer"); the
+  #              chain they contain was completed by the 2026-09-29 release-energy
+  #              re-declaration (EXCITATION_TAKEOFF_ALTITUDE_M 0.60 -> 0.30, per
+  #              the ground-hold verdict's ranked lever 1): the window has to
+  #              contain the airframe's own pre-thrust time (2.0 s motor-interlock
+  #              delay, measured), the ~0.2 s slew to the spool's first nonzero
+  #              command, the MEASURED ~2.0 s ground-contact hold that follows it
+  #              (the floor-to-body pair releases ~2.0 s after the first nonzero
+  #              command at any thrust in 1.045x-1.369x weight --
+  #              ground-hold-20260929T150956Z verdict.json), and the declared
+  #              0.30 m climb at the declared 0.3 m/s = 1.0 s (the second
+  #              repair's declared rate; 5.2 s of chain, inside the declared
+  #              5.5 s climb window).
   #   carrier:   the pose-assisted diagnostic arm (GUIDED, truth republish ON for
   #              that run only, via the bridge's per-run arm= override): it is a
   #              DIAGNOSTIC, never a sensor-derived result, never pooled with one,
@@ -414,8 +422,9 @@ localization:
   #              realtime envelope, so a stalled simulator ends the wait instead
   #              of hanging the run. The same unit applies to the declared probe
   #              windows above, and to hold_per_waypoint_s for the scored route.
-  #   excitation: ALT_HOLD, one takeoff command to 0.60 m (<= half the declared
-  #              1.5 m hover altitude), NO lateral setpoint, LAND always --
+  #   excitation: ALT_HOLD, one takeoff command to 0.30 m (re-declared from
+  #              0.60 m on 2026-09-29, the ground-hold verdict's loop-side
+  #              lever), NO lateral setpoint, LAND always --
   #              the same E-EXC envelope the diagnostic flew, in the mode that
   #              requires no position estimate (requires_position() is false,
   #              ArduCopter/mode.h:506). The takeoff carries the documented
@@ -526,7 +535,7 @@ localization:
   #                  RC_Channel.cpp:557-566) with the vehicle's own RC report as
   #                  the evidence that it took and that it was lifted. What is
   #                  declared is the pilot CLIMB RATE it must produce, 0.5 m/s
-  #                  (inside the frozen E-EXC envelope: a climb to 0.60 m, no
+  #                  (inside the frozen E-EXC envelope: a climb to 0.30 m, no
   #                  lateral setpoint); the channel value that produces it is
   #                  DERIVED from the vehicle's own answers for RC3_MIN, RC3_MAX,
   #                  RC3_DZ, THR_DZ and PILOT_SPD_UP through the firmware's own
@@ -587,16 +596,34 @@ localization:
   #                  target ran to 2.2-2.4 m/s while the aircraft was already
   #                  ballistic, and both flights coasted to the room's 2.5 m
   #                  ceiling. The window value is the declared pilot climb rate
-  #                  itself (0.5 m/s, BRING_UP_THROTTLE_CLIMB_RATE_M_S): the
-  #                  declaration now bounds the feed-forward, the Flying state's
-  #                  rising target, and the takeoff ramp's own velocity exit
-  #                  (0.25 m/s, takeoff.cpp:96-98) -- closing the defect the
-  #                  thrust-order report named: "the declared +0.494 m/s pilot
-  #                  climb rate is unbounded in ALT_HOLD". The override's PWM is
-  #                  derived from the vehicle's own answers with this value in
-  #                  force, so full stick expresses the declared 0.5 m/s.
-  #                  Restored to the firmware's own default 2.5 before the scored
-  #                  window opens.
+  #                  itself (0.3 m/s since the release-energy fix's second
+  #                  repair, 2026-09-29; 0.5 before it,
+  #                  BRING_UP_THROTTLE_CLIMB_RATE_M_S): the declaration bounds
+  #                  the feed-forward, the Flying state's rising target, and the
+  #                  takeoff ramp's own velocity exit (0.15 m/s,
+  #                  takeoff.cpp:96-98) -- closing the defect the thrust-order
+  #                  report named: "the declared +0.494 m/s pilot climb rate is
+  #                  unbounded in ALT_HOLD". The override's PWM is derived from
+  #                  the vehicle's own answers with this value in force, so full
+  #                  stick expresses the declared 0.3 m/s. Restored to the
+  #                  firmware's own default 2.5 before the scored window opens.
+  #                * TKOFF_SLEW_TIME: the open-loop ramp's own PACING -- the
+  #                  release-energy fix's second repair (2026-09-29). The
+  #                  ground-hold bench measured the floor-to-body contact pair
+  #                  holding the vehicle ~2.0 s past the spool's first nonzero
+  #                  command at any thrust in 1.045x-1.369x weight
+  #                  (ground-hold-20260929T150956Z verdict.json), and the first
+  #                  repair's flight (00000146.BIN) measured the closed loop
+  #                  riding the shaped 0.5 m/s target to ~0.78 actuator (~2.5x
+  #                  the physics hover) at that release -- the halved 0.30 m
+  #                  target had not moved it. At the window value 6.0 s the ramp
+  #                  (`G_Dt / takeoff_throttle_slew_time`, takeoff.cpp:83, the
+  #                  parameter at Parameters.cpp:978) crosses ~1.4x the PHYSICS
+  #                  hover at the hold's own expiry and reaches the 0.55 cap
+  #                  only at 3.3 s, so NOT_LANDED fires on real motion at the
+  #                  unstick itself and the closed-loop wind-up never runs while
+  #                  the vehicle is held. Restored to the firmware's own default
+  #                  2.0 before the scored window opens.
   #              THIS IS A BOUNDED LOCAL BRING-UP ACTION. It is not a cloud
   #              command: the cloud still sends intent and the planner still owns
   #              setpoints, and this message is neither. It is local to the
