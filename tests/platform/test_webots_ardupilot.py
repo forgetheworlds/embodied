@@ -90,6 +90,7 @@ FIXTURE_PARAMETER_VALUES = {
         "EK3_SRC1_VELXY": 6.0,
         "EK3_SRC1_POSZ": 6.0,
         "EK3_SRC1_YAW": 6.0,
+        "EK3_SRC1_VELZ": 6.0,
         "VISO_TYPE": 1.0,
         "COMPASS_USE": 0.0,
     },

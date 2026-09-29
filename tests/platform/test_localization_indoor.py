@@ -1543,6 +1543,7 @@ class TestAttitudeGate:
             self._alignment(initial=(math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))),
             self._stats(),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker is None
         record = json.loads(
@@ -1562,6 +1563,7 @@ class TestAttitudeGate:
             self._alignment(),
             self._stats(),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker and "composition deltas" in blocker
         record = json.loads(
@@ -1579,6 +1581,7 @@ class TestAttitudeGate:
             self._alignment(declared=(0.0, 0.0, math.pi / 2)),
             self._stats(truth_rpy=(0.0, 0.0, 0.0)),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker and "declaration deltas" in blocker
         record = json.loads(
@@ -1598,6 +1601,7 @@ class TestAttitudeGate:
             self._alignment(initial=tilted),
             self._stats(),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker and "level error" in blocker
         record = json.loads(
@@ -1610,6 +1614,176 @@ class TestAttitudeGate:
             self._writer(tmp_path), None, self._alignment(), self._stats(), []
         )
         assert blocker and "no published state" in blocker
+
+    def test_the_gate_joins_truth_at_the_seals_own_instant(self, tmp_path):
+        """A1 measures the sealed frame at the seal, not the run's last truth sample.
+
+        Measured defect, p01l-climbfix-20260928T174608Z/run-a/attitude-gate.json:
+        the gate read truth_time_ns 28.49 s -- the face-planted rest pose after the
+        excitation's crash -- against a seal taken at the arm, and refused the
+        scored arm on the landing A1 was never meant to judge. The declared
+        end-state check judges the landing now; the gate judges the seal.
+        """
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((1_000_000_000, (0.0, 0.0, 0.0)))
+        stats.truth_attitudes.append((28_490_000_000, (0.0, -math.pi / 2, 0.0)))
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, 0.0)},
+            self._alignment(),
+            stats,
+            [],
+            seal_time_ns=1_000_000_000,
+        )
+        assert blocker is None
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["seal_time_ns"] == 1_000_000_000
+        assert record["truth_time_ns"] == 1_000_000_000
+        assert record["state"] == "measured_pass"
+
+    def test_no_truth_sample_near_the_seal_refuses_as_unmeasured(self, tmp_path):
+        """A truth pose from another instant is not the seal's frame: unmeasured,
+        never interpolated and never substituted with the run's last sample."""
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((28_490_000_000, (0.0, 0.0, 0.0)))
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, 0.0)},
+            self._alignment(),
+            stats,
+            [],
+            seal_time_ns=1_000_000_000,
+        )
+        assert blocker and "unmeasured" in blocker
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["state"] == "unmeasured"
+
+
+class TestEndStateCheck:
+    """The declared end-state check: declared 2026-09-29, before any streak flight.
+
+    A run ends with the aircraft level at rest and no crash disarm. Moving A1's
+    sample point to the seal would otherwise leave the landing unjudged -- the
+    gaming path the phase plan names in so many words -- so this check closes it
+    with its own tolerance and its own receipt rows.
+    """
+
+    TIPPED_LIKE_00000145 = (0.0, math.radians(-89.7), 0.0)
+
+    @staticmethod
+    def _stats(final_rpy):
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((50_000_000_000, tuple(final_rpy)))
+        return stats
+
+    @staticmethod
+    def _mavlink_log(tmp_path, *texts):
+        path = tmp_path / "mavlink.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {"mavpackettype": "STATUSTEXT", "severity": 0, "text": text}
+                )
+                + "\n"
+                for text in texts
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _sample(armed=False, mode_name="LAND"):
+        class _Sample:
+            pass
+
+        sample = _Sample()
+        sample.armed = armed
+        sample.mode_name = mode_name
+        return sample
+
+    def _record(self, tmp_path, final_rpy=(0.0, 0.0, 0.0), texts=(), armed=False):
+        return check._end_state_record(
+            self._stats(final_rpy),
+            (0.0, 0.0, 0.0),
+            armed,
+            "LAND",
+            self._mavlink_log(tmp_path, *texts),
+            phase="excitation",
+        )
+
+    def test_a_level_end_state_passes(self, tmp_path):
+        record = self._record(tmp_path, final_rpy=(0.001, -0.002, 0.5))
+        assert record["state"] == "measured_pass"
+        assert record["roll_deg"] == pytest.approx(0.057, abs=1e-3)
+        assert record["pitch_deg"] == pytest.approx(-0.115, abs=1e-3)
+        assert check._end_state_blocker(record) is None
+        row = check._end_state_check_row(record)
+        assert row["name"] == "end_state"
+        assert row["status"] == "pass"
+        assert "no crash disarm" in row["detail"]
+
+    def test_a_tipped_end_state_fails(self, tmp_path):
+        record = self._record(tmp_path, final_rpy=self.TIPPED_LIKE_00000145)
+        assert record["state"] == "measured_fail"
+        blocker = check._end_state_blocker(record)
+        assert blocker and "end state failed" in blocker
+        assert "pitch -89.7" in blocker
+        assert check._end_state_check_row(record)["status"] == "fail"
+
+    def test_a_crash_disarm_fails_even_when_level(self, tmp_path):
+        record = self._record(
+            tmp_path,
+            texts=("Crash: Disarming: AngErr=111>30, Accel=0.1<3.0",),
+        )
+        assert record["state"] == "measured_fail"
+        assert record["crash_disarm_statustexts"] == [
+            "Crash: Disarming: AngErr=111>30, Accel=0.1<3.0"
+        ]
+        blocker = check._end_state_blocker(record)
+        assert blocker and "crash disarm" in blocker
+
+    def test_no_truth_attitude_is_unmeasured_not_a_pass(self, tmp_path):
+        record = check._end_state_record(
+            check._FeedStats(),
+            None,
+            None,
+            None,
+            self._mavlink_log(tmp_path),
+            phase="excitation",
+        )
+        assert record["state"] == "unmeasured"
+        blocker = check._end_state_blocker(record)
+        assert blocker and "unmeasured" in blocker
+        assert check._end_state_check_row(record)["status"] == "fail"
+
+    def test_the_bring_up_record_carries_the_end_state(self, tmp_path):
+        record = {"flight": {}, "blockers": []}
+        check._record_excitation_end_state(
+            record,
+            self._stats((0.0, 0.0, 0.0)),
+            self._sample(armed=False, mode_name="LAND"),
+            (0.0, 0.0, 0.0),
+            self._mavlink_log(tmp_path),
+        )
+        assert record["flight"]["end_state"]["state"] == "measured_pass"
+        assert record["flight"]["end_state"]["mode"] == "LAND"
+        assert record["blockers"] == []
+
+    def test_a_tipped_bring_up_end_state_is_a_blocker_in_the_record(self, tmp_path):
+        record = {"flight": {}, "blockers": []}
+        check._record_excitation_end_state(
+            record,
+            self._stats(self.TIPPED_LIKE_00000145),
+            self._sample(armed=False, mode_name="LAND"),
+            None,
+            self._mavlink_log(tmp_path),
+        )
+        assert record["flight"]["end_state"]["state"] == "measured_fail"
+        assert record["blockers"] and "end state failed" in record["blockers"][0]
 
 
 class TestH5Diagnosis:

@@ -805,6 +805,30 @@ SCENE_CAPTURE_TIMEOUT_S = 30.0
 # calibrates nothing -- it refuses the arm naming the per-axis error.
 ATTITUDE_GATE_TOLERANCE_DEG = 5.0
 
+# A1 joins the seal to the truth stream on the simulator's own clock by the same
+# rule E1 joins publications to truth (`_truth_error_statistics`): the nearest
+# truth sample inside this tolerance is the measurement, and anything further is
+# unmeasured rather than interpolated, because a truth pose from another instant
+# is not the frame the seal was taken in.
+ATTITUDE_GATE_JOIN_TOLERANCE_NS = 100_000_000
+
+# The declared end-state check (declared 2026-09-29, before any streak flight --
+# phase plan step 2): a run ends with the aircraft level at rest and no crash
+# disarm, sampled after the excitation's post-LAND drain and again after the
+# scored route's landing drain. The tolerance is A1's own class, and its
+# derivation is the four proven complete logs (00000135-138, the fix4b/fix5/fix5b
+# scored landings): each ended within 0.1 deg of level, so 5.0 deg sits an order
+# of magnitude above every proven good landing while staying far below any tipped
+# rest state ever measured here (00000145 came to rest at pitch -89.7 deg,
+# 00000143 at roll -179.6 deg).
+END_STATE_ATTITUDE_TOLERANCE_DEG = 5.0
+
+# The crash disarm is the firmware's own verdict, sent as STATUSTEXT when the
+# crash checker disarms the vehicle (crash_check.cpp:93, MAV_SEVERITY_EMERGENCY,
+# "Crash: Disarming: AngErr=..."). Matched by prefix, not by the word "crash":
+# nothing else in the firmware's own texts begins this way.
+CRASH_DISARM_STATUSTEXT_PREFIX = "Crash: Disarming"
+
 # How many stereo pairs the reader's sink may hold for the feed. A pair is ~614 KB of
 # pixels at the declared 640x480, and the sink is called from the reader's thread while
 # the drain loop feeds the estimator, so a small bound keeps memory predictable while
@@ -2698,6 +2722,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     feed_log_path = writer.path("estimator-feed.jsonl")
     stats = _FeedStats()
     latest_aligned: dict[str, object] | None = None
+    # The seal's own instant, on the simulator clock the truth samples keep, and
+    # the published attitude at that same instant: A1 measures the sealed epoch
+    # frame, so both compared quantities must come from the seal, not from
+    # whenever the gate runs -- after a flown excitation the run's newest samples
+    # are the landing, which is the end-state check's business (measured defect:
+    # p01l-climbfix-20260928T174608Z's attitude-gate.json read the truth sample
+    # at 28.49 s, the face-planted rest pose, against a seal taken at the arm).
+    seal_time_ns: int | None = None
+    seal_published_rpy: object | None = None
     # The scored window's publications, kept for E1. Only samples inside arm-to-disarm
     # count: bring-up publishes are reported by the freshness accounting and charged to
     # nothing, exactly as the machine's own window does.
@@ -2751,8 +2784,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             scene_capture["count"] += 1
 
     def on_publish(state: loc.EstimatorState, aligned: dict[str, object]) -> None:
-        nonlocal latest_aligned
+        nonlocal latest_aligned, seal_time_ns, seal_published_rpy
         latest_aligned = aligned
+        if seal_time_ns is None and alignment.sealed:
+            # This publication is the state whose attitude defined the epoch:
+            # ExternalNavPublisher._loop seals immediately before sending and
+            # calls back with the same state (localization.py), so its stamp is
+            # the seal's own instant at the resolution of the state itself.
+            seal_time_ns = state.time_ns
+            seal_published_rpy = aligned["attitude_rpy"]
         if scored_window_open:
             published_states.append((state.time_ns, tuple(aligned["position_ned_m"])))
         with feed_log_path.open("a", encoding="utf-8") as handle:
@@ -2925,6 +2965,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         )
 
     live_blockers: list[str] = []
+    # The scored route's declared end-state check, sampled after its landing
+    # drain; None until then, and a checks row only when it was sampled.
+    scored_end_state: dict[str, Any] | None = None
     shutdown: Any = None
 
     def gate_the_scored_arm(applied: dict[str, float], refusals: dict[str, int]) -> list[str]:
@@ -3072,6 +3115,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 drain,
                 log_lines,
                 stats,
+                published_attitude=lambda: (
+                    None if latest_aligned is None else latest_aligned["attitude_rpy"]
+                ),
             )
             live_blockers.extend(bring_up["blockers"])
         # H5's wait, in the declared budget's own unit: the estimator's readiness is
@@ -3094,7 +3140,16 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             )
         else:
             log_lines.append("estimator initialized before arm (H5)")
-            a1_blocker = _attitude_gate(writer, latest_aligned, alignment, stats, log_lines)
+            a1_blocker = _attitude_gate(
+                writer,
+                None
+                if seal_published_rpy is None
+                else {"attitude_rpy": seal_published_rpy},
+                alignment,
+                stats,
+                log_lines,
+                seal_time_ns=seal_time_ns,
+            )
             if a1_blocker:
                 live_blockers.append(a1_blocker)
         if live_blockers:
@@ -3231,6 +3286,24 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     drain()
                     time.sleep(0.005)
                 route_windows.append(landing_drain)
+                # The declared end-state check, sampled at the scored route's own
+                # landing: the drain has run, so the newest truth sample is the
+                # aircraft at rest. It lands in end-state.json and among the
+                # checks as end_state, where a failure fails the run (declared
+                # 2026-09-29, before any streak flight).
+                try:
+                    sample = platform.telemetry()
+                except ProbeFailure:
+                    sample = None
+                scored_end_state = _end_state_record(
+                    stats,
+                    None if latest_aligned is None else latest_aligned["attitude_rpy"],
+                    None if sample is None else sample.armed,
+                    None if sample is None else sample.mode_name,
+                    writer.path("mavlink.jsonl"),
+                    phase="scored_route",
+                )
+                writer.write_json("end-state.json", scored_end_state)
                 # The scored window is declared arm to disarm, and the vehicle has
                 # disarmed by the time the sequence is over; everything after this is
                 # the harness stopping Webots and SITL. Measured, run
@@ -3331,6 +3404,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         truth_published,
         gps_aiding,
     )
+    if scored_end_state is not None:
+        checks.append(_end_state_check_row(scored_end_state))
     writer.write_json("checks.json", checks)
     _write_log(writer, log_lines)
     passed = all(check["status"] == "pass" for check in checks)
@@ -3406,6 +3481,7 @@ def _run_ordered_bring_up(
     drain: Callable[[], None],
     log_lines: list[str],
     stats: _FeedStats,
+    published_attitude: Callable[[], object | None],
 ) -> dict[str, Any]:
     """The declared ordered bring-up: datum, exception window, excitation, restoration.
 
@@ -3429,6 +3505,9 @@ def _run_ordered_bring_up(
 
     Returns the window's record. ``record["blockers"]`` carries anything that
     stopped it; the caller must not open the scored window with a non-empty list.
+    The excitation's declared end-state check is sampled after the post-LAND
+    drain into ``flight["end_state"]``, and a tipped or crash-disarmed rest
+    state blocks the same way.
     """
     declaration = _bring_up_window(settings)
     names = tuple(name for name, _window, _restore, _why in BRING_UP_WINDOW_PARAMETERS)
@@ -4105,6 +4184,19 @@ def _run_ordered_bring_up(
         flight["motor_output_samples"] = motors["samples"]
         flight["mode_after_window"] = sample.mode_name
         flight["armed_after_window"] = sample.armed
+        # The declared end-state check, sampled at the excitation's own landing:
+        # the post-LAND drain has run, so the newest truth sample is the aircraft
+        # at rest. It lands in the record's flight section, and a tipped or
+        # crash-disarmed rest state is a blocker -- the scored window does not
+        # open on an excitation that ended in a face-plant (declared 2026-09-29,
+        # before any streak flight).
+        _record_excitation_end_state(
+            record,
+            stats,
+            sample,
+            published_attitude(),
+            writer.path("mavlink.jsonl"),
+        )
         if override["sent"] and override["observed_during_window"] != override["sent_pwm"]:
             blockers.append(
                 "the window's throttle override never took effect: the vehicle's own RC "
@@ -5105,8 +5197,9 @@ def _attitude_gate(
     alignment: loc.OdomAlignment,
     stats: _FeedStats,
     log_lines: list[str],
+    seal_time_ns: int | None = None,
 ) -> str | None:
-    """A1, second form: the sealed epoch frame, checked before the arm (0.3 item 5).
+    """A1, second form: the sealed epoch frame, measured at the seal's own instant.
 
     The first textured invocation measured a −180° roll (the missing FLU→FRD body
     map) and the second a +90° yaw (the odom frame's yaw, unobservable and chosen
@@ -5122,23 +5215,56 @@ def _attitude_gate(
     observes it. That the seal absorbs the estimator's own initialization tilt is
     a recorded limitation, not a hidden one: a real tilt error shows up in E1 and
     H3 once the vehicle moves.
+
+    Revised 2026-09-29 (phase plan step 2): the gate read
+    ``stats.truth_attitudes[-1]`` -- the run's LAST truth sample -- and the scored
+    arm's gate runs after the flown excitation, so that sample is the landing.
+    p01l-climbfix-20260928T174608Z's attitude-gate.json is the measured defect:
+    truth_time_ns 28.49 s, the face-planted rest pose, refused the scored arm on
+    the landing A1 was never meant to judge. The gate now measures both compared
+    attitudes at the seal's own instant -- the state published at the seal, and
+    the truth sample nearest that instant inside ATTITUDE_GATE_JOIN_TOLERANCE_NS
+    -- and refuses as unmeasured when no truth sample lies within the join
+    tolerance, rather than substitute another instant's attitude. What this
+    leaves is honest by declaration: A1 no longer judges the landing at all; the
+    declared end-state check does, at both landings, with its own receipt rows.
     """
     declared = tuple(alignment.declared_start_rpy)
     record: dict[str, Any] = {
         "tolerance_deg": ATTITUDE_GATE_TOLERANCE_DEG,
         "declared_start_rpy_rad": list(declared),
+        "seal_time_ns": seal_time_ns,
+        "join_tolerance_ns": ATTITUDE_GATE_JOIN_TOLERANCE_NS,
     }
-    if aligned is None or not stats.truth_attitudes:
+    if aligned is None or seal_time_ns is None:
         reason = (
             "no published state to compare"
             if aligned is None
-            else "no truth attitude arrived on the pose records"
+            else "the alignment carries no seal instant"
         )
         record.update({"state": "unmeasured", "reason": reason})
         writer.write_json("attitude-gate.json", record)
         return f"A1 could not run: {reason}"
+    if not stats.truth_attitudes:
+        reason = "no truth attitude arrived on the pose records"
+        record.update({"state": "unmeasured", "reason": reason})
+        writer.write_json("attitude-gate.json", record)
+        return f"A1 could not run: {reason}"
     published = aligned["attitude_rpy"]
-    truth_time_ns, truth_rpy = stats.truth_attitudes[-1]
+    truth_time_ns, truth_rpy = min(
+        stats.truth_attitudes, key=lambda entry: abs(entry[0] - seal_time_ns)
+    )
+    join_distance_ns = abs(truth_time_ns - seal_time_ns)
+    if join_distance_ns > ATTITUDE_GATE_JOIN_TOLERANCE_NS:
+        reason = (
+            "no truth sample within the "
+            f"{ATTITUDE_GATE_JOIN_TOLERANCE_NS / 1e6:.0f} ms join tolerance of the "
+            f"seal: the nearest is {join_distance_ns / 1e9:.3f} s away, so the "
+            "sealed frame is unmeasured rather than read at another instant"
+        )
+        record.update({"state": "unmeasured", "reason": reason})
+        writer.write_json("attitude-gate.json", record)
+        return f"A1 could not run: {reason}"
     composition_deg = [
         math.degrees(_wrap_angle(p - d)) for p, d in zip(published, declared)
     ]
@@ -5158,6 +5284,7 @@ def _attitude_gate(
             "published_rpy_rad": list(published),
             "truth_rpy_rad": list(truth_rpy),
             "truth_time_ns": truth_time_ns,
+            "truth_join_distance_ns": join_distance_ns,
             "composition_deltas_deg": composition_deg,
             "declaration_deltas_deg": declaration_deg,
             "epoch_yaw_deg": alignment.epoch_yaw_deg(),
@@ -5165,15 +5292,18 @@ def _attitude_gate(
             "note": (
                 "epoch_yaw_deg is recorded, not gated: nothing in this arm observes the "
                 "odom frame's yaw, which the pinned initializer fixes by a "
-                "noise-decided branch; the seal derives it once from the declared start"
+                "noise-decided branch; the seal derives it once from the declared start. "
+                "truth_time_ns is the truth sample nearest the seal inside the join "
+                "tolerance, not the run's last sample (declared end-state checks own "
+                "the landings)"
             ),
         }
     )
     writer.write_json("attitude-gate.json", record)
     log_lines.append(
-        f"A1 attitude gate: composition deltas (deg) {composition_deg}, declaration "
-        f"deltas (deg) {declaration_deg}, epoch yaw {record['epoch_yaw_deg']:.2f} deg, "
-        f"level error {level_error_deg:.3f} deg"
+        f"A1 attitude gate at the seal: composition deltas (deg) {composition_deg}, "
+        f"declaration deltas (deg) {declaration_deg}, epoch yaw "
+        f"{record['epoch_yaw_deg']:.2f} deg, level error {level_error_deg:.3f} deg"
     )
     if passed:
         return None
@@ -5184,6 +5314,154 @@ def _attitude_gate(
         f"{ATTITUDE_GATE_TOLERANCE_DEG} deg tolerance (plan section 0.3 item 5), so the "
         "arm is refused"
     )
+
+
+def _crash_disarm_statustexts(mavlink_log: Path) -> list[str]:
+    """The run's own recorded crash-disarm STATUSTEXTs (crash_check.cpp:93)."""
+    texts: list[str] = []
+    if mavlink_log.is_file():
+        with mavlink_log.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    document = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(document, dict):
+                    continue
+                if document.get("mavpackettype") != "STATUSTEXT":
+                    continue
+                text = str(document.get("text", ""))
+                if text.startswith(CRASH_DISARM_STATUSTEXT_PREFIX):
+                    texts.append(text)
+    return texts
+
+
+def _end_state_record(
+    stats: _FeedStats,
+    published_attitude_rpy: Sequence[float] | None,
+    armed: bool | None,
+    mode_name: str | None,
+    mavlink_log: Path,
+    phase: str,
+) -> dict[str, Any]:
+    """The declared end-state check's sample: level at rest, no crash disarm.
+
+    Declared 2026-09-29, before any streak flight (phase plan step 2), because
+    moving A1's sample point to the seal would otherwise leave the landing
+    unjudged. The judged quantities are the newest truth sample the run has read
+    -- the aircraft at rest after its own landing -- against
+    END_STATE_ATTITUDE_TOLERANCE_DEG on roll and pitch (yaw is heading, not
+    levelness), and the run's own mavlink log for the firmware's crash disarm.
+    The published attitude, the armed state and the mode are recorded beside
+    them and judged by nothing: a tipped airframe's published estimate is the
+    crash's product, not a measurement of how the aircraft is resting.
+    """
+    crash_texts = _crash_disarm_statustexts(mavlink_log)
+    record: dict[str, Any] = {
+        "phase": phase,
+        "tolerance_deg": END_STATE_ATTITUDE_TOLERANCE_DEG,
+        "published_attitude_rpy_rad": (
+            None
+            if published_attitude_rpy is None
+            else [float(value) for value in published_attitude_rpy]
+        ),
+        "armed": armed,
+        "mode": mode_name,
+        "crash_disarm_statustexts": crash_texts,
+    }
+    if not stats.truth_attitudes:
+        record.update(
+            {
+                "state": "unmeasured",
+                "reason": (
+                    "no truth attitude arrived on the pose records, so how the "
+                    "aircraft ended is unmeasured"
+                ),
+            }
+        )
+        return record
+    truth_time_ns, truth_rpy = stats.truth_attitudes[-1]
+    roll_deg = math.degrees(_wrap_angle(truth_rpy[0]))
+    pitch_deg = math.degrees(_wrap_angle(truth_rpy[1]))
+    failures: list[str] = []
+    if max(abs(roll_deg), abs(pitch_deg)) > END_STATE_ATTITUDE_TOLERANCE_DEG:
+        failures.append(
+            f"the aircraft came to rest at roll {roll_deg:.1f} deg, pitch "
+            f"{pitch_deg:.1f} deg against the declared "
+            f"{END_STATE_ATTITUDE_TOLERANCE_DEG} deg end-state tolerance (the four "
+            "proven complete logs 00000135-138 each ended within 0.1 deg)"
+        )
+    for text in crash_texts:
+        failures.append(f"the vehicle's own log carries a crash disarm: {text}")
+    record.update(
+        {
+            "state": "measured_fail" if failures else "measured_pass",
+            "truth_attitude_rpy_rad": [float(value) for value in truth_rpy],
+            "truth_time_ns": truth_time_ns,
+            "roll_deg": roll_deg,
+            "pitch_deg": pitch_deg,
+            "failures": failures,
+        }
+    )
+    return record
+
+
+def _end_state_blocker(record: dict[str, Any]) -> str | None:
+    """The end-state check's refusal for the bring-up record, or None when it passed."""
+    if record["state"] == "measured_pass":
+        return None
+    if record["state"] == "unmeasured":
+        return f"the {record['phase']}'s end state is unmeasured: {record['reason']}"
+    return (
+        f"the {record['phase']}'s end state failed: " + "; ".join(record["failures"])
+    )
+
+
+def _end_state_check_row(record: dict[str, Any]) -> dict[str, str]:
+    """The scored route's end-state check as a row among the predeclared checks."""
+    passed = record["state"] == "measured_pass"
+    if passed:
+        detail = (
+            f"the scored route ended level at rest: roll {record['roll_deg']:.2f} deg, "
+            f"pitch {record['pitch_deg']:.2f} deg against the "
+            f"{END_STATE_ATTITUDE_TOLERANCE_DEG} deg tolerance, no crash disarm"
+        )
+    elif record.get("failures"):
+        detail = "; ".join(record["failures"])
+    else:
+        detail = record["reason"]
+    return {
+        "name": "end_state",
+        "status": "pass" if passed else "fail",
+        "detail": detail,
+    }
+
+
+def _record_excitation_end_state(
+    record: dict[str, Any],
+    stats: _FeedStats,
+    sample: Any,
+    published_attitude_rpy: Sequence[float] | None,
+    mavlink_log: Path,
+) -> None:
+    """Fold the excitation's declared end-state sample into the bring-up record.
+
+    The record carries the end state under ``flight``, and a failed or
+    unmeasured end state is a blocker: the scored window does not open on an
+    excitation that ended tipped over or crash-disarmed.
+    """
+    end_state = _end_state_record(
+        stats,
+        published_attitude_rpy,
+        None if sample is None else sample.armed,
+        None if sample is None else sample.mode_name,
+        mavlink_log,
+        phase="excitation",
+    )
+    record["flight"]["end_state"] = end_state
+    end_state_blocker = _end_state_blocker(end_state)
+    if end_state_blocker:
+        record["blockers"].append(end_state_blocker)
 
 
 def _percentile(values: Sequence[float], fraction: float) -> float:
