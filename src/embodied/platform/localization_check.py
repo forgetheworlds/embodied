@@ -107,9 +107,13 @@ SEAM_REQUIREMENTS: tuple[tuple[str, float, str], ...] = (
     ("GPS1_TYPE", 0.0, "p01l_sensor.parm"),
     ("GPS2_TYPE", 0.0, "p01l_sensor.parm"),
     # Measured, FIXER5: the pose arrives p50 2.5-5.7 ms (sim) after its own validity
-    # stamp, so the EKF's declared fusion delay is the pin's default 10 ms
-    # (AP_VisualOdom.cpp:83), not the 50 ms tuned when the pose was stale.
-    ("VISO_DELAY_MS", 10.0, "p01l_sensor.parm"),
+    # Measured, FIXER5: the pose arrives p50 2.5-5.7 ms (sim) after its own validity
+    # stamp, so the EKF's declared fusion delay was the pin's default 10 ms.
+    # Re-measured for the 2026-09-30 F2 fix (run p01l-f2fix-1-20260930T051723Z):
+    # with the published stamp no longer falling back to the last camera update,
+    # the pose arrives p50 20 ms behind its own stamp (p95 208 ms), so the
+    # declared delay is the measured median, 20 ms.
+    ("VISO_DELAY_MS", 20.0, "p01l_sensor.parm"),
     ("VISO_QUAL_MIN", 0.0, "p01l_sensor.parm"),
     ("FS_EKF_ACTION", 1.0, "p01l_sensor.parm"),
 )
@@ -2909,6 +2913,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                         "n_tracks": state.n_tracks,
                         "t_last_visual_ns": state.t_last_visual_ns,
                         "visual_age_verdict": machine.visual_update_verdict(state),
+                        "newest_imu_ns": stats.newest_imu_ns,
                     },
                     default=str,
                 )
