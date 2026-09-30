@@ -5859,6 +5859,12 @@ def _truth_error_statistics(
     truth_times = [time_ns for time_ns, _position in truth]
     horizontal: list[float] = []
     vertical: list[float] = []
+    # Per-sample rows (E1 coupling, 2026-09-30): the aggregates above answer "did it
+    # pass"; they cannot answer "where does the error live" -- bias against scatter,
+    # transit against hold, one shifted distribution against run-to-run noise. The
+    # rows carry both sides of one joined sample so the join is reproducible offline;
+    # truth still reaches nothing but this artifact.
+    samples: list[dict[str, Any]] = []
     unjoined = 0
     for time_ns, estimate in published:
         index = bisect_left(truth_times, time_ns)
@@ -5873,6 +5879,20 @@ def _truth_error_statistics(
             math.hypot(estimate[0] - nearest_position[0], estimate[1] - nearest_position[1])
         )
         vertical.append(abs(estimate[2] - nearest_position[2]))
+        samples.append(
+            {
+                "time_ns": time_ns,
+                "estimate_ned_m": [estimate[0], estimate[1], estimate[2]],
+                "truth_ned_m": [
+                    nearest_position[0],
+                    nearest_position[1],
+                    nearest_position[2],
+                ],
+                "truth_time_ns": nearest_time_ns,
+                "error_horizontal_m": horizontal[-1],
+                "error_vertical_m": vertical[-1],
+            }
+        )
     if not horizontal:
         return {
             "measured": False,
@@ -5896,6 +5916,7 @@ def _truth_error_statistics(
         "p95_vertical_error_m": _percentile(vertical, 0.95),
         "max_horizontal_error_m": max(horizontal),
         "max_vertical_error_m": max(vertical),
+        "samples": samples,
         **bounds,
     }
 

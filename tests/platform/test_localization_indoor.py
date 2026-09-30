@@ -3187,3 +3187,64 @@ class TestSimulatorPacing:
         assert percentiles["p50"] == pytest.approx(0.9)
         assert percentiles["max"] == pytest.approx(6.0)
         assert document["controller"] == {"enabled": True}
+
+
+class TestE1PerSampleRows:
+    """The join's per-sample rows must reproduce the aggregates they sit beside.
+
+    E1 coupling (2026-09-30): the aggregates answer "did it pass"; the rows answer
+    "where does the error live". A row set that disagrees with the p95/max it
+    accompanies would let an offline analysis argue from different data than the
+    gate scored.
+    """
+
+    def test_rows_reproduce_the_aggregates_and_the_join_counts(self):
+        published = [
+            (1_000_000_000 * second, (float(second), 0.25 * second, -1.5))
+            for second in range(1, 11)
+        ]
+        # Truth every 500 ms offset 60 ms late, so every publication joins its
+        # nearest truth sample inside the 100 ms tolerance without any stamp
+        # coinciding: the rows must carry the joined truth, not the publication.
+        truth = [
+            (500_000_000 * half + 60_000_000, (float(half) / 2.0, 0.0, -1.5))
+            for half in range(2, 23)
+        ]
+        bounds = {
+            "error_p95_horizontal_m": 0.10,
+            "error_p95_vertical_m": 0.15,
+            "error_max_horizontal_m": 0.15,
+            "error_max_vertical_m": 0.30,
+        }
+        statistics = check._truth_error_statistics(published, truth, bounds)
+        rows = statistics["samples"]
+        assert statistics["measured"] is True
+        assert len(rows) == statistics["joined_samples"]
+        assert len(rows) + statistics["unjoined"] == statistics["scored_publications"]
+        horizontal = [row["error_horizontal_m"] for row in rows]
+        vertical = [row["error_vertical_m"] for row in rows]
+        assert statistics["p95_horizontal_error_m"] == check._percentile(horizontal, 0.95)
+        assert statistics["p95_vertical_error_m"] == check._percentile(vertical, 0.95)
+        assert statistics["max_horizontal_error_m"] == max(horizontal)
+        assert statistics["max_vertical_error_m"] == max(vertical)
+        for row in rows:
+            joined = math.hypot(
+                row["estimate_ned_m"][0] - row["truth_ned_m"][0],
+                row["estimate_ned_m"][1] - row["truth_ned_m"][1],
+            )
+            assert row["error_horizontal_m"] == pytest.approx(joined)
+            assert 0 < abs(row["truth_time_ns"] - row["time_ns"]) <= 100_000_000
+
+    def test_every_row_carries_both_sides_of_its_join(self):
+        published = [(7_000_000_000, (1.0, 2.0, -1.5))]
+        truth = [(7_000_000_000, (1.02, 1.99, -1.48))]
+        bounds = {
+            "error_p95_horizontal_m": 0.10,
+            "error_p95_vertical_m": 0.15,
+            "error_max_horizontal_m": 0.15,
+            "error_max_vertical_m": 0.30,
+        }
+        row = check._truth_error_statistics(published, truth, bounds)["samples"][0]
+        assert row["estimate_ned_m"] == [1.0, 2.0, -1.5]
+        assert row["truth_ned_m"] == [1.02, 1.99, -1.48]
+        assert row["time_ns"] == row["truth_time_ns"] == 7_000_000_000
