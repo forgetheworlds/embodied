@@ -903,6 +903,13 @@ class TestRefusals:
         # so the block above is the missing process and nothing else.
         assert "localization_mode" not in unsatisfied
         assert "bridge_truth_republish" not in unsatisfied
+        # Even a blocked receipt states the pacing it was configured under, so an
+        # iteration-only configuration can never be read as a scored attempt (owner
+        # ruling 2026-09-30, APPROVAL-RECORD "F2's denominator").
+        manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["simulator_pacing"]["webots_mode"] == "realtime"
+        assert manifest["simulator_pacing"]["sim_wall_clamp"] is True
+        assert manifest["simulator_pacing"]["evidence_class"] == "scored"
 
     def test_module_registers_the_dispatch_command(self):
         parser = build_parser()

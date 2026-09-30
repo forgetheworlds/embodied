@@ -2468,6 +2468,9 @@ def _localize_check_command(args: argparse.Namespace, output_dir: Path) -> Comma
                 "preflight": rows,
                 "estimator_pin": document["localization"]["estimator"],
                 "bounds": document["localization"]["bounds"],
+                "simulator_pacing": _simulator_pacing_document(
+                    _platform_settings(document, repository_root()), None, ()
+                ),
             },
             ("preflight.json",),
             mode,
@@ -2810,7 +2813,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "stop rule (plan section 11) records the blocker and stops",
                 DISPATCH_REGISTRATION_NOTE,
             ),
-            {"stage_id": STAGE_ID, "sensor_mode_label": "sensor-derived", "estimator_pin": estimator},
+            {
+                "stage_id": STAGE_ID,
+                "sensor_mode_label": "sensor-derived",
+                "estimator_pin": estimator,
+                # The receipt states the pacing the run was configured under even when
+                # no vehicle ever moved (owner ruling 2026-09-30): iteration-only runs
+                # must not be confusable with scored ones at any outcome.
+                "simulator_pacing": _simulator_pacing_document(settings, None, ()),
+            },
             (*writer.artifacts, "preflight.json"),
             SensorMode.SENSOR_DERIVED,
         )
@@ -2832,7 +2843,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "stop rule (plan section 11) records the blocker and stops",
                 DISPATCH_REGISTRATION_NOTE,
             ),
-            {"stage_id": STAGE_ID, "sensor_mode_label": "sensor-derived", "estimator_pin": estimator},
+            {
+                "stage_id": STAGE_ID,
+                "sensor_mode_label": "sensor-derived",
+                "estimator_pin": estimator,
+                "simulator_pacing": _simulator_pacing_document(settings, None, ()),
+            },
             (*writer.artifacts, "preflight.json"),
             SensorMode.SENSOR_DERIVED,
         )
@@ -3549,6 +3565,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "sensor_mode_label": "sensor-derived",
                 "estimator_pin": estimator,
                 "bring_up": bring_up_receipt,
+                # The pacing this run actually ran under, from the same measurement the
+                # completed receipts carry, so a blocked flight still says whose pacing
+                # it was (owner ruling 2026-09-30).
+                "simulator_pacing": _simulator_pacing_document(
+                    settings, platform.controller_status.get("pacing"), feed_pacing_rows
+                ),
                 "truth_republish": settings.truth_republish,
                 "bridge_truth_published": truth_published,
                 "gps_aiding_blockers": gps_aiding["blockers"],
