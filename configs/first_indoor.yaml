@@ -696,14 +696,17 @@ localization:
   declared:
     # The EKF's fusion delay for external navigation (AP_VisualOdom::_delay_ms,
     # AP_VisualOdom.cpp:83). 50 ms until FIXER5, tuned when the pose was stale
-    # (F2 0.292 s in that era). MEASURED now, from the dataflash VISP records of
-    # the clean runs: the published pose arrives at SITL p50 2.5-5.7 ms (sim)
-    # AFTER its own validity stamp, so the EKF was back-dating every measurement
-    # ~45 ms too far in a loop that carries ext-nav yaw (EK3_SRC1_YAW 6). 10 ms
-    # is the pin's own default (AP_VisualOdom.cpp:83) and sits inside the
-    # measured band (p50 3-6 ms, burst tail p90 42-200 ms). Not a bound: no
+    # (F2 0.292 s in that era); 10 ms after FIXER5 measured the pose arriving at
+    # SITL p50 2.5-5.7 ms (sim) after its own validity stamp. Re-measured for the
+    # 2026-09-30 F2 fix (run p01l-f2fix-1-20260930T051723Z): now that the
+    # published stamp no longer falls back to the last camera update, the pose
+    # the FC receives is p50 20 ms / p95 208 ms behind its own stamp, because the
+    # pinned estimator's consumption of the ordered stream lags the host's send
+    # head while it tracks each stereo pair. The declared value is the measured
+    # median. The tail is the estimator's own processing latency: no single
+    # declared delay removes it, and F2 reports it honestly. Not a bound: no
     # bound value below changes.
-    viso_delay_ms: 10
+    viso_delay_ms: 20
   params_file: scenarios/compat/params/p01l_sensor.parm
   bounds:
     state_lost_after_ms: 300

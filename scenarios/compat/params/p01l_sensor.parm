@@ -8,14 +8,17 @@
 GPS1_TYPE 0
 GPS2_TYPE 0
 # The EKF's fusion delay for external navigation (AP_VisualOdom::_delay_ms).
-# 50 ms until FIXER5, tuned when the pose was stale (F2 0.292 s then). Measured
-# from the dataflash VISP records of the clean runs (p01l-fix5b, p01l-fix5): the
-# published pose arrives at SITL p50 2.5-5.7 ms (sim) after its own validity
-# stamp, so 50 ms back-dated every measurement ~45 ms too far in a loop that
-# carries ext-nav yaw. 10 ms is the pin's default (AP_VisualOdom.cpp:83) and sits
-# inside the measured band (p50 3-6 ms, burst tail p90 42-200 ms).
+# 50 ms until FIXER5, tuned when the pose was stale (F2 0.292 s then); 10 ms
+# after FIXER5 measured the pose arriving p50 2.5-5.7 ms (sim) after its own
+# validity stamp. Re-measured for the F2 fix (2026-09-30, run
+# p01l-f2fix-1-20260930T051723Z): with the published stamp no longer falling back
+# to the last camera update, the pose the FC receives is p50 20 ms / p95 208 ms
+# behind its own stamp -- the pinned estimator's consumption of the ordered
+# stream lags what the host has sent while it tracks each stereo pair. The
+# declared delay is the measured median, 20 ms; the tail is the estimator's own
+# processing latency and no single declared delay removes it.
 # Range 0-250 ms (AP_VisualOdom.cpp:77-83).
-VISO_DELAY_MS 10
+VISO_DELAY_MS 20
 # Fusion noise floors, left at firmware defaults and recorded
 # (AP_VisualOdom.cpp:85-105: VEL 0.1 m/s, POS 0.2 m, YAW 0.2 rad).
 # Quality cannot carry -1 on VISION_POSITION_ESTIMATE at af85259
