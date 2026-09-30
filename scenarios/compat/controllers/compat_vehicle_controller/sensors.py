@@ -49,11 +49,13 @@ class SimWallPacer:
         self._clock = clock
         self._sleep = sleep
         self._next_release = None
+        self.steps = 0
         self.gates = 0
         self.slept_s = 0.0
 
     def after_step(self):
         """Hold the wall until this step's slot has been paid for."""
+        self.steps += 1
         now = self._clock()
         if self._next_release is None:
             self._next_release = now + self._dt
@@ -76,6 +78,7 @@ class SimWallPacer:
                 "the schedule never runs early, so no catch-up sprint is possible"
             ),
             "timestep_ms": self.timestep_ms,
+            "steps": self.steps,
             "gates": self.gates,
             "slept_s": round(self.slept_s, 3),
         }
