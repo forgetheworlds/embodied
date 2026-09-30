@@ -4251,7 +4251,11 @@ def _run_ordered_bring_up(
             # absolute threshold can mistake for altitude -- measured, run
             # p01l-streak-2-20260930T015214Z, where the climb window closed
             # altitude_reached at 2.2 s on a takeoff that had just been refused.
-            sample_motion()
+            for _ in range(20):
+                sample_motion()
+                if sample.local_position_ned is not None:
+                    break
+                time.sleep(0.05)
             if sample.local_position_ned is not None:
                 climb_reference_m = -sample.local_position_ned[2]
                 flight["altitude_at_takeoff_ack_m"] = round(climb_reference_m, 3)

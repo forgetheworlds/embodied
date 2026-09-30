@@ -32,7 +32,7 @@ platform:
   sitl_binary: work/ardupilot/build/sitl/bin/arducopter
   webots_home: work/Webots.app
   webots_version: R2025a
-  webots_mode: realtime
+  webots_mode: fast
   sim_model: webots-python
   vehicle: ArduCopter
   sitl_home: "-35.363261,149.165230,584,353"
