@@ -324,6 +324,7 @@ MAX_QUEUED_STREAM_BYTES = 8 << 20
 MAX_QUEUED_CONTROL_BYTES = 256 << 10
 
 
+
 class OutboundStream:
     """Whole frames queued for a non-blocking socket, with bounds and drop counts.
 
@@ -2070,7 +2071,17 @@ class SubprocessRunner:
         log_path: Path,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        low_priority: bool = False,
     ) -> ChildProcess:
+        """Start one child of this rig, logged, in its own session.
+
+        ``low_priority`` demotes the child (nice 10). It is for the sim-clocked
+        children -- the simulator and SITL -- which pace themselves against
+        simulated time and only run slower when demoted, so under a host
+        contention burst they yield the CPU to the wall-clocked pair this rig's
+        freshness bounds are measured on: the pinned estimator process and this
+        process's feed and publisher threads.
+        """
         log_path.parent.mkdir(parents=True, exist_ok=True)
         merged = dict(os.environ)
         if env:
@@ -2084,6 +2095,7 @@ class SubprocessRunner:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
+                preexec_fn=(lambda: os.nice(10)) if low_priority else None,
             )
         self._processes[name] = process
         return ChildProcess(name=name, argv=tuple(argv), pid=process.pid, log_path=log_path)
@@ -2139,6 +2151,22 @@ class SubprocessRunner:
         text = data.decode("utf-8", errors="replace").splitlines()
         return text[-lines:]
 
+
+
+class LowPrioritySubprocessRunner(SubprocessRunner):
+    """A runner whose every child is demoted (nice 10).
+
+    The production rigs hand this runner the simulator and SITL spawns: both are
+    sim-clocked and self-pacing, so demotion costs them nothing but wall speed,
+    and under a host contention burst they stop competing with the wall-clocked
+    pinned estimator and this process's feed and publisher threads -- the pair
+    the F2 freshness bound is measured on.
+    """
+
+    def spawn(self, name, argv, *, log_path, cwd=None, env=None):
+        return super().spawn(
+            name, argv, log_path=log_path, cwd=cwd, env=env, low_priority=True
+        )
 
 class PymavlinkSession:
     """The real MAVLink session, wrapping pymavlink.

@@ -67,6 +67,7 @@ from embodied.platform.webots_ardupilot import (
     EvidenceWriter,
     Kind,
     LocalNedTarget,
+    LowPrioritySubprocessRunner,
     MAV_CMD_NAV_TAKEOFF,
     MSG_ID_RC_CHANNELS,
     PlatformSettings,
@@ -74,7 +75,6 @@ from embodied.platform.webots_ardupilot import (
     ProbeFailure,
     RC_THROTTLE_CHANNEL,
     RC_THROTTLE_RELEASE_PWM,
-    SubprocessRunner,
     TcpSensorGateway,
     WebotsArduPilot,
     check_prerequisites,
@@ -296,6 +296,12 @@ EXCITATION_MAX_AIRTIME_S = 6.0  # re-declared from 5.0, see above
 EXCITATION_CLIMB_DRAIN_S = 5.5  # re-declared from 5.0 by the second repair, see above
 EXCITATION_POST_LAND_DRAIN_S = 10.0
 EXCITATION_ALTITUDE_REACHED_MARGIN_M = 0.05
+# The excitation's takeoff command is retried on a refusal: measured, run
+# p01l-streak-2-20260930T015214Z, the first command drew COMMAND_ACK result 4 while
+# the estimator's parked initialization was still settling the EKF's position
+# estimate, and the single-shot command turned a one-second race into a blocked run.
+EXCITATION_TAKEOFF_ATTEMPTS = 3
+EXCITATION_TAKEOFF_RETRY_WAIT_S = 1.0
 
 # The yaw the scored window's position targets carry, as a commanded angle.
 # The frozen route is a position command (plan section 5, "the frozen route is
@@ -2915,7 +2921,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     session = PymavlinkSession()
     platform = WebotsArduPilot(
         settings,
-        runner=SubprocessRunner(),
+        runner=LowPrioritySubprocessRunner(),
         session=session,
         gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
         evidence=writer,
@@ -4158,44 +4164,97 @@ def _run_ordered_bring_up(
                 "still shut down. The vehicle's own log records which spool state it "
                 "was held in (SPOL Spl/SplDes) beside the mode changes"
             )
-        record["sent"].append(
-            link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
-        )
-        flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
-            timespec="milliseconds"
-        )
-        flight["takeoff_commanded_after_arm_simulator_s"] = (
-            None
-            if stats.sim_clock.newest_s is None or arm_simulator_s is None
-            else round(stats.sim_clock.newest_s - arm_simulator_s, 3)
-        )
-        # A liveness wait, and the wall clock is its right unit: what it asks is whether
-        # the autopilot answers this command AT ALL, not whether the scene has had time
-        # to do anything. The answer is milliseconds of the autopilot's own time away, so
-        # a wall ceiling that admits a simulator at a fifth of realtime is still generous.
-        ack_deadline = time.monotonic() + BRING_UP_TAKEOFF_ACK_TIMEOUT_S
-        ack: dict[str, Any] | None = None
-        while time.monotonic() < ack_deadline and ack is None:
-            drain()
-            link.drain()
-            refresh_override()
-            note_vehicle_rc_report()
-            ack = link.command_ack(MAV_CMD_NAV_TAKEOFF)
-            time.sleep(0.05)
+        climb_reference_m: float | None = None
+
+        def takeoff_ack_count() -> int:
+            """How many takeoff COMMAND_ACKs the link has recorded so far.
+
+            ``command_ack`` scans the accumulated replies and never consumes, so a
+            retry must count: without the per-attempt baseline it would re-read the
+            previous attempt's refusal as the new attempt's answer.
+            """
+            return sum(
+                1
+                for reply in link.replies
+                if reply.get("mavpackettype") == "COMMAND_ACK"
+                and reply.get("command") == MAV_CMD_NAV_TAKEOFF
+            )
+
+        # The excitation's takeoff is retried on a refusal, briefly: a GUIDED takeoff
+        # needs the EKF to hold a position estimate, and with GPS off that estimate
+        # arrives over the external-nav feed. Every attempt and its answer is
+        # recorded; the refusal blocker below survives only when the last attempt is
+        # refused too.
+        takeoff_acks: list[dict[str, Any]] = []
+        for attempt in range(1, EXCITATION_TAKEOFF_ATTEMPTS + 1):
+            if airtime.expired():
+                break
+            baseline_acks = takeoff_ack_count()
+            record["sent"].append(
+                link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
+            )
+            if attempt == 1:
+                flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                )
+                flight["takeoff_commanded_after_arm_simulator_s"] = (
+                    None
+                    if stats.sim_clock.newest_s is None or arm_simulator_s is None
+                    else round(stats.sim_clock.newest_s - arm_simulator_s, 3)
+                )
+            # A liveness wait, and the wall clock is its right unit: what it asks is whether
+            # the autopilot answers this command AT ALL, not whether the scene has had time
+            # to do anything. The answer is milliseconds of the autopilot's own time away, so
+            # a wall ceiling that admits a simulator at a fifth of realtime is still generous.
+            ack_deadline = time.monotonic() + BRING_UP_TAKEOFF_ACK_TIMEOUT_S
+            ack: dict[str, Any] | None = None
+            while time.monotonic() < ack_deadline and ack is None:
+                drain()
+                link.drain()
+                refresh_override()
+                note_vehicle_rc_report()
+                if takeoff_ack_count() > baseline_acks:
+                    ack = link.command_ack(MAV_CMD_NAV_TAKEOFF)
+                else:
+                    time.sleep(0.05)
+            takeoff_acks.append(
+                {"attempt": attempt, "result": None if ack is None else ack.get("result")}
+            )
+            if ack is not None and ack.get("result") == 0:
+                break
+            time.sleep(EXCITATION_TAKEOFF_RETRY_WAIT_S)
+        flight["takeoff_command_acks"] = takeoff_acks
+        ack = None
+        for row in reversed(takeoff_acks):
+            if row["result"] is not None:
+                ack = {"result": row["result"]}
+                break
         flight["takeoff_command_ack"] = ack
         if ack is None:
             blockers.append(
                 "the autopilot did not answer the excitation's takeoff command within "
-                f"{BRING_UP_TAKEOFF_ACK_TIMEOUT_S:.0f} s: no COMMAND_ACK for "
+                f"{BRING_UP_TAKEOFF_ACK_TIMEOUT_S:.0f} s on any of "
+                f"{EXCITATION_TAKEOFF_ATTEMPTS} attempts: no COMMAND_ACK for "
                 "MAV_CMD_NAV_TAKEOFF arrived on the bring-up link, so whether the "
                 "vehicle will climb is unmeasured"
             )
         elif ack.get("result") != 0:
             blockers.append(
-                "the autopilot refused the excitation's takeoff: COMMAND_ACK result "
-                f"{ack.get('result')} (0 is MAV_RESULT_ACCEPTED); the window's climb "
-                "did not start"
+                "the autopilot refused the excitation's takeoff: the last of "
+                f"{EXCITATION_TAKEOFF_ATTEMPTS} attempts answered COMMAND_ACK result "
+                f"{ack.get('result')} (0 is MAV_RESULT_ACCEPTED; every attempt is "
+                "recorded in takeoff_command_acks); the window's climb did not start"
             )
+        else:
+            # The climb's rise is measured from the readback at the accepted takeoff:
+            # the windowed height source is the barometer, whose parked drift an
+            # absolute threshold can mistake for altitude -- measured, run
+            # p01l-streak-2-20260930T015214Z, where the climb window closed
+            # altitude_reached at 2.2 s on a takeoff that had just been refused.
+            sample_motion()
+            if sample.local_position_ned is not None:
+                climb_reference_m = -sample.local_position_ned[2]
+                flight["altitude_at_takeoff_ack_m"] = round(climb_reference_m, 3)
         # The rest of the excitation's climb window -- the part left after the thrust path
         # opened. Its declared job is to keep feeding while the climb happens (the
         # estimator latches on the frames the climb produces) so a wall deadline would
@@ -4212,12 +4271,22 @@ def _run_ordered_bring_up(
             refresh_override()
             note_vehicle_rc_report()
             sample_motion()
-            if max_altitude_m >= (
+            risen_m = (
+                max_altitude_m
+                if climb_reference_m is None
+                else max_altitude_m - climb_reference_m
+            )
+            if risen_m >= (
                 EXCITATION_TAKEOFF_ALTITUDE_M - EXCITATION_ALTITUDE_REACHED_MARGIN_M
             ):
                 climb_window.close("altitude_reached")
                 break
             time.sleep(0.05)
+        flight["climb_rise_m"] = (
+            None
+            if climb_reference_m is None
+            else round(max_altitude_m - climb_reference_m, 3)
+        )
         # The airtime is read and closed here, at the LAND command, because that is
         # what it measures: the window is never polled to expiry, so it would otherwise
         # report the time until the whole bring-up was documented.
@@ -4306,10 +4375,17 @@ def _run_ordered_bring_up(
                 "the vehicle's own declared GCS (GCS_Common.cpp:4216-4220), and the "
                 "vehicle's own RC report is what says whether it accepted this one"
             )
-        if max_altitude_m < 0.10:
+        risen_m = (
+            max_altitude_m
+            if climb_reference_m is None
+            else max_altitude_m - climb_reference_m
+        )
+        if risen_m < 0.10:
             blockers.append(
-                f"the excitation produced no measured motion: max altitude readback "
-                f"{max_altitude_m:.3f} m against the commanded "
+                f"the excitation produced no measured motion: the readback rose "
+                f"{risen_m:.3f} m over the takeoff-ack reference "
+                f"({flight.get('altitude_at_takeoff_ack_m')} m at the ack, "
+                f"{max_altitude_m:.3f} m absolute readback) against the commanded "
                 f"{EXCITATION_TAKEOFF_ALTITUDE_M} m climb, so the estimator had nothing "
                 f"to latch on. The airframe's own outputs are recorded beside it: "
                 f"{motors['max_pwm']} us maximum on the four motors over "
@@ -4878,7 +4954,7 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
     carrier_params = settings.compat_estimator_params
     platform = WebotsArduPilot(
         settings,
-        runner=SubprocessRunner(),
+        runner=LowPrioritySubprocessRunner(),
         session=session,
         gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
         evidence=writer,
