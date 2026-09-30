@@ -45,6 +45,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 from embodied.cli import (
@@ -945,6 +946,13 @@ CRASH_DISARM_STATUSTEXT_PREFIX = "Crash: Disarming"
 # backlog that deep is a stopped estimator, which the health machine is already about
 # to catch.
 PAIR_QUEUE_FRAMES = 16
+
+# The estimator feed thread's poll: how long one pump of the stream waits for the next
+# record before treating the metadata stream as momentarily empty (which is the pair
+# flush's condition). At the declared 500 Hz inertial cadence the reader delivers a
+# record every ~2 ms of simulator time, so this is a poll, not a wait: it exists so an
+# empty instant is a 2 ms pause rather than a busy spin.
+FEED_STREAM_POLL_S = 0.002
 
 # How long one parameter readback waits for the autopilot's own answer. A local SITL
 # answers in well under a second; this is generous enough that an answer would have to
@@ -3003,56 +3011,87 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             )
 
     last_telemetry_sample = 0.0
-    def drain() -> None:
-        """Consume the sensor stream and the estimator's answers without judging.
 
-        The health machine is driven only by the publisher's tick; this loop
-        feeds, and stops the machine only when the feed itself fails.
+    # The estimator feed runs on its own thread, not on the choreography's.
+    #
+    # Why (F2, 2026-09-30): the feed used to be pumped by drain(), once per call, and
+    # every choreography loop between calls slept -- 0.5/0.1 s inside request_control,
+    # 0.2 s inside arm_and_guided's takeoff wait, 0.05 s in the excitation loops. The
+    # single writer therefore delivered the stream in bursts whose period was whichever
+    # sleep the choreography happened to be in, and the estimator (which consumes a
+    # 614 KB stereo pair in ~5-7 ms, measured p01l-f2fix-2-20260930T052312Z) sat idle
+    # between them. At each burst the host's newest-sent inertial stamp jumped up to
+    # +224 ms ahead of the newest the estimator had consumed, for several publisher
+    # ticks: that gap was the whole of F2's tail (in-window p99 58 ms, max 222 ms, with
+    # the max at the window's opening -- the last burst of the 0.2 s takeoff-wait loop).
+    # Moving the identical loop onto a dedicated thread decouples the feed's cadence
+    # from the choreography's waits without changing one byte of what is sent or in
+    # what order: this thread is still the socket's single writer, the metadata stream
+    # is still drained in arrival order, and the pairs are still flushed only when that
+    # stream is momentarily empty, which is what keeps every image behind the inertial
+    # samples that precede it (the ordering rule I2 in the navigation doc).
+    feed_stop = threading.Event()
+    feed_failures: list[str] = []
+    feed_thread: threading.Thread | None = None
+
+    def feed_cycle() -> None:
+        """One pump of the feed: every queued record, then the pairs, then the state.
+
+        Raises whatever the feed itself raised; the caller (the feed thread or the
+        choreography, before the thread starts) owns stopping the machine.
         """
-        nonlocal last_telemetry_sample
         while True:
-            try:
-                record = platform.sensor_record(0.0)
-            except ProbeFailure as error:
-                machine.stop(time.monotonic_ns(), f"the sensor stream failed: {error}")
-                return
+            # A short timeout instead of 0.0: it is the thread's pacing, turning what
+            # would be a busy spin between the reader's deliveries into a 2 ms poll,
+            # while still returning None the moment the stream is empty.
+            record = platform.sensor_record(FEED_STREAM_POLL_S)
             if record is None:
-                # The metadata stream is momentarily empty, so the inertial samples
-                # either side of a queued image have been fed: the sink's pairs can go
-                # now, which keeps every image behind the IMU that must precede it.
-                try:
-                    while True:
-                        feed_record(pending_pairs.get_nowait())
-                except queue.Empty:
-                    pass
-                except loc.ProtocolError as error:
-                    machine.stop(time.monotonic_ns(), str(error))
-                    return
-                try:
-                    state = client.poll_state()
-                except loc.ProtocolError as error:
-                    machine.stop(time.monotonic_ns(), str(error))
-                    return
-                if state is not None:
-                    publisher.offer(state, stats.newest_imu_ns)
-                if time.monotonic() - last_telemetry_sample >= TELEMETRY_SAMPLE_PERIOD_S:
-                    last_telemetry_sample = time.monotonic()
-                    # G4's evidence is the run's own record: folding the telemetry here
-                    # records every inbound MAVLink message through the whole window,
-                    # not only the windows the readback and arming happen to sample.
-                    try:
-                        platform.telemetry()
-                    except ProbeFailure as error:
-                        machine.stop(
-                            time.monotonic_ns(), f"the telemetry stream failed: {error}"
-                        )
-                        return
-                return
+                break
+            feed_record(record)
+        # The metadata stream is momentarily empty, so the inertial samples either
+        # side of a queued image have been fed: the sink's pairs can go now, which
+        # keeps every image behind the IMU that must precede it.
+        try:
+            while True:
+                feed_record(pending_pairs.get_nowait())
+        except queue.Empty:
+            pass
+        state = client.poll_state()
+        if state is not None:
+            publisher.offer(state, stats.newest_imu_ns)
+
+    def feed_loop() -> None:
+        while not feed_stop.is_set():
             try:
-                feed_record(record)
+                feed_cycle()
             except loc.ProtocolError as error:
+                feed_failures.append(f"the estimator feed failed: {error}")
                 machine.stop(time.monotonic_ns(), str(error))
                 return
+            except ProbeFailure as error:
+                feed_failures.append(f"the sensor stream failed: {error}")
+                machine.stop(time.monotonic_ns(), f"the sensor stream failed: {error}")
+                return
+
+    def drain() -> None:
+        """Fold the telemetry evidence at its declared cadence.
+
+        The estimator feed moved to its own thread (``feed_loop`` above); this stays
+        as the choreography's pump for G4's record, on the check's own thread, because
+        every other telemetry fold already runs there and two concurrent folds would
+        race each other rather than the feed.
+        """
+        nonlocal last_telemetry_sample
+        if time.monotonic() - last_telemetry_sample < TELEMETRY_SAMPLE_PERIOD_S:
+            return
+        last_telemetry_sample = time.monotonic()
+        # G4's evidence is the run's own record: folding the telemetry here records
+        # every inbound MAVLink message through the whole window, not only the windows
+        # the readback and arming happen to sample.
+        try:
+            platform.telemetry()
+        except ProbeFailure as error:
+            machine.stop(time.monotonic_ns(), f"the telemetry stream failed: {error}")
 
     disagreements: list[dict[str, Any]] = []
 
@@ -3117,6 +3156,17 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.startup)
+
+        # The feed thread starts once readiness has parked and handed back the
+        # records that arrived before it (wait_ready consumes the stream while it
+        # waits), and before anything else: every later phase -- the parameter
+        # readback, the bring-up, the flight -- then runs beside a continuously
+        # fed estimator instead of feeding it whenever its own loop gets around to
+        # calling drain().
+        feed_thread = threading.Thread(
+            target=feed_loop, name="estimator-feed", daemon=True
+        )
+        feed_thread.start()
         # The adapter's own link: a port the running SITL declares it serves and
         # that this check's session does not already own (plan section 0.5).
         feed_endpoint = _autopilot_feed_endpoint(
@@ -3427,6 +3477,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows
         live_blockers.append(f"the platform failed during the run: {error}")
     finally:
+        # The feed thread stops first: it owns the estimator socket and the sensor
+        # stream's handoff, and platform.stop() retires the reader that fills both.
+        feed_stop.set()
+        if feed_thread is not None:
+            feed_thread.join(timeout=5.0)
+        live_blockers.extend(feed_failures)
         shutdown = platform.stop()
         publisher.stop()
         client.close()
