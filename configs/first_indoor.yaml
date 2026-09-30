@@ -33,6 +33,19 @@ platform:
   webots_home: work/Webots.app
   webots_version: R2025a
   webots_mode: realtime
+  # The scored path's sim/wall clamp, on the owner's ruling of 2026-09-30
+  # (design/docs/APPROVAL-RECORD.md, "F2's denominator: scored runs clamp the
+  # simulator's pacing"): the simulator process is started with
+  # EMBODIED_SIM_WALL_CLAMP=1 and the scene's controller holds each basic time step
+  # (2 ms, the world's own basicTimeStep) to at least its own duration of wall
+  # time, so simulated sensor time is produced at no more than 1x wall and a 10 ms
+  # publish tick means 10 ms of sensor time. F2's 40 ms keeps both its declared
+  # unit and its declared value; the burst delivery it could not be met against
+  # (local sim/wall ratio p95 6.7-7.7 at pair arrivals, F2-TRANSPORT-REPORT.md) is
+  # the simulator's realtime catch-up sprint, which this forbids. Runs at
+  # webots_mode fast keep the clamp OFF and are ITERATION-ONLY evidence, labelled
+  # in their receipts and never pooled with scored runs.
+  sim_wall_clamp: true
   sim_model: webots-python
   vehicle: ArduCopter
   sitl_home: "-35.363261,149.165230,584,353"

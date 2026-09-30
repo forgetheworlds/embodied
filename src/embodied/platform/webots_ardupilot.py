@@ -898,6 +898,14 @@ class PlatformSettings:
     # is silent corruption rather than a redundant measurement (plan section 4.6).
     truth_republish: bool = True
 
+    # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
+    # "F2's denominator"): when True the simulator process is started with
+    # EMBODIED_SIM_WALL_CLAMP=1 and the scene's controller holds each basic time
+    # step to at least its own duration of wall time, so simulated sensor time is
+    # produced at no more than 1x wall and a 10 ms tick means 10 ms of sensor time.
+    # Fast mode keeps this False: fast runs are iteration-only evidence.
+    sim_wall_clamp: bool = False
+
     # The localization arm's own parameter layer (localization.params_file). It is
     # NOT part of the compatibility probe: see compat_estimator_params.
     localization_params_file: Path | None = None
@@ -1003,6 +1011,7 @@ class PlatformSettings:
             webots_home=resolve(platform["webots_home"]),
             webots_version=platform["webots_version"],
             webots_mode=platform["webots_mode"],
+            sim_wall_clamp=bool(platform.get("sim_wall_clamp", False)),
             sim_model=platform["sim_model"],
             vehicle=platform["vehicle"],
             sitl_home=platform["sitl_home"],
@@ -1079,6 +1088,13 @@ class PlatformSettings:
 
     def check_values(self) -> None:
         """Reject settings that cannot describe a real run, naming the value."""
+        if self.webots_mode == "fast" and self.sim_wall_clamp:
+            raise ConfigError(
+                "platform.sim_wall_clamp cannot be combined with webots_mode fast: the "
+                "clamp holds the simulator to 1x wall, which is the scored path's "
+                "pacing (owner ruling 2026-09-30), while fast mode is the owner's "
+                "iteration mode -- a run cannot be both"
+            )
         if self.stereo.encoding != "rgb8":
             raise ConfigError(
                 f"sensors.stereo.encoding must be rgb8 for the compat gate, "
@@ -1196,17 +1212,25 @@ class PlatformSettings:
         return tuple(argv)
 
     def controller_environment(self) -> dict[str, str]:
-        """The environment the Webots controller needs to import this package.
+        """The environment the Webots process (and so its controller) runs under.
 
         Webots runs the controller under whatever interpreter it was configured
         with, which is not necessarily the one that installed this package. The
         source directory goes on PYTHONPATH so the shared framing and record
         helpers are imported from one place instead of being copied into the scene.
+        The sim/wall clamp travels the same way: EMBODIED_SIM_WALL_CLAMP=1 tells the
+        scene's controller to hold each basic time step to at least its own duration
+        of wall time (owner ruling 2026-09-30), and the controller's own status
+        record reports whether it enforced that, so a receipt never has to infer the
+        pacing from the mode alone.
         """
         source_root = str(Path(__file__).resolve().parents[2])
         existing = os.environ.get("PYTHONPATH", "")
         merged = os.pathsep.join(part for part in (source_root, existing) if part)
-        return {"PYTHONPATH": merged, "EMBODIED_SRC": source_root}
+        environment = {"PYTHONPATH": merged, "EMBODIED_SRC": source_root}
+        if self.sim_wall_clamp:
+            environment["EMBODIED_SIM_WALL_CLAMP"] = "1"
+        return environment
 
 
 # ---------------------------------------------------------------------------
@@ -4488,6 +4512,7 @@ class CompatibilityProbe:
                 "application": str(self.settings.webots_home),
                 "version": self.settings.webots_version,
                 "mode": self.settings.webots_mode,
+                "sim_wall_clamp": self.settings.sim_wall_clamp,
                 "argv": list(self.settings.simulator_argv()),
             },
             "autopilot": {
@@ -6181,6 +6206,7 @@ def _configuration_document(settings: PlatformSettings) -> dict[str, Any]:
             "application": str(settings.webots_home),
             "configured_version": settings.webots_version,
             "mode": settings.webots_mode,
+            "sim_wall_clamp": settings.sim_wall_clamp,
         },
         "autopilot": {
             "root": str(settings.ardupilot_root),

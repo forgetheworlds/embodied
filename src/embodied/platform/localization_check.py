@@ -2852,6 +2852,11 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     # count: bring-up publishes are reported by the freshness accounting and charged to
     # nothing, exactly as the machine's own window does.
     published_states: list[tuple[int, tuple[float, float, float]]] = []
+    # Every publication's (wall monotonic, feed send head on the simulator clock):
+    # the run's own sim/wall pacing evidence, computed into the receipt below. Whole
+    # run, not just the scored window, because the pacing is a property of the
+    # simulator's delivery the whole time it was stepping.
+    feed_pacing_rows: list[tuple[float, int]] = []
     # The scored route's own declared windows (each waypoint hold and the drain after the
     # LAND), recorded in the units they are declared in for the same reason the bring-up's
     # are: a hold is the aircraft holding a waypoint, not however much of one a loaded
@@ -2912,6 +2917,13 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             seal_published_rpy = aligned["attitude_rpy"]
         if scored_window_open:
             published_states.append((state.time_ns, tuple(aligned["position_ned_m"])))
+        # The pacing pair the receipt's sim/wall measurement is computed from: the
+        # wall instant of this publication beside the feed's own send head on the
+        # simulator clock (the newest inertial stamp sent), so the run's own
+        # evidence states how much simulated sensor time the host delivered per
+        # unit of wall time (owner ruling 2026-09-30, APPROVAL-RECORD "F2's
+        # denominator").
+        feed_pacing_rows.append((time.monotonic(), stats.newest_imu_ns))
         with feed_log_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -3575,6 +3587,22 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     writer.write_json("checks.json", checks)
     _write_log(writer, log_lines)
     passed = all(check["status"] == "pass" for check in checks)
+    simulator_pacing = _simulator_pacing_document(
+        settings, platform.controller_status.get("pacing"), feed_pacing_rows
+    )
+    writer.write_json("simulator-pacing.json", simulator_pacing)
+    pacing_limitations: tuple[str, ...] = ()
+    if simulator_pacing["evidence_class"] != "scored":
+        # The ruling's labelling rule, in the receipt itself: a run that is not the
+        # scored pacing cannot be read as scored evidence however green its rows are.
+        pacing_limitations = (
+            "ITERATION-ONLY pacing evidence (owner ruling 2026-09-30, APPROVAL-RECORD "
+            "\"F2's denominator\"): this run's simulator pacing was "
+            f"webots_mode {simulator_pacing['webots_mode']}, sim_wall_clamp "
+            f"{str(simulator_pacing['sim_wall_clamp']).lower()}, which is not the scored "
+            "path's realtime clamped to at most 1x sim/wall; its rows may not be pooled "
+            "with scored runs",
+        )
     manifest = {
         "stage_id": STAGE_ID,
         "sensor_mode_label": "sensor-derived",
@@ -3593,6 +3621,11 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         "reset_counter": machine.reset_counter,
         "valid_fraction": valid_fraction,
         "params_applied": applied,
+        # Which simulator pacing this run actually ran under, and what the feed's own
+        # delivery measured (owner ruling 2026-09-30, APPROVAL-RECORD "F2's
+        # denominator"): the scored path is realtime clamped to <= 1x sim/wall, and
+        # anything else is iteration-only evidence that may not be pooled with it.
+        "simulator_pacing": simulator_pacing,
         # The scored route's declared windows in the units they are declared in, so the
         # receipt says whether an 8 s hold was 8 s of the aircraft holding the waypoint.
         "route_windows": [opened.document() for opened in route_windows],
@@ -3608,6 +3641,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         )
         or ("all predeclared bounds met on the frozen route",),
         limitations=(
+            *pacing_limitations,
             "E1 compares the scored window's publications against the controller's pose "
             "stream, which is read in this process for scoring only and sent to nothing: "
             "the estimator's feed carries stereo pairs and inertial samples and no other "
@@ -3636,6 +3670,62 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         artifacts=(*writer.artifacts, "preflight.json"),
         sensor_mode=SensorMode.SENSOR_DERIVED,
     )
+
+
+def _simulator_pacing_document(
+    settings: PlatformSettings,
+    controller_pacing: Any,
+    rows: Sequence[tuple[float, int]],
+) -> dict[str, Any]:
+    """The run's simulator pacing: what ran, what the controller enforced, what the
+    feed's own delivery measured.
+
+    The owner ruling of 2026-09-30 (APPROVAL-RECORD "F2's denominator") clamps the
+    scored path's sim/wall at <= 1x so that F2's sim-unit ages mean the same thing
+    as wall ages; the measured ratio here is the feed's own sim span over its wall
+    span -- the newest inertial stamp the host had sent, sampled at every
+    publication, over the wall time those publications spanned -- because that is
+    the rate at which simulated sensor time actually reached the pipeline, which is
+    the denominator F2's ages inherit. The per-interval percentiles are the same
+    consecutive-publication ratio the transport report baselined (p50 0.90-0.91,
+    p95 6.7-7.7 unclamped), so a clamped run reads against that record directly.
+    """
+    measured: dict[str, Any] = {"publications": len(rows)}
+    if len(rows) >= 2:
+        first_wall, first_sim = rows[0]
+        last_wall, last_sim = rows[-1]
+        wall_span_s = last_wall - first_wall
+        sim_span_s = (last_sim - first_sim) / 1e9
+        if wall_span_s > 0.0:
+            measured["wall_span_s"] = round(wall_span_s, 3)
+            measured["sim_span_s"] = round(sim_span_s, 3)
+            measured["span_ratio_sim_over_wall"] = round(sim_span_s / wall_span_s, 3)
+        intervals = [
+            (sim - prev_sim) / 1e9 / (wall - prev_wall)
+            for (prev_wall, prev_sim), (wall, sim) in zip(rows, rows[1:])
+            if wall > prev_wall and sim >= prev_sim
+        ]
+        if intervals:
+            measured["interval_ratio_percentiles"] = {
+                "p50": round(_percentile(intervals, 0.50), 3),
+                "p90": round(_percentile(intervals, 0.90), 3),
+                "p95": round(_percentile(intervals, 0.95), 3),
+                "max": round(max(intervals), 3),
+                "n": len(intervals),
+            }
+    scored_pacing = settings.webots_mode == "realtime" and settings.sim_wall_clamp
+    return {
+        "webots_mode": settings.webots_mode,
+        "sim_wall_clamp": settings.sim_wall_clamp,
+        "evidence_class": "scored" if scored_pacing else "iteration-only",
+        "controller": controller_pacing,
+        "measured": measured,
+        "ruling": (
+            "scored runs clamp sim/wall at <= 1x (owner ruling 2026-09-30, "
+            "APPROVAL-RECORD 'F2's denominator'); fast-mode runs are iteration-only "
+            "evidence, labelled here, and are never pooled with scored runs"
+        ),
+    }
 
 
 def _run_ordered_bring_up(

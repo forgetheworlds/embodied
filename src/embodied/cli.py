@@ -225,6 +225,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "webots_home": str,
         "webots_version": str,
         "webots_mode": _Choice("realtime", "fast"),
+        # The scored path's sim/wall clamp (owner ruling 2026-09-30): optional and
+        # absent-by-default so every configuration that predates it -- including the
+        # platform fixtures and the compatibility gate's own file -- loads unchanged.
+        "sim_wall_clamp": _Optional(bool),
         "sim_model": str,
         "vehicle": str,
         "sitl_home": str,
@@ -478,6 +482,10 @@ def _validate(value: Any, schema: Any, where: str) -> None:
             # than make the author write 2.0 for a count of two seconds.
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ConfigError(f"{where} must be a number")
+            return
+        if schema is bool:
+            if not isinstance(value, bool):
+                raise ConfigError(f"{where} must be true or false")
             return
         if schema is int:
             if isinstance(value, bool) or not isinstance(value, int):

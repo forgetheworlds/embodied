@@ -3132,3 +3132,51 @@ class TestDeclaredBudgetsAreSpentInTheirOwnUnits:
             check._sim_window_wall_ceiling_s(settings.pre_arm_wait_s, envelope[0])
             == settings.pre_arm_wait_s / envelope[0]
         )
+
+
+class TestSimulatorPacing:
+    """The receipt's pacing labelling and sim/wall measurement (owner ruling
+    2026-09-30, APPROVAL-RECORD "F2's denominator"): a receipt must state which
+    pacing the run flew under, so iteration-only runs cannot be confused with
+    scored ones, and must carry the feed's own sim span over its wall span."""
+
+    def test_the_declared_configuration_is_the_scored_pacing(self):
+        settings = PlatformSettings.from_config(_declared_document(), root=Path(".").resolve())
+        assert settings.webots_mode == "realtime"
+        assert settings.sim_wall_clamp is True
+        document = check._simulator_pacing_document(settings, None, [])
+        assert document["evidence_class"] == "scored"
+
+    def test_fast_mode_and_an_unclamped_realtime_run_are_iteration_only(self):
+        document = _declared_document()
+        document["platform"]["webots_mode"] = "fast"
+        document["platform"].pop("sim_wall_clamp")
+        fast = PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert check._simulator_pacing_document(fast, None, [])["evidence_class"] == (
+            "iteration-only"
+        )
+
+        document = _declared_document()
+        document["platform"].pop("sim_wall_clamp")
+        unclamped = PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert check._simulator_pacing_document(unclamped, None, [])["evidence_class"] == (
+            "iteration-only"
+        )
+
+    def test_the_measured_ratio_is_the_feeds_own_sim_span_over_its_wall_span(self):
+        settings = PlatformSettings.from_config(_declared_document(), root=Path(".").resolve())
+        # Nine publications 10 ms of wall apart, each carrying 9 ms of simulator
+        # time (a 0.9x run), then one burst: 60 ms of simulator time inside one
+        # 10 ms tick -- the catch-up sprint the clamp exists to forbid.
+        rows = [(0.000 + 0.010 * index, int((0.009 * index) * 1e9)) for index in range(10)]
+        rows.append((0.100, int((0.081 + 0.060) * 1e9)))
+        document = check._simulator_pacing_document(settings, {"enabled": True}, rows)
+        measured = document["measured"]
+        assert measured["publications"] == 11
+        assert measured["wall_span_s"] == pytest.approx(0.1)
+        assert measured["sim_span_s"] == pytest.approx(0.141)
+        assert measured["span_ratio_sim_over_wall"] == pytest.approx(1.41)
+        percentiles = measured["interval_ratio_percentiles"]
+        assert percentiles["p50"] == pytest.approx(0.9)
+        assert percentiles["max"] == pytest.approx(6.0)
+        assert document["controller"] == {"enabled": True}
