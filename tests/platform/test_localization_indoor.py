@@ -1222,7 +1222,12 @@ def _textured_image() -> np.ndarray:
 
 class TestSceneAdmission:
     """T7 and its revision-4 extension: the admission gate is real, both ways,
-    and it only measures frames that can prove which world they show."""
+    and it only measures frames that can prove which world they show.
+
+    The arm-gate fixtures declare their capture already complete (``count`` at
+    ``SCENE_CAPTURE_MAX_FRAMES``), so the gate measures the pairs written on
+    disk without waiting out the live capture's window, which a unit test with
+    no stream running could never satisfy."""
 
     def _world_settings(self, tmp_path: Path, world_text: str = "#VRML_SIM R2025a utf8\n"):
         """Settings whose world exists under tmp_path, so its sha256 is real."""
@@ -1353,7 +1358,7 @@ class TestSceneAdmission:
         pairs_dir = tmp_path / "run/run-a/pairs"
         _write_pair_frames(pairs_dir, 1, _featureless_image(0), _featureless_image(1))
         blocker = check._scene_capture_gate(
-            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+            writer, settings, lambda: None, {"count": check.SCENE_CAPTURE_MAX_FRAMES, "last_s": 0.0}, []
         )
         assert blocker and "FAST keypoints" in blocker
         assert "left 0, right 0" in blocker
@@ -1369,7 +1374,7 @@ class TestSceneAdmission:
         textured = _textured_image()
         _write_pair_frames(pairs_dir, 1, textured, textured)
         blocker = check._scene_capture_gate(
-            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+            writer, settings, lambda: None, {"count": check.SCENE_CAPTURE_MAX_FRAMES, "last_s": 0.0}, []
         )
         assert blocker and "no complete stereo pair" in blocker
         assert "identical pairs 1" in blocker
@@ -1387,7 +1392,7 @@ class TestSceneAdmission:
             pairs_dir, 1, _textured_image(), np.roll(_textured_image(), 4, axis=1)
         )
         blocker = check._scene_capture_gate(
-            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+            writer, settings, lambda: None, {"count": check.SCENE_CAPTURE_MAX_FRAMES, "last_s": 0.0}, []
         )
         assert blocker is None
         record = json.loads(
