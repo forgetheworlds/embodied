@@ -86,6 +86,7 @@ def _path_bytes(path: Path) -> int:
 
 
 def _plan_stage(stage: Path, sources, runs_root: Path, window: int) -> list[dict]:
+    window = 0 if stage.name in retention.CLOSED_STAGES else window
     cited_names = retention.cited_run_names(sources, stage)
     protected_paths = retention.citation_paths(sources, stage, runs_root)
     candidates = []

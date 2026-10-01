@@ -245,6 +245,62 @@ class TestEnforceWindow:
         assert not (failed_old / "run-a" / "pairs").exists()
         assert all((run_dir / "run-a" / "pairs").exists() for run_dir in fresh_runs)
 
+    def test_a_closed_stage_has_no_window_all_runs_prune_to_receipt_level(self, tmp_path: Path):
+        stage = tmp_path / "p00-airframe"
+        runs = []
+        for index in range(retention.WINDOW_RUNS + 3):
+            run_dir = _make_run(stage, f"accept-{index:02d}")
+            stamp = time.time() - (1000 - index)
+            os.utime(run_dir / "receipt.json", (stamp, stamp))
+            runs.append(run_dir)
+        records = retention.enforce_window(stage, citation_sources=())
+        # No window protects a closed stage: every run leaves, not just the
+        # three oldest.
+        pruned = {record["run"] for record in records if record["pruned"]}
+        assert pruned == {run_dir.name for run_dir in runs}
+        for run_dir in runs:
+            assert not (run_dir / "run-a" / "pairs").exists()
+            assert not (run_dir / "run-a" / "mavlink.jsonl").exists()
+            assert (run_dir / "run-a" / "checks.json").exists()
+            assert (run_dir / "receipt.json").exists()
+        written = json.loads((runs[0] / retention.PRUNE_FILENAME).read_text())
+        assert "closed" in written["rule"]
+
+    def test_never_prune_classes_survive_inside_a_closed_stage(self, tmp_path: Path):
+        stage = tmp_path / "p00-compat"
+        cited = _make_run(stage, "accept-cited-1")
+        capture = _make_run(stage, "accept-capture-1")
+        _touch(capture / "run-a" / "sensor-capture" / "records.jsonl", 16)
+        marked = _make_run(stage, "accept-marked-1")
+        (marked / retention.KEEP_MARKER).write_text('{"reason": "operator --keep-artifacts"}\n')
+        plain = _make_run(stage, "accept-plain-1")
+        source = tmp_path / "docs.md"
+        source.write_text("`accept-cited-1` backs a live claim.\n")
+        retention.enforce_window(stage, citation_sources=(source,))
+        for run_dir in (cited, capture, marked):
+            assert (run_dir / "run-a" / "pairs").exists()
+            assert not (run_dir / retention.PRUNE_FILENAME).exists()
+        assert not (plain / "run-a" / "pairs").exists()
+
+    def test_an_open_stage_keeps_its_window_a_closed_one_does_not(self, tmp_path: Path):
+        open_stage = tmp_path / "p01-localization"
+        closed_stage = tmp_path / "p00-airframe"
+        for stage in (open_stage, closed_stage):
+            for index in range(retention.WINDOW_RUNS):
+                run_dir = _make_run(stage, f"run-{index:02d}")
+                stamp = time.time() - (1000 - index)
+                os.utime(run_dir / "receipt.json", (stamp, stamp))
+        retention.enforce_window(open_stage, citation_sources=())
+        retention.enforce_window(closed_stage, citation_sources=())
+        assert all(
+            (run_dir / "run-a" / "pairs").exists()
+            for run_dir in sorted(open_stage.iterdir())
+        )
+        assert all(
+            not (run_dir / "run-a" / "pairs").exists()
+            for run_dir in sorted(closed_stage.iterdir())
+        )
+
 
 class TestApplyOnScore:
     def _repo(self, tmp_path: Path) -> Path:

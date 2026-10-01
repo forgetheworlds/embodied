@@ -7,7 +7,9 @@ bring-up and the other small JSON records) always stay -- they are kilobytes
 and they are the ground truth behind the README's claims -- while the bulky
 raw material they were made from (stereo pairs, the MAVLink stream, the
 estimator feed) is pruned once a run has left the newest-``WINDOW_RUNS``
-window and nothing cites it.
+window and nothing cites it. A stage in :data:`CLOSED_STAGES` has no window:
+it will not be scored again, so it keeps no diagnosis headroom, and its
+unprotected runs drop straight to receipt level.
 
 Three things stop a run from being pruned at all:
 
@@ -43,6 +45,22 @@ KEEP_MARKER = "retention-keep"
 # p01l-clamp-1..9); ten covers a full session's sweep with one to spare, and
 # bounds the retained bulk at roughly half a gigabyte at ~50 MB per run.
 WINDOW_RUNS = 10
+
+# Stages whose gate has shipped and which will not be scored again. The
+# window is diagnosis headroom for the stage under test; a closed stage has
+# none, so its window is empty and every run not protected by a capture, a
+# keep marker or a citation drops to receipt level. Without this the closed
+# stages' newest-10 windows would never age out, because nothing scores into
+# them again to push runs out.
+CLOSED_STAGES = frozenset({
+    "p00-airframe",
+    "p00-baseline",
+    "p00-baseline-2",
+    "p00-baseline-3",
+    "p00-compat",
+    "p00-compat-live-o",
+    "p00-live-j",
+})
 
 # The bulky artifact kinds: the stereo pair frames and the wire/feed streams.
 BULKY_FILES = frozenset({"mavlink.jsonl", "estimator-feed.jsonl", "imu.jsonl", "pairs.jsonl"})
@@ -163,6 +181,7 @@ def prune_run(
     citation_sources: Sequence[Path] = (),
     captures_prunable: bool = False,
     only_paths: Iterable[Path] | None = None,
+    window_runs: int = WINDOW_RUNS,
 ) -> dict:
     """Prune one run's bulky artifacts, keeping the receipt level.
 
@@ -175,7 +194,8 @@ def prune_run(
     sets it: a fresh capture is always under diagnosis). ``only_paths`` prunes
     exactly those paths (still guard-filtered) instead of the full prunable
     set -- the apply pass uses it to take a capture from a run that otherwise
-    stays whole.
+    stays whole. ``window_runs`` is the stage's effective window, recorded in
+    the prune receipt's rule text (``0`` for a closed stage).
     """
     name = run_dir.name
     reason = None if captures_prunable else _run_is_kept_whole(run_dir)
@@ -209,9 +229,14 @@ def prune_run(
         "run": name,
         "pruned_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "rule": (
-            f"receipt-level files kept; bulky artifacts removed "
+            "receipt-level files kept; bulky artifacts removed "
             f"({', '.join(sorted(BULKY_DIRECTORIES | BULKY_FILES))} and unscored "
-            f"attempt directories); newest {WINDOW_RUNS} runs of the stage stay whole"
+            "attempt directories); "
+            + (
+                f"newest {window_runs} runs of the stage stay whole"
+                if window_runs
+                else "the stage is closed (CLOSED_STAGES): no window run stays whole"
+            )
         ),
         "removed": removed,
         "bytes_freed": sum(entry["bytes"] for entry in removed),
@@ -413,9 +438,13 @@ def enforce_window(stage_dir: Path, *, citation_sources: Sequence[Path] = ()) ->
     """Keep the newest ``WINDOW_RUNS`` runs of one stage whole, prune the rest.
 
     Runs that carry a capture, a keep marker or a citation never consume a
-    window slot: they are simply not candidates. Returns one record per run
+    window slot: they are simply not candidates. A closed stage
+    (:data:`CLOSED_STAGES`) has no window at all -- it will not be scored
+    again, so it has no diagnosis headroom to protect, and every one of its
+    unprotected runs drops to receipt level. Returns one record per run
     pruned in this pass.
     """
+    window = 0 if stage_dir.name in CLOSED_STAGES else WINDOW_RUNS
     try:
         candidates = [child for child in sorted(stage_dir.iterdir()) if _is_run_directory(child)]
     except OSError:
@@ -428,8 +457,8 @@ def enforce_window(stage_dir: Path, *, citation_sources: Sequence[Path] = ()) ->
     ]
     prunable_candidates.sort(key=_ordering_stamp, reverse=True)
     records: list[dict] = []
-    for run_dir in prunable_candidates[WINDOW_RUNS:]:
-        record = prune_run(run_dir, citation_sources=citation_sources)
+    for run_dir in prunable_candidates[window:]:
+        record = prune_run(run_dir, citation_sources=citation_sources, window_runs=window)
         if record["pruned"]:
             records.append(record)
     return records
