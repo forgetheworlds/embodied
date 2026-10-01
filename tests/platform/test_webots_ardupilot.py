@@ -807,6 +807,36 @@ def check(result, name):
     raise AssertionError(f"{name} was not reported; got {[c.name for c in result.checks]}")
 
 
+def test_the_iteration_no_rendering_knob_reaches_the_simulator_argv(tmp_path, monkeypatch):
+    """``EMBODIED_WEBOTS_NO_RENDERING=1`` is an iteration-only speed knob.
+
+    It appends Webots' own ``--no-rendering``, which disables the main 3D view and
+    leaves the Camera devices that feed the estimator alone; the harness never sets
+    it, so a scored run's argv is the same six arguments with or without the knob.
+    """
+    config_path = write_scene(tmp_path)
+    baseline = settings_for(config_path, tmp_path).simulator_argv()
+    assert "--no-rendering" not in baseline
+    assert baseline[1:3] == ("--batch", "--mode=realtime")
+    assert baseline[-1].endswith(".wbt")
+    monkeypatch.setenv("EMBODIED_WEBOTS_NO_RENDERING", "1")
+    with_flag = settings_for(config_path, tmp_path).simulator_argv()
+    # The flag lands immediately before the world and changes nothing else.
+    assert list(with_flag) == [*baseline[:-1], "--no-rendering", baseline[-1]]
+
+def test_the_fast_iteration_arm_loads_and_declares_no_clamp():
+    """``configs/first_indoor_fast.yaml`` is the iteration arm, not a scored one.
+
+    The scored configuration keeps the clamp and realtime mode (owner ruling
+    2026-09-30); this file exists so the owner can iterate at Webots' own speed
+    without touching the scored arm, and its receipt labels it iteration-only.
+    """
+    document = cli.load_config(Path("configs/first_indoor_fast.yaml"))
+    settings = W.PlatformSettings.from_config(document, root=Path(".").resolve())
+    assert settings.webots_mode == "fast"
+    assert settings.sim_wall_clamp is False
+    assert "--mode=fast" in settings.simulator_argv()
+
 # ---------------------------------------------------------------------------
 # Framing
 # ---------------------------------------------------------------------------
