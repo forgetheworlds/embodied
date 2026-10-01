@@ -16,11 +16,22 @@ def main():
     errors = []
     tracked = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"]).decode().split("\0")
     forbidden = {"design", "archive", "docs", "work", ".atomic", ".Codex", ".codex"}
+    # Exact paths that are not public prose and must stay where they are. Nothing beyond
+    # these three: no globs, no directory rules, no prefixes.
+    prose_exceptions = {
+        "scenarios/missions/common/PROVENANCE.md":
+            "the Apache-2.0 licence and sha256 record for the vendored appearance protos, "
+            "referenced by eight world files",
+        "tests/fixtures/navigation/doorway/truth/MANUAL-VALUES.md":
+            "written by the fixture generator and byte-compared by its own check()",
+        "tests/fixtures/bench/hand-checkable-episode.truth/MANUAL-VALUES.md":
+            "the bench fixture's hidden-truth sheet, which must not be published",
+    }
     for name in filter(None, tracked):
         p = Path(name)
         if p.parts[0] in forbidden or p.name in {"AGENTS.md", "CLAUDE.md"}:
             errors.append("Private context tracked on code branch: " + name)
-        if p.suffix.lower() == ".md" and p.name != "README.md":
+        if p.suffix.lower() == ".md" and p.name != "README.md" and name not in prose_exceptions:
             errors.append("Public prose belongs in README.md: " + name)
     if git(root, "branch", "--show-current") == "design":
         errors.append("Run from the code checkout, not the design branch.")
@@ -45,7 +56,11 @@ def main():
             if not (design / "docs" / name).is_file():
                 errors.append("Missing required document: " + str(design / "docs" / name))
         startup_packet = ["GOAL.md", "CURRENT-STATE.md"]
-        words = sum(len((design / "docs" / name).read_text().split()) for name in startup_packet)
+        words = sum(
+            len((design / "docs" / name).read_text().split())
+            for name in startup_packet
+            if (design / "docs" / name).is_file()
+        )
         if words > 1800:
             errors.append("Startup packet exceeds 1800 words; move task-specific detail behind links.")
         entry, template = root / "AGENTS.md", design / "docs/templates/AGENTS.md"
