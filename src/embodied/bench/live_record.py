@@ -271,18 +271,33 @@ class TruthCollector:
         return False, f"ended {distance:.2f} m from the start position (bound {radius_m:.2f} m)"
 
 
+def truth_world_state(seed: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The seed's declared world state: (targets, world_counts).
+
+    The seed may declare it under a ``world_state`` key (the suite's own
+    layout) or at the top level; both name the same facts, and the facts are
+    what the referee records, never the wrapper.
+    """
+    state = seed.get("world_state") if isinstance(seed.get("world_state"), dict) else seed
+    targets = state.get("targets")
+    counts = state.get("world_counts")
+    return targets or {}, counts or {}
+
+
 def load_truth_seed(path: Path) -> dict[str, Any]:
     """The bench-side hidden facts for the suite's scenario."""
     if not path.is_file():
         raise SuiteConfigError(f"the suite's truth seed {path} is missing")
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict) or not isinstance(document.get("targets"), dict):
+    if not isinstance(document, dict):
+        raise SuiteConfigError(f"{path} must hold a truth seed object")
+    targets, counts = truth_world_state(document)
+    if not targets:
         raise SuiteConfigError(f"{path} must declare a targets object")
-    for name, entry in document["targets"].items():
+    for name, entry in targets.items():
         if not isinstance(entry, dict) or not isinstance(entry.get("present"), bool):
             raise SuiteConfigError(f"{path} target {name!r} must declare a boolean present")
-    counts = document.get("world_counts")
-    if not isinstance(counts, dict) or not counts:
+    if not counts:
         raise SuiteConfigError(f"{path} must declare world_counts")
     return document
 
@@ -335,11 +350,12 @@ def world_state_payload(seed: dict[str, Any]) -> dict[str, Any]:
     ``targets[name]`` holds exactly ``present`` (the bench-side envelope accepts
     no other key), and the counts ride beside it.
     """
+    targets, counts = truth_world_state(seed)
     return {
         "targets": {
-            name: {"present": bool(entry["present"])} for name, entry in seed["targets"].items()
+            name: {"present": bool(entry["present"])} for name, entry in targets.items()
         },
-        "world_counts": {str(key): int(value) for key, value in seed["world_counts"].items()},
+        "world_counts": {str(key): int(value) for key, value in counts.items()},
     }
 
 
@@ -483,7 +499,7 @@ def record(
     # the suite's scene.
     document.setdefault("localization", {})["world"] = str(world_value)
     settings = _platform_settings(document, repository)
-    truth_targets = seed["targets"]
+    truth_targets, _world_counts = truth_world_state(seed)
     present_targets = sorted(
         name for name, entry in truth_targets.items() if entry.get("present") is True
     )

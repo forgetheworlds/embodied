@@ -29,12 +29,20 @@ every record — including POSE — to the ``sensor_tap`` the bench side owns,
 without reading a POSE record's contents anywhere. No attribute here holds a
 truth pose.
 
-Frame and clock conventions: the map, plans and poses are all in the
-estimator's ``odom`` frame; the one transform to the autopilot's local-NED is
-the frozen :class:`~embodied.platform.localization.OdomAlignment` (the same
-object the external-navigation publisher seals), and the one time base for
-trajectory sampling is the host's monotonic clock, which is also the clock the
-controller stamps its frames on.
+Frame and clock conventions. The mission's ``odom`` frame is the **aligned
+local-NED frame**: the estimator's own initialization frame is not used
+directly, because its yaw is unobservable at initialization (OpenVINS's
+alignment picks it from accelerometer noise, the b477ee7 permutation). Every
+pose, every map cell and every plan is expressed in the frame the frozen
+:class:`~embodied.platform.localization.OdomAlignment` produces — the same
+transform the external-navigation publisher seals and sends — so the map, the
+published setpoints and the evaluator's own truth positions are all in one
+frame, and a map bounding box means what it says about the scene. This is the
+specification's own definition of odom (4.2): continuous, gravity-aligned,
+horizontal axes fixed at startup, not necessarily pointing north.
+
+The one time base for trajectory sampling is the host's monotonic clock, which
+is also the clock the controller stamps its frames on.
 """
 
 from __future__ import annotations
@@ -62,6 +70,8 @@ from embodied.platform import localization as loc
 # declared ordered bring-up, the simulator-second window, the estimator
 # process and the pre-arm checks are the ones P01-L measured with.
 from embodied.platform.localization_check import (
+    BRING_UP_GCS_CONNECT_TIMEOUT_S,
+    BRING_UP_GCS_SYSTEM_PARAMETER,
     FEED_STREAM_POLL_S,
     GPS_AIDING_SAMPLE_HZ,
     MSG_ID_GPS_RAW_INT,
@@ -109,9 +119,12 @@ from embodied.pilot.recipe_runner import RecipeRunner
 # Map values are the P03 slice's declared values (tests/fixtures/navigation/
 # doorway/truth/scene.json); the bounds are widened to the live scene, whose
 # spawn sits in a vestibule rather than at the fixture's origin.
+# The bounds are the scene's own extents in the aligned NED frame (the world's
+# floor is 12.4 x 5.4 m centred at (4, 0) with the vehicle spawning at
+# (-1, 0, 0.09) and NED z pointing down), plus a voxel of margin.
 MAP_PARAMETERS = dict(
     voxel_m=0.1,
-    bounds_odom_m={"x": (-6.0, 8.0), "y": (-5.0, 5.0), "z": (-0.5, 3.0)},
+    bounds_odom_m={"x": (-2.4, 10.6), "y": (-3.2, 3.2), "z": (-2.8, 0.4)},
     surface_band_m=0.1,
     log_odds_hit=0.7,
     log_odds_pass=-0.4,
@@ -155,6 +168,13 @@ MISSION_YAW_HOLD_RAD = 0.0
 # the newest pair, at most this often (wall seconds). The estimator feed is on
 # its own thread and never waits behind this.
 MIN_PERCEPTION_INTERVAL_S = 0.3
+# Certificate renewal cadence: the planner is re-run against the newest map at
+# most this often (wall seconds). The cost is real (the P03 inflation pass runs
+# over the whole grid: ~70 ms at this scene's declared bounds), so renewal is
+# bounded rather than attempted on every perception cycle; the stored
+# certificate names the map revision it was certified against, and the
+# validator's dependency rule is what makes a stale one refused.
+RENEWAL_PERIOD_S = 1.0
 # An observation whose frames become episode payloads — the evidence a claim
 # can cite — is one that grounded a candidate, bounded by this many payloads.
 MAX_EVIDENCE_PAYLOADS = 48
@@ -351,14 +371,14 @@ class MissionRuntime:
                 parent_frame="odom",
                 child_frame="body",
                 stamp=self._state_stamp(),
-                position_m=tuple(float(v) for v in state.position_m),
-                quaternion_wxyz=tuple(float(v) for v in state.quat_wxyz),
+                position_m=self.alignment.aligned_position_ned(state.position_m),
+                quaternion_wxyz=self.alignment.aligned_quat_ned_wxyz(state.quat_wxyz),
                 covariance=(sigma[0] ** 2, sigma[1] ** 2, sigma[2] ** 2),
                 nav_epoch=self.nav_epoch,
                 source_ids=("ov_stream",),
                 valid=bool(state.initialized),
             ),
-            velocity_mps=tuple(float(v) for v in state.velocity_mps),
+            velocity_mps=self.alignment.aligned_velocity_ned(state.velocity_mps),
             covariance=None,
             nav_epoch=self.nav_epoch,
             visual_source_ids=(),
@@ -368,14 +388,17 @@ class MissionRuntime:
         )
 
     def _position_odom(self) -> tuple[float, float, float] | None:
+        """The aircraft's position in the mission's odom frame (aligned local NED)."""
         state = self._latest_state
-        if state is None:
+        if state is None or not self.alignment.sealed:
             return None
-        return tuple(float(v) for v in state.position_m)
+        return self.alignment.aligned_position_ned(state.position_m)
 
     def _speed(self) -> float:
         state = self._latest_state
-        return 0.0 if state is None else float(np.linalg.norm(state.velocity_mps))
+        if state is None or not self.alignment.sealed:
+            return 0.0
+        return float(np.linalg.norm(self.alignment.aligned_velocity_ned(state.velocity_mps)))
 
     def _capture_pose(self, record: Any) -> R.PoseEstimate | None:
         """The estimator pose nearest one pair's capture instant, on its own clock."""
@@ -396,8 +419,8 @@ class MissionRuntime:
                 clock_id=controller_clock,
                 monotonic_ns=int(record.pair.capture_host_ns),
             ),
-            position_m=tuple(float(v) for v in state.position_m),
-            quaternion_wxyz=tuple(float(v) for v in state.quat_wxyz),
+            position_m=self.alignment.aligned_position_ned(state.position_m),
+            quaternion_wxyz=self.alignment.aligned_quat_ned_wxyz(state.quat_wxyz),
             covariance=(sigma[0] ** 2, sigma[1] ** 2, sigma[2] ** 2),
             nav_epoch=self.nav_epoch,
             source_ids=("ov_stream",),
@@ -573,18 +596,24 @@ class MissionRuntime:
                 log.append("not starting the flight: a precondition of the scored arm failed")
                 return self.result
             publisher.start()
+            # The link speaks as the vehicle's OWN declared GCS system id, read
+            # back here rather than assumed: the firmware drops an RC override
+            # from any other id, and the bring-up's thrust path is exactly that
+            # message (the worked example's own finding).
             gcs_id = platform.read_parameters(
-                ("SYSID_MYGCS",), timeout_s=PARAMETER_READ_TIMEOUT_S, drain=drain
-            ).get("SYSID_MYGCS")
+                (BRING_UP_GCS_SYSTEM_PARAMETER,),
+                timeout_s=PARAMETER_READ_TIMEOUT_S,
+                drain=drain,
+            ).get(BRING_UP_GCS_SYSTEM_PARAMETER)
             if gcs_id is None:
                 self.result.blockers.append(
-                    "the vehicle did not answer SYSID_MYGCS: the bring-up's RC override path "
-                    "is only accepted from the vehicle's own declared GCS"
+                    f"the vehicle did not answer {BRING_UP_GCS_SYSTEM_PARAMETER}: the bring-up's "
+                    "RC override path is only accepted from the vehicle's own declared GCS"
                 )
                 self.result.termination_reason = "preflight_refused"
                 return self.result
             bring_up_link = BringUpLink(bring_up_endpoint, source_system=int(gcs_id))
-            bring_up_link.connect(timeout_s=10.0)
+            bring_up_link.connect(timeout_s=BRING_UP_GCS_CONNECT_TIMEOUT_S)
             bring_up = _run_ordered_bring_up(
                 self.settings,
                 platform,
@@ -923,12 +952,10 @@ class MissionRuntime:
         certificate = active.certificate
         if certificate is not None:
             sample_t = min(time.monotonic(), certificate.t_end_s)
-            position, velocity, _acceleration = certificate.sample(sample_t)
-            position_ned = self.alignment.aligned_position_ned(position)
-            velocity_ned = self.alignment.aligned_velocity_ned(velocity)
+            position_ned, velocity_ned, _acceleration = certificate.sample(sample_t)
             certificate_ref = certificate.certificate_id
         elif active.hold_position_odom is not None:
-            position_ned = self.alignment.aligned_position_ned(active.hold_position_odom)
+            position_ned = active.hold_position_odom
             velocity_ned = (0.0, 0.0, 0.0)
             certificate_ref = active.goal_id
         else:
@@ -999,7 +1026,18 @@ class MissionRuntime:
                 continue
             point: tuple[float, float, float] | None = None
             if ref == "start":
-                point = (RETURN_STANDOFF_COMPENSATION_M, 0.0, self.settings.hover_altitude_m)
+                # The start position in the mission frame is the alignment's own
+                # origin, and the hover band sits above it (NED z points down).
+                # An unsealed alignment has no frame yet, so nothing is resolved
+                # from it (the seam refuses the goal rather than inventing one).
+                if not self.alignment.sealed:
+                    continue
+                origin = self.alignment.aligned_position_ned((0.0, 0.0, 0.0))
+                point = (
+                    origin[0] + RETURN_STANDOFF_COMPENSATION_M,
+                    origin[1],
+                    origin[2] - self.settings.hover_altitude_m,
+                )
             else:
                 region = self.frontier_regions().get(ref)
                 if region is not None:
@@ -1153,6 +1191,7 @@ class _LiveRunnerWorld:
         self._visited: set[str] = set()
         self._inspected: set[str] = set()
         self._step_observations: list[str] = []
+        self._last_renewal_s = 0.0
 
     # -- the runner's views ---------------------------------------------------
 
@@ -1293,6 +1332,10 @@ class _LiveRunnerWorld:
             return
         if active.certificate.map_revision == runtime.store.revision:
             return
+        now = time.monotonic()
+        if now - getattr(self, "_last_renewal_s", 0.0) < RENEWAL_PERIOD_S:
+            return
+        self._last_renewal_s = now
         state = runtime._navigation_state()
         if state is None:
             return

@@ -46,6 +46,7 @@ from embodied.contracts.records import (
     Observation,
     ReportClaim,
     SensorMode,
+    SpatialGoal,
     VisualSelection,
     to_dict,
 )
@@ -604,10 +605,22 @@ def test_the_runtime_refuses_to_publish_without_an_admitted_goal(tmp_path):
 
 
 def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
-    from embodied.contracts.records import PoseEstimate, SpatialGoal
+    from embodied.contracts.records import PoseEstimate
     from embodied.perception.camera import DepthProduct, PoseProvenance
 
     runtime, _ = _runtime(tmp_path)
+    # The mission frame is the aligned frame, so nothing can resolve before the
+    # alignment seals from the estimator's first healthy state.
+    assert runtime.resolve_targets(
+        SpatialGoal(
+            proposal_id="p-unsealed", request_id=None, fingerprint="fp-u",
+            mission_revision=0, base_goal_revision=0, selection_ids=(),
+            target_refs=("start",), intent="return", constraints=(),
+            completion_condition="c", lease_bounds=(("step_lease_s", 30.0),),
+            local_discretion_bounds=(),
+        )
+    ) == ()
+    runtime.alignment.seal((1.0, 0.0, 0.0, 0.0))
     calibration = runtime.calibration
     height, width = 480, 640
     valid = np.zeros((height, width), dtype=bool)
@@ -632,7 +645,7 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
         parent_frame="odom",
         child_frame="body",
         stamp=_stamp(3),
-        position_m=(0.0, 0.0, 1.0),
+        position_m=(0.0, 0.0, -1.5),  # NED: 1.5 m above the spawn
         quaternion_wxyz=(1.0, 0.0, 0.0, 0.0),
         covariance=None,
         nav_epoch=runtime.nav_epoch,
@@ -682,7 +695,10 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
     from embodied.platform.mission_runtime import _terminal_region_for
 
     region = _terminal_region_for(targets)
-    assert region.contains((0.0, 0.0, targets[0].geometry[2]))
+    # The mission frame is world-anchored local NED, so the spawn sits at the
+    # world's own vehicle translation and the hover band above it.
+    origin = runtime.alignment.aligned_position_ned((0.0, 0.0, 0.0))
+    assert region.contains((origin[0], origin[1], origin[2] - runtime.settings.hover_altitude_m))
     assert region == GE.approach_region(
         targets[0].geometry, GE.Envelope(body_radius_m=0.3, error_allowance_m=0.15),
         direction=(1.0, 0.0, 0.0),
@@ -706,6 +722,23 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
     frontier_targets = runtime.resolve_targets(frontier_goal)
     assert len(frontier_targets) == 1
     assert frontier_targets[0].anchor_revision == runtime.store.revision
+
+
+def test_the_seed_reads_the_suites_world_state_layout(tmp_path):
+    """The suite nests its world state under ``world_state``; both shapes work."""
+    nested = {
+        "schema": "first-indoor-truth-1",
+        "world_state": {"targets": {"red_block": {"present": True}}, "world_counts": {"red_block": 1}},
+        "identity": {"red_block": {"position_ned_from_world_origin_m": [8.8, 1.6, -0.9]}},
+    }
+    seed_path = tmp_path / "truth.yaml"
+    seed_path.write_text(yaml.safe_dump(nested, sort_keys=False), encoding="utf-8")
+    seed = live_record.load_truth_seed(seed_path)
+    assert live_record.world_state_payload(seed) == {
+        "targets": {"red_block": {"present": True}},
+        "world_counts": {"red_block": 1},
+    }
+    assert live_record.target_position_ned(seed, "red_block") == pytest.approx((8.8, 1.6, -0.9))
 
 
 def test_the_seed_must_declare_the_target_position(tmp_path):
