@@ -131,6 +131,28 @@ const double STEREO_PERIOD_NS = 1e8;   // declared 10 Hz (:65)
 const size_t STATE_PAYLOAD_SIZE = 8 + 1 + 19 * 8 + 4 + 8 + 1;  // "<QB19dIQB"
 const double PUBLISH_PERIOD_S = 0.010; // 100 Hz: F2's 20 ms bound is unreachable on 25 ms ticks (FIXER5)
 
+// Replay publish mode (replay surface, 2026-09-30): OV_REPLAY_PUBLISH_EVERY_IMU=N
+// in this process's environment replaces the wall-clock publish tick with one the
+// input itself drives -- one STATE after every N-th inertial sample fed and one
+// after every stereo frame fed, published the moment that frame is parsed, with no
+// steady_clock anywhere on the path. The STATE sequence then becomes a pure
+// function of the input byte stream, so replaying a recorded stream reproduces a
+// reproducible STATE sequence (and a candidate change can be diffed against the
+// baseline message by message) instead of sampling the same filter at whatever
+// wall instants the host happened to choose. N=5 matches the live cadence's
+// density (one publish per 10 ms of simulated time at the declared 500 Hz). This
+// is also the sim-denominated publish tick the single-clock change proposes,
+// testable here offline before any flight spends on it. Absent the variable the
+// process behaves exactly as before: the wall tick below is the flown path.
+int replay_publish_every() {
+  static int value = -1;
+  if (value < 0) {
+    const char *env = ::getenv("OV_REPLAY_PUBLISH_EVERY_IMU");
+    value = (env != nullptr) ? std::max(1, std::atoi(env)) : 0;
+  }
+  return value;
+}
+
 // ---------------------------------------------------------------------------
 // Per-tick diagnostics (F2, 2026-09-30). Enabled by F2_PER_TICK=1 in the
 // estimator process's environment; silent otherwise, so a production run's
@@ -590,6 +612,22 @@ int main(int argc, char **argv) {
     auto last_publish = std::chrono::steady_clock::now();
     newest_imu_time = 0.0;
 
+    // The replay path's publish: identical encoding and failure handling to the
+    // wall tick below, triggered by the input instead of the clock. Returns false
+    // when the host is gone, exactly as the tick's send does.
+    auto publish_state_now = [&]() -> bool {
+      if (!sys->initialized()) return true;
+      char action = 'f';
+      std::vector<uint8_t> frame =
+          encode_state(sys, reset_counter, newest_imu_time, &last_projection, &action);
+      if (!send_all(client, frame)) {
+        log_line("ov_stream: the host is gone while publishing");
+        return false;
+      }
+      published += 1;
+      return true;
+    };
+
     while (true) {
     fd_set readable;
     FD_ZERO(&readable);
@@ -640,6 +678,9 @@ int main(int argc, char **argv) {
             g_fed_imu.pop_front();
           }
         }
+        if (replay_publish_every() > 0 && imu_samples % (uint64_t)replay_publish_every() == 0) {
+          if (!publish_state_now()) break;
+        }
       } else if (kind == KIND_STEREO) {
         if (length < 16) {
           std::fprintf(stderr, "ov_stream: STEREO payload is %u bytes, too short for its header\n", length);
@@ -677,6 +718,9 @@ int main(int argc, char **argv) {
           log_line("ov_stream: PAIR wall=%.3f frame_t=%.3f delay=%.3f imu_fed=%llu",
                    steady_now_s(), image_time, steady_now_s() - image_time,
                    (unsigned long long)imu_samples);
+        }
+        if (replay_publish_every() > 0) {
+          if (!publish_state_now()) break;
         }
         if (stereo_frames <= 10 || stereo_frames % 25 == 0) {
           // Diagnostic: the frame's own timestamp, the pixel statistics of what the
@@ -716,7 +760,9 @@ int main(int argc, char **argv) {
 
     auto now = std::chrono::steady_clock::now();
     double since_publish = std::chrono::duration<double>(now - last_publish).count();
-    if (since_publish >= PUBLISH_PERIOD_S) {
+    // Replay publish mode owns publishing outright: the wall tick is the flown
+    // path's pacer and must not interleave with the input-driven one.
+    if (replay_publish_every() == 0 && since_publish >= PUBLISH_PERIOD_S) {
       last_publish = now;
       if (sys->initialized()) {
         char action = 'f';
