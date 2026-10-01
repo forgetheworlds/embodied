@@ -1148,15 +1148,26 @@ class PlatformSettings:
             raise ConfigError("platform.endpoints ports must be positive integers")
 
     def simulator_argv(self) -> tuple[str, ...]:
-        """The exact Webots command line, headless at the configured simulation mode."""
-        return (
+        """The exact Webots command line, headless at the configured simulation mode.
+
+        ``EMBODIED_WEBOTS_NO_RENDERING=1`` appends Webots' own ``--no-rendering``,
+        an ITERATION-ONLY speed knob the harness never sets: it disables rendering
+        of the main 3D view (Webots R2025a ``--help``: "Disable rendering in the
+        main 3D view"), while the Camera devices the estimator is fed from render
+        on their own pipeline. A scored run's argv is therefore unchanged, and the
+        manifest records the argv actually used (``webots.argv``).
+        """
+        argv = [
             str(self.webots_binary),
             "--batch",
             f"--mode={self.webots_mode}",
             "--stdout",
             "--stderr",
-            str(self.world),
-        )
+        ]
+        if os.environ.get("EMBODIED_WEBOTS_NO_RENDERING", "") == "1":
+            argv.append("--no-rendering")
+        argv.append(str(self.world))
+        return tuple(argv)
 
     def parameter_files(self, extra_params: Sequence[Path] = ()) -> tuple[Path, ...]:
         """Every parameter file one run layers, in the order it layers them."""

@@ -1,0 +1,754 @@
+# ITERATION-ONLY arm of configs/first_indoor.yaml: byte-for-byte that file except
+# platform.webots_mode (realtime -> fast) and platform.sim_wall_clamp (true -> false).
+# The two keys move together by construction: PlatformSettings refuses fast + clamp,
+# because the clamp holds the simulator to <= 1x wall, which is the SCORED path's
+# pacing (owner ruling 2026-09-30, APPROVAL-RECORD "F2's denominator"), while fast mode
+# is the owner's iteration mode. Nothing here is evidence for a bound: a run on this file
+# is labelled by its own receipt (simulator_pacing.evidence_class "iteration-only") and
+# may never be pooled with scored evidence. The scored arm stays configs/first_indoor.yaml.
+# P00 compatibility gate: one Webots/ArduPilot candidate, probed from end to end.
+#
+# Every path is relative to the repository root, and every value that is genuinely a
+# number (a baseline, a rate, a timeout, a budget) is configuration rather than a
+# constant in code. Nothing here is a control gain or a measured latency.
+#
+# Three keys are criteria rather than plumbing and are called out because a reviewer has
+# to be able to tell a declared engineering parameter from a value taken out of a
+# document:
+#   sensors.stereo.identical_channel_fraction_limit - the declared threshold for
+#     calling a frame colour, which the grayscale check compares against.
+#   scenario.estimator_params - the EKF-active set that both runs apply. The pinned
+#     example's simulator AHRS (AHRS_EKF_TYPE 10) was measured unable to track a local-NED
+#     target at all (accept-1: zero horizontal displacement, [0, 0, -16.95] and
+#     [0, 0, -17.42]), so the pinned set is recorded as evidence rather than flown, and run
+#     A is not the pinned upstream configuration. Honesty note 2026-09-23: an earlier
+#     version of this comment claimed the EKF set "holds the same targets to centimetres";
+#     that was true only of accept-2/accept-4 samples. At the reviewed revision (accept-5)
+#     the EKF set's closed-loop stability is the open question of the authorized airframe
+#     cycle; residuals and regimes live in the accept receipts, not here.
+#   probe.realtime_ratio_envelope - the real-time envelope specification section 21.2
+#     asks a run to declare. The specification names no value; this is this stage's
+#     declared engineering parameter, justified where it is set below.
+
+project:
+  stage: P00
+  name: first-indoor
+
+platform:
+  ardupilot_root: work/ardupilot
+  ardupilot_commit: af8525911b49a4c2a3bdc83bc5ed57e1d0098134
+  sitl_binary: work/ardupilot/build/sitl/bin/arducopter
+  webots_home: work/Webots.app
+  webots_version: R2025a
+  webots_mode: fast
+  # The scored path's sim/wall clamp, on the owner's ruling of 2026-09-30
+  # (design/docs/APPROVAL-RECORD.md, "F2's denominator: scored runs clamp the
+  # simulator's pacing"): the simulator process is started with
+  # EMBODIED_SIM_WALL_CLAMP=1 and the scene's controller holds each basic time step
+  # (2 ms, the world's own basicTimeStep) to at least its own duration of wall
+  # time, so simulated sensor time is produced at no more than 1x wall and a 10 ms
+  # publish tick means 10 ms of sensor time. F2's 40 ms keeps both its declared
+  # unit and its declared value; the burst delivery it could not be met against
+  # (local sim/wall ratio p95 6.7-7.7 at pair arrivals, F2-TRANSPORT-REPORT.md) is
+  # the simulator's realtime catch-up sprint, which this forbids. Runs at
+  # webots_mode fast keep the clamp OFF and are ITERATION-ONLY evidence, labelled
+  # in their receipts and never pooled with scored runs.
+  sim_wall_clamp: false
+  sim_model: webots-python
+  vehicle: ArduCopter
+  sitl_home: "-35.363261,149.165230,584,353"
+  endpoints:
+    sitl: "tcp:127.0.0.1:5760"
+    fdm_port: 9002
+    controller_port: 9010
+
+scenario:
+  world: scenarios/compat/worlds/compat_stereo.wbt
+  # Layered in order. compat_base.parm is the pinned example's set, copied unchanged;
+  # compat_arming.parm holds what a simulated airframe needs before ArduPilot's
+  # pre-arm checks pass; compat_ekf.parm is the EKF-active set both runs apply, because
+  # the pinned set's simulator AHRS does not hold a guided local-NED target on this
+  # candidate (measured; see the note at the top of this file).
+  params:
+    - scenarios/compat/params/compat_base.parm
+    - scenarios/compat/params/compat_arming.parm
+  estimator_params:
+    - scenarios/compat/params/compat_ekf.parm
+    - scenarios/compat/params/p01l_sensor.parm
+
+sensors:
+  stereo:
+    left: "camera left"
+    right: "camera right"
+    width: 640
+    height: 480
+    baseline_m: 0.10
+    sampling_period_ms: 100
+    encoding: rgb8
+    identical_channel_fraction_limit: 0.99
+  imu:
+    accelerometer: accelerometer
+    gyro: gyro
+    inertial_unit: "inertial unit"
+    gps: gps
+    sampling_period_ms: 2
+  calibration: scenarios/compat/calibration.json
+
+# The two measurement windows are configuration because they are properties of this
+# scene rather than of the adapter: the freshly loaded airframe is pushed out of the
+# floor and its accelerometer converges over about a second of simulated time, and a
+# window measured in simulated time is comparable between the realtime and fast modes.
+probe:
+  hover_altitude_m: 1.5
+  # Waypoints are local-NED offsets from the takeoff point; z is added to the hover
+  # altitude, so 0.0 means "level with where it took off".
+  waypoints_local_ned:
+    - [2.0, 0.0, 0.0]
+    - [2.0, 1.0, 0.0]
+  hold_per_waypoint_s: 8
+  stream_loss_window_s: 6
+  settle_s: 1.5
+  at_rest_window_s: 2.0
+  # How long to wait for the autopilot's own pre-arm checks to clear before asking it to
+  # arm: a simulated GPS needs a fix, the EKF needs a home, and the IMU consistency
+  # check needs a quiet window, all of which take simulated time.
+  pre_arm_wait_s: 60
+  estimator_fault:
+    kind: position_step
+    magnitude_m: 30.0
+    hold_s: 6
+  timebase_samples: 40
+  # How often the simulator's rate is recorded, in host seconds, and the envelope it has
+  #   to stay inside. Specification section 21.2 asks for a declared real-time-ratio
+  #   envelope recorded in windows rather than as a run average, and for a timing-invalid
+  # result when the host cannot sustain the load; it names no number. The declared
+  # envelope is 0.5-1.5 simulated seconds per wall second: the scene asks Webots for
+  # realtime mode, and a window outside that range means the recorded simulator times no
+  # longer describe the environment the scene declares. Measured windows live per run in
+  # the accept-* receipts, superseding any figure once quoted here; the envelope exists to
+  # catch a simulator that stalls or fast-forwards, not to describe normal operation.
+  realtime_window_s: 5.0
+  realtime_ratio_envelope: [0.5, 1.5]
+  # How often the timebase item reads the autopilot's clock. A message can only be
+  # stamped when it is read off the socket, so this is the resolution of that
+  # measurement: the joined relation's residual scatter cannot come out smaller than
+  # this, and a slower loop would report its own latency as scatter between two clocks.
+  timebase_poll_s: 0.005
+  step_timeout_s:
+    startup: 90
+    ready: 60
+    flight: 120
+  budget_wall_clock_s: 600
+
+output: work/runs/p00-compat
+
+# ---------------------------------------------------------------------------
+# P01-C offline stereo calibration (stage definition p01c-calibration). Additive
+# section: every P00 key above is untouched. The declared values name the same
+# pinned rig as sensors.calibration's compat-stereo-1 declaration, re-versioned
+# because a changed calibration is a new version, never an edit.
+#
+# The bounds below were written here BEFORE the validation run over the accept-5
+# evidence and are never adjusted after seeing results (plan section 6). Where a
+# bound is this stage's declared engineering parameter rather than a plan-fixed
+# number, the justification stands next to it. Justification recorded once: a
+# 1 px disparity-quantization envelope gives sigma_z = z^2*sigma_d/(f*B) ~= 1.8 cm
+# at 2 m and 7.3 % of z at 4 m, so sub-pixel geometry bounds and the >= 10 % depth
+# bound sit above quantization noise and can only be failed by real geometry error.
+
+calibration:
+  calibration_id: first-indoor-stereo-1
+  version: "2"
+  records_revision: p00-records-1
+
+  # Evidence reuse (plan section 2): the P00 accept-5 colour pairs and the pinned
+  # scene declaration. No new simulator capture is justified for this stage.
+  evidence:
+    pair_dirs:
+      - work/runs/p00-compat/accept-5/run-a/pairs
+      - work/runs/p00-compat/accept-5/run-b/pairs
+    accept5_receipt: work/runs/p00-compat/accept-5/receipt.json
+    accept5_manifest: work/runs/p00-compat/accept-5/manifest.json
+    timebase_run_a: work/runs/p00-compat/accept-5/run-a/frames-and-timebases.json
+    timebase_run_b: work/runs/p00-compat/accept-5/run-b/frames-and-timebases.json
+    declared_calibration: scenarios/compat/calibration.json
+    declared_calibration_sha256: 0230799daa822f815ef8d0336c958e1fa8cde12ccc635755f1ba5d470fdd4b46
+    world: scenarios/compat/worlds/compat_stereo.wbt
+    world_sha256: 02a68d9b2e337a5f439f2359f3354f2d94e45914284442f747ac2a1859783e4d
+    proto: scenarios/compat/protos/Iris.proto
+    proto_sha256: 1eab7722a7e3da6aa4b131a556de31e7c54af2bd80400ccbdbf37ba6549c7a3c
+
+  # Referee geometry for the depth check, transcribed from the pinned world and
+  # proto (sha256 above). Referee truth from the scene declaration; it never
+  # feeds the calibration values themselves.
+  referee:
+    # All 24 stored accept-5 pairs carry sim times <= 2.5 s, before takeoff, and
+    # the 12 pairs within each run are byte-identical: the vehicle is at the
+    # declared static start for every stored capture. The capture-time pose used
+    # for the depth check is therefore the scene declaration's start pose. That
+    # is simulator-scene truth: DIAGNOSTIC provenance, never a scored
+    # sensor-derived pose and never pooled with one.
+    pose_source: static_start_declared
+    body_position_world_m: [0.0, 0.0, 0.02]
+    body_quaternion_world_wxyz: [1.0, 0.0, 0.0, 0.0]
+    surfaces:
+      # WorldInfo floor: Plane size 14x14 at translation (0, 0, -0.02).
+      - name: floor
+        plane_point_world_m: [0.0, 0.0, -0.02]
+        plane_normal_world: [0.0, 0.0, 1.0]
+        axis_bounds_world_m:
+          x: [-7.0, 7.0]
+          y: [-7.0, 7.0]
+      # Colour witness: Box 1.2 x 0.08 x 1.5 at (3.0, 0.0, 0.75); its camera-facing
+      # face is the plane x = 2.4.
+      - name: witness_front
+        plane_point_world_m: [2.4, 0.0, 0.75]
+        plane_normal_world: [1.0, 0.0, 0.0]
+        axis_bounds_world_m:
+          y: [-0.6, 0.6]
+          z: [0.0, 1.5]
+      # Side walls: Box 3.5 x 0.1 x 1.8 at (+/-2.2, 0.9 in z); inner faces at
+      # y = +/-2.15.
+      - name: wall_north_inner
+        plane_point_world_m: [2.0, 2.15, 0.9]
+        plane_normal_world: [0.0, -1.0, 0.0]
+        axis_bounds_world_m:
+          x: [0.25, 3.75]
+          z: [0.0, 1.8]
+      - name: wall_south_inner
+        plane_point_world_m: [2.0, -2.15, 0.9]
+        plane_normal_world: [0.0, 1.0, 0.0]
+        axis_bounds_world_m:
+          x: [0.25, 3.75]
+          z: [0.0, 1.8]
+
+  # Pre-registered gate bounds. B1 and B3 tolerances are plan-fixed (plan
+  # section 6); the sample floors are this stage's declared parameters.
+  bounds:
+    rectification_row_residual_median_px: 1.0
+    rectification_row_residual_p95_px: 2.0
+    # A 95th percentile across retained matches is a distribution statistic;
+    # below 20 retained matches it is ordering noise, so 20 is the floor for
+    # evaluating B1's percentiles on one pair.
+    min_retained_matches: 20
+    # Per-sample B3 bound, plan-fixed: |z_meas - z_declared| <= max of these.
+    depth_abs_tol_m: 0.15
+    depth_rel_tol: 0.10
+    depth_range_m: [0.5, 4.0]
+    # A per-surface pass/fail on a handful of matches is not a distribution:
+    # a surface must contribute at least this many compared samples before its
+    # accuracy fraction gates, and at least this fraction of them must sit
+    # inside the per-sample bound. Spec 5.2 concedes wrong matches near
+    # discontinuities, so 100 % is not the requirement; 95 % of a large set is.
+    min_compared_samples_per_surface: 1000
+    min_within_fraction: 0.95
+    # A declared surface is gate-eligible only if its in-window, unoccluded
+    # projection holds at least this many pixels outside the declared border
+    # margin; ineligible surfaces are recorded, never claimed. A gate-eligible
+    # surface that is not compared, or not within the fraction, blocks the run.
+    min_eligible_pixels_per_surface: 1000
+    # Declared image-border rejection margin (pixels), spec 5.2.
+    border_px: 8
+
+  # Declared matching machinery, spec 5.2. These are documented mechanisms, not
+  # calibrated safety probabilities.
+  features:
+    detector: ORB
+    nfeatures: 2000
+    scale_factor: 1.2
+    nlevels: 8
+    descriptor_ratio_threshold: 0.8
+  matcher:
+    algorithm: StereoSGBM
+    # The declared 0.5 m operating bound implies f*B/z_min = 110.9 px of
+    # disparity; 128 is the next multiple of 16 above it. Chosen from the
+    # declared range, not from the images.
+    num_disparities: 128
+    block_size: 5
+    uniqueness_ratio: 10
+    speckle_window_size: 200
+    speckle_range: 2
+    texture_threshold: 10
+    lr_tolerance_px: 1.0
+    # Declared disparity-quantization sigma for the uncertainty envelope
+    # sigma_z = z^2 * sigma_d / (f * B); an envelope, not a probability.
+    disparity_quantization_sigma_px: 1.0
+
+  # Where the offline derivation writes its artifacts (plan section 10).
+  output: work/runs/p01-calibration
+
+# ---------------------------------------------------------------------------
+# P01-L sensor-derived localization (slice P01-L, plan sections 3-6). Additive
+# section: every P00/P01-C key above is untouched. The estimator pin names one
+# maintained fixed-lag stereo-inertial implementation (OpenVINS) with the
+# version evidence a pin requires: tag, commit, tarball sha256, the build log
+# of a successful build on this host, and the built library. The bounds below
+# are the plan's predeclared values, frozen BEFORE any measurement and never
+# adjusted after seeing a run (plan section 6); the smallest declared opening
+# each bound protects is in the plan's bound table.
+#
+#   state_lost_after_ms   300 ms of silence stops transmission: the adapter
+#                         never publishes a stale estimate, and the firmware's
+#                         own healthy() window (AP_VisualOdom_Backend.cpp:32-35)
+#                         trips 300 ms after the last message.
+#   published_state_age_max_ms  40 ms behind the newest consumed IMU sample.
+#                         DECLARED AT 20 ms AND RE-DECLARED HERE as a criterion
+#                         change, on the owner's ruling. The reason is
+#                         STRUCTURAL, not a run result, which is what keeps this
+#                         consistent with the rule three paragraphs above: the
+#                         seam publishes on a 10 ms tick (publish.period_ms), so
+#                         two ticks is the floor any implementation can reach,
+#                         and the bound as declared sat exactly ON that floor
+#                         with no margin for scheduling jitter. Measured in
+#                         flight afterwards: p50 1.0 ms, p95 11.4 ms, max 21 ms
+#                         — one row, 1 ms over the old bound. The 274 ms
+#                         shutdown tail that also failed it is not counted at
+#                         all any more: the freshness accounting is scoped to
+#                         the flight and ends at the LAND command (commit
+#                         90eb7ea), which is what reconciles this bound with
+#                         state_lost_after_ms's declared 300 ms silence
+#                         watchdog — two declarations that had never been
+#                         reconciled because neither had been exercised at these
+#                         rates. 40 ms is four ticks: above the structural floor,
+#                         above every value measured in flight, and still a real
+#                         constraint on the loop (F2).
+#   max_publish_gap_ms    100 ms: ten missed 10 ms slots (F3; four slots at the
+#                         25 ms period this was declared with — the period was
+#                         raised to 10 ms for F2's floor, FIXER5-REPORT.md, and
+#                         this 100 ms bound is untouched); beyond this the
+#                         firmware's 300 ms health window is one skipped beat
+#                         from tripping.
+#   visual_update_warn/fail_ms  300/500 ms: three camera periods at warn; IMU-
+#                         only propagation is a degraded estimate, not a
+#                         position solution (F4).
+#   valid_fraction_min    0.99 of the scored window, outages charged whole (H1).
+#   sigma_min/max_m       0.02-1.0 m per axis (H4): below it the filter is
+#                         claiming more than this rig knows; above it the
+#                         estimate is lost. Outside the envelope: stop
+#                         transmission, never publish garbage to EKF3.
+#   disagreement_p95/max_m  0.20/0.40 m (H3): p95 sits at VISO_POS_M_NSE, the
+#                         firmware's own declared fusion noise floor
+#                         (AP_VisualOdom.cpp:93-99); max 2x the floor catches
+#                         divergence without tripping on fusion transients.
+
+localization:
+  # The arm this configuration declares, and the one key the bridge reads to
+  # decide whether it republishes the simulator's own pose. sensor-derived means
+  # the bridge's truth feed stays off, so the autopilot's external-navigation
+  # source has exactly one publisher (the estimator adapter) and no truth enters
+  # the estimate. The check command refuses to start a claimed arm when the
+  # bridge's actual setting disagrees with the requested mode; an absent key
+  # reproduces the P00 gate's behaviour exactly (republish on, bit for bit).
+  mode: sensor-derived
+
+  # E1-DIAG's declared bounded excitation (E-EXC), DECLARED HERE AS A COMMENT on
+  # purpose: the operative carrier is the frozen module constants in
+  # src/embodied/platform/localization_check.py (EXCITATION_*), because this file
+  # is also loaded by the compatibility probe through the shared cli.py schema,
+  # which rejects localization keys it does not know -- a localization.excitation
+  # key here would break `python -m embodied compat`, the P00 gate's own command
+  # (work/runs/p01-localization/plan.md section 0.8 item 3, Correction C). The
+  # declaration, and the reason it should excite feature propagation:
+  #   distance:  one vertical takeoff command to 0.30 m, NO lateral setpoint --
+  #              a fifth of the declared 1.5 m hover altitude, well under the
+  #              2.0 m doorway lintel (re-declared from 0.60 m on 2026-09-29, see
+  #              the duration note below). A climb is deliberate estimator
+  #              excitation:
+  #              VioManager::initialized() needs timelastupdate (VioManager.cpp:651),
+  #              which needs >= 5 camera frames the zero-velocity updater DECLINED
+  #              (UpdaterZeroVelocity.cpp:246: disparity >= 1.0 px together with a
+  #              chi2/velocity violation); thrust makes the accelerometer read
+  #              other than gravity (the chi2 term) and at this rig's 554 px focal
+  #              length ~2.7 mm of translation is ~1 px of disparity, so >= 0.5 s
+  #              of climb at the declared 10 Hz stereo rate is >= 5 declining
+  #              frames (plan section 0.6 item 5).
+  #   duration:  <= 6.0 s from the arm readback to the LAND command (more than a
+  #              factor of ten over that criterion), termination LAND always,
+  #              plus a bounded post-LAND drain so the descent's frames are fed
+  #              too. 6.0 s and the bring-up's 5.0 s climb window are the OWNER's
+  #              re-declaration of 2026-09-28 ("just run the sim longer"); the
+  #              chain they contain was completed by the 2026-09-29 release-energy
+  #              re-declaration (EXCITATION_TAKEOFF_ALTITUDE_M 0.60 -> 0.30, per
+  #              the ground-hold verdict's ranked lever 1): the window has to
+  #              contain the airframe's own pre-thrust time (2.0 s motor-interlock
+  #              delay, measured), the ~0.2 s slew to the spool's first nonzero
+  #              command, the MEASURED ~2.0 s ground-contact hold that follows it
+  #              (the floor-to-body pair releases ~2.0 s after the first nonzero
+  #              command at any thrust in 1.045x-1.369x weight --
+  #              ground-hold-20260929T150956Z verdict.json), and the declared
+  #              0.30 m climb at the declared 0.3 m/s = 1.0 s (the second
+  #              repair's declared rate; 5.2 s of chain, inside the declared
+  #              5.5 s climb window).
+  #   carrier:   the pose-assisted diagnostic arm (GUIDED, truth republish ON for
+  #              that run only, via the bridge's per-run arm= override): it is a
+  #              DIAGNOSTIC, never a sensor-derived result, never pooled with one,
+  #              and no predeclared E/F/H bound is judged by it.
+  # -------------------------------------------------------------------------
+  # The DECLARED ORDERED BRING-UP (plan sections 0.6 item 6 and 0.8 item 7,
+  # "Deliverable B"), carried here as a comment for the same schema reason the
+  # excitation above is: the shared cli.py schema rejects localization keys it
+  # does not know, and this file is also loaded by the P00 compatibility probe
+  # through that loader. The operative constants are the frozen module
+  # constants in src/embodied/platform/localization_check.py
+  # (BRING_UP_*, ARMING_CHECK_BIT_*, EXCITATION_*); this is the declaration a
+  # reader of the configuration is owed.
+  #
+  # WHY IT EXISTS. E1-DIAG (work/runs/p01-localization/E1-DIAG-report.md,
+  # run pose-assisted-diagnostic-20260926T152643Z) measured the pinned
+  # estimator latching the moment the vehicle moves: 188 STATE frames with
+  # initialized true, 30 completed visual updates, the estimate tracking a
+  # 0.6 m climb. VioManager::initialized() is
+  # `is_initialized_vio && timelastupdate != -1` (VioManager.h:99),
+  # timelastupdate is written only at the tail of do_feature_propagate_update
+  # (VioManager.cpp:651), and that needs motion. The sensor-derived arm could
+  # therefore not move: the arm gate demanded a healthy vision source
+  # (Check::VISION, AP_Arming.cpp:2090) and a home (Check::GPS,
+  # AP_Arming.cpp:748), the vision source is the estimator's own adapter, and
+  # the adapter publishes only an initialized state. The bring-up is the
+  # ordering that breaks exactly that circle, and nothing else.
+  #
+  # THE WINDOW -- bounded, declared, restored.
+  #   duration:  <= 6.0 s (EXCITATION_MAX_AIRTIME_S) from the arm readback to
+  #              the LAND command, containing the 5.0 s climb window
+  #              (EXCITATION_CLIMB_DRAIN_S) and the 0.3 s override settle both
+  #              re-declared by the owner on 2026-09-28 (the derivation, and the
+  #              airframe's own measurements behind it, are beside the constants
+  #              in src/embodied/platform/localization_check.py); termination
+  #              LAND, always; then a bounded
+  #              post-LAND drain (EXCITATION_POST_LAND_DRAIN_S = 10 s) so the
+  #              descent's frames are fed too. What ENDS it is not only the
+  #              clock: every parameter it writes is restored and read back
+  #              from the vehicle itself, and the scored window refuses to
+  #              open while any window value is still in force
+  #              (`_bring_up_closure_blockers`).
+  #
+  #              THE UNIT OF EVERY ONE OF THESE WINDOWS IS THE SIMULATOR'S
+  #              SECOND, NOT THE HOST'S (corrected 2026-09-28; the code spent
+  #              them on the wall clock until then). The airtime bound is a
+  #              quantity of the aircraft's own time -- "from the arm readback
+  #              to the LAND command", weighed below against the firmware's own
+  #              MOT_IDLE_SEC -- and a climb rate times a window is a distance
+  #              the aircraft has to fly, so the same declaration must cost the
+  #              same amount of the aircraft's time whatever the host is doing.
+  #              Measured on this host while loaded
+  #              (run-2026-09-28T02-43-27-442Z): the simulator ran at 0.40-0.92
+  #              simulated seconds per wall second, the then-declared 3.5 s climb
+  #              window bought 2.20 simulated seconds, and the airtime was 2.34
+  #              simulated seconds against the then-declared 5.0 s bound -- the
+  #              excitation
+  #              was cut off 0.80 simulated seconds before the thrust path's
+  #              first motor output. The clock is the simulator's own (the
+  #              controller's robot.getTime(), carried on every sensor frame);
+  #              the wall clock keeps only a ceiling derived from the declared
+  #              realtime envelope, so a stalled simulator ends the wait instead
+  #              of hanging the run. The same unit applies to the declared probe
+  #              windows above, and to hold_per_waypoint_s for the scored route.
+  #   excitation: ALT_HOLD, one takeoff command to 0.30 m (re-declared from
+  #              0.60 m on 2026-09-29, the ground-hold verdict's loop-side
+  #              lever), NO lateral setpoint, LAND always --
+  #              the same E-EXC envelope the diagnostic flew, in the mode that
+  #              requires no position estimate (requires_position() is false,
+  #              ArduCopter/mode.h:506). The takeoff carries the documented
+  #              flag MAV_CMD_NAV_TAKEOFF param3 =
+  #              NAV_TAKEOFF_FLAGS_HORIZONTAL_POSITION_NOT_REQUIRED
+  #              (common.xml:1005): without it `must_navigate` is true
+  #              (GCS_Mavlink_Copter.cpp:594) and ALT_HOLD's own user takeoff
+  #              is refused (mode.h:512-514).
+  #   excepted checks, each by its pinned bit (a SET bit SKIPS a check:
+  #              AP_Arming::check_enabled = (checks_to_skip & check) == 0,
+  #              AP_Arming.cpp:329-332):
+  #                * Check::VISION = 1<<18 (AP_Arming.h:46): visodom_checks
+  #                  (AP_Arming.cpp:2087-2100) fails while the last
+  #                  external-navigation message is older than
+  #                  AP_VISUALODOM_TIMEOUT_MS = 300 ms
+  #                  (AP_VisualOdom_Backend.cpp:32-37; the failure is
+  #                  AP_VisualOdom.cpp:277,292). The source is the estimator's
+  #                  adapter, which publishes only once initialized() is true.
+  #                * Check::GPS = 1<<3 (AP_Arming.h:31): its home requirement
+  #                  (AP_Arming.cpp:747-750, "AHRS: waiting for home") is met
+  #                  by the origin datum below rather than by GPS, and the
+  #                  exception covers the seconds before that derivation. The
+  #                  GPS-fix half of the same check is vacuous with GPS off: no
+  #                  receiver driver exists, so num_instances is 0.
+  #              ARMING_SKIPCHK during the window = 8 | 262144 = 262152 (the
+  #              GPS-lock bit and the VisualOdometry bit), restored to 0 --
+  #              "skip nothing", every check enabled, which is that parameter's
+  #              own recommended default -- and read back before the claimed arm.
+  #              The NAME IS THE PINNED ONE and that is a measured correction to
+  #              the plan's "ARMING_CHECK mask": the firmware renamed the
+  #              parameter (AP_Arming.cpp:199-205 AP_GROUPINFO("SKIPCHK", 13,
+  #              ...); migration comment at :233 "ARMING_CHECK -> ARMING_SKIPCHK",
+  #              conversion at :235-260), and there is no name alias -- the first
+  #              invocation of this run wrote and then read "ARMING_CHECK", the
+  #              write took nothing and the readback answered nothing
+  #              (work/runs/p01-localization/p01l-bringup-20260926T161038Z,
+  #              run-a/bring-up.json: readbacks.window.ARMING_CHECK = null).
+  #              No default changes: the applied parameter files above are
+  #              untouched, and the write is a runtime parameter on this
+  #              invocation's own vehicle.
+  #   the height reference the window needs, and why it is not an exception:
+  #              alt_checks is MANDATORY -- "Need Alt Estimate"
+  #              (AP_Arming_Copter.cpp:551-557) is reached from
+  #              run_pre_arm_checks (:82) and from mandatory_checks (:654-665)
+  #              when the mask skips everything (:72-73), so no mask can except
+  #              it -- and it requires copter.ekf_alt_ok() = VERT_POS && VERT_VEL
+  #              (ArduCopter/system.cpp:294-308), which exist only once a
+  #              height measurement of the SELECTED source is fused
+  #              (AP_NavEKF3_Control.cpp:795; hgtTimeout clears only on such a
+  #              fusion, AP_NavEKF3_PosVelFusion.cpp:1363-1379). With
+  #              EK3_SRC1_POSZ = 6 (ExternalNav) and no external-nav data yet
+  #              there is no height at all -- the very state the window exists
+  #              to end. The window therefore sets EK3_SRC1_POSZ = 1 (Baro), the
+  #              airframe's OWN height sensor and not simulator truth, for its
+  #              duration only, and restores it to 6 with a readback. It is a
+  #              height reference only: no horizontal position, no attitude, no
+  #              velocity, and nothing about it supplies the scored pose.
+  #              ALT_HOLD is used and not STABILIZE/ACRO because only the
+  #              position-holding modes have a user takeoff (mode.h:132), and
+  #              they need the height estimate their mode check also wants.
+  #              (Recorded correction to plan section 0.6 item 6 phase 1's
+  #              "VISO_TYPE 0 for this phase only": it is not restorable at this
+  #              pin. AP_VisualOdom::init() allocates the backend once, from the
+  #              value the parameter holds at boot (AP_VisualOdom.cpp:132-152;
+  #              called at AP_Vehicle.cpp:479), and every later message path
+  #              forwards only when the driver exists (:227-229). A runtime
+  #              0 -> 1 would leave the seam permanently dead, so the window
+  #              leaves VISO_TYPE alone and the Check::VISION exception covers
+  #              the interval before the adapter's first publication.)
+  #
+  #   the window's THROTTLE PATH, and why it is the window's: the baro element
+  #              above answers the ALTITUDE check, and it does not make the
+  #              aircraft move. With GPS off and the estimator unlatched the only
+  #              modes that can arm are the position-free ones, and every one of
+  #              them lifts on the PILOT throttle: a mode that needs a position
+  #              (GUIDED, AUTO, LOITER) cannot arm at all
+  #              (mandatory_position_checks demands position_ok(),
+  #              AP_Arming_Copter.cpp:444-470) and position arrives only from the
+  #              estimator's own publication, which does not exist before the
+  #              estimator latches. MEASURED on the SITL's own dataflash log
+  #              (work/ardupilot/logs/00000070.BIN, the previous session's third
+  #              invocation): RCIN C3 = 1000 (the pilot throttle at its minimum),
+  #              CTUN ThI ramping 0 -> 0.891 (the takeoff routine's own ramp
+  #              running to full), MOTB ThrOut 0.0 and RCOU 1000 (the motors
+  #              never leaving idle), SPOL SplDes 2 only at 15.904 s with Spl 1
+  #              from 15.908 s, LAND at 17.148 s. Two things stood between the
+  #              accepted takeoff and thrust:
+  #                * the pilot climb rate was negative
+  #                  (get_pilot_desired_climb_rate_ms with the RC throttle at
+  #                  minimum, Attitude.cpp:103-105), so the mode's own spool-state
+  #                  branch never asked for THROTTLE_UNLIMITED before the takeoff
+  #                  command arrived (mode.cpp:1047-1055) and the takeoff state
+  #                  itself sets no spool state -- the desired state stayed
+  #                  SHUT_DOWN for the window's first 2.6 s;
+  #                * MOT_IDLE_SEC 4.0 (compat_arming.parm) then held the spool in
+  #                  GROUND_IDLE for four seconds after it WAS asked for
+  #                  (_idle_time_delay_s, AP_MotorsMulticopter.cpp:684,716-719),
+  #                  which is longer than this window's whole declared airtime.
+  #              So the window declares ONE bounded local action and one more
+  #              parameter:
+  #                * the throttle: an RC_CHANNELS_OVERRIDE on RC channel 3
+  #                  (throttle) and on no other channel -- every other field left
+  #                  at MAVLink's own "ignore this field", UINT16_MAX
+  #                  (GCS_Common.cpp:4244-4249) -- for the window's duration only,
+  #                  refreshed every 0.5 s inside the firmware's own 3.0 s
+  #                  override timeout (RC_OVERRIDE_TIME), and RELEASED with a zero
+  #                  on the same channel (zero clears the override outright,
+  #                  RC_Channel.cpp:557-566) with the vehicle's own RC report as
+  #                  the evidence that it took and that it was lifted. What is
+  #                  declared is the pilot CLIMB RATE it must produce, 0.5 m/s
+  #                  (inside the frozen E-EXC envelope: a climb to 0.30 m, no
+  #                  lateral setpoint); the channel value that produces it is
+  #                  DERIVED from the vehicle's own answers for RC3_MIN, RC3_MAX,
+  #                  RC3_DZ, THR_DZ and PILOT_SPD_UP through the firmware's own
+  #                  arithmetic, and the value actually sent is recorded. It is
+  #                  sent AFTER the arm, because arm_checks refuses to arm with a
+  #                  positive pilot climb rate ("Throttle too high",
+  #                  AP_Arming_Copter.cpp:621-635), and BEFORE the takeoff command,
+  #                  because the desired spool state has to be set while the mode
+  #                  is still in its landed branch.
+  #                * MOT_IDLE_SEC: the window value 0 (the firmware's own default)
+  #                  in force for the window only, restored to the airframe's
+  #                  declared 4.0 and read back from the vehicle before the scored
+  #                  window opens. The scored run's guided takeoff depends on that
+  #                  delay (compat_arming.parm, iteration 11), so it is restored
+  #                  exactly like the mask and the height source.
+  #                * TKOFF_THR_MAX: the takeoff's own OPEN-LOOP RAMP, bounded at
+  #                  the airframe's own hover. OWNER-RATIFIED CRITERION CHANGE of
+  #                  2026-09-28 (the climb-fix brief), recorded the way the window
+  #                  re-declaration above was. `do_pilot_takeoff_ms` ramps the
+  #                  throttle with no altitude feedback while `land_complete`
+  #                  holds (ArduCopter/takeoff.cpp:76-118), and its only exit
+  #                  that needs no motion is the cap `throttle >=
+  #                  MIN(TKOFF_THR_MAX, 0.9)` -- so the cap is where the
+  #                  open-loop ramp ends on this airframe. The firmware default
+  #                  0.9 is ~2.2x the hover the airframe itself holds (the P00
+  #                  accept runs measured the hover hold at 1419 us,
+  #                  compat_arming.parm iteration 11; through the motors' own
+  #                  MOT_SPIN_MIN 0.15 mapping that is a throttle of ~0.316, and
+  #                  the ramp's own accel exit at 0.5 * PILOT_ACC_Z 2.5 = 1.25
+  #                  m/s^2 needs ~1.13x that). The measured consequence
+  #                  (00000143.BIN): the ramp ran 1.7 s to RCOU 1867 us (~2x
+  #                  weight) before the vehicle left the ground, the aircraft
+  #                  climbed through 3.7 m/s, and its centre of gravity reached
+  #                  2.39 m -- the room's own 2.5 m ceiling -- before LAND could
+  #                  arrest it: roll +-180 deg, Crash: Disarming at arm+10.19 s.
+  #                  The window value 0.55 clears the hover and the accel exit
+  #                  with headroom, bounds the thrust at unstick to ~1.5x hover,
+  #                  and reaches its cap EARLIER (1.1 s against 1.8 s at 0.5/s),
+  #                  so the same declared 5.0 s window and 6.0 s airtime contain
+  #                  it with more room than they contained the default. Restored
+  #                  to the firmware's own default 0.9 (parameters.cpp:1057; no
+  #                  parm file this project applies sets it) and read back before
+  #                  the scored window opens -- the scored run's guided takeoff
+  #                  keeps the ramp the P00 gate was accepted with.
+  #                * PILOT_SPD_UP: the climb rate the MODE may command, bounded
+  #                  at the rate the window itself declares -- the second
+  #                  owner-ratified criterion change of the climb-fix brief
+  #                  (2026-09-28). The position loop shapes its desired
+  #                  trajectory inside PILOT_SPEED_UP (`_vel_max_up_ms`,
+  #                  AC_PosControl.cpp:1002-1033, set from it every ALT_HOLD
+  #                  iteration), and the throttle's collapse after the unstick
+  #                  burn begins only when the velocity estimate crosses that
+  #                  target. Both climb-fix logs (00000143/00000144) measure
+  #                  this airframe leaving the ground only at commanded throttle
+  #                  ~0.87-0.93, releasing ~2x hover thrust for the ~0.4 s the
+  #                  estimate needs to catch up; at the firmware default 2.5 m/s
+  #                  (config.h:531-532, unset by any parm file here) the shaped
+  #                  target ran to 2.2-2.4 m/s while the aircraft was already
+  #                  ballistic, and both flights coasted to the room's 2.5 m
+  #                  ceiling. The window value is the declared pilot climb rate
+  #                  itself (0.3 m/s since the release-energy fix's second
+  #                  repair, 2026-09-29; 0.5 before it,
+  #                  BRING_UP_THROTTLE_CLIMB_RATE_M_S): the declaration bounds
+  #                  the feed-forward, the Flying state's rising target, and the
+  #                  takeoff ramp's own velocity exit (0.15 m/s,
+  #                  takeoff.cpp:96-98) -- closing the defect the thrust-order
+  #                  report named: "the declared +0.494 m/s pilot climb rate is
+  #                  unbounded in ALT_HOLD". The override's PWM is derived from
+  #                  the vehicle's own answers with this value in force, so full
+  #                  stick expresses the declared 0.3 m/s. Restored to the
+  #                  firmware's own default 2.5 before the scored window opens.
+  #                * TKOFF_SLEW_TIME: the open-loop ramp's own PACING -- the
+  #                  release-energy fix's second repair (2026-09-29). The
+  #                  ground-hold bench measured the floor-to-body contact pair
+  #                  holding the vehicle ~2.0 s past the spool's first nonzero
+  #                  command at any thrust in 1.045x-1.369x weight
+  #                  (ground-hold-20260929T150956Z verdict.json), and the first
+  #                  repair's flight (00000146.BIN) measured the closed loop
+  #                  riding the shaped 0.5 m/s target to ~0.78 actuator (~2.5x
+  #                  the physics hover) at that release -- the halved 0.30 m
+  #                  target had not moved it. At the window value 6.0 s the ramp
+  #                  (`G_Dt / takeoff_throttle_slew_time`, takeoff.cpp:83, the
+  #                  parameter at Parameters.cpp:978) crosses ~1.4x the PHYSICS
+  #                  hover at the hold's own expiry and reaches the 0.55 cap
+  #                  only at 3.3 s, so NOT_LANDED fires on real motion at the
+  #                  unstick itself and the closed-loop wind-up never runs while
+  #                  the vehicle is held. Restored to the firmware's own default
+  #                  2.0 before the scored window opens.
+  #              THIS IS A BOUNDED LOCAL BRING-UP ACTION. It is not a cloud
+  #              command: the cloud still sends intent and the planner still owns
+  #              setpoints, and this message is neither. It is local to the
+  #              bring-up, it lives only while a declared window is in force, it
+  #              cannot outlive the window (the closure gate refuses the scored
+  #              window while it is still in force), the CLAIMED arm sends no RC,
+  #              throttle or pulse command at all, and the connection that owns the
+  #              claimed arm's wire is not the object that can send one.
+  #
+  # THE EKF ORIGIN DATUM -- set_ekf_origin, a frame definition, NOT a pose feed.
+  #              The window sends SET_GPS_GLOBAL_ORIGIN (msgid 48,
+  #              common.xml:5487) with platform.sitl_home, the coordinate this
+  #              autopilot is launched with. It is a DATUM: the local frame's
+  #              geographic anchor, set once, carrying no vehicle position,
+  #              attitude or velocity. It must be declared because at this pin
+  #              EKF3 sets its origin only from GPS, from a beacon, or from a
+  #              GCS declaration -- never from ExternalNav data
+  #              (AP_NavEKF3_Measurements.cpp:680-715; GCS_MAVLINK::set_ekf_origin,
+  #              GCS_Common.cpp:3961, reached by handle_set_gps_global_origin
+  #              :3982-4014). The diagnostic sharpened this: its truth-driven
+  #              carrier got an origin from the synthesized GPS, and this
+  #              GPS-off arm has none. Home is then derived from the origin
+  #              (Copter::update_home_from_EKF, commands.cpp:4-20), which is
+  #              what lets the claimed arm's own Check::GPS pass with the full
+  #              check set restored.
+  #
+  # WHAT THE EXCEPTION DOES NOT CHANGE: the estimator pin, its input (the
+  # declared stereo pairs and inertial samples, nothing else), every predeclared
+  # bound, the seam (VISO_TYPE 1, EK3_SRC1_* = 6 at the claimed arm, restored and
+  # read back), and the truth republish (off by construction for this arm). The
+  # exception changes only WHEN the aircraft may move. The claimed arm is GUIDED
+  # with every arming check enabled, and H5 applies to it as written.
+  # The sensor-derived development route's world. Separate from scenario.world
+  # on purpose: the compatibility gate's 16/16 was measured on scenario.world
+  # (compat_stereo.wbt), and repointing that key would silently change the
+  # vehicle the gate measures. The localize-check command runs in this world
+  # when the key is present and falls back to scenario.world otherwise. Why
+  # this world: the compat scene measured ZERO FAST keypoints across 12
+  # recorded frames (run-2026-09-26T08-30-18-273Z), so no visual odometry can
+  # initialize there; dev-a-single is the dev group's simplest textured layout
+  # (Plaster walls, Parquetry floor; one room, one centred 1.0 m doorway), the
+  # vehicle spawns at rest yaw 0 in its vestibule, and the frozen two-waypoint
+  # route fits its geometry unchanged (work/runs/p01-localization/plan.md
+  # section 0.3 item 1; headless device validation in
+  # work/runs/scenarios/validation/dev-a-single.json).
+  world: scenarios/missions/dev/dev-a-single/world.wbt
+  estimator:
+    name: openvins
+    tag: v2.7
+    commit: 93adc241390d13e99232652cf05cbe18a93c7bea
+    tarball_path: work/runs/p01-localization/pin-evidence/open_vins-2.7.tar.gz
+    tarball_sha256: 0135af4acd8dc099c8b50fc51c9faf53fe69462d0e6bad9e986ad4090af02df8
+    build_log: work/runs/p01-localization/pin-evidence/build-openvins.log
+    # The build script writes this line only after the whole pinned tree
+    # (ov_core + ov_msckf) has built and installed; the pin's evidence is the
+    # line, the library below, and the unmodified tarball's sha256 above.
+    build_success_marker: OV_MSCKF BUILD OK
+    library: work/runs/p01-localization/pin-evidence/open_vins-2.7/ov_msckf/build/install/lib/libov_msckf_lib.dylib
+    executable: estimator/ov_stream
+    socket_port: 9021
+  publish:
+    # Declared publish period of the estimator seam (ov_stream's STATE tick and
+    # the adapter's VISION_POSITION_ESTIMATE tick share it). 25 ms until
+    # FIXER5: F2's published_state_age_max_ms 20 is smaller than one 25 ms slot
+    # on either side, so the bound was unreachable at the declared period — an
+    # engineering change to the period, NOT a change to any bound; every bound
+    # below is untouched. This is the retry after db3153f, made after the EKF's
+    # ext-nav fusion delay was measured and corrected (FIXER5-REPORT.md).
+    period_ms: 10
+  declared:
+    # The EKF's fusion delay for external navigation (AP_VisualOdom::_delay_ms,
+    # AP_VisualOdom.cpp:83). 50 ms until FIXER5, tuned when the pose was stale
+    # (F2 0.292 s in that era); 10 ms after FIXER5 measured the pose arriving at
+    # SITL p50 2.5-5.7 ms (sim) after its own validity stamp. Re-measured for the
+    # 2026-09-30 F2 fix (run p01l-f2fix-1-20260930T051723Z): now that the
+    # published stamp no longer falls back to the last camera update, the pose
+    # the FC receives is p50 20 ms / p95 208 ms behind its own stamp, because the
+    # pinned estimator's consumption of the ordered stream lags the host's send
+    # head while it tracks each stereo pair. The declared value is the measured
+    # median. The tail is the estimator's own processing latency: no single
+    # declared delay removes it, and F2 reports it honestly. Not a bound: no
+    # bound value below changes.
+    viso_delay_ms: 20
+  params_file: scenarios/compat/params/p01l_sensor.parm
+  bounds:
+    state_lost_after_ms: 300
+    published_state_age_max_ms: 40
+    max_publish_gap_ms: 100
+    visual_update_warn_ms: 300
+    visual_update_fail_ms: 500
+    valid_fraction_min: 0.99
+    sigma_min_m: 0.02
+    sigma_max_m: 1.0
+    disagreement_p95_m: 0.20
+    disagreement_max_m: 0.40
+    # E1, against evaluator truth in the odom-aligned frame (plan section 6,
+    # plan-fixed): p95 0.10 m horizontal is the upper edge of the advisory band
+    # and consistent with ~1.5% of the ~6 m route; p95 0.15 m vertical is the
+    # same band's upper edge on the gravity-constrained axis. Max 0.15 m
+    # horizontal is the smallest declared opening: the witness face at x = 2.4 m
+    # stands 0.4 m beyond waypoint-1's x = 2.0 and the rotor-hub diagonal reach is
+    # ~0.256 m; max 0.30 m vertical is that geometry in z. Truth measures error
+    # and never enters the estimator.
+    error_p95_horizontal_m: 0.10
+    error_p95_vertical_m: 0.15
+    error_max_horizontal_m: 0.15
+    error_max_vertical_m: 0.30
