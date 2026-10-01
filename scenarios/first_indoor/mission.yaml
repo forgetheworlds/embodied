@@ -1,0 +1,54 @@
+# Mission for the first-indoor scene (P05).
+#
+# This file is the whole public task surface. By fence it names no route, no
+# doorway order and no target placement: the instruction below is everything
+# the pilot is told. The scene's geometry lives only in world.wbt, and the
+# hidden task facts live only in truth.yaml (bench-side, evaluator-only).
+layout: first-indoor
+mission_type: search_inspect_return
+instruction_family: first_indoor_single_clause
+instructions:
+- Find the red block, inspect it, and return to the start.
+search_region: room_pair
+spawn_pose:
+  x: -1.0
+  y: 0.0
+  z: 0.09
+  yaw_rad: 0.0
+  note: identical to the Iris translation in world.wbt (plan section 6 pin 8)
+expected_devices:
+- camera left
+- camera right
+- accelerometer
+- gyro
+- inertial unit
+- gps
+- m1_motor
+- m2_motor
+- m3_motor
+- m4_motor
+budgets:
+  hover_altitude_m: 1.5
+  hold_per_waypoint_s: 8
+  settle_s: 1.5
+  at_rest_window_s: 2.0
+  pre_arm_wait_s: 60
+  step_timeout_s:
+    startup: 90
+    ready: 60
+    flight: 120
+  budget_wall_clock_s: 600
+budgets_source: configs/first_indoor.yaml probe (no new values)
+variants:
+- name: mid_mission_change
+  trigger: bench_supplied_instruction_revision
+  world_contains: true
+  note: the goal text is revised mid-mission; the world file is unchanged
+vehicle:
+  base:
+  - scenarios/compat/params/compat_base.parm
+  - scenarios/compat/params/compat_arming.parm
+  estimator:
+  - scenarios/compat/params/compat_ekf.parm
+  calibration: scenarios/compat/calibration.json
+  controller: scenarios/compat/controllers/compat_vehicle_controller

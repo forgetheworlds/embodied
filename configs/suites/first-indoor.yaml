@@ -1,0 +1,30 @@
+# Suite registration data for `first-indoor` (P05).
+#
+# This file is the declared registration artifact: the stage that owns live
+# recording reads it and constructs `embodied.bench.recorder.SuiteSpec` from
+# it, so `bench record --suite first-indoor` resolves instead of being
+# refused. The keys below map one-to-one onto SuiteSpec's required fields,
+# plus pointers the transport needs. Nothing here is read by the runtime
+# side of an episode: the agent surface is the episode directory projection
+# only (embodied.bench.recorder.PROJECTION).
+#
+# Hidden task truth is NOT here. The suite carries only the PATH of the
+# bench-side truth seed (truth_seed); the facts live in that file, and the
+# per-episode store the grader reads is written by the referee beside the
+# episode (embodied.bench.referee.truth_store_path).
+
+name: first-indoor
+registered_by: P05
+localization_mode: sensor-derived
+
+# Positive numbers only (SuiteSpec refuses zero and negatives, so a budget
+# key cannot silently mean "absent"). spend_ceiling_usd is the one recorded
+# ceiling in the project (configs/runtime-model.yaml probe section, Entry-2
+# context); max_calls is deliberately not declared — B0 makes no model call.
+provider_budget:
+  spend_ceiling_usd: 5.0
+
+scene_root: scenarios/first_indoor
+world: scenarios/first_indoor/world.wbt
+mission_instruction: "Find the red block, inspect it, and return to the start."
+truth_seed: scenarios/first_indoor/truth.yaml
