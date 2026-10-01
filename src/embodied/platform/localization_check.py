@@ -2958,8 +2958,23 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 + "\n"
             )
 
+    # The single clock-maker on the scored path (2026-10-01): the publisher's
+    # PACING clock is the sensor stream's simulator time, the same
+    # ``stats.sim_clock`` the declared windows below already spend their budgets
+    # against. It is observed per record at the feed seam (``feed_record``), so
+    # it advances with the simulation even while the estimator itself is silent
+    # -- which is what keeps the 300 ms silence and freeze bounds sound on this
+    # clock: a dead feed still accrues simulated staleness against its last
+    # offer. The machine's F1/F3/H1 accounting stays on the wall clock (the
+    # accounting_clock default): a wall-measured gap also fails when the HOST
+    # stalls, and in a scored run (realtime, clamped to <= 1x sim/wall) the two
+    # clocks coincide in value anyway.
     publisher = loc.ExternalNavPublisher(
-        settings.mavlink_endpoint, alignment, machine, on_publish=on_publish
+        settings.mavlink_endpoint,
+        alignment,
+        machine,
+        clock=lambda: stats.sim_clock.newest_s or 0.0,
+        on_publish=on_publish,
     )
     session = PymavlinkSession()
     platform = WebotsArduPilot(
