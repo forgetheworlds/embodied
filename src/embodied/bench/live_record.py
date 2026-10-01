@@ -82,6 +82,12 @@ RETURN_RADIUS_M = 1.0
 # evidence, so a loaded host blocks the run before the simulator is started.
 HOST_LOAD_1M_MAX = 10.0
 HOST_SWAP_FREE_MIN_MB = 500.0
+# Every port a live run needs. The platform's own prerequisite check covers the
+# configured endpoints; these are checked here too because a port already held
+# by another process fails the SITL's own bind with a message that arrives as a
+# crash rather than as the prerequisite it is (measured on this transport's
+# first attempt: 5760 was held and SITL exited 1 before any flight).
+LIVE_PORTS = (9002, 9003, 5760, 9010, 9021)
 
 
 class SuiteConfigError(Exception):
@@ -172,6 +178,24 @@ def host_state() -> dict[str, Any]:
     except (OSError, subprocess.CalledProcessError):
         pass
     return state
+
+
+def port_blockers(ports: tuple[int, ...] = LIVE_PORTS) -> list[str]:
+    """Every declared port that is already held, named with the check that failed."""
+    import socket
+
+    blockers: list[str] = []
+    for port in ports:
+        for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+            probe = socket.socket(socket.AF_INET, kind)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                blockers.append(f"port {port} is already in use")
+                break
+            finally:
+                probe.close()
+    return blockers
 
 
 def host_blockers(state: dict[str, Any]) -> list[str]:
@@ -456,7 +480,10 @@ def record(
             manifest=manifest_common,
             sensor_mode=sensor_mode,
         )
-    blockers = host_blockers(manifest_common["host_state"])
+    blockers = host_blockers(manifest_common["host_state"]) + port_blockers()
+    manifest_common["ports_blocked"] = [
+        reason for reason in blockers if reason.startswith("port ")
+    ]
     if blockers:
         return CommandOutcome(
             status=CommandStatus.BLOCKED,
@@ -636,6 +663,7 @@ def record(
         "publications": result.publications,
         "publish_refusals": result.publish_refusals,
         "truth_samples": len(collector.samples),
+        "stream": getattr(result, "stream", {}),
         "end_state": result.end_state,
         "log": result.log,
     }

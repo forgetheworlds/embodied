@@ -220,6 +220,7 @@ class MissionResult:
     crash_statustexts: list[str] = field(default_factory=list)
     publications: int = 0
     publish_refusals: int = 0
+    stream: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -340,6 +341,7 @@ class MissionRuntime:
         self._return_evidence: list[str] = []
         self._inspect_evidence: list[str] = []
         self._stats = _FeedStats()
+        self._first_record_kind: str | None = None
         self._platform: WebotsArduPilot | None = None
         self._session: PymavlinkSession | None = None
         self._publisher: loc.ExternalNavPublisher | None = None
@@ -477,6 +479,12 @@ class MissionRuntime:
         def feed_record(record: Any) -> None:
             # The simulator's clock is read on the one path that consumes the
             # whole stream, exactly as the worked example does.
+            if self._first_record_kind is None:
+                self._first_record_kind = record.kind.name
+                log.append(
+                    f"first sensor record: {record.kind.name} at sim "
+                    f"{record.sim_time_s:.3f} s"
+                )
             self._stats.sim_clock.observe(record.sim_time_s)
             if self._sensor_tap is not None:
                 # Bench-side observation only: this module never reads a POSE
@@ -558,6 +566,11 @@ class MissionRuntime:
             platform.start()
             readiness = platform.wait_ready(self.settings.step_timeout_s.startup)
             self._controller_status = readiness.controller_status
+            log.append(
+                f"platform ready after {readiness.waited_s:.1f} s: pair_seen="
+                f"{readiness.pair_seen}, imu_seen={readiness.imu_seen}, "
+                f"status={readiness.telemetry.system_status}"
+            )
             feed_thread = threading.Thread(target=feed_loop, name="estimator-feed", daemon=True)
             feed_thread.start()
             feed_endpoint = _autopilot_feed_endpoint(
@@ -676,6 +689,18 @@ class MissionRuntime:
             )
             self.result.publications = self._publication_count
             self.result.publish_refusals = self._publish_refusal_count
+            self.result.stream = {
+                "pairs": self._stats.pairs,
+                "pair_records_filed": self._stats.pair_records_filed,
+                "imu_samples": self._stats.imu_samples,
+                "truth_samples": len(self._stats.truth_samples),
+                "sim_clock_frames": self._stats.sim_clock.frames,
+                "sim_clock_newest_s": self._stats.sim_clock.newest_s,
+                "first_record_kind": self._first_record_kind,
+                "feed_failures": list(feed_failures),
+                "publisher_published": getattr(publisher, "published", None),
+                "publisher_failures": list(getattr(publisher, "publish_failures", [])),
+            }
         return self.result
 
     # -- the mission phases -------------------------------------------------

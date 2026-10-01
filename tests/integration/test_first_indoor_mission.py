@@ -482,10 +482,13 @@ def test_the_runtime_never_reads_a_truth_pose():
     source = (REPOSITORY / "src" / "embodied" / "platform" / "mission_runtime.py").read_text()
     assert "record.pose" not in source
     assert "pose.position_xyz" not in source
-    assert "truth_samples" not in source
+    assert "pose.attitude_rpy" not in source
     assert "truth_attitudes" not in source
-    # The runtime hands every record out through the tap it was given.
+    # The runtime hands every record out through the tap it was given; the only
+    # truth-stream field it ever touches is that stream's own count, kept for
+    # the receipt's evidence and never read into a computation.
     assert "self._sensor_tap(record)" in source
+    assert sum(1 for line in source.splitlines() if "truth_samples" in line) == 1
 
 
 # ---------------------------------------------------------------------------
