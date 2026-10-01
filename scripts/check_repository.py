@@ -33,13 +33,19 @@ def main():
             other = git(design, "rev-parse", "--path-format=absolute", "--git-common-dir")
             if Path(common).resolve() != Path(other).resolve() or git(design, "branch", "--show-current") != "design":
                 errors.append("Design worktree uses the wrong repository or branch.")
-        words = 0
-        for name in ["START-HERE.md", "GOAL.md", "CURRENT-STATE.md", "DECISIONS.md"]:
-            p = design / "docs" / name
-            if not p.is_file():
-                errors.append("Missing startup document: " + str(p))
-            else:
-                words += len(p.read_text().split())
+        required = [
+            "GOAL.md",
+            "CURRENT-STATE.md",
+            "SYSTEM-SPECIFICATION.md",
+            "BASELINE-GUARD.md",
+            "LIVE-RULINGS.md",
+            "LEARNED-FAILURES.md",
+        ]
+        for name in required:
+            if not (design / "docs" / name).is_file():
+                errors.append("Missing required document: " + str(design / "docs" / name))
+        startup_packet = ["GOAL.md", "CURRENT-STATE.md"]
+        words = sum(len((design / "docs" / name).read_text().split()) for name in startup_packet)
         if words > 1800:
             errors.append("Startup packet exceeds 1800 words; move task-specific detail behind links.")
         entry, template = root / "AGENTS.md", design / "docs/templates/AGENTS.md"
