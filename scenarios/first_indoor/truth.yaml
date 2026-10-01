@@ -28,19 +28,32 @@ world_state:
 # measured by the referee/transport at record time, never declared here.
 physical_outcome: null
 
-# Evaluator notes — identity of the target and of scene furniture that is
-# deliberately NOT a truth target. Never written to the store.
+# Evaluator-only geometric facts, for the per-run physical predicate (the
+# aircraft's truth pose sustained within a declared radius of the target's
+# true position) and for anyone re-deriving the scene. These keys are NOT the
+# store payload: a `world_state` target entry is exactly {"present": bool}
+# (`embodied.bench.events._check_truth_payload` refuses any other key), so a
+# referee must read position from here and write only `present` into the
+# event. Frames: world ENU has x north, y west, z up with the origin at floor
+# level (world.wbt header); NED here is the same origin converted to
+# x north, y east, z down, i.e. (x, -y, -z) of the ENU value.
 identity:
   red_block:
     node: target_block
+    position_enu_m: [8.8, -1.6, 0.9]
+    position_ned_from_world_origin_m: [8.8, 1.6, -0.9]
     size_m: 0.3
     base_color: [0.85, 0.05, 0.05]
-    note: the only object of this shade in the scene
+    note: the only object of this shade in the scene; centre of the 0.3 m cube
   decoy_box:
     role: distractor
     node: decoy_box
+    position_enu_m: [2.2, 1.6, 0.15]
+    position_ned_from_world_origin_m: [2.2, -1.6, -0.15]
+    size_m: [0.4, 0.4, 0.3]
     base_color: [0.72, 0.12, 0.08]
     in_truth: false
-    note: near-red, wrong shade; a report claiming it as the red block grades
-      against no target (unverifiable), and its presence never counts as a
-      missed present target because the store does not declare it
+    note: near-red, wrong shade; its node name differs from the target's, and
+      it is deliberately not a truth target. A report claiming it as the red
+      block grades against no target (unverifiable), and its presence never
+      counts as a missed present target because the store does not declare it.
