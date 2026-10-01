@@ -480,6 +480,22 @@ def load_stereo_pairs(pairs_dir: Path, count: int) -> list[tuple[str, bytes, byt
             pairs.append((left.name.replace("-left.ppm", ""), left.read_bytes(), right.read_bytes()))
     return pairs
 
+def _encode_png_uri(payload: bytes) -> str:
+    """PNG data URI. The pinned commandcode route rejects ``image/ppm`` data
+    URIs with HTTP 400 regardless of size (measured, the J3 diagnostic matrix:
+    a 1 KB fixture PPM and a 1.2 MB captured PPM both refused; the same frame
+    as PNG answered). Pillow re-encodes the captured P6 frames, which also
+    shrinks the upload about 4x.
+    """
+    import base64
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.open(io.BytesIO(payload)).save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
 
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
@@ -518,12 +534,16 @@ def execute_tactical_sample(
             response_deadline_s=parameters.response_deadline_s,
             model_identity=model.identity,
         )
+        encode_start_ns = time.monotonic_ns()
+        left_uri = _encode_png_uri(left)
+        right_uri = _encode_png_uri(right)
+        encode_ms = (time.monotonic_ns() - encode_start_ns) / 1_000_000
         packet = RequestPacket(
             request=request,
             mission_instruction=SAMPLE_MISSION_INSTRUCTION,
             image_parts=(
-                (pair_id, encode_image_data_uri(left)),
-                (pair_id, encode_image_data_uri(right)),
+                (pair_id, left_uri),
+                (pair_id, right_uri),
             ),
             navigation_status=SAMPLE_NAV_STATUS[index % len(SAMPLE_NAV_STATUS)],
             uncertainty_summary="pose sigma 0.05 m horizontal; stereo depth invalid on the textureless floor",
@@ -537,6 +557,7 @@ def execute_tactical_sample(
             "request_id": request.request_id,
             "pair_id": pair_id,
             "send_ns": send_ns,
+            "encode_ms": encode_ms,
             "round_trip_s": None,
             "request_bytes": record.request_bytes if record else None,
             "outcome": "no_reply",
