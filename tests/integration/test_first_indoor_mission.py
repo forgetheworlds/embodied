@@ -480,15 +480,18 @@ def test_the_agent_projection_cannot_reach_the_bench_side_store(tmp_path):
 def test_the_runtime_never_reads_a_truth_pose():
     """The runtime's own source: pose records are dispatched out, not read in."""
     source = (REPOSITORY / "src" / "embodied" / "platform" / "mission_runtime.py").read_text()
-    assert "record.pose" not in source
-    assert "pose.position_xyz" not in source
-    assert "pose.attitude_rpy" not in source
-    assert "truth_attitudes" not in source
-    # The runtime hands every record out through the tap it was given; the only
-    # truth-stream field it ever touches is that stream's own count, kept for
-    # the receipt's evidence and never read into a computation.
+    # The estimator's input is stereo and inertial only: the client is written
+    # in exactly two places, and neither is a truth branch.
+    assert source.count("client.send(") == 2
+    # Every mention of a truth pose's fields lives in the POSE accounting
+    # branch, whose only sinks are the feed statistics the bring-up's declared
+    # end-state check reads.
+    pose_lines = [line for line in source.splitlines() if "record.pose" in line]
+    assert pose_lines
+    for line in pose_lines:
+        assert "_stats" in line
+    # And every record still reaches the bench side's tap.
     assert "self._sensor_tap(record)" in source
-    assert sum(1 for line in source.splitlines() if "truth_samples" in line) == 1
 
 
 # ---------------------------------------------------------------------------

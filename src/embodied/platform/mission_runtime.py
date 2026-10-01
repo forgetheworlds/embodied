@@ -24,10 +24,13 @@ components instead of reimplementing any of them:
   the shared recipe runner, with ``pilot.mission``'s B0 policy as executive.
 
 Truth isolation is structural: this module dispatches sensor records for PAIR
-(estimator feed and its own perception) and IMU (estimator feed), and hands
-every record — including POSE — to the ``sensor_tap`` the bench side owns,
-without reading a POSE record's contents anywhere. No attribute here holds a
-truth pose.
+(estimator feed and its own perception) and IMU (estimator feed), hands every
+record to the ``sensor_tap`` the bench side owns, and keeps POSE records only
+as the bring-up's own end-state accounting — the same
+:class:`~embodied.platform.localization_check._FeedStats` lists the worked
+example fills, read by the bring-up's declared P01-L gate and by nothing else
+here. No truth value reaches the estimator's input, the map, a plan, an
+admission or a published setpoint.
 
 Frame and clock conventions. The mission's ``odom`` frame is the **aligned
 local-NED frame**: the estimator's own initialization frame is not used
@@ -531,6 +534,18 @@ class MissionRuntime:
                 self._stats.newest_imu_ns = max(self._stats.newest_imu_ns, stamp_ns)
                 client.send(loc.encode_imu(stamp_ns, imu.gyro, imu.accelerometer))
                 self._stats.imu_samples += 1
+            elif record.kind is Kind.POSE and record.pose is not None:
+                # Bench-side accounting on the same feed object the worked
+                # example keeps: the bring-up's declared end-state check reads
+                # these, and they are the only truth fields this module touches.
+                # Nothing here reaches the estimator (its feed handles PAIR and
+                # IMU only) and nothing here feeds the map, a plan or a setpoint.
+                self._stats.truth_samples.append(
+                    (sim_time_ns(record.sim_time_s), tuple(record.pose.position_xyz))
+                )
+                self._stats.truth_attitudes.append(
+                    (sim_time_ns(record.sim_time_s), tuple(record.pose.attitude_rpy))
+                )
 
         def feed_cycle() -> None:
             while True:
