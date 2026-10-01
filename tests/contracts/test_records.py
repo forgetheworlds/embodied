@@ -9,6 +9,7 @@ stable enough to hash.
 import dataclasses
 import json
 import os
+import pathlib
 import subprocess
 import sys
 
@@ -566,13 +567,18 @@ def test_the_module_imports_without_the_runtime_stack(tmp_path):
     """Later stages must be able to load records without numpy, YAML or MAVLink.
 
     The check runs in a subprocess whose interpreter is the one that ran this test,
-    with the three modules blocked on its import path. Nothing is put on PYTHONPATH
-    except the blocker itself: the package is the installed one, the same code the
-    tests and the command use. The blocker is imported by name rather than shipped
-    as ``sitecustomize.py``: a ``sitecustomize`` on PYTHONPATH shadows the
-    interpreter's own, and Homebrew's is what adds pip's site-packages (where the
-    editable ``embodied`` lives) to ``sys.path``.
+    with the three modules blocked on its import path. PYTHONPATH carries the blocker
+    and this repository's own ``src``, the same package tree this test session
+    imports, and nothing else. Relying on whatever ``embodied`` the interpreter
+    happens to have installed measured machine state rather than the code under
+    test: on this host ``/usr/local/bin/python3`` is python.org 3.14 and has no
+    ``embodied`` install at all, while the Homebrew interpreter's editable install
+    pointed into a scratch worktree, so this check passed or failed on which
+    interpreter the invoking shell's PATH picked. The blocker is imported by name
+    rather than shipped as ``sitecustomize.py``: a ``sitecustomize`` on PYTHONPATH
+    shadows the interpreter's own.
     """
+    src_root = pathlib.Path(__file__).resolve().parents[2] / "src"
     blocker = tmp_path / "runtime_blocker.py"
     blocker.write_text(
         "import sys\n"
@@ -596,7 +602,7 @@ def test_the_module_imports_without_the_runtime_stack(tmp_path):
         capture_output=True,
         text=True,
         env={
-            "PYTHONPATH": str(tmp_path),
+            "PYTHONPATH": os.pathsep.join((str(tmp_path), str(src_root))),
             "PATH": os.environ.get("PATH", ""),
         },
         cwd=str(tmp_path),

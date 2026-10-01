@@ -316,22 +316,36 @@ def status_document(args, devices, robot, channel):
         "cameras": devices.camera_periods_ms(),
         "camera_size": list(devices.camera_size()),
         "imu_period_ms": args.imu_period_ms,
+        "pacing": devices.pacing_document(),
         "scene": scene,
         "stream": channel.describe(),
         "injection_state": {},
     }
 
 
-def send_status(channel, status, sim_time_s):
-    """Refresh the stream counters and send the status to the analysis process."""
+def send_status(channel, status, sim_time_s, devices):
+    """Refresh the live counters and send the status to the analysis process.
+
+    The pacing block is rebuilt here rather than at startup, because the whole point
+    of reporting it is the gate count the run actually accumulated: a snapshot taken
+    before the first step would always read zero and would look like a clamp that
+    never fired (this was measured on the first clamped flight, whose status carried
+    the startup's zeroes for the entire run).
+    """
     status["stream"] = channel.describe()
+    status["pacing"] = devices.pacing_document()
     channel.send(SHARED.Kind.STATUS, sim_time_s, SHARED.encode_status_payload(status))
 
 
 def main():
     args = parse_args()
     robot = Robot()
-    devices = VehicleDevices(robot, args)
+    # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
+    # "F2's denominator"): the bridge sets EMBODIED_SIM_WALL_CLAMP=1 in this
+    # process's environment only when the run's configuration asked for it, and the
+    # controller's own status reports what was actually enforced.
+    clamp_sim_wall = os.environ.get("EMBODIED_SIM_WALL_CLAMP", "") == "1"
+    devices = VehicleDevices(robot, args, clamp_sim_wall=clamp_sim_wall)
     link = SitlLink(args.sitl_address, args.sitl_port)
     channel = ObservationChannel(args.controller_port)
     injections = Injections()
@@ -390,7 +404,7 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
         elapsed_ms = int(devices.simulator_time_s() * 1000.0)
 
         if channel.accept() and not channel.status_sent:
-            send_status(channel, status, devices.simulator_time_s())
+            send_status(channel, status, devices.simulator_time_s(), devices)
             channel.status_sent = True
 
         state = devices.read_flight_state(SHARED.enu_to_ned)
@@ -493,7 +507,7 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
             )
 
         if channel.sequence and channel.sequence % args.status_interval == 0:
-            send_status(channel, status, devices.simulator_time_s())
+            send_status(channel, status, devices.simulator_time_s(), devices)
 
 
 if __name__ == "__main__":

@@ -903,6 +903,13 @@ class TestRefusals:
         # so the block above is the missing process and nothing else.
         assert "localization_mode" not in unsatisfied
         assert "bridge_truth_republish" not in unsatisfied
+        # Even a blocked receipt states the pacing it was configured under, so an
+        # iteration-only configuration can never be read as a scored attempt (owner
+        # ruling 2026-09-30, APPROVAL-RECORD "F2's denominator").
+        manifest = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["simulator_pacing"]["webots_mode"] == "realtime"
+        assert manifest["simulator_pacing"]["sim_wall_clamp"] is True
+        assert manifest["simulator_pacing"]["evidence_class"] == "scored"
 
     def test_module_registers_the_dispatch_command(self):
         parser = build_parser()
@@ -1222,7 +1229,12 @@ def _textured_image() -> np.ndarray:
 
 class TestSceneAdmission:
     """T7 and its revision-4 extension: the admission gate is real, both ways,
-    and it only measures frames that can prove which world they show."""
+    and it only measures frames that can prove which world they show.
+
+    The arm-gate fixtures declare their capture already complete (``count`` at
+    ``SCENE_CAPTURE_MAX_FRAMES``), so the gate measures the pairs written on
+    disk without waiting out the live capture's window, which a unit test with
+    no stream running could never satisfy."""
 
     def _world_settings(self, tmp_path: Path, world_text: str = "#VRML_SIM R2025a utf8\n"):
         """Settings whose world exists under tmp_path, so its sha256 is real."""
@@ -1353,7 +1365,7 @@ class TestSceneAdmission:
         pairs_dir = tmp_path / "run/run-a/pairs"
         _write_pair_frames(pairs_dir, 1, _featureless_image(0), _featureless_image(1))
         blocker = check._scene_capture_gate(
-            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+            writer, settings, lambda: None, {"count": check.SCENE_CAPTURE_MAX_FRAMES, "last_s": 0.0}, []
         )
         assert blocker and "FAST keypoints" in blocker
         assert "left 0, right 0" in blocker
@@ -1369,7 +1381,7 @@ class TestSceneAdmission:
         textured = _textured_image()
         _write_pair_frames(pairs_dir, 1, textured, textured)
         blocker = check._scene_capture_gate(
-            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+            writer, settings, lambda: None, {"count": check.SCENE_CAPTURE_MAX_FRAMES, "last_s": 0.0}, []
         )
         assert blocker and "no complete stereo pair" in blocker
         assert "identical pairs 1" in blocker
@@ -1387,7 +1399,7 @@ class TestSceneAdmission:
             pairs_dir, 1, _textured_image(), np.roll(_textured_image(), 4, axis=1)
         )
         blocker = check._scene_capture_gate(
-            writer, settings, lambda: None, {"count": 1, "last_s": 0.0}, []
+            writer, settings, lambda: None, {"count": check.SCENE_CAPTURE_MAX_FRAMES, "last_s": 0.0}, []
         )
         assert blocker is None
         record = json.loads(
@@ -1543,6 +1555,7 @@ class TestAttitudeGate:
             self._alignment(initial=(math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4))),
             self._stats(),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker is None
         record = json.loads(
@@ -1562,6 +1575,7 @@ class TestAttitudeGate:
             self._alignment(),
             self._stats(),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker and "composition deltas" in blocker
         record = json.loads(
@@ -1579,6 +1593,7 @@ class TestAttitudeGate:
             self._alignment(declared=(0.0, 0.0, math.pi / 2)),
             self._stats(truth_rpy=(0.0, 0.0, 0.0)),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker and "declaration deltas" in blocker
         record = json.loads(
@@ -1598,6 +1613,7 @@ class TestAttitudeGate:
             self._alignment(initial=tilted),
             self._stats(),
             [],
+            seal_time_ns=1_000_000_000,
         )
         assert blocker and "level error" in blocker
         record = json.loads(
@@ -1610,6 +1626,176 @@ class TestAttitudeGate:
             self._writer(tmp_path), None, self._alignment(), self._stats(), []
         )
         assert blocker and "no published state" in blocker
+
+    def test_the_gate_joins_truth_at_the_seals_own_instant(self, tmp_path):
+        """A1 measures the sealed frame at the seal, not the run's last truth sample.
+
+        Measured defect, p01l-climbfix-20260928T174608Z/run-a/attitude-gate.json:
+        the gate read truth_time_ns 28.49 s -- the face-planted rest pose after the
+        excitation's crash -- against a seal taken at the arm, and refused the
+        scored arm on the landing A1 was never meant to judge. The declared
+        end-state check judges the landing now; the gate judges the seal.
+        """
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((1_000_000_000, (0.0, 0.0, 0.0)))
+        stats.truth_attitudes.append((28_490_000_000, (0.0, -math.pi / 2, 0.0)))
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, 0.0)},
+            self._alignment(),
+            stats,
+            [],
+            seal_time_ns=1_000_000_000,
+        )
+        assert blocker is None
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["seal_time_ns"] == 1_000_000_000
+        assert record["truth_time_ns"] == 1_000_000_000
+        assert record["state"] == "measured_pass"
+
+    def test_no_truth_sample_near_the_seal_refuses_as_unmeasured(self, tmp_path):
+        """A truth pose from another instant is not the seal's frame: unmeasured,
+        never interpolated and never substituted with the run's last sample."""
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((28_490_000_000, (0.0, 0.0, 0.0)))
+        blocker = check._attitude_gate(
+            self._writer(tmp_path),
+            {"attitude_rpy": (0.0, 0.0, 0.0)},
+            self._alignment(),
+            stats,
+            [],
+            seal_time_ns=1_000_000_000,
+        )
+        assert blocker and "unmeasured" in blocker
+        record = json.loads(
+            (tmp_path / "run/run-a/attitude-gate.json").read_text(encoding="utf-8")
+        )
+        assert record["state"] == "unmeasured"
+
+
+class TestEndStateCheck:
+    """The declared end-state check: declared 2026-09-29, before any streak flight.
+
+    A run ends with the aircraft level at rest and no crash disarm. Moving A1's
+    sample point to the seal would otherwise leave the landing unjudged -- the
+    gaming path the phase plan names in so many words -- so this check closes it
+    with its own tolerance and its own receipt rows.
+    """
+
+    TIPPED_LIKE_00000145 = (0.0, math.radians(-89.7), 0.0)
+
+    @staticmethod
+    def _stats(final_rpy):
+        stats = check._FeedStats()
+        stats.truth_attitudes.append((50_000_000_000, tuple(final_rpy)))
+        return stats
+
+    @staticmethod
+    def _mavlink_log(tmp_path, *texts):
+        path = tmp_path / "mavlink.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {"mavpackettype": "STATUSTEXT", "severity": 0, "text": text}
+                )
+                + "\n"
+                for text in texts
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    @staticmethod
+    def _sample(armed=False, mode_name="LAND"):
+        class _Sample:
+            pass
+
+        sample = _Sample()
+        sample.armed = armed
+        sample.mode_name = mode_name
+        return sample
+
+    def _record(self, tmp_path, final_rpy=(0.0, 0.0, 0.0), texts=(), armed=False):
+        return check._end_state_record(
+            self._stats(final_rpy),
+            (0.0, 0.0, 0.0),
+            armed,
+            "LAND",
+            self._mavlink_log(tmp_path, *texts),
+            phase="excitation",
+        )
+
+    def test_a_level_end_state_passes(self, tmp_path):
+        record = self._record(tmp_path, final_rpy=(0.001, -0.002, 0.5))
+        assert record["state"] == "measured_pass"
+        assert record["roll_deg"] == pytest.approx(0.057, abs=1e-3)
+        assert record["pitch_deg"] == pytest.approx(-0.115, abs=1e-3)
+        assert check._end_state_blocker(record) is None
+        row = check._end_state_check_row(record)
+        assert row["name"] == "end_state"
+        assert row["status"] == "pass"
+        assert "no crash disarm" in row["detail"]
+
+    def test_a_tipped_end_state_fails(self, tmp_path):
+        record = self._record(tmp_path, final_rpy=self.TIPPED_LIKE_00000145)
+        assert record["state"] == "measured_fail"
+        blocker = check._end_state_blocker(record)
+        assert blocker and "end state failed" in blocker
+        assert "pitch -89.7" in blocker
+        assert check._end_state_check_row(record)["status"] == "fail"
+
+    def test_a_crash_disarm_fails_even_when_level(self, tmp_path):
+        record = self._record(
+            tmp_path,
+            texts=("Crash: Disarming: AngErr=111>30, Accel=0.1<3.0",),
+        )
+        assert record["state"] == "measured_fail"
+        assert record["crash_disarm_statustexts"] == [
+            "Crash: Disarming: AngErr=111>30, Accel=0.1<3.0"
+        ]
+        blocker = check._end_state_blocker(record)
+        assert blocker and "crash disarm" in blocker
+
+    def test_no_truth_attitude_is_unmeasured_not_a_pass(self, tmp_path):
+        record = check._end_state_record(
+            check._FeedStats(),
+            None,
+            None,
+            None,
+            self._mavlink_log(tmp_path),
+            phase="excitation",
+        )
+        assert record["state"] == "unmeasured"
+        blocker = check._end_state_blocker(record)
+        assert blocker and "unmeasured" in blocker
+        assert check._end_state_check_row(record)["status"] == "fail"
+
+    def test_the_bring_up_record_carries_the_end_state(self, tmp_path):
+        record = {"flight": {}, "blockers": []}
+        check._record_excitation_end_state(
+            record,
+            self._stats((0.0, 0.0, 0.0)),
+            self._sample(armed=False, mode_name="LAND"),
+            (0.0, 0.0, 0.0),
+            self._mavlink_log(tmp_path),
+        )
+        assert record["flight"]["end_state"]["state"] == "measured_pass"
+        assert record["flight"]["end_state"]["mode"] == "LAND"
+        assert record["blockers"] == []
+
+    def test_a_tipped_bring_up_end_state_is_a_blocker_in_the_record(self, tmp_path):
+        record = {"flight": {}, "blockers": []}
+        check._record_excitation_end_state(
+            record,
+            self._stats(self.TIPPED_LIKE_00000145),
+            self._sample(armed=False, mode_name="LAND"),
+            None,
+            self._mavlink_log(tmp_path),
+        )
+        assert record["flight"]["end_state"]["state"] == "measured_fail"
+        assert record["blockers"] and "end state failed" in record["blockers"][0]
 
 
 class TestH5Diagnosis:
@@ -1947,7 +2133,14 @@ class TestOrderedBringUp:
 
         # Every window parameter is bounded: a window value, a restore value, a reason.
         rows = {row["name"]: row for row in window["parameter_window"]}
-        assert set(rows) == {"ARMING_SKIPCHK", "EK3_SRC1_POSZ", "MOT_IDLE_SEC"}
+        assert set(rows) == {
+            "ARMING_SKIPCHK",
+            "EK3_SRC1_POSZ",
+            "MOT_IDLE_SEC",
+            "TKOFF_THR_MAX",
+            "PILOT_SPD_UP",
+            "TKOFF_SLEW_TIME",
+        }
         assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
         assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
         assert rows["EK3_SRC1_POSZ"]["window_value"] == 1.0  # baro, its own sensor
@@ -1958,7 +2151,28 @@ class TestOrderedBringUp:
         assert rows["MOT_IDLE_SEC"]["window_value"] == 0.0  # the firmware's own default
         assert rows["MOT_IDLE_SEC"]["restore_value"] == 4.0  # compat_arming.parm's
         assert "GROUND_IDLE" in rows["MOT_IDLE_SEC"]["why"]
+        # The fourth one bounds the takeoff's open-loop ramp (see the class below for
+        # the derivation): a window value below the pin's own default, restored to it.
+        assert rows["TKOFF_THR_MAX"]["window_value"] == (
+            check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
+        )
+        assert rows["TKOFF_THR_MAX"]["restore_value"] == 0.9
+        # The fifth one bounds the climb rate the MODE may command at the rate the
+        # window itself declares (the class below carries the derivation).
+        assert rows["PILOT_SPD_UP"]["window_value"] == (
+            check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        assert check.BRING_UP_CLIMB_RATE_WINDOW_VALUE == 0.3
+        assert rows["PILOT_SPD_UP"]["restore_value"] == 2.5  # the pin's own default
         assert all(row["why"] for row in rows.values())
+        # The sixth one paces the open-loop ramp itself (the release-energy fix's
+        # second repair, 2026-09-29): the ground-hold bench measured the contact
+        # pair holding the vehicle ~2.0 s past the spool's first nonzero command
+        # at any thrust, so the ramp crosses ~1.4x the physics hover at the
+        # hold's own expiry and the closed loop never runs while stuck.
+        assert rows["TKOFF_SLEW_TIME"]["window_value"] == 6.0
+        assert rows["TKOFF_SLEW_TIME"]["restore_value"] == 2.0  # Parameters.cpp:978
+        assert "takeoff.cpp:83" in rows["TKOFF_SLEW_TIME"]["why"]
         # The check no mask can except is named, with what the window does instead.
         assert window["not_exceptable"][0]["check"].startswith("the mandatory altitude")
         assert "mandatory_checks" in window["not_exceptable"][0]["citation"]
@@ -1967,16 +2181,22 @@ class TestOrderedBringUp:
             "ARMING_SKIPCHK": 0.0,
             "EK3_SRC1_POSZ": 6.0,
             "MOT_IDLE_SEC": 4.0,
+            "TKOFF_THR_MAX": 0.9,
+            "PILOT_SPD_UP": 2.5,
+            "TKOFF_SLEW_TIME": 2.0,
         }
-
         # The thrust path is declared as a bounded LOCAL bring-up action, with the
         # frozen E-EXC climb target and the window's own airtime bound.
         thrust = window["thrust_path"]
         assert thrust["kind"] == "bounded_local_bring_up_action"
         assert "bounded local bring-up action" in thrust["statement"]
         assert "setpoint" in thrust["statement"]
-        assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.60
-        assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 5.0
+        # Re-declared from 0.60 on 2026-09-29 (the release-energy fix, per the
+        # ground-hold verdict's ranked lever 1); the derivation is beside the
+        # constant in localization_check.py and asserted in
+        # test_the_declared_windows_contain_the_airframes_own_pre_thrust_time.
+        assert thrust["climb_target_m"] == check.EXCITATION_TAKEOFF_ALTITUDE_M == 0.30
+        assert thrust["max_airtime_s"] == check.EXCITATION_MAX_AIRTIME_S == 6.0
         assert thrust["sent_by_the_scored_arm"] is False
 
         # The excitation stays inside the frozen E-EXC envelope.
@@ -2208,3 +2428,823 @@ class TestOrderedBringUp:
         wrong["MOT_IDLE_SEC"] = 0.0  # the window's value, not the scored arm's
         assert check._bring_up_closure_blockers(wrong, cleared)
         assert settings.sensor_mode is SensorMode.SENSOR_DERIVED
+
+# ---------------------------------------------------------------------------
+# T17: the ordering of the window's thrust path. The takeoff command is what pins
+# the mode's alt-hold state machine into AltHoldModeState::Takeoff, and that state
+# sets no spool state at all (`get_alt_hold_state_D_ms`, mode.cpp:1030-1068, tests
+# `takeoff.running()` before the branch at :1041-1055 that asks for one). Commanded
+# while the airframe's motor interlock is still down -- Copter holds it down for its
+# 2.0 s `ap.in_arming_delay` (motors.cpp:59,75) -- the takeoff therefore freezes the
+# desired spool state at SHUT_DOWN, which the motors library forces while the
+# interlock is down (`set_desired_spool_state`/`output_logic`,
+# AP_MotorsMulticopter.cpp:619-638), for the rest of the arm.
+#
+# Measured (work/ardupilot/logs/00000142.BIN, the clock-fix flight): CTUN.ThO
+# (= motors->get_throttle(), Log.cpp:58) ramped to 1.000 inside the window, MOTB.ThrOut
+# (= _throttle_out) stayed 0.000 and RCOU stayed 1000 us for the whole 4.1 s; the first
+# SPOL entry of the run is (Spl=0, SplDes=2) at the LAND mode change, 16 ms before the
+# motors finally left the floor. The command is therefore held until the VEHICLE's own
+# report of its motor outputs leaves the floor it read at the arm readback.
+# ---------------------------------------------------------------------------
+
+
+class TestTheTakeoffWaitsForTheThrustPath:
+    """The ordering that lets the declared excitation actually fly."""
+
+    @staticmethod
+    def _clock(
+        sim_step_s: float = 0.05, wall_step_s: float = 0.1
+    ) -> tuple[Any, dict, Any]:
+        clock = check._SimulatorClock()
+        clock.observe(0.0)
+        wall = {"now": 0.0}
+
+        def step() -> None:
+            wall["now"] += wall_step_s
+            clock.observe((clock.newest_s or 0.0) + sim_step_s)
+
+        return clock, wall, step
+
+    @staticmethod
+    def _window(clock, wall, budget_s: float = 3.5) -> Any:
+        return check._SimWindow(
+            clock,
+            budget_s,
+            label="the excitation's climb drain",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(budget_s, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+
+    def test_the_wait_ends_the_moment_the_motors_leave_the_floor(self):
+        """The gate is the airframe's own report, and it opens the takeoff with it.
+
+        The floor is what the vehicle reported while no spool-up was requested; the
+        thrust path is open when that same report rises above it. Anything later --
+        a fixed settle, a wall deadline -- is a guess about when the vehicle's own
+        interlock will be up, which is the quantity that caused the defect.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1000}
+
+        def poll():
+            step()
+            return (1150,) * 4 if (clock.newest_s or 0.0) >= 2.0 else (1000,) * 4
+
+        wait = self._window(clock, wall)
+        opened = check._wait_for_thrust_path(poll, wait, motors, clock, poll_s=0.0)
+        assert opened is not None, "the wait did not see the motors leave the floor"
+        assert opened >= 2.0
+        assert motors["left_floor_at_simulator_s"] == opened
+        assert motors["floor_pwm"] == 1000
+        # The window is not consumed by the wait: it is the climb window, and the
+        # climb is what happens after the thrust path opens.
+        assert wait.expired() is False
+        assert wait.ended_by is None
+
+    def test_the_floor_is_the_vehicles_own_number_not_a_literal(self):
+        """An airframe whose floor is not 1000 us is waited on the same way.
+
+        The window has no PWM value of its own: MOT_PWM_MIN is the airframe's, and the
+        report at the arm readback is what says where its motors sit. A gate written
+        against a literal 1000 would open this airframe's takeoff while its motors were
+        still shut down.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1100}
+
+        def poll():
+            step()
+            return (1150,) * 4 if (clock.newest_s or 0.0) >= 1.0 else (1100,) * 4
+
+        opened = check._wait_for_thrust_path(
+            poll, self._window(clock, wall), motors, clock, poll_s=0.0
+        )
+        assert opened is not None and opened >= 1.0
+        assert motors["floor_pwm"] == 1100
+
+    def test_a_vehicle_that_never_leaves_its_floor_spends_the_declared_window(self):
+        """The failure side: the wait ends with the declared budget spent, and says so.
+
+        A vehicle whose motors never leave the floor has no thrust path, and the run
+        owes that fact rather than a takeoff command that looks the same as a working
+        one. The declared climb window is what bounds the wait, so the LAND command
+        still goes out inside the declared airtime bound.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1000}
+
+        def poll():
+            step()
+            return (1000,) * 4
+
+        wait = self._window(clock, wall)
+        assert check._wait_for_thrust_path(poll, wait, motors, clock, poll_s=0.0) is None
+        document = wait.document()
+        assert document["ended_by"] == "simulator"
+        assert document["elapsed_simulator_s"] >= 3.5
+        assert document["budget_simulator_s"] == 3.5
+        assert "left_floor_at_simulator_s" not in motors
+
+    def test_a_vehicle_that_never_reports_its_motor_outputs_cannot_open_the_path(self):
+        """Silence is not a thrust path: an unreported output keeps the wait honest.
+
+        The window has no other statement about the motors, so a vehicle that never
+        reports them ends on the declared budget, exactly like a vehicle whose motors
+        never moved -- which is what its own evidence says.
+        """
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": 1000}
+
+        def poll():
+            step()
+            return None
+
+        assert (
+            check._wait_for_thrust_path(
+                poll, self._window(clock, wall), motors, clock, poll_s=0.0
+            )
+            is None
+        )
+
+    def test_a_floor_read_late_is_taken_from_the_first_report(self):
+        """When the arm readback carried no servo report, the first one is the floor."""
+        clock, wall, step = self._clock()
+        motors: dict[str, Any] = {"max_pwm": 0, "samples": 0, "floor_pwm": None}
+
+        def poll():
+            step()
+            return (1050,) * 4 if (clock.newest_s or 0.0) >= 1.0 else (1000,) * 4
+
+        opened = check._wait_for_thrust_path(
+            poll, self._window(clock, wall), motors, clock, poll_s=0.0
+        )
+        assert opened is not None, "a floor learned late must still open on a rise"
+        assert motors["floor_pwm"] == 1000
+
+    def test_the_declared_windows_contain_the_airframes_own_pre_thrust_time(self):
+        """The re-declared window is the one the airframe's own clock requires.
+
+        The numbers here come from the airframe's own measurements, not from the
+        constants. The 2026-09-28 re-declaration ("just run the sim longer") fixed
+        the pre-thrust chain: the motor interlock comes up 2.0 s after the arm
+        (ARMING_DELAY_SEC, the MOTORS_INTERLOCK_ENABLED event at arm+2.004 s in
+        logs 00000139/00000140/00000142) and the takeoff's own slew runs at the
+        measured 0.5 per second to whatever TKOFF_THR_MAX is in force (the
+        NOT_LANDED event at command+1.735 s in 00000142 was the 0.9 default
+        reaching its cap). The 2026-09-29 re-declaration (the release-energy fix,
+        per the ground-hold verdict's ranked lever 1) added the measured stuck
+        phase and halved the climb: the floor-to-body contact pair holds the
+        vehicle ~2.0 s after the spool's first nonzero command, independent of
+        thrust across 1.045x-1.369x weight (verdict.json hold_time_s 2.008; the
+        flights unstick at 2.1-2.2 s of spool + 1.9-2.0 s, replayed to +/-0.02 s),
+        and the declared climb is now 0.30 m at the declared 0.5 m/s = 0.6 s. A
+        climb window shorter than the chain it must contain -- interlock, slew to
+        the first nonzero command, the contact hold, the climb -- cannot contain
+        the climb it declares, whatever the ordering does; an airtime bound
+        shorter than the settle plus that window cannot contain the window. The
+        ramp bound the window declares is the SHORTER slew, so the slew
+        containment is asserted against the pin's own default cap too: bounding
+        the ramp must not be a change the airtime only affords because the ramp
+        got shorter.
+        """
+        interlock_delay_s = 2.0  # ARMING_DELAY_SEC, measured at arm+2.004 s
+        slew_to_first_nonzero_s = 0.2  # first nonzero at 2.1-2.2 s, 143/144/145
+        contact_hold_s = 2.0  # ground-hold verdict.json: hold_time_s 2.008
+        ramp_rate_per_s = 0.5  # 1 / TKOFF_SLEW_TIME 2.0 s, measured in 00000142/43
+        pin_default_cap = check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE  # 0.9
+        declared_climb_s = (
+            check.EXCITATION_TAKEOFF_ALTITUDE_M / check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        # The stuck-phase chain the window must contain, from the measured numbers.
+        assert check.EXCITATION_CLIMB_DRAIN_S >= (
+            interlock_delay_s
+            + slew_to_first_nonzero_s
+            + contact_hold_s
+            + declared_climb_s
+        )
+        # The slew containment holds for the pin's own default cap and the window's.
+        for cap in (pin_default_cap, check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE):
+            assert check.EXCITATION_CLIMB_DRAIN_S >= (
+                interlock_delay_s + cap / ramp_rate_per_s + declared_climb_s
+            )
+        assert check.EXCITATION_MAX_AIRTIME_S >= (
+            check.BRING_UP_OVERRIDE_SETTLE_S + check.EXCITATION_CLIMB_DRAIN_S
+        )
+        # And the re-declared climb window is what the wait is bounded by, so the
+        # LAND command still goes out inside the airtime bound even if the path
+        # never opens. The pacing repair (2026-09-29) pins the window's own ramp:
+        # paced by TKOFF_SLEW_TIME, its throttle at the hold's own expiry sits in
+        # the release band, ~1.3-1.5x the PHYSICS hover the ground-hold bench
+        # measured (actuator 0.307: thrust 48 f N against weight 14.715 N), and
+        # the TKOFF_THR_MAX cap is not reached before that expiry -- so
+        # NOT_LANDED fires on real motion at the unstick itself and the
+        # closed-loop wind-up never runs while the vehicle is held.
+        assert check.EXCITATION_CLIMB_DRAIN_S == 5.5
+        assert check.EXCITATION_MAX_AIRTIME_S == 6.0
+        spin_min, pwm_floor, pwm_ceiling = 0.15, 1000.0, 2000.0
+        physics_hover_actuator = 0.307  # the bench's static threshold, 48 f = weight
+        slew_s = check.BRING_UP_TAKEOFF_SLEW_WINDOW_VALUE
+        ramp_throttle_at_expiry = contact_hold_s / slew_s  # ramp rate = 1 / slew
+        ramp_actuator_at_expiry = spin_min + (1.0 - spin_min) * ramp_throttle_at_expiry
+        assert 1.3 * physics_hover_actuator <= ramp_actuator_at_expiry
+        assert ramp_actuator_at_expiry <= 1.5 * physics_hover_actuator
+        assert (
+            check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE * slew_s
+            > slew_to_first_nonzero_s + contact_hold_s
+        )
+
+
+# ---------------------------------------------------------------------------
+# T18: the takeoff's open-loop ramp is bounded by the airframe's own hover.
+# `_TakeOff::do_pilot_takeoff_ms` (ArduCopter/takeoff.cpp:76-118) ramps the
+# throttle open-loop -- `get_throttle_in() + G_Dt / takeoff_throttle_slew_time`,
+# no altitude feedback -- for as long as `land_complete` holds, and every exit
+# condition except one needs motion the aircraft cannot have while it is still
+# on the ground: estimated accel >= 0.5 * PILOT_ACC_Z, or velocity, or altitude.
+# The one motion-free exit is the ramp's own cap, `throttle >= MIN(TKOFF_THR_MAX,
+# 0.9)`. On this airframe (Iris proto: 1.5 kg body plus children, propellers
+# 0.0012 * omega^2, maxVelocity 100 rad/s -- thrust-to-weight about 2.3) the
+# firmware's default cap 0.9 is roughly twice the hover the airframe actually
+# holds, so the measured flight (00000143.BIN) ramped to ThO 0.875 (RCOU 1867,
+# ~2x weight) before the vehicle left the ground at arm+4.0, and the aircraft
+# then climbed to 3.7 m/s and put its centre of gravity at 2.39 m -- the room's
+# own 2.5 m ceiling (dev-a-single/world.wbt) -- before LAND could arrest it.
+#
+# The window therefore declares its own TKOFF_THR_MAX for the takeoff it
+# commands, derived from the airframe's own numbers: the P00 accept runs
+# measured this airframe's hover hold at 1419 us (compat_arming.parm iteration
+# 11), which through the motors' own MOT_SPIN_MIN 0.15 mapping (the flown floor
+# RCOU 1150-1151 in every log) is a hover throttle of ~0.316, and the firmware's
+# accel exit at 0.5 * PILOT_ACC_Z 2.5 = 1.25 m/s^2 needs about 1.13x that. A cap
+# above both, below the pin's default, and restoring to the pin's own default
+# before the scored window opens, is the ramp bounded rather than loosened.
+# ---------------------------------------------------------------------------
+
+
+class TestTheTakeoffRampIsBoundedByTheAirframesOwnHover:
+    """The open-loop ramp the window's takeoff rides is bounded at the hover it needs.
+
+    The declared cap has to clear two of the airframe's own numbers or the takeoff
+    cannot even happen: the measured hover throttle (below it, the vehicle never
+    leaves the ground) and the firmware's own accel-based ramp exit (below it, the
+    loop cannot close until the cap itself is reached, which is the default's
+    measured behaviour). And it has to sit below the pin's own default, or the
+    bound is looser than the one the airframe flew into its ceiling.
+    """
+
+    def test_the_cap_clears_the_hover_and_the_ramps_own_accel_exit(self):
+        # The airframe's own numbers, each from a measurement, none from the
+        # constant under test: the hover hold the P00 accept runs measured, the
+        # motors' own PWM floor and spin-min mapping the flown logs show, and the
+        # firmware's own pilot accel default.
+        hover_pwm_us = 1419.0  # compat_arming.parm iteration 11's own record
+        pwm_floor, pwm_ceiling = 1000.0, 2000.0  # MOT_PWM_MIN/MAX, the flown floor 1150
+        spin_min = 0.15  # MOT_SPIN_MIN, the flown RCOU floor 1150-1151
+        pilot_accel_z = 2.5  # PILOT_ACC_Z default (config.h:535), unset by any parm
+        gravity = 9.81
+        hover_actuator = (hover_pwm_us - pwm_floor) / (pwm_ceiling - pwm_floor)
+        hover_throttle = (hover_actuator - spin_min) / (1.0 - spin_min)
+        accel_exit_throttle = hover_throttle * (
+            1.0 + 0.5 * pilot_accel_z / gravity
+        )
+        cap = check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
+        # The vehicle can leave the ground under the cap...
+        assert cap > hover_throttle
+        # ...the ramp's own accel exit is reachable under the cap, so the loop can
+        # close on motion rather than on the cap...
+        assert cap > accel_exit_throttle
+        # ...and the cap is below the pin's default: a bound, not a loosening.
+        assert cap < check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE == 0.9
+
+    def test_the_cap_bounds_the_thrust_at_unstick_to_below_twice_the_hover(self):
+        """The whole point of the cap: what the motors may command at unstick.
+
+        The default 0.9 let the ramp command ~2.2x the hover thrust while the
+        aircraft was still on the ground (RCOU 1867 against the 1419 us hover);
+        the window's cap has to hold that below twice the hover, or the measured
+        ceiling shot survives the change in principle.
+        """
+        hover_pwm_us = 1419.0
+        pwm_floor, pwm_ceiling = 1000.0, 2000.0
+        spin_min = 0.15
+
+        def actuator_at(throttle: float) -> float:
+            return spin_min + (1.0 - spin_min) * throttle
+
+        hover_actuator = (hover_pwm_us - pwm_floor) / (pwm_ceiling - pwm_floor)
+        cap_actuator = actuator_at(check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE)
+        default_actuator = actuator_at(check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE)
+        assert cap_actuator / hover_actuator < 2.0
+        assert default_actuator / hover_actuator > 2.0  # the measured defect
+        assert cap_actuator < default_actuator
+
+    def test_the_window_declares_the_ramp_bound_with_its_derivation(self):
+        """The bound is a declared window element: a value, a restore, a reason.
+
+        The restore is the pin's own default (parameters.cpp:1057, unset by every
+        parm file this project applies), the why carries the open-loop ramp it
+        bounds, and the scored window requires the restore exactly as it does for
+        the window's other parameters.
+        """
+        row = next(
+            row for row in check.BRING_UP_WINDOW_PARAMETERS if row[0] == "TKOFF_THR_MAX"
+        )
+        assert row[1] == check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
+        assert row[2] == check.BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE
+        why = row[3]
+        assert "open-loop" in why
+        assert "1419" in why  # the airframe's own measured hover
+        assert "parameters.cpp:1057" in why  # the restore's provenance
+
+    def test_the_readback_is_judged_at_the_vehicles_own_storage_precision(self):
+        """The vehicle answers parameters in its own 32-bit float, not ours.
+
+        Measured at the first climb-fix launch
+        (work/runs/p01-localization/p01l-climbfix-20260928T171500Z): the vehicle
+        read the declared TKOFF_THR_MAX 0.55 back as 0.550000011920929 and the
+        window's exact-equality readback refused a write that had taken -- the
+        run stopped before the arm, no flight happened. The same equality also
+        decides the closure gate's still-in-force direction, so a naive compare
+        would clear a window whose 0.55 was still in force: the comparison has
+        to happen at the vehicle's own precision, and a value that really is
+        different must still read as different.
+        """
+        # float32(0.55) and float32(0.9), as the vehicle answers them
+        assert check._vehicle_parameter_matches(0.550000011920929, 0.55)
+        assert check._vehicle_parameter_matches(0.8999999761581421, 0.9)
+        # the window's float32-exact values compare exactly as before
+        assert check._vehicle_parameter_matches(4.0, 4.0)
+        assert check._vehicle_parameter_matches(0.0, 0.0)
+        # a real difference survives the packing, and silence is not a match
+        assert not check._vehicle_parameter_matches(0.6, 0.55)
+        assert not check._vehicle_parameter_matches(0.5500000715255737, 0.55)  # the next float32
+        assert not check._vehicle_parameter_matches(None, 0.55)
+
+        # The closure gate, both directions, with the vehicle's own answers.
+        no_override = {
+            "sent": False,
+            "channel": check.RC_THROTTLE_CHANNEL,
+            "sent_pwm": None,
+            "released": False,
+            "observed_during_window": None,
+            "observed_after_release": None,
+        }
+        restored = {
+            "ARMING_SKIPCHK": 0.0,
+            "EK3_SRC1_POSZ": 6.0,
+            "MOT_IDLE_SEC": 4.0,
+            "TKOFF_THR_MAX": 0.8999999761581421,  # the vehicle's float32(0.9)
+            "PILOT_SPD_UP": 2.5,
+            "TKOFF_SLEW_TIME": 2.0,
+        }
+        assert check._bring_up_closure_blockers(restored, no_override) == []
+        still_in_force = dict(restored)
+        still_in_force["TKOFF_THR_MAX"] = 0.550000011920929  # float32(0.55)
+        blockers = check._bring_up_closure_blockers(still_in_force, no_override)
+        assert any("TKOFF_THR_MAX" in b and "still" in b for b in blockers), blockers
+
+
+class TestTheModeClimbRateIsBoundedAtTheDeclaredRate:
+    """The declared pilot climb rate is the bound the mode actually flies inside.
+
+    Measured in both climb-fix logs (00000143/00000144): the position loop shapes
+    its desired trajectory inside PILOT_SPEED_UP, the firmware default 2.5 m/s let
+    the velocity target run to 2.2-2.4 m/s while the aircraft was already
+    ballistic past it, and the throttle's collapse -- which waits for the velocity
+    estimate to cross that target -- came ~0.4 s after the aircraft left the
+    ground. The window therefore bounds the mode's own maximum at the rate it
+    declares, and the stick derivation must still express that rate on the
+    vehicle's own channel.
+    """
+
+    def test_the_window_bounds_the_mode_at_the_declared_rate(self):
+        row = next(
+            row for row in check.BRING_UP_WINDOW_PARAMETERS if row[0] == "PILOT_SPD_UP"
+        )
+        # The window value IS the declared pilot climb rate: the declaration and
+        # the mode's own ceiling are the same number, so the envelope the receipt
+        # declares is the envelope the aircraft can fly in.
+        assert row[1] == check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        # The restore is the pin's own default (config.h:531-532), which no
+        # parameter file this project applies sets.
+        assert row[2] == 2.5
+        assert "config.h:531-532" in row[3]
+
+    def test_the_stick_derivation_expresses_the_declared_rate_at_full_deflection(self):
+        """With the bound in force, full stick is the declared rate -- and derivable.
+
+        The override's PWM is derived from the vehicle's own calibration AFTER the
+        window parameter is in force, so the derivation sees PILOT_SPD_UP 0.5 and
+        must place the declared 0.5 m/s at the very top of the channel's own range.
+        The guard is `pwm > radio_max` and the arithmetic is integer, so the
+        boundary lands exactly on the vehicle's own RC3_MAX and passes.
+        """
+        calibration = {
+            "RC3_MIN": 1102.0,
+            "RC3_MAX": 2000.0,
+            "RC3_DZ": 0.0,
+            "THR_DZ": 0.0,
+            "PILOT_SPD_UP": check.BRING_UP_CLIMB_RATE_WINDOW_VALUE,
+        }
+        pwm, measured_rate = check._bring_up_throttle_pwm(
+            calibration, check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        )
+        assert pwm == 2000  # the vehicle's own RC3_MAX, exactly
+        assert measured_rate == pytest.approx(check.BRING_UP_THROTTLE_CLIMB_RATE_M_S)
+        assert 0.0 < measured_rate <= check.BRING_UP_THROTTLE_MAX_CLIMB_RATE_M_S
+
+    def test_the_ramps_own_velocity_exit_closes_the_loop_earlier_under_the_bound(self):
+        """Phase 1's velocity exit is `constrain(pilot_rate, 0.1*max, 0.5*max)`.
+
+        With the mode's maximum at the declared rate (0.3 m/s since the
+        release-energy fix's second repair; 0.5 before it), that exit fires at
+        0.15 m/s of climb instead of the restore state's 0.3 -- the open-loop
+        ramp hands over to the closed loop earlier, which is the direction the
+        measurement asks for: the handover happens on real motion at the
+        release, not on the cap while the contact still holds the vehicle.
+        """
+        pilot_rate = check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
+        max_up = check.BRING_UP_CLIMB_RATE_WINDOW_VALUE
+        default_max_up = check.BRING_UP_CLIMB_RATE_RESTORE_VALUE
+        bounded_exit = min(max(pilot_rate, 0.1 * max_up), 0.5 * max_up)
+        default_exit = min(max(pilot_rate, 0.1 * default_max_up), 0.5 * default_max_up)
+        assert bounded_exit == pytest.approx(0.5 * max_up)
+        assert bounded_exit == pytest.approx(0.15)
+        assert default_exit == pytest.approx(pilot_rate)
+        assert bounded_exit < default_exit
+
+
+# ---------------------------------------------------------------------------
+# T16: a declared budget is spent in the units it is declared in. The ordered
+# bring-up's windows are windows of the AIRCRAFT's time, and the simulator's own
+# clock -- the controller's robot.getTime(), carried on every sensor frame the
+# feed reads (sensors.py:55, webots_ardupilot.py FrameHeader.sim_time_s) -- is
+# what has to spend them.
+#
+# Measured defect (run-2026-09-28T02-43-27-442Z, receipt
+# work/runs/p01-localization/receipt-p01l-2026-09-28T02-43-27-442Z.json): the
+# windows were wall-clock deadlines, this host ran the simulator at 0.40-0.92
+# simulated seconds per wall second, the declared 3.5 s climb window bought 2.20
+# simulated seconds, and the LAND command went out 0.80 simulated seconds BEFORE
+# the thrust path's first motor output. The airframe's own log for the same run
+# (work/ardupilot/logs/00000141.BIN) puts the first motor output at 18.923 s of
+# autopilot time, 29 ms after the LAND mode was applied and the throttle override
+# released: the excitation was cut off by the host's pace, not by its physics.
+# ---------------------------------------------------------------------------
+
+
+class TestDeclaredBudgetsAreSpentInTheirOwnUnits:
+    """A budget declared in simulator seconds is spent in simulator seconds.
+
+    The configuration declares those windows in simulated time and says so
+    ("a window measured in simulated time is comparable between the realtime and
+    fast modes", configs/first_indoor.yaml probe section), the excitation's
+    declaration reasons in the same units as the firmware's own MOT_IDLE_SEC
+    (BRING_UP_JUSTIFICATION, localization_check.py), and a climb rate times a
+    window is a distance the aircraft has to fly. A wall-clock deadline makes all
+    of that depend on how loaded the host happens to be.
+    """
+
+    @staticmethod
+    def _clock(sim_step_s: float, wall_step_s: float):
+        """A simulator clock and a wall clock that advance together, by injected steps.
+
+        The clock is seeded with one reading, because a window opens on a running
+        scene in every real use: a window whose start is latched lazily (the fallback
+        for a clock that has not delivered a reading yet) would count its own start
+        from its first poll, which is not what it measures.
+        """
+        clock = check._SimulatorClock()
+        clock.observe(0.0)
+        wall = {"now": 0.0}
+
+        def drain() -> None:
+            wall["now"] += wall_step_s
+            clock.observe((clock.newest_s or 0.0) + sim_step_s)
+
+        return clock, wall, drain
+
+    def test_the_wall_ceiling_is_derived_from_the_declared_realtime_envelope(self):
+        """Inside its declared envelope a simulated budget cannot outlast N/floor wall.
+
+        probe.realtime_ratio_envelope declares the simulator's rate as simulated
+        seconds per wall second, so its floor is the worst pace the run admits; the
+        ceiling exists only to stop a stalled simulator from hanging the run, which
+        is a finding rather than a reason to hang (the bridge's own
+        AT_REST_WALL_CLOCK_LIMIT_S states the same rule for its sim-time window).
+        """
+        assert check._sim_window_wall_ceiling_s(3.5, 0.5) == pytest.approx(7.0)
+        assert check._sim_window_wall_ceiling_s(60.0, 0.5) == pytest.approx(120.0)
+        # A slower admitted pace gives a longer ceiling: the factor is the declared
+        # floor, never a literal of this module's own.
+        assert check._sim_window_wall_ceiling_s(3.5, 0.25) == pytest.approx(14.0)
+
+    def test_a_slow_simulator_still_gets_the_declared_budget_in_its_own_seconds(self):
+        """At the envelope's floor the window closes on simulated time, not on wall.
+
+        The pace here is the declared floor (0.5 simulated seconds per wall
+        second), which is the worst a run may admit. The old wall-clock deadline
+        would have declared this 3.5 s window over after 3.5 wall seconds, with
+        only 1.75 simulated seconds spent -- which is the measured defect.
+        """
+        clock, wall, drain = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the excitation's climb drain",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        for _ in range(34):  # 3.4 wall seconds: 1.7 simulated seconds
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+            wall["now"] += 0.1
+            assert not window.expired(), window.document()
+        assert window.elapsed_simulator_s() == pytest.approx(1.7, abs=0.05)
+        assert window.ended_by is None
+
+        for _ in range(40):  # on to 7.4 wall seconds / 3.7 simulated seconds
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+            wall["now"] += 0.1
+            if window.expired():
+                break
+        document = window.document()
+        assert document["ended_by"] == "simulator", document
+        assert document["elapsed_simulator_s"] >= 3.5
+        assert document["budget_simulator_s"] == 3.5
+        assert document["elapsed_wall_s"] > 3.5  # the wall clock was not the deadline
+        assert document["wall_ceiling_s"] == pytest.approx(7.0)
+
+    def test_a_simulator_outside_its_envelope_is_ended_by_the_wall_ceiling(self):
+        """Outside the declared envelope the ceiling ends the window, and says so.
+
+        A simulator slower than the declared floor makes the run timing-invalid
+        (the probe's realtime evidence already reports those windows); the ceiling
+        is what stops the run from waiting forever for time that is not arriving.
+        It is recorded as the wall ceiling, never as the declared budget honoured.
+        """
+        clock, wall, drain = self._clock(sim_step_s=0.02, wall_step_s=0.1)
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the excitation's climb drain",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        for _ in range(200):
+            drain()
+            if window.expired():
+                break
+        document = window.document()
+        assert document["ended_by"] == "wall_ceiling", document
+        assert document["elapsed_simulator_s"] < document["budget_simulator_s"]
+        assert document["elapsed_wall_s"] >= document["wall_ceiling_s"]
+
+    def test_a_stalled_simulator_does_not_hang_the_wait(self):
+        """A clock that never advances ends on the ceiling, and never on the budget."""
+        clock = check._SimulatorClock()
+        wall = {"now": 0.0}
+        window = check._SimWindow(
+            clock,
+            60.0,
+            label="the bring-up's wait for the vehicle's own pre-arm checks to clear",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(60.0, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        assert not window.expired()
+        clock.observe(12.0)
+        for _ in range(700):
+            wall["now"] += 0.2
+            if window.expired():
+                break
+        document = window.document()
+        assert document["ended_by"] == "wall_ceiling"
+        assert document["elapsed_simulator_s"] == pytest.approx(0.0)
+
+    def test_the_initialization_wait_is_spent_in_simulator_seconds(self):
+        """H5's wait: the estimator's readiness is work in simulated time too.
+
+        The estimator latches on frames, and frames arrive in the scene's time, so
+        the declared pre_arm_wait_s ("all of which take simulated time") cannot be a
+        wall-clock deadline either. On a host running at the envelope's floor the
+        estimator that latches at 3.0 simulated seconds would be missed by a 3.5 s
+        wall deadline and is found by a 3.5 s simulated one.
+        """
+
+        class _Machine:
+            state = "warming"
+
+        machine = _Machine()
+        clock, wall, _ = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+
+        def drain() -> None:
+            wall["now"] += 0.1
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+            if clock.newest_s >= 3.0:
+                machine.state = "healthy"
+
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the declared wait for the estimator to initialize (pre_arm_wait_s)",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        assert check._wait_initialized(machine, drain, window) is True
+        document = window.document()
+        assert document["ended_by"] == "estimator_initialized"
+        assert document["elapsed_simulator_s"] >= 3.0
+        # The old wall deadline would have declared this over at 3.5 wall seconds,
+        # with 1.75 simulated seconds spent and a still-warming estimator.
+        assert document["elapsed_wall_s"] > 3.5
+
+    def test_an_estimator_that_never_latches_spends_the_declared_budget(self):
+        """The failure side: the wait ends with the declared budget spent, and says so."""
+
+        class _Machine:
+            state = "warming"
+
+        clock, wall, _ = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+
+        def drain() -> None:
+            wall["now"] += 0.1
+            clock.observe((clock.newest_s or 0.0) + 0.05)
+
+        window = check._SimWindow(
+            clock,
+            3.5,
+            label="the declared wait for the estimator to initialize (pre_arm_wait_s)",
+            wall_ceiling_s=check._sim_window_wall_ceiling_s(3.5, 0.5),
+            wall_clock=lambda: wall["now"],
+        )
+        assert check._wait_initialized(_Machine(), drain, window) is False
+        document = window.document()
+        assert document["ended_by"] == "simulator"
+        assert document["elapsed_simulator_s"] >= 3.5
+
+    def test_a_window_reports_what_it_cost_and_not_what_the_run_took(self):
+        """Each window's cost is frozen when it ends, not read when the receipt is written.
+
+        Found on the first flight of the change
+        (work/runs/p01-localization/p01l-clockfix-20260928T041129Z): every window of one
+        bring-up is documented together at the end, and a live reading made the 0.3 s
+        override settle report 14.092 simulated seconds -- the time from the settle to
+        the end of the descent drain. The measured airtime was correct there only because
+        it is read at the LAND command, which is exactly what this pins.
+        """
+        clock, wall, _ = self._clock(sim_step_s=0.05, wall_step_s=0.1)
+
+        def advance(steps: int, *, simulator: bool = True) -> None:
+            for _ in range(steps):
+                wall["now"] += 0.1
+                if simulator:
+                    clock.observe((clock.newest_s or 0.0) + 0.05)
+
+        settle = check._SimWindow(
+            clock, 0.3, label="the override settle", wall_ceiling_s=1.0,
+            wall_clock=lambda: wall["now"],
+        )
+        advance(6)
+        assert settle.expired() is True
+        assert settle.document()["ended_by"] == "simulator"
+        cost = settle.document()["elapsed_simulator_s"]
+        assert cost == pytest.approx(0.3, abs=0.05)
+        # Ten more simulated seconds of run, and the settle's cost does not move.
+        advance(200)
+        assert settle.document()["elapsed_simulator_s"] == cost
+        assert settle.document()["elapsed_wall_s"] == pytest.approx(0.6, abs=0.05)
+
+        # A window that a command closes (the airtime window ends at the LAND command)
+        # freezes at the close, and does not wait for the run to finish either.
+        airtime = check._SimWindow(
+            clock, 5.0, label="the airtime", wall_ceiling_s=10.0,
+            wall_clock=lambda: wall["now"],
+        )
+        advance(20)
+        airtime.close("land_commanded")
+        assert airtime.document()["ended_by"] == "land_commanded"
+        assert airtime.document()["elapsed_simulator_s"] == pytest.approx(1.0, abs=0.05)
+        advance(40)
+        assert airtime.document()["elapsed_simulator_s"] == pytest.approx(1.0, abs=0.05)
+
+
+    def test_the_bring_up_declares_the_clock_its_windows_are_spent_against(self):
+        """The receipt owes a reader the unit: the simulator's own clock, and its source."""
+        settings, window = TestOrderedBringUp()._settings_and_window()
+        envelope = settings.realtime_ratio_envelope
+        assert envelope == (0.5, 1.5)
+        assert check.SIMULATOR_CLOCK_SOURCE
+        assert "robot.getTime()" in check.SIMULATOR_CLOCK_SOURCE
+        assert (
+            check._sim_window_wall_ceiling_s(settings.pre_arm_wait_s, envelope[0])
+            == settings.pre_arm_wait_s / envelope[0]
+        )
+
+
+class TestSimulatorPacing:
+    """The receipt's pacing labelling and sim/wall measurement (owner ruling
+    2026-09-30, APPROVAL-RECORD "F2's denominator"): a receipt must state which
+    pacing the run flew under, so iteration-only runs cannot be confused with
+    scored ones, and must carry the feed's own sim span over its wall span."""
+
+    def test_the_declared_configuration_is_the_scored_pacing(self):
+        settings = PlatformSettings.from_config(_declared_document(), root=Path(".").resolve())
+        assert settings.webots_mode == "realtime"
+        assert settings.sim_wall_clamp is True
+        document = check._simulator_pacing_document(settings, None, [])
+        assert document["evidence_class"] == "scored"
+
+    def test_fast_mode_and_an_unclamped_realtime_run_are_iteration_only(self):
+        document = _declared_document()
+        document["platform"]["webots_mode"] = "fast"
+        document["platform"].pop("sim_wall_clamp")
+        fast = PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert check._simulator_pacing_document(fast, None, [])["evidence_class"] == (
+            "iteration-only"
+        )
+
+        document = _declared_document()
+        document["platform"].pop("sim_wall_clamp")
+        unclamped = PlatformSettings.from_config(document, root=Path(".").resolve())
+        assert check._simulator_pacing_document(unclamped, None, [])["evidence_class"] == (
+            "iteration-only"
+        )
+
+    def test_the_measured_ratio_is_the_feeds_own_sim_span_over_its_wall_span(self):
+        settings = PlatformSettings.from_config(_declared_document(), root=Path(".").resolve())
+        # Nine publications 10 ms of wall apart, each carrying 9 ms of simulator
+        # time (a 0.9x run), then one burst: 60 ms of simulator time inside one
+        # 10 ms tick -- the catch-up sprint the clamp exists to forbid.
+        rows = [(0.000 + 0.010 * index, int((0.009 * index) * 1e9)) for index in range(10)]
+        rows.append((0.100, int((0.081 + 0.060) * 1e9)))
+        document = check._simulator_pacing_document(settings, {"enabled": True}, rows)
+        measured = document["measured"]
+        assert measured["publications"] == 11
+        assert measured["wall_span_s"] == pytest.approx(0.1)
+        assert measured["sim_span_s"] == pytest.approx(0.141)
+        assert measured["span_ratio_sim_over_wall"] == pytest.approx(1.41)
+        percentiles = measured["interval_ratio_percentiles"]
+        assert percentiles["p50"] == pytest.approx(0.9)
+        assert percentiles["max"] == pytest.approx(6.0)
+        assert document["controller"] == {"enabled": True}
+
+
+class TestE1PerSampleRows:
+    """The join's per-sample rows must reproduce the aggregates they sit beside.
+
+    E1 coupling (2026-09-30): the aggregates answer "did it pass"; the rows answer
+    "where does the error live". A row set that disagrees with the p95/max it
+    accompanies would let an offline analysis argue from different data than the
+    gate scored.
+    """
+
+    def test_rows_reproduce_the_aggregates_and_the_join_counts(self):
+        published = [
+            (1_000_000_000 * second, (float(second), 0.25 * second, -1.5))
+            for second in range(1, 11)
+        ]
+        # Truth every 500 ms offset 60 ms late, so every publication joins its
+        # nearest truth sample inside the 100 ms tolerance without any stamp
+        # coinciding: the rows must carry the joined truth, not the publication.
+        truth = [
+            (500_000_000 * half + 60_000_000, (float(half) / 2.0, 0.0, -1.5))
+            for half in range(2, 23)
+        ]
+        bounds = {
+            "error_p95_horizontal_m": 0.10,
+            "error_p95_vertical_m": 0.15,
+            "error_max_horizontal_m": 0.15,
+            "error_max_vertical_m": 0.30,
+        }
+        statistics = check._truth_error_statistics(published, truth, bounds)
+        rows = statistics["samples"]
+        assert statistics["measured"] is True
+        assert len(rows) == statistics["joined_samples"]
+        assert len(rows) + statistics["unjoined"] == statistics["scored_publications"]
+        horizontal = [row["error_horizontal_m"] for row in rows]
+        vertical = [row["error_vertical_m"] for row in rows]
+        assert statistics["p95_horizontal_error_m"] == check._percentile(horizontal, 0.95)
+        assert statistics["p95_vertical_error_m"] == check._percentile(vertical, 0.95)
+        assert statistics["max_horizontal_error_m"] == max(horizontal)
+        assert statistics["max_vertical_error_m"] == max(vertical)
+        for row in rows:
+            joined = math.hypot(
+                row["estimate_ned_m"][0] - row["truth_ned_m"][0],
+                row["estimate_ned_m"][1] - row["truth_ned_m"][1],
+            )
+            assert row["error_horizontal_m"] == pytest.approx(joined)
+            assert 0 < abs(row["truth_time_ns"] - row["time_ns"]) <= 100_000_000
+
+    def test_every_row_carries_both_sides_of_its_join(self):
+        published = [(7_000_000_000, (1.0, 2.0, -1.5))]
+        truth = [(7_000_000_000, (1.02, 1.99, -1.48))]
+        bounds = {
+            "error_p95_horizontal_m": 0.10,
+            "error_p95_vertical_m": 0.15,
+            "error_max_horizontal_m": 0.15,
+            "error_max_vertical_m": 0.30,
+        }
+        row = check._truth_error_statistics(published, truth, bounds)["samples"][0]
+        assert row["estimate_ned_m"] == [1.0, 2.0, -1.5]
+        assert row["truth_ned_m"] == [1.02, 1.99, -1.48]
+        assert row["time_ns"] == row["truth_time_ns"] == 7_000_000_000

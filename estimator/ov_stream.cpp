@@ -96,6 +96,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -129,6 +130,35 @@ const double IMU_PERIOD_NS = 2e6;      // declared 500 Hz (configs/first_indoor.
 const double STEREO_PERIOD_NS = 1e8;   // declared 10 Hz (:65)
 const size_t STATE_PAYLOAD_SIZE = 8 + 1 + 19 * 8 + 4 + 8 + 1;  // "<QB19dIQB"
 const double PUBLISH_PERIOD_S = 0.010; // 100 Hz: F2's 20 ms bound is unreachable on 25 ms ticks (FIXER5)
+
+// ---------------------------------------------------------------------------
+// Per-tick diagnostics (F2, 2026-09-30). Enabled by F2_PER_TICK=1 in the
+// estimator process's environment; silent otherwise, so a production run's
+// behaviour and log volume are unchanged. What it records per publish: the
+// filter's own stamp (st), the newest inertial sample consumed (ni), what the
+// publish path did (p=projected to that sample, k=kept: no newer sample was
+// consumed, so the last successful projection is republished unchanged,
+// f=frozen at the filter's stamp because the newest consumed sample is not
+// ahead of it, r=refused and fell back to the filter's own camera-time state),
+// the clone count and the oldest clone (marg), and a shadow of every inertial
+// stamp this process has fed (sf..sl) with the count of fed stamps strictly
+// inside (st, ni] (win) -- the samples the projection needed. The shadow is a
+// superset of the propagator's own buffer (it applies no trimming), so a
+// refusal with win >= 2 means the samples were fed to the manager but were not
+// usable at select time, while win <= 1 means they never reached this process
+// at all. Per stereo frame it records the arrival wall time against the frame's
+// own stamp, which measures the hold in the host's pair queue directly.
+// ---------------------------------------------------------------------------
+bool per_tick_enabled() {
+  static const bool enabled = (::getenv("F2_PER_TICK") != nullptr);
+  return enabled;
+}
+
+std::deque<double> g_fed_imu;  // shadow of fed inertial stamps, untrimmed superset
+
+double steady_now_s() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 struct Reader {
   int fd = -1;
@@ -307,16 +337,50 @@ void build_options(ov_msckf::VioManagerOptions &params) {
 }
 
 // ---------------------------------------------------------------------------
+// The last successfully projected publication.
+//
+// Why this exists (F2, 2026-09-30): the pin's fast propagation carries its own
+// cache and, on every successful projection, moves that cache forward to the
+// projection target itself (Propagator.cpp:241-242, "cache_state_time = time1").
+// The very next publish tick therefore asks it to project from the newest
+// sample it already consumed to that same sample: an empty interval, which
+// `select_imu_readings` answers with fewer than two readings, so the pin
+// refuses. That is the normal case at 100 Hz publishes whenever no new inertial
+// sample was consumed in the last 10 ms -- which our host's burst-delivered feed
+// makes routine (measured, runs p01l-f2tick-1/-8-20260930: 55 % of publishes
+// carry no new sample; 2400+ refusals per run).
+//
+// The old fallback published the FILTER's state at its own timestamp -- the last
+// camera update, measured 0.06-0.5 s behind the newest consumed sample, and the
+// whole of this run's F2 failure. The newest pose this process actually holds is
+// the last successful projection: it is the filter's own propagation to the
+// newest inertial sample consumed, computed once and still valid, since no newer
+// sample has arrived. Republishing it, stamp and all, is strictly newer than the
+// filter state's own stamp and hides nothing: if the host has fed samples this
+// process has not consumed, the published stamp stays where it is and the age
+// (newest_imu_sent - stamp) grows to show it.
+// ---------------------------------------------------------------------------
+struct LastProjection {
+  bool valid = false;
+  double time = 0.0;
+  Eigen::Vector4d q_GtoI = Eigen::Vector4d(1.0, 0.0, 0.0, 0.0);
+  Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  double sigma[3] = {0.0, 0.0, 0.0};
+};
+
+// ---------------------------------------------------------------------------
 // One STATE frame (must match localization.py's decode_state)
 // ---------------------------------------------------------------------------
 
 void log_line(const char *format, ...);
 
 std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &sys,
-                                  uint8_t reset_counter, double newest_imu_time) {
+                                  uint8_t reset_counter, double newest_imu_time,
+                                  LastProjection *last = nullptr, char *action = nullptr) {
   auto state = sys->get_state();
   auto imu = state->_imu;
-
+  if (action != nullptr) *action = 'f';
   // The filter's own timestamp is the last camera/ZUPT update; between updates
   // the newest consumed inertial sample is ahead of it. Publish the projection
   // to that sample when the propagator can cover the interval, and the state
@@ -330,41 +394,68 @@ std::vector<uint8_t> encode_state(const std::shared_ptr<ov_msckf::VioManager> &s
   double publish_time = state->_timestamp;
   Eigen::Matrix<double, 13, 1> state_plus;
   Eigen::Matrix<double, 12, 12> cov_plus;
-  if (newest_imu_time > state->_timestamp &&
-      sys->get_propagator()->fast_state_propagate(state, newest_imu_time, state_plus, cov_plus)) {
-    publish_time = newest_imu_time;
-    q_GtoI = state_plus.block(0, 0, 4, 1);
-    position = state_plus.block(4, 0, 3, 1);
-    // state_plus carries the body-frame velocity (R_GtoI * v_G); the payload's
-    // contract is the estimator's global frame, so rotate it back.
-    velocity = ov_core::quat_2_Rot(q_GtoI).transpose() * state_plus.block(7, 0, 3, 1);
-    for (int i = 0; i < 3; ++i) {
-      double variance = cov_plus(3 + i, 3 + i);
-      sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
-    }
-  } else if (newest_imu_time > state->_timestamp) {
-    // The propagator cannot cover the interval, so the honest publication is the
-    // filter's own state at its own timestamp -- the same values the branch below
-    // publishes -- never the uninitialised locals this branch used to leave in
-    // place. Measured, runs p01l-fix5c/-7c-20260927: the refusal states' sigma of
-    // 0.0 kept them off the wire, but with the parked-phase sigma excursion
-    // declared benign (FIXER6) these frames are published while parked, and
-    // publishing uninitialised memory would inject a garbage pose instead.
-    q_GtoI = imu->quat();
-    position = imu->pos();
-    velocity = imu->vel();
-    {
-      std::vector<std::shared_ptr<ov_type::Type>> variables{imu};
-      Eigen::MatrixXd cov = ov_msckf::StateHelper::get_marginal_covariance(state, variables);
-      for (int i = 0; i < 3; i++) {
-        double variance = cov(3 + i, 3 + i);
+  if (newest_imu_time > state->_timestamp) {
+    bool projected = sys->get_propagator()->fast_state_propagate(state, newest_imu_time, state_plus, cov_plus);
+    if (projected) {
+      publish_time = newest_imu_time;
+      q_GtoI = state_plus.block(0, 0, 4, 1);
+      position = state_plus.block(4, 0, 3, 1);
+      // state_plus carries the body-frame velocity (R_GtoI * v_G); the payload's
+      // contract is the estimator's global frame, so rotate it back.
+      velocity = ov_core::quat_2_Rot(q_GtoI).transpose() * state_plus.block(7, 0, 3, 1);
+      if (action != nullptr) *action = 'p';
+      for (int i = 0; i < 3; ++i) {
+        double variance = cov_plus(3 + i, 3 + i);
         sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
       }
-    }
-    refusals += 1;
-    if (refusals == 1 || refusals % 200 == 0) {
-      log_line("ov_stream: projection refused (%llu so far): state_t=%.3f newest_imu=%.3f",
-               (unsigned long long)refusals, state->_timestamp, newest_imu_time);
+      if (last != nullptr) {
+        last->valid = true;
+        last->time = publish_time;
+        last->q_GtoI = q_GtoI;
+        last->position = position;
+        last->velocity = velocity;
+        for (int i = 0; i < 3; ++i) last->sigma[i] = sigma[i];
+      }
+    } else if (last != nullptr && last->valid && newest_imu_time <= last->time) {
+      // No inertial sample has been consumed since the last successful
+      // projection, so the pin's cache (which that projection moved forward to
+      // its own target, Propagator.cpp:241) asks it to project an empty
+      // interval and it refuses. The newest pose this process holds is exactly
+      // that last projection -- nothing newer has arrived to invalidate it --
+      // so republish it rather than dropping back to the filter's camera-time
+      // state. The stamp is unchanged, so F2 still measures the true age
+      // against what the host has sent.
+      publish_time = last->time;
+      q_GtoI = last->q_GtoI;
+      position = last->position;
+      velocity = last->velocity;
+      for (int i = 0; i < 3; ++i) sigma[i] = last->sigma[i];
+      if (action != nullptr) *action = 'k';
+    } else {
+      // The propagator cannot cover the interval, so the honest publication is the
+      // filter's own state at its own timestamp -- the same values the branch below
+      // publishes -- never the uninitialised locals this branch used to leave in
+      // place. Measured, runs p01l-fix5c/-7c-20260927: the refusal states' sigma of
+      // 0.0 kept them off the wire, but with the parked-phase sigma excursion
+      // declared benign (FIXER6) these frames are published while parked, and
+      // publishing uninitialised memory would inject a garbage pose instead.
+      q_GtoI = imu->quat();
+      position = imu->pos();
+      velocity = imu->vel();
+      {
+        std::vector<std::shared_ptr<ov_type::Type>> variables{imu};
+        Eigen::MatrixXd cov = ov_msckf::StateHelper::get_marginal_covariance(state, variables);
+        for (int i = 0; i < 3; i++) {
+          double variance = cov(3 + i, 3 + i);
+          sigma[i] = variance > 0.0 ? std::sqrt(variance) : 0.0;
+        }
+      }
+      if (action != nullptr) *action = 'r';
+      refusals += 1;
+      if (refusals == 1 || refusals % 200 == 0) {
+        log_line("ov_stream: projection refused (%llu so far): state_t=%.3f newest_imu=%.3f",
+                 (unsigned long long)refusals, state->_timestamp, newest_imu_time);
+      }
     }
   } else {
     q_GtoI = imu->quat();
@@ -474,6 +565,10 @@ int main(int argc, char **argv) {
   // these, and the next one carries the stream. Only a malformed frame or a dead
   // listener ends the process.
   double newest_imu_time = 0.0;
+  // The last successful projection, republished unchanged on a tick where no new
+  // inertial sample has been consumed (see LastProjection above). It is a
+  // property of the filter, so it survives a host reconnection but not a reset.
+  LastProjection last_projection;
   uint64_t stereo_frames = 0;
   uint64_t imu_samples = 0;
   uint64_t published = 0;
@@ -539,6 +634,12 @@ int main(int argc, char **argv) {
         sys->feed_measurement_imu(message);
         newest_imu_time = message.timestamp;
         imu_samples += 1;
+        if (per_tick_enabled()) {
+          g_fed_imu.push_back(message.timestamp);
+          while (!g_fed_imu.empty() && g_fed_imu.front() < message.timestamp - 2.0) {
+            g_fed_imu.pop_front();
+          }
+        }
       } else if (kind == KIND_STEREO) {
         if (length < 16) {
           std::fprintf(stderr, "ov_stream: STEREO payload is %u bytes, too short for its header\n", length);
@@ -572,6 +673,11 @@ int main(int argc, char **argv) {
         }
         sys->feed_measurement_camera(message);
         stereo_frames += 1;
+        if (per_tick_enabled()) {
+          log_line("ov_stream: PAIR wall=%.3f frame_t=%.3f delay=%.3f imu_fed=%llu",
+                   steady_now_s(), image_time, steady_now_s() - image_time,
+                   (unsigned long long)imu_samples);
+        }
         if (stereo_frames <= 10 || stereo_frames % 25 == 0) {
           // Diagnostic: the frame's own timestamp, the pixel statistics of what the
           // tracker was handed, and how many features it is carrying. Without these,
@@ -596,6 +702,7 @@ int main(int argc, char **argv) {
         // again, so the adapter sees silence rather than a jump (plan section
         // 4.4); its own reset counter is what rides the published messages.
         reset_counter += 1;
+        last_projection.valid = false;
         newest_imu_time = 0.0;
         sys = std::make_shared<ov_msckf::VioManager>(params);
         log_line("ov_stream: reset %u: fresh filter", (unsigned)reset_counter);
@@ -612,7 +719,21 @@ int main(int argc, char **argv) {
     if (since_publish >= PUBLISH_PERIOD_S) {
       last_publish = now;
       if (sys->initialized()) {
-        std::vector<uint8_t> frame = encode_state(sys, reset_counter, newest_imu_time);
+        char action = 'f';
+        std::vector<uint8_t> frame = encode_state(sys, reset_counter, newest_imu_time, &last_projection, &action);
+        if (per_tick_enabled()) {
+          auto state = sys->get_state();
+          size_t in_window = 0;
+          for (double stamp : g_fed_imu) {
+            if (stamp > state->_timestamp && stamp <= newest_imu_time) in_window += 1;
+          }
+          log_line("ov_stream: PUB wall=%.3f st=%.3f ni=%.3f act=%c clones=%zu marg=%.3f "
+                   "sf=%.3f sl=%.3f win=%zu",
+                   steady_now_s(), state->_timestamp, newest_imu_time, action,
+                   state->_clones_IMU.size(), state->margtimestep(),
+                   g_fed_imu.empty() ? -1.0 : g_fed_imu.front(),
+                   g_fed_imu.empty() ? -1.0 : g_fed_imu.back(), in_window);
+        }
         if (!send_all(client, frame)) {
           log_line("ov_stream: the host is gone while publishing");
           break;

@@ -45,7 +45,14 @@ platform:
   # the simulator's realtime catch-up sprint, which this forbids. Runs at
   # webots_mode fast keep the clamp OFF and are ITERATION-ONLY evidence, labelled
   # in their receipts and never pooled with scored runs.
-  sim_wall_clamp: true
+  # DIAGNOSTIC CONTROL ARM, never a scored configuration. This file exists for one
+  # purpose: the E1 pacing A/B (E1-COUPLING-REPORT, 2026-09-30). It is byte-for-byte
+  # configs/first_indoor.yaml except this key, so the clamp-off arm of the A/B differs
+  # from the clamp-on arm by the pacing gate alone. The owner's ruling (APPROVAL-RECORD
+  # "F2's denominator") keeps the clamp ON for every scored run; a run on this file is
+  # labelled by its own receipt (realtime, clamp off reads evidence class
+  # iteration-only) and may never be pooled with scored evidence.
+  sim_wall_clamp: false
   sim_model: webots-python
   vehicle: ArduCopter
   sitl_home: "-35.363261,149.165230,584,353"

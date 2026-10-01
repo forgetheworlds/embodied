@@ -11,7 +11,77 @@ resolves the shared module, including the ``EMBODIED_SRC`` fallback, before it
 imports this file.
 """
 
+import time
+
 from embodied.platform.webots_ardupilot import propeller_velocity
+
+
+class SimWallPacer:
+    """Clamp the simulator's advance to at most one simulated second per wall second.
+
+    WHY THIS SHAPE. The world advances only while this synchronized controller is
+    inside ``robot.step()`` (Iris.proto ``synchronization TRUE``), so the controller's
+    step loop IS the simulator's pacing. Webots' realtime mode recovers lost ground by
+    sprinting: after a slow stretch it runs steps back-to-back until simulation time is
+    back in phase with the wall, which delivers tens of milliseconds of sensor time
+    inside a single wall tick (measured: local sim/wall ratio p95 6.7-7.7 at pair
+    arrivals, F2-TRANSPORT-REPORT.md §4). A gate that only slept "when sim leads wall"
+    would never fire, because catch-up never leads the wall; the clamp has to hold the
+    RATE, not the phase. This pacer therefore schedules each step's release one
+    ``timestep`` after the previous one, on the wall clock, and never reschedules
+    early: a step that overran its slot may push later slots back, but no later step
+    may run early to recover the lost time. The simulation clock is then 1-Lipschitz
+    in the wall clock -- over any window, at most that window's duration of simulated
+    time can be produced -- which is exactly the owner's ruling that a 10 ms tick must
+    mean 10 ms of sensor time. Slower than realtime is still allowed (a loaded host
+    cannot be sped up, and a slower simulator only ages the wall-clock side); the
+    clamp forbids only the sprint.
+
+    The gate is selected by the run's configuration (the bridge sets
+    ``EMBODIED_SIM_WALL_CLAMP=1`` in the simulator process's environment for the
+    scored path); with the gate off, Webots' own pacing -- realtime with catch-up, or
+    fast mode for iteration -- is untouched.
+    """
+
+    def __init__(self, timestep_ms, clock=time.monotonic, sleep=time.sleep):
+        self.timestep_ms = int(timestep_ms)
+        self._dt = self.timestep_ms / 1000.0
+        self._clock = clock
+        self._sleep = sleep
+        self._next_release = None
+        self.steps = 0
+        self.gates = 0
+        self.slept_s = 0.0
+
+    def after_step(self):
+        """Hold the wall until this step's slot has been paid for."""
+        self.steps += 1
+        now = self._clock()
+        if self._next_release is None:
+            self._next_release = now + self._dt
+            return
+        if now < self._next_release:
+            self._sleep(self._next_release - now)
+            self.gates += 1
+            self.slept_s += self._clock() - now
+            now = self._clock()
+        # Schedule from the later of the planned release and the actual wake-up, so the
+        # release times only ever fall behind: a late step cannot be followed by an
+        # early one, which is what forbids the catch-up sprint.
+        self._next_release = max(self._next_release, now) + self._dt
+
+    def document(self):
+        return {
+            "enabled": True,
+            "rule": (
+                "each basic time step holds at least its own duration of wall time; "
+                "the schedule never runs early, so no catch-up sprint is possible"
+            ),
+            "timestep_ms": self.timestep_ms,
+            "steps": self.steps,
+            "gates": self.gates,
+            "slept_s": round(self.slept_s, 3),
+        }
 
 
 class VehicleDevices:
@@ -21,9 +91,13 @@ class VehicleDevices:
     so a renamed device is a loud load error rather than a silently missing sensor.
     """
 
-    def __init__(self, robot, args):
+    def __init__(self, robot, args, clamp_sim_wall=False):
         self.robot = robot
         self.timestep_ms = int(robot.getBasicTimeStep())
+        # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
+        # "F2's denominator"): None leaves the simulator's own pacing untouched, which
+        # is what iteration runs keep.
+        self.pacer = SimWallPacer(self.timestep_ms) if clamp_sim_wall else None
         self.accelerometer = self._device(robot, args.accelerometer)
         self.gyro = self._device(robot, args.gyro)
         self.inertial_unit = self._device(robot, args.inertial_unit)
@@ -56,7 +130,20 @@ class VehicleDevices:
 
     def step(self):
         """Advance the simulation by one basic time step. False when Webots closed."""
-        return self.robot.step(self.timestep_ms) != -1
+        stepped = self.robot.step(self.timestep_ms) != -1
+        if stepped and self.pacer is not None:
+            self.pacer.after_step()
+        return stepped
+
+    def pacing_document(self):
+        """What this controller enforces on the simulator's pacing, or its absence."""
+        if self.pacer is None:
+            return {
+                "enabled": False,
+                "rule": "none: the simulator's own pacing is unmodified",
+                "timestep_ms": self.timestep_ms,
+            }
+        return self.pacer.document()
 
     def camera_periods_ms(self):
         return {name: int(camera.getSamplingPeriod()) for name, camera in self.cameras.items()}

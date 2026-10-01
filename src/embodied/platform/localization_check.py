@@ -45,6 +45,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 from embodied.cli import (
@@ -67,6 +68,7 @@ from embodied.platform.webots_ardupilot import (
     EvidenceWriter,
     Kind,
     LocalNedTarget,
+    LowPrioritySubprocessRunner,
     MAV_CMD_NAV_TAKEOFF,
     MSG_ID_RC_CHANNELS,
     PlatformSettings,
@@ -74,7 +76,6 @@ from embodied.platform.webots_ardupilot import (
     ProbeFailure,
     RC_THROTTLE_CHANNEL,
     RC_THROTTLE_RELEASE_PWM,
-    SubprocessRunner,
     TcpSensorGateway,
     WebotsArduPilot,
     check_prerequisites,
@@ -107,9 +108,13 @@ SEAM_REQUIREMENTS: tuple[tuple[str, float, str], ...] = (
     ("GPS1_TYPE", 0.0, "p01l_sensor.parm"),
     ("GPS2_TYPE", 0.0, "p01l_sensor.parm"),
     # Measured, FIXER5: the pose arrives p50 2.5-5.7 ms (sim) after its own validity
-    # stamp, so the EKF's declared fusion delay is the pin's default 10 ms
-    # (AP_VisualOdom.cpp:83), not the 50 ms tuned when the pose was stale.
-    ("VISO_DELAY_MS", 10.0, "p01l_sensor.parm"),
+    # Measured, FIXER5: the pose arrives p50 2.5-5.7 ms (sim) after its own validity
+    # stamp, so the EKF's declared fusion delay was the pin's default 10 ms.
+    # Re-measured for the 2026-09-30 F2 fix (run p01l-f2fix-1-20260930T051723Z):
+    # with the published stamp no longer falling back to the last camera update,
+    # the pose arrives p50 20 ms behind its own stamp (p95 208 ms), so the
+    # declared delay is the measured median, 20 ms.
+    ("VISO_DELAY_MS", 20.0, "p01l_sensor.parm"),
     ("VISO_QUAL_MIN", 0.0, "p01l_sensor.parm"),
     ("FS_EKF_ACTION", 1.0, "p01l_sensor.parm"),
 )
@@ -183,14 +188,16 @@ FAST_THRESHOLD = 20
 # motion measurement existed (plan sections 0.6 item 5, 0.7 item 4, 0.8 item 3).
 # Carrier GUIDED, no lateral setpoint at all, termination LAND always:
 #
-#   height    <= 0.60 m, the commanded takeoff altitude -- half the declared 1.5 m
-#               hover altitude and well under the 2.0 m doorway lintel;
-#   airtime   <= 5.0 s from the arm readback to the LAND command;
+#   height    <= 0.30 m, the commanded takeoff altitude -- a fifth of the
+#               declared 1.5 m hover altitude and well under the 2.0 m doorway
+#               lintel (re-declared from 0.60 m, see the 2026-09-29 amendment);
+#   airtime   <= 6.0 s from the arm readback to the LAND command;
 #   post-LAND drain 10.0 s, so the descent's frames are fed too -- still motion,
 #               still inside the same flight event, still terminated by LAND.
 #
-# Why a 0.60 m climb excites feature propagation, read from the pinned source
-# (plan section 0.6 item 5) rather than hoped: VioManager::initialized() needs
+# Why a climb excites feature propagation, read from the pinned source
+# (plan section 0.6 item 5) rather than hoped -- and why 0.30 m still carries
+# it after the 2026-09-29 re-declaration: VioManager::initialized() needs
 # timelastupdate written once (VioManager.cpp:651), which needs
 # do_feature_propagate_update past the clone gate (VioManager.cpp:348), which
 # needs >= 5 frames the zero-velocity updater declined
@@ -199,8 +206,69 @@ FAST_THRESHOLD = 20
 # the accelerometer read other than gravity (the chi2 residual of the
 # zero-velocity hypothesis) and, at the rig's 554 px focal length, ~2.7 mm of
 # translation is ~1 px of mean disparity -- so >= 0.5 s of climb at the declared
-# 10 Hz stereo rate is >= 5 declining frames, and the 5.0 s bound carries a
+# 10 Hz stereo rate is >= 5 declining frames. The 0.60 m climb bought 1.2 s of
+# that at the declared 0.5 m/s; the 0.30 m re-declaration still buys 0.6 s --
+# above the criterion, with the margin now carried by the unstick-to-LAND
+# descent the post-LAND drain feeds -- and the 6.0 s bound carries more than a
 # factor of ten over a criterion read from the code.
+#
+# RE-DECLARED BY THE OWNER, 2026-09-28 (the operator's ruling: "just run the sim
+# longer"; recorded here as a criterion change, not a quiet bump). The 5.0 s
+# airtime bound and the 3.5 s climb window were frozen before any measurement of
+# the vehicle's own pre-thrust time existed, and that time is now measured: the
+# airframe holds its motor interlock down for its own 2.0 s `ap.in_arming_delay`
+# after arming (`ARMING_DELAY_SEC`, ArduCopter/motors.cpp:59,75 -- the
+# MOTORS_INTERLOCK_ENABLED event, at arm+2.004 s in logs 00000139/00000140/
+# 00000142), the takeoff's own slew reaches TKOFF_THR_MAX 0.9 at 0.5/s
+# (`do_pilot_takeoff_ms`, measured as the NOT_LANDED event at command+1.735 s in
+# 00000142), and the declared 0.60 m climb at the declared 0.5 m/s is 1.2 s. A
+# window that must contain a climb therefore cannot be shorter than
+# 2.0 + 1.8 + 1.2 = 5.0 s, and the airtime bound that must contain that window
+# plus the 0.3 s override settle cannot be shorter than 5.3 s: hence
+# EXCITATION_CLIMB_DRAIN_S = 5.0 and EXCITATION_MAX_AIRTIME_S = 6.0. The ordering
+# defect fixed beside this (the takeoff command is held until the airframe's own
+# thrust path is open) is what makes those seconds reachable at all; see
+# `_run_ordered_bring_up` and work/runs/p01-localization/THRUST-ORDER-REPORT.md.
+#
+# AMENDED BY THE OWNER-RATIFIED RAMP BOUND, 2026-09-28 (the climb-fix brief; the
+# derivation is beside BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE below): the window
+# now bounds the takeoff's open-loop ramp at TKOFF_THR_MAX 0.55, so the slew the
+# window has to contain is 1.1 s to that cap -- SHORTER than the 1.8 s this
+# derivation measured at the firmware-default cap 0.9, which the containment
+# above still covers: bounding the ramp did not need, and did not get, a longer
+# window. A test asserts both containments (the default cap's and the window's)
+# so the two declarations cannot drift apart again.
+#
+# RE-DECLARED FOR THE RELEASE-ENERGY FIX, 2026-09-29 (step `release-energy-fix`
+# of the P01-L phase plan; one hypothesis, applied per the ground-hold verdict's
+# ranked lever 1). The ground-hold bench measured the floor-to-body contact pair
+# holding the vehicle at rest height for ~2.0 s after the spool's first nonzero
+# command -- independent of thrust level across 1.045x-1.369x weight -- and then
+# releasing (work/runs/p01-localization/ground-hold-20260929T150956Z,
+# verdict.json: hold_time_s 2.008; the flights' own unstick instants replayed to
+# +/-0.02 s). The stuck phase is real thrust time, so the climb window has to
+# contain it, and the release energy -- what the vehicle does with the demand
+# the loop has wound up by the moment the hold expires -- is the loop-side lever
+# the verdict owns: halve the commanded takeoff target 0.60 -> 0.30 m. The
+# derivation the two window constants must satisfy is therefore, in simulator
+# seconds: 2.0 s interlock (in_arming_delay, unchanged) + ~0.2 s slew to the
+# spool's first nonzero command (measured: 2.1-2.2 s after arm in
+# 00000143/144/145) + 2.0 s contact hold (measured, above) + the declared climb
+# 0.30 m at the declared 0.5 m/s = 0.6 s -- 4.8 s, inside the declared 5.0 s
+# climb window; and the airtime bound must still contain that window plus the
+# 0.3 s override settle = 5.3 s, inside the declared 6.0 s. Both constants keep
+# their 2026-09-28 values; what changed is the chain they must contain (the
+# measured hold replaces the slew-to-cap term as the binding pre-climb element)
+# and the climb term halves with the target. A test asserts the new chain
+# against the measured numbers beside the old containment.
+#
+# AMENDED BY THE SECOND REPAIR, 2026-09-29 (the same step, after repair 1's
+# flight failed its falsifiers): the declared pilot climb rate moves to 0.3 m/s
+# with the pacing repair, so the climb term is 0.30/0.3 = 1.0 s and the chain
+# the window must contain is 2.0 + 0.2 + 2.0 + 1.0 = 5.2 s -- hence
+# EXCITATION_CLIMB_DRAIN_S = 5.5. The airtime bound still contains that window
+# plus the 0.3 s settle = 5.8 s, inside the declared 6.0 s, which keeps its
+# value. A test asserts both containments against the measured numbers.
 #
 # The envelope is carried as constants, not a localization.excitation
 # configuration key, because the shared cli.py schema rejects unknown
@@ -209,12 +277,36 @@ FAST_THRESHOLD = 20
 # so the key would break `python -m embodied compat` -- the P00 gate's own
 # command (plan section 0.8 item 3, Correction C). configs/first_indoor.yaml
 # carries the same declaration as a comment beside the section it belongs to.
+#
+# THE UNIT OF EVERY WINDOW BELOW IS THE SIMULATOR'S SECOND, NOT THE HOST'S, and
+# until 2026-09-28 the code spent them on the wall clock. That is a defect, not a
+# preference: the airtime bound is "from the arm readback to the LAND command",
+# a quantity of the aircraft's own time; the MOT_IDLE_SEC reasoning above weighs
+# it against the firmware's own 4.0 s; a climb rate times the window is a
+# distance the aircraft has to fly; and the configuration declares these windows
+# in simulated time for the same reason ("a window measured in simulated time is
+# comparable between the realtime and fast modes"). Measured on a loaded host
+# (run-2026-09-28T02-43-27-442Z, receipt work/runs/p01-localization/
+# receipt-p01l-2026-09-28T02-43-27-442Z.json): the simulator ran at 0.40-0.92
+# simulated seconds per wall second, this 3.5 s climb window bought 2.20
+# simulated seconds, and the LAND command was applied 0.80 simulated seconds
+# BEFORE the thrust path's first motor output (the airframe's own log,
+# work/ardupilot/logs/00000141.BIN: first motor output at 18.923 s of autopilot
+# time) -- an excitation cut off by the host's pace. Every window here is spent
+# with `_SimWindow` against the simulator's clock, with the wall ceiling
+# `_sim_window_wall_ceiling_s` derives from the declared realtime envelope.
 EXCITATION_MODE = "GUIDED"
-EXCITATION_TAKEOFF_ALTITUDE_M = 0.60
-EXCITATION_MAX_AIRTIME_S = 5.0
-EXCITATION_CLIMB_DRAIN_S = 3.5
+EXCITATION_TAKEOFF_ALTITUDE_M = 0.30  # re-declared from 0.60, see above
+EXCITATION_MAX_AIRTIME_S = 6.0  # re-declared from 5.0, see above
+EXCITATION_CLIMB_DRAIN_S = 5.5  # re-declared from 5.0 by the second repair, see above
 EXCITATION_POST_LAND_DRAIN_S = 10.0
 EXCITATION_ALTITUDE_REACHED_MARGIN_M = 0.05
+# The excitation's takeoff command is retried on a refusal: measured, run
+# p01l-streak-2-20260930T015214Z, the first command drew COMMAND_ACK result 4 while
+# the estimator's parked initialization was still settling the EKF's position
+# estimate, and the single-shot command turned a one-second race into a blocked run.
+EXCITATION_TAKEOFF_ATTEMPTS = 3
+EXCITATION_TAKEOFF_RETRY_WAIT_S = 1.0
 
 # The yaw the scored window's position targets carry, as a commanded angle.
 # The frozen route is a position command (plan section 5, "the frozen route is
@@ -377,6 +469,128 @@ BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE = 6.0  # SourceZ::EXTNAV, the declared seam
 BRING_UP_MOTOR_IDLE_PARAMETER = "MOT_IDLE_SEC"
 BRING_UP_MOTOR_IDLE_WINDOW_VALUE = 0.0  # the firmware's own default
 BRING_UP_MOTOR_IDLE_RESTORE_VALUE = 4.0  # compat_arming.parm, iteration 11
+# The window's fourth parameter: the takeoff's own open-loop ramp, bounded at
+# the airframe's own hover. OWNER-RATIFIED CRITERION CHANGE of 2026-09-28 (the
+# climb-fix brief authorises a declared-value change "recorded as an
+# owner-ratified criterion change with the airframe's own numbers behind it",
+# the way the window extension of 16192e1 was recorded).
+#
+# THE MEASURED DEFECT (work/ardupilot/logs/00000143.BIN, the thrust-order
+# flight). `_TakeOff::do_pilot_takeoff_ms` (ArduCopter/takeoff.cpp:76-118)
+# ramps the throttle OPEN-LOOP -- `get_throttle_in() + G_Dt /
+# takeoff_throttle_slew_time`, the measured 0.5/s -- for as long as
+# `land_complete` holds, with no altitude feedback. Every exit condition but
+# one needs motion the aircraft cannot have while still on the ground
+# (estimated accel >= 0.5 * PILOT_ACC_Z, velocity, altitude); the one
+# motion-free exit is the ramp's own cap `throttle >= MIN(TKOFF_THR_MAX,
+# 0.9)` (takeoff.cpp:92). On this airframe the firmware's default cap 0.9 is
+# roughly twice the hover it actually holds, so the ramp ran 1.7 s to ThO 0.875
+# (RCOU 1867 us, ~2x weight; the vehicle still at 0.00-0.01 m of truth),
+# NOT_LANDED fired on the throttle condition at arm+3.995, and the aircraft
+# then climbed through 3.7 m/s and put its centre of gravity at 2.39 m -- the
+# room's own 2.5 m ceiling (dev-a-single/world.wbt: interior height 2.5) --
+# before the closed loop or the LAND (arm+4.651) could arrest it: roll +-180
+# deg, `Crash: Disarming: AngErr=164>30` at arm+10.19. The closed loop itself
+# was never the driver: the commanded climb-rate target (CTUN.DCRt) peaked at
+# 0.69 m/s and the throttle was cut to the floor 0.6 s after the loop closed.
+#
+# THE VALUE, FROM THE AIRFRAME'S OWN NUMBERS. The P00 accept runs measured this
+# airframe's hover hold at 1419 us (compat_arming.parm, iteration 11's own
+# record). Through the motors' own mapping -- actuator = (PWM - MOT_PWM_MIN) /
+# (MOT_PWM_MAX - MOT_PWM_MIN) = 0.419, throttle = (actuator - MOT_SPIN_MIN
+# 0.15) / (1 - MOT_SPIN_MIN) -- that is a hover throttle of ~0.316 (the flown
+# RCOU floor 1150-1151 in every log is that same MOT_SPIN_MIN). The ramp's own
+# accel exit needs thrust ~ weight * (1 + 0.5 * PILOT_ACC_Z 2.5 / g) = 1.13x
+# hover, throttle ~0.357. A window value of 0.55 clears both with headroom for
+# the unstick transient while bounding the thrust the ramp may command at
+# unstick to ~1.5x the hover (actuator 0.6175) against the default's ~2.2x
+# (actuator 0.915) -- and because the ramp now reaches the cap in 0.55 / 0.5 =
+# 1.1 s against the default's 1.8 s, liftoff arrives EARLIER, inside the same
+# declared 5.0 s climb window and 6.0 s airtime (asserted in a test against
+# the pin's own default cap as well, so the bound is not a change the airtime
+# only affords because the ramp got shorter). The scored run's guided takeoff
+# is untouched: the window writes this for its own takeoff only and restores
+# the pin's default before the scored window opens.
+BRING_UP_TAKEOFF_RAMP_MAX_PARAMETER = "TKOFF_THR_MAX"
+BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE = 0.55
+BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE = 0.9  # the pin's own default
+
+# The window's sixth parameter, added by the release-energy fix's second repair
+# (2026-09-29): the PACING of the open-loop ramp, not its cap. The repair-1
+# flight (work/runs/p01-localization/p01l-release-20260929T204914Z, dataflash
+# 00000146.BIN) measured the halved 0.30 m target leaving the unstick demand
+# UNCHANGED -- C1 1783 us at unstick, actuator 0.783, against the
+# cap-plus-velocity-chase model 0.15 + 0.85 x (TKOFF_THR_MAX 0.55 + 0.37 x
+# PILOT_SPD_UP 0.5) = 0.775 -- and peak truth altitude 2.39 m against 145's
+# 2.11 m at the 0.60 m target: the altitude error is not in the stuck-phase
+# demand. What the same log's timeline shows is that the closed loop takes over
+# at NOT_LANDED -- the ramp's own cap exit, fired at ~1.4 s of ramp -- and
+# chases the shaped velocity target for the remaining ~0.6 s of the contact
+# hold. The measured countermeasure keeps the closed loop out of the stuck
+# phase entirely: pace the ramp with TKOFF_SLEW_TIME (ArduCopter/Parameters.cpp:978,
+# `G_Dt / copter.g2.takeoff_throttle_slew_time`, takeoff.cpp:83) so the ramp
+# crosses the release band -- ~1.3-1.5x the PHYSICS hover the ground-hold bench
+# measured (actuator 0.307; thrust 48 f N against weight 14.715 N) -- at the
+# hold's own expiry, ~2.0 s after the spool's first nonzero command. At the
+# window value 6.0 s the ramp sits at 2.0/6.0 = 0.333 throttle = actuator 0.433
+# = 1.41x physics weight at hold expiry, every motion exit is still absent
+# while held, and the cap 0.55 is not reached until 3.3 s -- after the
+# release -- so NOT_LANDED fires on real motion at the unstick itself and the
+# wind-up never runs. Restored to the firmware's own default 2.0 (unset by
+# every parm file this project applies) before the scored window opens.
+BRING_UP_TAKEOFF_SLEW_PARAMETER = "TKOFF_SLEW_TIME"
+BRING_UP_TAKEOFF_SLEW_WINDOW_VALUE = 6.0
+BRING_UP_TAKEOFF_SLEW_RESTORE_VALUE = 2.0  # Parameters.cpp:978, the pin's default
+
+# The window's fifth parameter, and the second OWNER-RATIFIED CRITERION CHANGE of
+# the climb-fix brief (2026-09-28): the climb rate the MODE may command, bounded
+# at the rate the window itself declares.
+#
+# THE MEASURED DEFECT (work/ardupilot/logs/00000143.BIN and 00000144.BIN, the
+# thrust-order flight and the first ramp-bounded flight). Both flights measure
+# this airframe leaving the ground only at commanded throttle ~0.87-0.93 -- at or
+# above the firmware's own takeoff cap -- so the unstick releases roughly twice
+# the hover thrust for the ~0.4 s it takes the controller's state estimate to
+# catch up. What decides how long that burn lasts is the velocity TARGET the
+# position loop is chasing: `input_pos_vel_accel_D_m` shapes the desired
+# trajectory inside `_vel_max_up_ms` = PILOT_SPEED_UP, and the throttle collapse
+# begins only when the velocity ESTIMATE crosses that target. At the firmware
+# default 2.5 m/s (config.h:531-532; no parameter file this project applies sets
+# it) the shaped target ran to 2.2-2.4 m/s while the aircraft was already
+# ballistic (CTUN.DCRt in 00000143), the collapse came ~0.4 s after unstick, and
+# the aircraft coasted to the room's 2.5 m ceiling both times.
+#
+# THE VALUE. The window declares a pilot climb rate of 0.5 m/s
+# (BRING_UP_THROTTLE_CLIMB_RATE_M_S); ALT_HOLD's own maximum is a declaration
+# nobody made. Setting PILOT_SPD_UP to the declared rate bounds everything the
+# mode can command -- the shaped trajectory's feed-forward, the Flying state's
+# target rise, and the ramp's own velocity exit (which drops to 0.25 m/s,
+# `constrain(pilot_climb_rate, 0.1*max_up, 0.5*max_up)` at takeoff.cpp:96-98) --
+# at the rate the envelope already declares. The predecessor's own words name
+# the defect this closes: "the declared +0.494 m/s pilot climb rate is unbounded
+# in ALT_HOLD". The stick override's PWM is derived AFTER this parameter is in
+# force, so the derivation sees the vehicle's own 0.5 and expresses the declared
+# rate at the top of the channel's own range -- full stick is now the declared
+# 0.5 m/s, not an unbounded climb. Restored to the firmware's own default 2.5
+# before the scored window opens.
+#
+# RE-DECLARED BY THE RELEASE-ENERGY FIX'S SECOND REPAIR, 2026-09-29. The
+# repair-1 flight (00000146.BIN) measured the stuck-phase demand riding the
+# 0.5 m/s shaped target to the cap-plus-chase model's own number (actuator 0.783
+# at unstick against the model 0.775), so the declared rate the window bounds
+# the mode at moves to 0.3 m/s: the chase term (~0.37 actuator per m/s) halves,
+# the throttle collapse now waits for the velocity estimate to cross 0.3 m/s
+# instead of 0.5 -- a shorter burn at a lower demand -- and the ramp's own
+# velocity exit drops to 0.15 m/s (constrain(pilot, 0.1 max, 0.5 max),
+# takeoff.cpp:96-98), so the open-loop ramp hands over to the closed loop on
+# real motion at the release itself, which is the pacing repair's design. The
+# override's declared rate moves with it (BRING_UP_THROTTLE_CLIMB_RATE_M_S
+# below); full stick now expresses the declared 0.3 m/s. Restored to the
+# firmware's own default 2.5 before the scored window opens.
+BRING_UP_CLIMB_RATE_PARAMETER = "PILOT_SPD_UP"
+BRING_UP_CLIMB_RATE_WINDOW_VALUE = 0.3  # re-declared from 0.5, see the 2026-09-29 note above
+BRING_UP_CLIMB_RATE_RESTORE_VALUE = 2.5  # the pin's own default
+
 
 BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
     (
@@ -411,6 +625,71 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
         "firmware's own default (0) for its duration only, and restores the "
         "airframe's declared 4.0 before the scored window opens: the scored run's "
         "guided takeoff needs the delay (compat_arming.parm, iteration 11)",
+    ),
+    (
+        BRING_UP_TAKEOFF_RAMP_MAX_PARAMETER,
+        BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE,
+        BRING_UP_TAKEOFF_RAMP_MAX_RESTORE_VALUE,
+        "the takeoff's own open-loop ramp, bounded at the airframe's own hover: "
+        "`do_pilot_takeoff_ms` ramps the throttle with no altitude feedback for as "
+        "long as `land_complete` holds (ArduCopter/takeoff.cpp:76-118), and the only "
+        "exit that needs no motion is the cap `throttle >= MIN(TKOFF_THR_MAX, 0.9)` "
+        "(takeoff.cpp:92) -- so the cap is where an open-loop ramp ends on this "
+        "airframe. The firmware default 0.9 is ~2.2x the hover the airframe itself "
+        "holds: the P00 accept runs measured the hover hold at 1419 us "
+        "(compat_arming.parm iteration 11), which through the motors' own "
+        "MOT_SPIN_MIN 0.15 mapping is a throttle of ~0.316, and the ramp's own accel "
+        "exit (0.5 * PILOT_ACC_Z 2.5 = 1.25 m/s^2) needs ~1.13x that. The window "
+        "value 0.55 clears both and bounds the thrust at unstick to ~1.5x hover; the "
+        "measured alternative (00000143.BIN) was the ramp to RCOU 1867 us at 2x "
+        "weight, a 3.7 m/s climb, and the aircraft's centre of gravity at the room's "
+        "own 2.5 m ceiling. Restored to the firmware's own default 0.9 "
+        "(parameters.cpp:1057; no parm file this project applies sets it) before the "
+        "scored window opens -- the scored run's guided takeoff keeps the ramp the "
+        "P00 gate was accepted with",
+    ),
+    (
+        BRING_UP_CLIMB_RATE_PARAMETER,
+        BRING_UP_CLIMB_RATE_WINDOW_VALUE,
+        BRING_UP_CLIMB_RATE_RESTORE_VALUE,
+        "the climb rate the MODE may command, bounded at the rate this window "
+        "itself declares: `input_pos_vel_accel_D_m` shapes the desired trajectory "
+        "inside `_vel_max_up_ms` = PILOT_SPEED_UP (AC_PosControl.cpp:1002-1033, set "
+        "from it every ALT_HOLD iteration by `set_max_speed_accel_z`, mode_althold.cpp), "
+        "and the throttle's collapse after the unstick burn begins only when the "
+        "velocity estimate crosses that target. At the firmware default 2.5 m/s "
+        "(config.h:531-532, unset by every parameter file this project applies) the "
+        "shaped target ran to 2.2-2.4 m/s while the aircraft was already ballistic "
+        "(CTUN.DCRt, logs 00000143/00000144), and both flights coasted to the room's "
+        "2.5 m ceiling. The window value is the declared pilot climb rate itself "
+        "(BRING_UP_THROTTLE_CLIMB_RATE_M_S): the declaration now bounds the "
+        "full stick expresses the declared 0.3 m/s (re-declared from 0.5 by the "
+        "release-energy fix's second repair, 2026-09-29: the 0.5 chase target is "
+        "what the stuck-phase demand rode to actuator 0.783 in 00000146.BIN). "
+        "Restored to the firmware's own "
+        "default 2.5 before the scored window opens",
+    ),
+    (
+        BRING_UP_TAKEOFF_SLEW_PARAMETER,
+        BRING_UP_TAKEOFF_SLEW_WINDOW_VALUE,
+        BRING_UP_TAKEOFF_SLEW_RESTORE_VALUE,
+        "the open-loop ramp's own PACING, the release-energy fix's second repair "
+        "(2026-09-29): `do_pilot_takeoff_ms` ramps `get_throttle_in() + G_Dt / "
+        "takeoff_throttle_slew_time` while `land_complete` holds "
+        "(ArduCopter/takeoff.cpp:83, the parameter at Parameters.cpp:978, default "
+        "2.0), and the ground-hold bench measured the floor-to-body contact pair "
+        "holding the vehicle ~2.0 s past the spool's first nonzero command at any "
+        "thrust in 1.045x-1.369x weight (verdict.json hold_time_s 2.008). At the "
+        "default pacing the ramp reaches the TKOFF_THR_MAX cap at ~1.1 s, "
+        "NOT_LANDED fires on the cap, and the closed loop chases the shaped "
+        "velocity target for the rest of the hold -- the measured 0.78 actuator "
+        "(~2.5x the physics hover) at the release, 00000146.BIN. At the window "
+        "value 6.0 s the ramp crosses 1.3-1.5x the PHYSICS hover (actuator "
+        "0.40-0.46, throttle 0.29-0.37) exactly at the hold's expiry, the cap 0.55 "
+        "is not reached until 3.3 s, so every exit that fires is a REAL-motion "
+        "exit at the unstick itself and the closed-loop wind-up never runs while "
+        "stuck. Restored to the firmware's own default 2.0 before the scored "
+        "window opens",
     ),
 )
 
@@ -471,7 +750,7 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
 # which is the same class of defect as a parameter write under a name the vehicle
 # does not have. The PWM actually sent is recorded in the receipt, so the
 # declaration is a rate and the receipt is the measurement.
-BRING_UP_THROTTLE_CLIMB_RATE_M_S = 0.5
+BRING_UP_THROTTLE_CLIMB_RATE_M_S = 0.3  # re-declared from 0.5, see BRING_UP_CLIMB_RATE_WINDOW_VALUE above
 # The rate the window will not exceed: the airframe's declared maximum pilot
 # climb rate is WP_SPD_UP 1.0 m/s (compat_arming.parm), and a rate above it would
 # be a faster climb than any other part of this project commands.
@@ -581,7 +860,7 @@ BRING_UP_JUSTIFICATION = (
     "The exception changes only WHEN the aircraft may move, never what supplies "
     "the scored pose. The estimator is the same pinned build, fed the same "
     "declared stereo and inertial stream; the exception is a bounded window "
-    "(<= 5.0 s from the arm readback to LAND, no lateral setpoint, LAND always) "
+    "(<= 6.0 s from the arm readback to LAND, no lateral setpoint, LAND always) "
     "that lets the airframe move so the estimator CAN latch, and every element "
     "of it is restored -- with the vehicle's own parameter readback -- before "
     "the scored window opens. The scored window's pose source is unchanged: the "
@@ -636,6 +915,30 @@ SCENE_CAPTURE_TIMEOUT_S = 30.0
 # calibrates nothing -- it refuses the arm naming the per-axis error.
 ATTITUDE_GATE_TOLERANCE_DEG = 5.0
 
+# A1 joins the seal to the truth stream on the simulator's own clock by the same
+# rule E1 joins publications to truth (`_truth_error_statistics`): the nearest
+# truth sample inside this tolerance is the measurement, and anything further is
+# unmeasured rather than interpolated, because a truth pose from another instant
+# is not the frame the seal was taken in.
+ATTITUDE_GATE_JOIN_TOLERANCE_NS = 100_000_000
+
+# The declared end-state check (declared 2026-09-29, before any streak flight --
+# phase plan step 2): a run ends with the aircraft level at rest and no crash
+# disarm, sampled after the excitation's post-LAND drain and again after the
+# scored route's landing drain. The tolerance is A1's own class, and its
+# derivation is the four proven complete logs (00000135-138, the fix4b/fix5/fix5b
+# scored landings): each ended within 0.1 deg of level, so 5.0 deg sits an order
+# of magnitude above every proven good landing while staying far below any tipped
+# rest state ever measured here (00000145 came to rest at pitch -89.7 deg,
+# 00000143 at roll -179.6 deg).
+END_STATE_ATTITUDE_TOLERANCE_DEG = 5.0
+
+# The crash disarm is the firmware's own verdict, sent as STATUSTEXT when the
+# crash checker disarms the vehicle (crash_check.cpp:93, MAV_SEVERITY_EMERGENCY,
+# "Crash: Disarming: AngErr=..."). Matched by prefix, not by the word "crash":
+# nothing else in the firmware's own texts begins this way.
+CRASH_DISARM_STATUSTEXT_PREFIX = "Crash: Disarming"
+
 # How many stereo pairs the reader's sink may hold for the feed. A pair is ~614 KB of
 # pixels at the declared 640x480, and the sink is called from the reader's thread while
 # the drain loop feeds the estimator, so a small bound keeps memory predictable while
@@ -643,6 +946,13 @@ ATTITUDE_GATE_TOLERANCE_DEG = 5.0
 # backlog that deep is a stopped estimator, which the health machine is already about
 # to catch.
 PAIR_QUEUE_FRAMES = 16
+
+# The estimator feed thread's poll: how long one pump of the stream waits for the next
+# record before treating the metadata stream as momentarily empty (which is the pair
+# flush's condition). At the declared 500 Hz inertial cadence the reader delivers a
+# record every ~2 ms of simulator time, so this is a poll, not a wait: it exists so an
+# empty instant is a 2 ms pause rather than a busy spin.
+FEED_STREAM_POLL_S = 0.002
 
 # How long one parameter readback waits for the autopilot's own answer. A local SITL
 # answers in well under a second; this is generous enough that an answer would have to
@@ -1884,6 +2194,32 @@ def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
     }
 
 
+def _vehicle_parameter_matches(reported: float | None, declared: float) -> bool:
+    """Whether a vehicle's parameter answer equals the declared value it stores.
+
+    The vehicle answers in its own storage precision, a 32-bit float: the first
+    climb-fix launch (work/runs/p01-localization/p01l-climbfix-20260928T171500Z)
+    wrote the declared TKOFF_THR_MAX 0.55, the write took, and the vehicle read
+    it back as 0.550000011920929 -- which an exact comparison of Python floats
+    refuses, stopping the window before the arm over a write that had succeeded.
+    The window's earlier values (0.0, 1.0, 4.0, 6.0 and the integer mask) are all
+    exactly representable, which is the only reason the machinery had not met
+    this yet.
+
+    The comparison is therefore made at the vehicle's own precision: both sides
+    packed to the same four bytes. A value that really is different remains
+    different (a neighbouring float32 is a refusal, not a rounding), the same
+    stored value reads equal however it was written, and a parameter the vehicle
+    never answered is never a match -- silence stays a refusal.
+    """
+    if reported is None:
+        return False
+    try:
+        return struct.pack("!f", float(reported)) == struct.pack("!f", float(declared))
+    except (OverflowError, ValueError):
+        return False
+
+
 def _bring_up_closure_blockers(
     applied: dict[str, float], rc_override: dict[str, Any] | None = None
 ) -> list[str]:
@@ -1914,14 +2250,14 @@ def _bring_up_closure_blockers(
                 "silent readback cannot show that the declared exception was lifted, so "
                 "the scored window does not open"
             )
-        elif applied[name] == window_value:
+        elif _vehicle_parameter_matches(applied[name], window_value):
             blockers.append(
                 f"{name} is still {window_value:g} -- its declared bring-up window value -- "
                 f"at the claimed arm; the window must be restored to {restore_value:g} and "
                 "read back before the scored window opens (plan sections 0.6 item 6, 0.8 "
                 "item 7)"
             )
-        elif applied[name] != restore_value:
+        elif not _vehicle_parameter_matches(applied[name], restore_value):
             blockers.append(
                 f"{name} read back as {applied[name]:g} after the bring-up window; the "
                 f"scored arm's declared value is {restore_value:g}"
@@ -2132,6 +2468,9 @@ def _localize_check_command(args: argparse.Namespace, output_dir: Path) -> Comma
                 "preflight": rows,
                 "estimator_pin": document["localization"]["estimator"],
                 "bounds": document["localization"]["bounds"],
+                "simulator_pacing": _simulator_pacing_document(
+                    _platform_settings(document, repository_root()), None, ()
+                ),
             },
             ("preflight.json",),
             mode,
@@ -2142,6 +2481,186 @@ def _localize_check_command(args: argparse.Namespace, output_dir: Path) -> Comma
 # ---------------------------------------------------------------------------
 # The live sensor-derived run
 # ---------------------------------------------------------------------------
+
+SIMULATOR_CLOCK_SOURCE = (
+    "the simulator's own clock: the controller stamps every frame it sends with "
+    "robot.getTime() (scenarios/compat/controllers/compat_vehicle_controller/"
+    "sensors.py simulator_time_s), the frame carries it as sim_time_s, and the feed "
+    "reads it on every record. A window declared in simulated seconds is spent "
+    "against this clock, so the window means the same thing on a fast host and on a "
+    "loaded one -- the unit probe's own windows already declare "
+    "(\"a window measured in simulated time is comparable between the realtime and "
+    "fast modes\", configs/first_indoor.yaml)")
+#
+# Simulation time arrives as a float, so a window that ends exactly on a frame
+# boundary can miss it by a rounding step; the bridge's own sim-time window carries
+# the same tolerance for the same reason (webots_ardupilot.py
+# TIME_COMPARISON_TOLERANCE_S).
+SIM_WINDOW_TOLERANCE_S = 1e-6
+# How long a declared window's wait polls between readings, when the wait does not
+# have a cadence of its own. The windows are decided by the simulator's clock, not by
+# this pacing: it only bounds how stale a reading can be.
+SIM_WINDOW_POLL_S = 0.05
+
+
+def _sim_window_wall_ceiling_s(budget_s: float, envelope_floor: float) -> float:
+    """The wall-clock ceiling on a budget declared in SIMULATOR seconds.
+
+    ``probe.realtime_ratio_envelope`` declares the simulator's rate as simulated
+    seconds per wall second, so its floor is the slowest pace the run admits: inside
+    the envelope a budget of N simulated seconds cannot take longer than N/floor wall
+    seconds. The ceiling is a liveness guard, not the window's deadline -- a
+    simulator that stops advancing would otherwise hang the run (the bridge's own
+    AT_REST_WALL_CLOCK_LIMIT_S states the same rule for its sim-time window). It is
+    derived from the declared envelope rather than chosen, and the budget is checked
+    before it, so a window whose simulated budget was genuinely spent is recorded as
+    the budget being honoured no matter what the host did.
+    """
+    if envelope_floor <= 0.0:
+        raise ConfigError("the declared realtime envelope's floor must be positive")
+    return float(budget_s) / float(envelope_floor)
+
+
+class _SimulatorClock:
+    """The newest simulator time the feed has read, and how many frames carried one.
+
+    A frame that carries no usable sim time (the sentinel the bridge uses before the
+    controller has stamped anything) is not an observation and does not move the
+    clock. The clock only moves forward: a frame read out of order is not a reason to
+    make a window think its budget has been given back.
+    """
+
+    def __init__(self) -> None:
+        self.newest_s: float | None = None
+        self.frames = 0
+
+    def observe(self, sim_time_s: float | None) -> None:
+        if sim_time_s is None or sim_time_s < 0.0:
+            return
+        self.frames += 1
+        if self.newest_s is None or sim_time_s > self.newest_s:
+            self.newest_s = sim_time_s
+
+
+class _SimWindow:
+    """A declared budget in SIMULATOR seconds, and the wall clock's own ceiling on it.
+
+    The ordered bring-up's windows are windows of the AIRCRAFT's time, and the
+    code once spent them on the wall clock. Measured on a loaded host
+    (run-2026-09-28T02-43-27-442Z): the simulator ran at 0.40-0.92 simulated seconds
+    per wall second, the declared 3.5 s climb window bought 2.20 simulated seconds,
+    and the excitation was cut off -- LAND at 2.34 simulated seconds after the arm,
+    with the thrust path's first motor output 0.80 simulated seconds later, at
+    18.923 s of autopilot time (the airframe's own log, 00000141.BIN). The budget is
+    spent against the simulator's clock here; ``ended_by`` says which clock decided
+    it, so a reader can tell a window that ran its declared course from one the host
+    truncated.
+    """
+
+    def __init__(
+        self,
+        clock: _SimulatorClock,
+        budget_s: float,
+        *,
+        label: str,
+        wall_ceiling_s: float,
+        wall_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.clock = clock
+        self.budget_s = float(budget_s)
+        self.label = label
+        self.wall_ceiling_s = float(wall_ceiling_s)
+        self._wall_clock = wall_clock
+        # The simulator's own reading when the window opened. A window opens with
+        # frames already flowing, so this is a reading of a running scene; if the
+        # stream has not delivered one yet the first one to arrive becomes the start,
+        # and the wall ceiling covers the case where none ever does.
+        self.started_sim_s = clock.newest_s
+        self.started_wall_s = wall_clock()
+        self.ended_by: str | None = None
+        # What the window cost, frozen when it ended. The readings have to be taken
+        # THEN and not when the receipt is written: every window of one bring-up is
+        # documented together at the end, so a live reading would report each window as
+        # lasting until the last one closed -- measured on the first run with this code
+        # (run-a/bring-up.json in work/runs/p01-localization/
+        # p01l-clockfix-20260928T041129Z), where the 0.3 s override settle reported
+        # 14.092 s because the clock was read after the descent.
+        self.ended_sim_s: float | None = None
+        self.ended_wall_s: float | None = None
+
+    def _freeze(self) -> None:
+        """Take this window's final readings, once."""
+        if self.ended_wall_s is None:
+            self.ended_wall_s = self._wall_clock()
+            self.ended_sim_s = self.clock.newest_s
+
+    def elapsed_simulator_s(self) -> float | None:
+        """Simulated seconds this window cost, frozen once it has ended."""
+        if self.ended_wall_s is not None:
+            return self._span(self.ended_sim_s)
+        return self._span(self.clock.newest_s)
+
+    def _span(self, now_s: float | None) -> float | None:
+        if self.started_sim_s is None:
+            self.started_sim_s = self.clock.newest_s
+        if self.started_sim_s is None or now_s is None:
+            return None
+        return max(0.0, now_s - self.started_sim_s)
+
+    def elapsed_wall_s(self) -> float:
+        """Host seconds this window cost, frozen once it has ended."""
+        end = (
+            self.ended_wall_s
+            if self.ended_wall_s is not None
+            else self._wall_clock()
+        )
+        return max(0.0, end - self.started_wall_s)
+
+    def expired(self) -> bool:
+        """Whether the window is over, recording which clock ended it.
+
+        The declared budget is tested first, deliberately: a window that spent its
+        simulated seconds has been given what it was declared, whatever the host
+        took to produce them. The ceiling therefore only ever decides a window whose
+        simulated budget was NOT spent -- which means the simulator ran slower than
+        the declared envelope's floor over that window, the condition the probe's own
+        realtime evidence already reports as timing-invalid.
+        """
+        if self.ended_by is not None:
+            return True
+        elapsed = self.elapsed_simulator_s()
+        if elapsed is not None and elapsed >= self.budget_s - SIM_WINDOW_TOLERANCE_S:
+            self._freeze()
+            self.ended_by = "simulator"
+            return True
+        if self.elapsed_wall_s() >= self.wall_ceiling_s:
+            self._freeze()
+            self.ended_by = "wall_ceiling"
+            return True
+        return False
+
+    def close(self, reason: str) -> None:
+        """Record how a window ended when something other than the clocks ended it."""
+        if self.ended_by is None:
+            self._freeze()
+            self.ended_by = reason
+    def document(self) -> dict[str, Any]:
+        """A JSON-ready view: the budget, what it cost in each clock, and what ended it."""
+        elapsed = self.elapsed_simulator_s()
+        return {
+            "label": self.label,
+            "budget_simulator_s": self.budget_s,
+            "elapsed_simulator_s": None if elapsed is None else round(elapsed, 3),
+            "elapsed_wall_s": round(self.elapsed_wall_s(), 3),
+            "wall_ceiling_s": round(self.wall_ceiling_s, 3),
+            "ended_by": self.ended_by,
+            "unit": (
+                "the budget is in SIMULATOR seconds and is spent against "
+                f"{SIMULATOR_CLOCK_SOURCE}; the wall ceiling is budget / the declared "
+                "realtime envelope's floor and only ends a window whose simulated "
+                "budget was not spent"
+            ),
+        }
 
 
 class _FeedStats:
@@ -2160,6 +2679,10 @@ class _FeedStats:
         self.pair_latencies_ns: list[int] = []
         self.imu_latencies_ns: list[int] = []
         self.newest_imu_ns = 0
+        # The scene's own clock, read beside the frames it stamps. Every window this
+        # stage declares in simulated seconds is spent against this one, so the same
+        # declaration costs the same amount of the aircraft's time on any host.
+        self.sim_clock = _SimulatorClock()
         self.truth_samples: list[tuple[int, tuple[float, float, float]]] = []
         # A1's evidence channel: the same pose records' attitudes, read for the
         # pre-arm attitude gate and sent nowhere (plan section 0.3 item 5).
@@ -2290,7 +2813,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "stop rule (plan section 11) records the blocker and stops",
                 DISPATCH_REGISTRATION_NOTE,
             ),
-            {"stage_id": STAGE_ID, "sensor_mode_label": "sensor-derived", "estimator_pin": estimator},
+            {
+                "stage_id": STAGE_ID,
+                "sensor_mode_label": "sensor-derived",
+                "estimator_pin": estimator,
+                # The receipt states the pacing the run was configured under even when
+                # no vehicle ever moved (owner ruling 2026-09-30): iteration-only runs
+                # must not be confusable with scored ones at any outcome.
+                "simulator_pacing": _simulator_pacing_document(settings, None, ()),
+            },
             (*writer.artifacts, "preflight.json"),
             SensorMode.SENSOR_DERIVED,
         )
@@ -2312,17 +2843,41 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "stop rule (plan section 11) records the blocker and stops",
                 DISPATCH_REGISTRATION_NOTE,
             ),
-            {"stage_id": STAGE_ID, "sensor_mode_label": "sensor-derived", "estimator_pin": estimator},
+            {
+                "stage_id": STAGE_ID,
+                "sensor_mode_label": "sensor-derived",
+                "estimator_pin": estimator,
+                "simulator_pacing": _simulator_pacing_document(settings, None, ()),
+            },
             (*writer.artifacts, "preflight.json"),
             SensorMode.SENSOR_DERIVED,
         )
     feed_log_path = writer.path("estimator-feed.jsonl")
     stats = _FeedStats()
     latest_aligned: dict[str, object] | None = None
+    # The seal's own instant, on the simulator clock the truth samples keep, and
+    # the published attitude at that same instant: A1 measures the sealed epoch
+    # frame, so both compared quantities must come from the seal, not from
+    # whenever the gate runs -- after a flown excitation the run's newest samples
+    # are the landing, which is the end-state check's business (measured defect:
+    # p01l-climbfix-20260928T174608Z's attitude-gate.json read the truth sample
+    # at 28.49 s, the face-planted rest pose, against a seal taken at the arm).
+    seal_time_ns: int | None = None
+    seal_published_rpy: object | None = None
     # The scored window's publications, kept for E1. Only samples inside arm-to-disarm
     # count: bring-up publishes are reported by the freshness accounting and charged to
     # nothing, exactly as the machine's own window does.
     published_states: list[tuple[int, tuple[float, float, float]]] = []
+    # Every publication's (wall monotonic, feed send head on the simulator clock):
+    # the run's own sim/wall pacing evidence, computed into the receipt below. Whole
+    # run, not just the scored window, because the pacing is a property of the
+    # simulator's delivery the whole time it was stepping.
+    feed_pacing_rows: list[tuple[float, int]] = []
+    # The scored route's own declared windows (each waypoint hold and the drain after the
+    # LAND), recorded in the units they are declared in for the same reason the bring-up's
+    # are: a hold is the aircraft holding a waypoint, not however much of one a loaded
+    # host delivers.
+    route_windows: list[_SimWindow] = []
     scored_window_open = False
     # Pixels reach a reader's sink before the handoff queue strips them: the queue
     # carries metadata only, so a stereo pair arrives there as a kind with no planes.
@@ -2367,10 +2922,24 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             scene_capture["count"] += 1
 
     def on_publish(state: loc.EstimatorState, aligned: dict[str, object]) -> None:
-        nonlocal latest_aligned
+        nonlocal latest_aligned, seal_time_ns, seal_published_rpy
         latest_aligned = aligned
+        if seal_time_ns is None and alignment.sealed:
+            # This publication is the state whose attitude defined the epoch:
+            # ExternalNavPublisher._loop seals immediately before sending and
+            # calls back with the same state (localization.py), so its stamp is
+            # the seal's own instant at the resolution of the state itself.
+            seal_time_ns = state.time_ns
+            seal_published_rpy = aligned["attitude_rpy"]
         if scored_window_open:
             published_states.append((state.time_ns, tuple(aligned["position_ned_m"])))
+        # The pacing pair the receipt's sim/wall measurement is computed from: the
+        # wall instant of this publication beside the feed's own send head on the
+        # simulator clock (the newest inertial stamp sent), so the run's own
+        # evidence states how much simulated sensor time the host delivered per
+        # unit of wall time (owner ruling 2026-09-30, APPROVAL-RECORD "F2's
+        # denominator").
+        feed_pacing_rows.append((time.monotonic(), stats.newest_imu_ns))
         with feed_log_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -2380,6 +2949,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                         "n_tracks": state.n_tracks,
                         "t_last_visual_ns": state.t_last_visual_ns,
                         "visual_age_verdict": machine.visual_update_verdict(state),
+                        "newest_imu_ns": stats.newest_imu_ns,
                     },
                     default=str,
                 )
@@ -2392,7 +2962,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     session = PymavlinkSession()
     platform = WebotsArduPilot(
         settings,
-        runner=SubprocessRunner(),
+        runner=LowPrioritySubprocessRunner(),
         session=session,
         gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
         evidence=writer,
@@ -2413,6 +2983,11 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     ]
 
     def feed_record(record: Any) -> None:
+        # Every frame carries the simulator's own clock, and every wait this stage
+        # declares in simulated seconds is measured against it. Reading it here, on the
+        # one path that consumes the whole stream, is what makes the clock the scene's
+        # rather than the host's.
+        stats.sim_clock.observe(record.sim_time_s)
         if record.kind is Kind.PAIR and record.pair is not None:
             pair = record.pair
             sample = SensorSample(
@@ -2464,56 +3039,87 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             )
 
     last_telemetry_sample = 0.0
-    def drain() -> None:
-        """Consume the sensor stream and the estimator's answers without judging.
 
-        The health machine is driven only by the publisher's tick; this loop
-        feeds, and stops the machine only when the feed itself fails.
+    # The estimator feed runs on its own thread, not on the choreography's.
+    #
+    # Why (F2, 2026-09-30): the feed used to be pumped by drain(), once per call, and
+    # every choreography loop between calls slept -- 0.5/0.1 s inside request_control,
+    # 0.2 s inside arm_and_guided's takeoff wait, 0.05 s in the excitation loops. The
+    # single writer therefore delivered the stream in bursts whose period was whichever
+    # sleep the choreography happened to be in, and the estimator (which consumes a
+    # 614 KB stereo pair in ~5-7 ms, measured p01l-f2fix-2-20260930T052312Z) sat idle
+    # between them. At each burst the host's newest-sent inertial stamp jumped up to
+    # +224 ms ahead of the newest the estimator had consumed, for several publisher
+    # ticks: that gap was the whole of F2's tail (in-window p99 58 ms, max 222 ms, with
+    # the max at the window's opening -- the last burst of the 0.2 s takeoff-wait loop).
+    # Moving the identical loop onto a dedicated thread decouples the feed's cadence
+    # from the choreography's waits without changing one byte of what is sent or in
+    # what order: this thread is still the socket's single writer, the metadata stream
+    # is still drained in arrival order, and the pairs are still flushed only when that
+    # stream is momentarily empty, which is what keeps every image behind the inertial
+    # samples that precede it (the ordering rule I2 in the navigation doc).
+    feed_stop = threading.Event()
+    feed_failures: list[str] = []
+    feed_thread: threading.Thread | None = None
+
+    def feed_cycle() -> None:
+        """One pump of the feed: every queued record, then the pairs, then the state.
+
+        Raises whatever the feed itself raised; the caller (the feed thread or the
+        choreography, before the thread starts) owns stopping the machine.
         """
-        nonlocal last_telemetry_sample
         while True:
-            try:
-                record = platform.sensor_record(0.0)
-            except ProbeFailure as error:
-                machine.stop(time.monotonic_ns(), f"the sensor stream failed: {error}")
-                return
+            # A short timeout instead of 0.0: it is the thread's pacing, turning what
+            # would be a busy spin between the reader's deliveries into a 2 ms poll,
+            # while still returning None the moment the stream is empty.
+            record = platform.sensor_record(FEED_STREAM_POLL_S)
             if record is None:
-                # The metadata stream is momentarily empty, so the inertial samples
-                # either side of a queued image have been fed: the sink's pairs can go
-                # now, which keeps every image behind the IMU that must precede it.
-                try:
-                    while True:
-                        feed_record(pending_pairs.get_nowait())
-                except queue.Empty:
-                    pass
-                except loc.ProtocolError as error:
-                    machine.stop(time.monotonic_ns(), str(error))
-                    return
-                try:
-                    state = client.poll_state()
-                except loc.ProtocolError as error:
-                    machine.stop(time.monotonic_ns(), str(error))
-                    return
-                if state is not None:
-                    publisher.offer(state, stats.newest_imu_ns)
-                if time.monotonic() - last_telemetry_sample >= TELEMETRY_SAMPLE_PERIOD_S:
-                    last_telemetry_sample = time.monotonic()
-                    # G4's evidence is the run's own record: folding the telemetry here
-                    # records every inbound MAVLink message through the whole window,
-                    # not only the windows the readback and arming happen to sample.
-                    try:
-                        platform.telemetry()
-                    except ProbeFailure as error:
-                        machine.stop(
-                            time.monotonic_ns(), f"the telemetry stream failed: {error}"
-                        )
-                        return
-                return
+                break
+            feed_record(record)
+        # The metadata stream is momentarily empty, so the inertial samples either
+        # side of a queued image have been fed: the sink's pairs can go now, which
+        # keeps every image behind the IMU that must precede it.
+        try:
+            while True:
+                feed_record(pending_pairs.get_nowait())
+        except queue.Empty:
+            pass
+        state = client.poll_state()
+        if state is not None:
+            publisher.offer(state, stats.newest_imu_ns)
+
+    def feed_loop() -> None:
+        while not feed_stop.is_set():
             try:
-                feed_record(record)
+                feed_cycle()
             except loc.ProtocolError as error:
+                feed_failures.append(f"the estimator feed failed: {error}")
                 machine.stop(time.monotonic_ns(), str(error))
                 return
+            except ProbeFailure as error:
+                feed_failures.append(f"the sensor stream failed: {error}")
+                machine.stop(time.monotonic_ns(), f"the sensor stream failed: {error}")
+                return
+
+    def drain() -> None:
+        """Fold the telemetry evidence at its declared cadence.
+
+        The estimator feed moved to its own thread (``feed_loop`` above); this stays
+        as the choreography's pump for G4's record, on the check's own thread, because
+        every other telemetry fold already runs there and two concurrent folds would
+        race each other rather than the feed.
+        """
+        nonlocal last_telemetry_sample
+        if time.monotonic() - last_telemetry_sample < TELEMETRY_SAMPLE_PERIOD_S:
+            return
+        last_telemetry_sample = time.monotonic()
+        # G4's evidence is the run's own record: folding the telemetry here records
+        # every inbound MAVLink message through the whole window, not only the windows
+        # the readback and arming happen to sample.
+        try:
+            platform.telemetry()
+        except ProbeFailure as error:
+            machine.stop(time.monotonic_ns(), f"the telemetry stream failed: {error}")
 
     disagreements: list[dict[str, Any]] = []
 
@@ -2536,6 +3142,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         )
 
     live_blockers: list[str] = []
+    # The scored route's declared end-state check, sampled after its landing
+    # drain; None until then, and a checks row only when it was sampled.
+    scored_end_state: dict[str, Any] | None = None
     shutdown: Any = None
 
     def gate_the_scored_arm(applied: dict[str, float], refusals: dict[str, int]) -> list[str]:
@@ -2575,6 +3184,17 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.startup)
+
+        # The feed thread starts once readiness has parked and handed back the
+        # records that arrived before it (wait_ready consumes the stream while it
+        # waits), and before anything else: every later phase -- the parameter
+        # readback, the bring-up, the flight -- then runs beside a continuously
+        # fed estimator instead of feeding it whenever its own loop gets around to
+        # calling drain().
+        feed_thread = threading.Thread(
+            target=feed_loop, name="estimator-feed", daemon=True
+        )
+        feed_thread.start()
         # The adapter's own link: a port the running SITL declares it serves and
         # that this check's session does not already own (plan section 0.5).
         feed_endpoint = _autopilot_feed_endpoint(
@@ -2683,16 +3303,41 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 drain,
                 log_lines,
                 stats,
+                published_attitude=lambda: (
+                    None if latest_aligned is None else latest_aligned["attitude_rpy"]
+                ),
             )
             live_blockers.extend(bring_up["blockers"])
-        initialized_in_window = _wait_initialized(machine, drain, settings.pre_arm_wait_s)
+        # H5's wait, in the declared budget's own unit: the estimator's readiness is
+        # simulated work (`_wait_initialized`).
+        initialized_in_window = _wait_initialized(
+            machine,
+            drain,
+            _SimWindow(
+                stats.sim_clock,
+                settings.pre_arm_wait_s,
+                label="the declared wait for the estimator to initialize (pre_arm_wait_s)",
+                wall_ceiling_s=_sim_window_wall_ceiling_s(
+                    settings.pre_arm_wait_s, settings.realtime_ratio_envelope[0]
+                ),
+            ),
+        )
         if not initialized_in_window:
             live_blockers.append(
                 _initialization_blocker(_initializer_diagnostics(writer.path("estimator.log")))
             )
         else:
             log_lines.append("estimator initialized before arm (H5)")
-            a1_blocker = _attitude_gate(writer, latest_aligned, alignment, stats, log_lines)
+            a1_blocker = _attitude_gate(
+                writer,
+                None
+                if seal_published_rpy is None
+                else {"attitude_rpy": seal_published_rpy},
+                alignment,
+                stats,
+                log_lines,
+                seal_time_ns=seal_time_ns,
+            )
             if a1_blocker:
                 live_blockers.append(a1_blocker)
         if live_blockers:
@@ -2735,7 +3380,23 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                         f"(config offset {tuple(float(v) for v in waypoint)}, "
                         f"hover altitude {settings.hover_altitude_m})"
                     )
-                    hold_end = time.monotonic() + settings.hold_per_waypoint_s
+                    # The hold is a declared window of the AIRCRAFT's time (the
+                    # configuration's own words for these windows: "a window measured in
+                    # simulated time is comparable between the realtime and fast modes"),
+                    # so an 8 s hold is 8 s of the vehicle holding the waypoint, not
+                    # however much of it a loaded host happens to deliver. The 50 ms
+                    # re-send cadence below stays on the wall clock: it paces the link,
+                    # not the aircraft.
+                    hold_window = _SimWindow(
+                        stats.sim_clock,
+                        settings.hold_per_waypoint_s,
+                        label=f"the hold at waypoint {index}",
+                        wall_ceiling_s=_sim_window_wall_ceiling_s(
+                            settings.hold_per_waypoint_s,
+                            settings.realtime_ratio_envelope[0],
+                        ),
+                    )
+                    route_windows.append(hold_window)
                     # The estimator's published pose can only be as current as
                     # the newest inertial sample it has CONSUMED, and it consumes
                     # what this loop feeds it. Measured on run
@@ -2748,7 +3409,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     # the guided target itself keeps its proven 50 ms re-send
                     # cadence (webots_ardupilot.py's own probe re-sends).
                     next_target_send = 0.0
-                    while time.monotonic() < hold_end:
+                    while not hold_window.expired():
                         now = time.monotonic()
                         if now >= next_target_send:
                             # Keep the stream alive while holding: a guided target lapses
@@ -2798,10 +3459,39 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 # accounting ends at the flight's end, so the descent and landing are
                 # still judged for accuracy.
                 machine.mark_flight_end(time.monotonic_ns())
-                drain_deadline = time.monotonic() + 5.0
-                while time.monotonic() < drain_deadline:
+                # The post-route drain, in the same seconds as the holds it follows: its
+                # job is to keep feeding while the LAND runs, and the LAND is the
+                # aircraft coming down in the aircraft's time.
+                landing_drain = _SimWindow(
+                    stats.sim_clock,
+                    5.0,
+                    label="the post-route drain after the LAND command",
+                    wall_ceiling_s=_sim_window_wall_ceiling_s(
+                        5.0, settings.realtime_ratio_envelope[0]
+                    ),
+                )
+                while not landing_drain.expired():
                     drain()
                     time.sleep(0.005)
+                route_windows.append(landing_drain)
+                # The declared end-state check, sampled at the scored route's own
+                # landing: the drain has run, so the newest truth sample is the
+                # aircraft at rest. It lands in end-state.json and among the
+                # checks as end_state, where a failure fails the run (declared
+                # 2026-09-29, before any streak flight).
+                try:
+                    sample = platform.telemetry()
+                except ProbeFailure:
+                    sample = None
+                scored_end_state = _end_state_record(
+                    stats,
+                    None if latest_aligned is None else latest_aligned["attitude_rpy"],
+                    None if sample is None else sample.armed,
+                    None if sample is None else sample.mode_name,
+                    writer.path("mavlink.jsonl"),
+                    phase="scored_route",
+                )
+                writer.write_json("end-state.json", scored_end_state)
                 # The scored window is declared arm to disarm, and the vehicle has
                 # disarmed by the time the sequence is over; everything after this is
                 # the harness stopping Webots and SITL. Measured, run
@@ -2815,6 +3505,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows
         live_blockers.append(f"the platform failed during the run: {error}")
     finally:
+        # The feed thread stops first: it owns the estimator socket and the sensor
+        # stream's handoff, and platform.stop() retires the reader that fills both.
+        feed_stop.set()
+        if feed_thread is not None:
+            feed_thread.join(timeout=5.0)
+        live_blockers.extend(feed_failures)
         shutdown = platform.stop()
         publisher.stop()
         client.close()
@@ -2869,6 +3565,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "sensor_mode_label": "sensor-derived",
                 "estimator_pin": estimator,
                 "bring_up": bring_up_receipt,
+                # The pacing this run actually ran under, from the same measurement the
+                # completed receipts carry, so a blocked flight still says whose pacing
+                # it was (owner ruling 2026-09-30).
+                "simulator_pacing": _simulator_pacing_document(
+                    settings, platform.controller_status.get("pacing"), feed_pacing_rows
+                ),
                 "truth_republish": settings.truth_republish,
                 "bridge_truth_published": truth_published,
                 "gps_aiding_blockers": gps_aiding["blockers"],
@@ -2902,9 +3604,27 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         truth_published,
         gps_aiding,
     )
+    if scored_end_state is not None:
+        checks.append(_end_state_check_row(scored_end_state))
     writer.write_json("checks.json", checks)
     _write_log(writer, log_lines)
     passed = all(check["status"] == "pass" for check in checks)
+    simulator_pacing = _simulator_pacing_document(
+        settings, platform.controller_status.get("pacing"), feed_pacing_rows
+    )
+    writer.write_json("simulator-pacing.json", simulator_pacing)
+    pacing_limitations: tuple[str, ...] = ()
+    if simulator_pacing["evidence_class"] != "scored":
+        # The ruling's labelling rule, in the receipt itself: a run that is not the
+        # scored pacing cannot be read as scored evidence however green its rows are.
+        pacing_limitations = (
+            "ITERATION-ONLY pacing evidence (owner ruling 2026-09-30, APPROVAL-RECORD "
+            "\"F2's denominator\"): this run's simulator pacing was "
+            f"webots_mode {simulator_pacing['webots_mode']}, sim_wall_clamp "
+            f"{str(simulator_pacing['sim_wall_clamp']).lower()}, which is not the scored "
+            "path's realtime clamped to at most 1x sim/wall; its rows may not be pooled "
+            "with scored runs",
+        )
     manifest = {
         "stage_id": STAGE_ID,
         "sensor_mode_label": "sensor-derived",
@@ -2923,6 +3643,14 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         "reset_counter": machine.reset_counter,
         "valid_fraction": valid_fraction,
         "params_applied": applied,
+        # Which simulator pacing this run actually ran under, and what the feed's own
+        # delivery measured (owner ruling 2026-09-30, APPROVAL-RECORD "F2's
+        # denominator"): the scored path is realtime clamped to <= 1x sim/wall, and
+        # anything else is iteration-only evidence that may not be pooled with it.
+        "simulator_pacing": simulator_pacing,
+        # The scored route's declared windows in the units they are declared in, so the
+        # receipt says whether an 8 s hold was 8 s of the aircraft holding the waypoint.
+        "route_windows": [opened.document() for opened in route_windows],
         "shutdown": {"exits": shutdown.exits},
     }
     return CommandOutcome(
@@ -2935,6 +3663,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         )
         or ("all predeclared bounds met on the frozen route",),
         limitations=(
+            *pacing_limitations,
             "E1 compares the scored window's publications against the controller's pose "
             "stream, which is read in this process for scoring only and sent to nothing: "
             "the estimator's feed carries stereo pairs and inertial samples and no other "
@@ -2965,6 +3694,62 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     )
 
 
+def _simulator_pacing_document(
+    settings: PlatformSettings,
+    controller_pacing: Any,
+    rows: Sequence[tuple[float, int]],
+) -> dict[str, Any]:
+    """The run's simulator pacing: what ran, what the controller enforced, what the
+    feed's own delivery measured.
+
+    The owner ruling of 2026-09-30 (APPROVAL-RECORD "F2's denominator") clamps the
+    scored path's sim/wall at <= 1x so that F2's sim-unit ages mean the same thing
+    as wall ages; the measured ratio here is the feed's own sim span over its wall
+    span -- the newest inertial stamp the host had sent, sampled at every
+    publication, over the wall time those publications spanned -- because that is
+    the rate at which simulated sensor time actually reached the pipeline, which is
+    the denominator F2's ages inherit. The per-interval percentiles are the same
+    consecutive-publication ratio the transport report baselined (p50 0.90-0.91,
+    p95 6.7-7.7 unclamped), so a clamped run reads against that record directly.
+    """
+    measured: dict[str, Any] = {"publications": len(rows)}
+    if len(rows) >= 2:
+        first_wall, first_sim = rows[0]
+        last_wall, last_sim = rows[-1]
+        wall_span_s = last_wall - first_wall
+        sim_span_s = (last_sim - first_sim) / 1e9
+        if wall_span_s > 0.0:
+            measured["wall_span_s"] = round(wall_span_s, 3)
+            measured["sim_span_s"] = round(sim_span_s, 3)
+            measured["span_ratio_sim_over_wall"] = round(sim_span_s / wall_span_s, 3)
+        intervals = [
+            (sim - prev_sim) / 1e9 / (wall - prev_wall)
+            for (prev_wall, prev_sim), (wall, sim) in zip(rows, rows[1:])
+            if wall > prev_wall and sim >= prev_sim
+        ]
+        if intervals:
+            measured["interval_ratio_percentiles"] = {
+                "p50": round(_percentile(intervals, 0.50), 3),
+                "p90": round(_percentile(intervals, 0.90), 3),
+                "p95": round(_percentile(intervals, 0.95), 3),
+                "max": round(max(intervals), 3),
+                "n": len(intervals),
+            }
+    scored_pacing = settings.webots_mode == "realtime" and settings.sim_wall_clamp
+    return {
+        "webots_mode": settings.webots_mode,
+        "sim_wall_clamp": settings.sim_wall_clamp,
+        "evidence_class": "scored" if scored_pacing else "iteration-only",
+        "controller": controller_pacing,
+        "measured": measured,
+        "ruling": (
+            "scored runs clamp sim/wall at <= 1x (owner ruling 2026-09-30, "
+            "APPROVAL-RECORD 'F2's denominator'); fast-mode runs are iteration-only "
+            "evidence, labelled here, and are never pooled with scored runs"
+        ),
+    }
+
+
 def _run_ordered_bring_up(
     settings: PlatformSettings,
     platform: WebotsArduPilot,
@@ -2974,6 +3759,7 @@ def _run_ordered_bring_up(
     drain: Callable[[], None],
     log_lines: list[str],
     stats: _FeedStats,
+    published_attitude: Callable[[], object | None],
 ) -> dict[str, Any]:
     """The declared ordered bring-up: datum, exception window, excitation, restoration.
 
@@ -2997,6 +3783,9 @@ def _run_ordered_bring_up(
 
     Returns the window's record. ``record["blockers"]`` carries anything that
     stopped it; the caller must not open the scored window with a non-empty list.
+    The excitation's declared end-state check is sampled after the post-LAND
+    drain into ``flight["end_state"]``, and a tipped or crash-disarmed rest
+    state blocks the same way.
     """
     declaration = _bring_up_window(settings)
     names = tuple(name for name, _window, _restore, _why in BRING_UP_WINDOW_PARAMETERS)
@@ -3011,6 +3800,35 @@ def _run_ordered_bring_up(
         "completed": False,
     }
     blockers: list[str] = record["blockers"]
+
+    # Every window below is declared in SIMULATOR seconds, and this is the clock that
+    # spends them: the scene's own, read on every frame the feed consumes. The wall
+    # clock keeps only two jobs here -- the ceiling `_sim_window_wall_ceiling_s`
+    # derives from the declared realtime envelope, which ends a window whose simulated
+    # budget was not spent (the simulator is then outside the envelope, which the
+    # probe's own realtime evidence already reports), and the pacing of the loops.
+    envelope_floor = settings.realtime_ratio_envelope[0]
+    windows: list[_SimWindow] = []
+
+    def window(budget_s: float, label: str) -> _SimWindow:
+        opened = _SimWindow(
+            stats.sim_clock,
+            budget_s,
+            label=label,
+            wall_ceiling_s=_sim_window_wall_ceiling_s(budget_s, envelope_floor),
+        )
+        windows.append(opened)
+        return opened
+
+    record["window_clock"] = {
+        "source": SIMULATOR_CLOCK_SOURCE,
+        "frames_carrying_a_simulator_time_at_the_window_open": stats.sim_clock.frames,
+        "declared_realtime_envelope": list(settings.realtime_ratio_envelope),
+        "wall_ceiling_rule": (
+            "budget_simulator_s / the envelope's floor: inside the declared envelope a "
+            "budget of N simulated seconds cannot take longer than N/floor wall seconds"
+        ),
+    }
     # The window's ONE thrust path, recorded as what the VEHICLE answered rather
     # than as what this link sent: the values the derivation was made of, the PWM
     # that went out, what the vehicle's own RC report showed while the override was
@@ -3030,7 +3848,10 @@ def _run_ordered_bring_up(
         "sent": False,
         "sent_at_utc": None,
         "refreshes": 0,
-        "last_refresh_monotonic": None,
+        # The override's refresh cadence is paced on the simulator's clock, because its
+        # declared bound is the firmware's own RC_OVERRIDE_TIME of 3.0 s of the
+        # vehicle's time.
+        "last_refresh_simulator_s": None,
         "observed_during_window": None,
         "observed_after_release": None,
         "released": False,
@@ -3047,6 +3868,12 @@ def _run_ordered_bring_up(
             f"{name} {window_value:g} -> {restore_value:g}"
             for name, window_value, restore_value, _why in BRING_UP_WINDOW_PARAMETERS
         )
+    )
+    log_lines.append(
+        "ordered bring-up clock: every declared window below is spent in SIMULATOR "
+        f"seconds against {SIMULATOR_CLOCK_SOURCE}; the wall ceiling on each is its "
+        f"budget / the declared realtime envelope's floor "
+        f"({settings.realtime_ratio_envelope[0]:g})"
     )
 
     # 1. The origin datum: a frame definition, set once, before anything moves.
@@ -3110,7 +3937,7 @@ def _run_ordered_bring_up(
                         "values": snapshot,
                     }
                 )
-            if all(reported.get(name) == expected[name] for name in names):
+            if all(_vehicle_parameter_matches(reported.get(name), expected[name]) for name in names):
                 break
             if time.monotonic() >= deadline:
                 break
@@ -3166,14 +3993,24 @@ def _run_ordered_bring_up(
         lapsed by the vehicle itself. The window re-sends it well inside that, and
         only while the window is open: ``released`` ends the sequence, and nothing
         in this program sends another.
+
+        The cadence is measured on the simulator's clock, because the timeout it has
+        to stay inside is the firmware's own 3.0 s of the vehicle's time. A wall-clock
+        cadence would refresh more often than necessary on a slow host and less often
+        than declared on a fast one; this is the same domain as the timeout it is
+        declared against.
         """
         if not override["sent"] or override["released"] or override["sent_pwm"] is None:
             return
-        now = time.monotonic()
-        last = override["last_refresh_monotonic"]
-        if last is not None and now - last < BRING_UP_OVERRIDE_REFRESH_S:
+        now = stats.sim_clock.newest_s
+        last = override["last_refresh_simulator_s"]
+        if now is not None and last is not None and now - last < BRING_UP_OVERRIDE_REFRESH_S:
             return
-        override["last_refresh_monotonic"] = now
+        # With no simulator reading yet the cadence cannot be measured, and the vehicle
+        # lapses an unrefreshed override on its own clock, which is stalled with the
+        # simulator: refreshing is the safe side of an unmeasurable cadence.
+        if now is not None:
+            override["last_refresh_simulator_s"] = now
         record["sent"].append(link.send_rc_channels_override(int(override["sent_pwm"])))
         override["refreshes"] += 1
 
@@ -3207,7 +4044,7 @@ def _run_ordered_bring_up(
         record["readbacks"]["window"] = {name: window_readback.get(name) for name in names}
         record["readback_observations"] = {"window": observations}
         for name, window_value, _restore, _why in BRING_UP_WINDOW_PARAMETERS:
-            if window_readback.get(name) != window_value:
+            if not _vehicle_parameter_matches(window_readback.get(name), window_value):
                 blockers.append(
                     f"the bring-up window's {name} did not take effect: the vehicle read "
                     f"back {window_readback.get(name)} against the declared window value "
@@ -3291,15 +4128,31 @@ def _run_ordered_bring_up(
 
     flight: dict[str, Any] = record["flight"]
     # The window's own motor evidence: the airframe's PWM outputs as the vehicle
-    # reports them. A takeoff the autopilot accepted but the motors never answered
-    # is a different finding from a takeoff it refused, and only the outputs say
-    # which happened.
-    motors = {"max_pwm": 0, "samples": 0}
+    # reports them, and -- because that is the quantity the takeoff command below
+    # waits on -- the floor those outputs sit at while no spool-up has been
+    # requested. A takeoff the autopilot accepted but the motors never answered is
+    # a different finding from a takeoff it refused, and only the outputs say which
+    # happened.
+    motors: dict[str, Any] = {
+        "max_pwm": 0,
+        "samples": 0,
+        "floor_pwm": None,
+        "floor_at_arm_readback": None,
+    }
     if not blockers:
         # 3. The window's own arm: ALT_HOLD, retried, every refusal kept.
         record["arm_attempts"] = 0
         refusals: dict[str, str] = {}
-        deadline = time.monotonic() + settings.pre_arm_wait_s
+        # A simulated autopilot needs simulated seconds for its pre-arm checks to clear
+        # (the configuration's own words for this budget: "a simulated GPS needs a fix,
+        # the EKF needs a home, and the IMU consistency check needs a quiet window, all
+        # of which take simulated time"), so the budget is spent on the simulator's
+        # clock. The retry cadence stays on the wall clock: it paces how often the
+        # request is repeated, which is a property of the loop and not of the aircraft.
+        arm_window = window(
+            settings.pre_arm_wait_s,
+            "the bring-up's wait for the vehicle's own pre-arm checks to clear",
+        )
         sample = platform.telemetry()
         while True:
             record["arm_attempts"] += 1
@@ -3313,10 +4166,13 @@ def _run_ordered_bring_up(
             for text in sample.statustexts:
                 if text.startswith("PreArm:") or text.startswith("Arm:"):
                     refusals[text] = text
-            if sample.armed or time.monotonic() >= deadline:
+            if sample.armed:
+                arm_window.close("vehicle_armed")
                 break
-            retry_until = min(deadline, time.monotonic() + BRING_UP_ARM_RETRY_S)
-            while time.monotonic() < retry_until:
+            if arm_window.expired():
+                break
+            retry_until = time.monotonic() + BRING_UP_ARM_RETRY_S
+            while time.monotonic() < retry_until and not arm_window.expired():
                 drain()
                 time.sleep(0.25)
         record["refusals"] = sorted(refusals)
@@ -3341,26 +4197,39 @@ def _run_ordered_bring_up(
                 motors["samples"] += 1
                 motors["max_pwm"] = max(motors["max_pwm"], max(sample.servo_outputs[:4]))
 
+        # The airtime budget the declaration bounds ("<= 5.0 s from the arm readback to
+        # the LAND command") and the wall clock's reading of the same interval. The bound
+        # is judged against the first: it is a quantity of the aircraft's own time, and on
+        # a loaded host the wall reading of it says more about the host than the flight.
+        airtime = window(
+            EXCITATION_MAX_AIRTIME_S,
+            "the excitation's declared airtime, arm readback to LAND",
+        )
         arm_monotonic = time.monotonic()
         flight["armed_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        flight["simulator_time_at_arm_s"] = stats.sim_clock.newest_s
         flight["mode"] = sample.mode_name
         flight["pairs_fed_at_arm"] = stats.pairs
         flight["imu_fed_at_arm"] = stats.imu_samples
+        # The airframe's own PWM floor, as the vehicle reports it while the thrust
+        # path is still off: a motor output sits at the airframe's own minimum until
+        # a spool state has been asked for and accepted (`output_to_pwm`,
+        # AP_MotorsMulticopter.cpp:439-450, SHUT_DOWN). "The motors left the floor"
+        # below is therefore a comparison between two of the VEHICLE's own readings,
+        # and this window supplies no PWM value of its own for it.
+        if sample.servo_outputs is not None:
+            motors["floor_pwm"] = max(sample.servo_outputs[:4])
+            motors["floor_at_arm_readback"] = motors["floor_pwm"]
         # The window's ONE thrust path goes on here, and the order is the point:
         #
         #   * AFTER the arm, because `arm_checks` refuses to arm with a positive
         #     pilot climb rate -- "Throttle too high" (AP_Arming_Copter.cpp:621-635)
         #     -- and the arm loop above retries, so an override in force during a
         #     retry would refuse every attempt;
-        #   * BEFORE the takeoff command, because the takeoff state does not set a
-        #     spool state at all: `get_alt_hold_state_D_ms` (mode.cpp:1042-1055)
-        #     only reaches the branch that asks for THROTTLE_UNLIMITED while the
-        #     mode is still landed and the pilot climb rate is not negative, and
-        #     with the takeoff already running that branch is never reached (the
-        #     measured SPOL trace: SplDes stayed SHUT_DOWN for 2.6 s of the window).
-        #     `takeoff.triggered_ms` also requires the spool state to BE
-        #     THROTTLE_UNLIMITED (mode.cpp:607-622), which is the other reason the
-        #     desired state has to be set first.
+        #   * and the takeoff command it feeds is held until the vehicle's own report
+        #     of its motor outputs shows the thrust path open (see the block below the
+        #     settle). Commanding the takeoff earlier loses the excitation entirely,
+        #     and that is the measured defect this ordering fixes.
         if override["sent_pwm"] is not None:
             record["sent"].append(
                 link.send_rc_channels_override(int(override["sent_pwm"]))
@@ -3369,59 +4238,258 @@ def _run_ordered_bring_up(
             override["sent_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
             )
-            settle_until = time.monotonic() + BRING_UP_OVERRIDE_SETTLE_S
-            while time.monotonic() < settle_until:
+            override_settle = window(
+                BRING_UP_OVERRIDE_SETTLE_S,
+                "the override settle before the takeoff command",
+            )
+            while not override_settle.expired():
                 drain()
                 link.drain()
                 note_vehicle_rc_report()
                 time.sleep(0.05)
-        record["sent"].append(
-            link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
-        )
-        flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
-            timespec="milliseconds"
-        )
-        ack_deadline = time.monotonic() + BRING_UP_TAKEOFF_ACK_TIMEOUT_S
-        ack: dict[str, Any] | None = None
-        while time.monotonic() < ack_deadline and ack is None:
-            drain()
-            link.drain()
-            refresh_override()
-            note_vehicle_rc_report()
-            ack = link.command_ack(MAV_CMD_NAV_TAKEOFF)
-            time.sleep(0.05)
-        flight["takeoff_command_ack"] = ack
-        if ack is None:
-            blockers.append(
-                "the autopilot did not answer the excitation's takeoff command within "
-                f"{BRING_UP_TAKEOFF_ACK_TIMEOUT_S:.0f} s: no COMMAND_ACK for "
-                "MAV_CMD_NAV_TAKEOFF arrived on the bring-up link, so whether the "
-                "vehicle will climb is unmeasured"
-            )
-        elif ack.get("result") != 0:
-            blockers.append(
-                "the autopilot refused the excitation's takeoff: COMMAND_ACK result "
-                f"{ack.get('result')} (0 is MAV_RESULT_ACCEPTED); the window's climb "
-                "did not start"
-            )
-        climb_deadline = time.monotonic() + EXCITATION_CLIMB_DRAIN_S
-        while time.monotonic() < climb_deadline:
+        # THE ORDERING, and why the takeoff command cannot be sent above.
+        #
+        # The takeoff command is what pins the mode into AltHoldModeState::Takeoff, and
+        # that state asks for no spool state at all: `get_alt_hold_state_D_ms`
+        # (mode.cpp:1030-1068) returns Takeoff on its second test -- `takeoff.running()
+        # || takeoff.triggered_ms(...)` -- BEFORE the landed branch at :1041-1055 that
+        # asks for THROTTLE_UNLIMITED, and `AltHold::run()`'s Takeoff case
+        # (mode_althold.cpp:63-74) asks for none either. The desired spool state is a
+        # latch, so the takeoff freezes whichever state was last accepted.
+        #
+        # Commanded one settle after the arm, that latch is SHUT_DOWN, and the run
+        # therefore produces no thrust at all. The motors library FORCES SHUT_DOWN while
+        # `!get_interlock()` (`set_desired_spool_state` and `output_logic`,
+        # AP_MotorsMulticopter.cpp:619-638), and Copter holds the interlock down for its
+        # own 2.0 s `ap.in_arming_delay` after arming (motors.cpp:59,75 -- the
+        # MOTORS_INTERLOCK_ENABLED event). The 0.3 s settle is spent entirely inside that
+        # delay, the THROTTLE_UNLIMITED the landed branch asks for is discarded, and the
+        # takeoff then pins the latch: nothing in ALT_HOLD asks again for as long as
+        # `takeoff.running()`.
+        #
+        # Measured in this window's own airframe log (work/ardupilot/logs/00000142.BIN):
+        # CTUN.ThO (= motors->get_throttle(), Log.cpp:58) ramped to 1.000 as the
+        # takeoff's own slew, while MOTB.ThrOut (= _throttle_out) stayed 0.000 and RCOU
+        # stayed 1000 us for the whole 4.1 s; the run's first SPOL entry is
+        # (Spl=0, SplDes=2) at the LAND mode change, 16 ms before the motors finally left
+        # the floor. The counter-case is in the same file: the GUIDED flight of
+        # 00000139.BIN asks for THROTTLE_UNLIMITED on every iteration, and SPOL records
+        # it as accepted at exactly arm+2.001 s -- the interlock, not the request, is
+        # what both flights waited on.
+        #
+        # So the takeoff waits for the vehicle's OWN report that the thrust path is open:
+        # the motors above the floor they sat at before the override went on. The wait is
+        # bounded by the excitation's own climb window, which therefore opens here rather
+        # than at the command, and no declared budget changes -- the settle, the climb
+        # window and the airtime bound are the declared ones, and the wait costs the climb
+        # window part of its own 5.0 s instead of the airtime bound the LAND command must
+        # stay inside.
+        climb_window = window(EXCITATION_CLIMB_DRAIN_S, "the excitation's climb drain")
+
+        def poll_while_waiting() -> Any:
+            """One iteration of the wait: feed, keep the override alive, read the vehicle."""
             drain()
             link.drain()
             refresh_override()
             note_vehicle_rc_report()
             sample_motion()
-            if max_altitude_m >= (
+            return sample.servo_outputs
+
+        thrust_path: dict[str, Any] = {
+            "floor_pwm": motors["floor_pwm"],
+            "floor_at_arm_readback_pwm": motors["floor_at_arm_readback"],
+            "opened_at_simulator_s": None,
+            "opened_after_arm_simulator_s": None,
+            "waited_within": "the excitation's climb drain (EXCITATION_CLIMB_DRAIN_S)",
+            "why": (
+                "the takeoff command is held until the vehicle's own report of its motor "
+                "outputs leaves the floor it read at the arm readback: with the takeoff "
+                "running, Mode::get_alt_hold_state_D_ms() (mode.cpp:1030-1068) returns "
+                "Takeoff before the branch that asks for a spool state, and the takeoff "
+                "state sets none, so a takeoff commanded while the airframe's motor "
+                "interlock is still down (motors.cpp:59,75, the 2.0 s in_arming_delay) "
+                "pins the desired spool state at SHUT_DOWN for the rest of the window "
+                "(AP_MotorsMulticopter.cpp:619-638)"
+            ),
+        }
+        record["thrust_path"] = thrust_path
+        opened_at = _wait_for_thrust_path(
+            poll_while_waiting, climb_window, motors, stats.sim_clock
+        )
+        thrust_path["opened_at_simulator_s"] = (
+            None if opened_at is None else round(opened_at, 3)
+        )
+        thrust_path["floor_pwm"] = motors["floor_pwm"]
+        arm_simulator_s = flight["simulator_time_at_arm_s"]
+        thrust_path["opened_after_arm_simulator_s"] = (
+            None
+            if opened_at is None or arm_simulator_s is None
+            else round(opened_at - arm_simulator_s, 3)
+        )
+        if opened_at is None and override["sent_pwm"] is not None:
+            blockers.append(
+                "the excitation had no thrust path: the vehicle's own report of its four "
+                f"motor outputs never rose above the floor it read before the window "
+                f"({motors['floor_pwm']} us at the arm readback, {motors['max_pwm']} us "
+                f"maximum over {motors['samples']} samples) within the excitation's "
+                f"declared {EXCITATION_CLIMB_DRAIN_S:g} s climb window, so the takeoff "
+                "command that follows is the takeoff of an airframe whose motors are "
+                "still shut down. The vehicle's own log records which spool state it "
+                "was held in (SPOL Spl/SplDes) beside the mode changes"
+            )
+        climb_reference_m: float | None = None
+
+        def takeoff_ack_count() -> int:
+            """How many takeoff COMMAND_ACKs the link has recorded so far.
+
+            ``command_ack`` scans the accumulated replies and never consumes, so a
+            retry must count: without the per-attempt baseline it would re-read the
+            previous attempt's refusal as the new attempt's answer.
+            """
+            return sum(
+                1
+                for reply in link.replies
+                if reply.get("mavpackettype") == "COMMAND_ACK"
+                and reply.get("command") == MAV_CMD_NAV_TAKEOFF
+            )
+
+        # The excitation's takeoff is retried on a refusal, briefly: a GUIDED takeoff
+        # needs the EKF to hold a position estimate, and with GPS off that estimate
+        # arrives over the external-nav feed. Every attempt and its answer is
+        # recorded; the refusal blocker below survives only when the last attempt is
+        # refused too.
+        takeoff_acks: list[dict[str, Any]] = []
+        for attempt in range(1, EXCITATION_TAKEOFF_ATTEMPTS + 1):
+            if airtime.expired():
+                break
+            baseline_acks = takeoff_ack_count()
+            record["sent"].append(
+                link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
+            )
+            if attempt == 1:
+                flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                )
+                flight["takeoff_commanded_after_arm_simulator_s"] = (
+                    None
+                    if stats.sim_clock.newest_s is None or arm_simulator_s is None
+                    else round(stats.sim_clock.newest_s - arm_simulator_s, 3)
+                )
+            # A liveness wait, and the wall clock is its right unit: what it asks is whether
+            # the autopilot answers this command AT ALL, not whether the scene has had time
+            # to do anything. The answer is milliseconds of the autopilot's own time away, so
+            # a wall ceiling that admits a simulator at a fifth of realtime is still generous.
+            ack_deadline = time.monotonic() + BRING_UP_TAKEOFF_ACK_TIMEOUT_S
+            ack: dict[str, Any] | None = None
+            while time.monotonic() < ack_deadline and ack is None:
+                drain()
+                link.drain()
+                refresh_override()
+                note_vehicle_rc_report()
+                if takeoff_ack_count() > baseline_acks:
+                    ack = link.command_ack(MAV_CMD_NAV_TAKEOFF)
+                else:
+                    time.sleep(0.05)
+            takeoff_acks.append(
+                {"attempt": attempt, "result": None if ack is None else ack.get("result")}
+            )
+            if ack is not None and ack.get("result") == 0:
+                break
+            time.sleep(EXCITATION_TAKEOFF_RETRY_WAIT_S)
+        flight["takeoff_command_acks"] = takeoff_acks
+        ack = None
+        for row in reversed(takeoff_acks):
+            if row["result"] is not None:
+                ack = {"result": row["result"]}
+                break
+        flight["takeoff_command_ack"] = ack
+        if ack is None:
+            blockers.append(
+                "the autopilot did not answer the excitation's takeoff command within "
+                f"{BRING_UP_TAKEOFF_ACK_TIMEOUT_S:.0f} s on any of "
+                f"{EXCITATION_TAKEOFF_ATTEMPTS} attempts: no COMMAND_ACK for "
+                "MAV_CMD_NAV_TAKEOFF arrived on the bring-up link, so whether the "
+                "vehicle will climb is unmeasured"
+            )
+        elif ack.get("result") != 0:
+            blockers.append(
+                "the autopilot refused the excitation's takeoff: the last of "
+                f"{EXCITATION_TAKEOFF_ATTEMPTS} attempts answered COMMAND_ACK result "
+                f"{ack.get('result')} (0 is MAV_RESULT_ACCEPTED; every attempt is "
+                "recorded in takeoff_command_acks); the window's climb did not start"
+            )
+        else:
+            # The climb's rise is measured from the readback at the accepted takeoff:
+            # the windowed height source is the barometer, whose parked drift an
+            # absolute threshold can mistake for altitude -- measured, run
+            # p01l-streak-2-20260930T015214Z, where the climb window closed
+            # altitude_reached at 2.2 s on a takeoff that had just been refused.
+            for _ in range(20):
+                sample_motion()
+                if sample.local_position_ned is not None:
+                    break
+                time.sleep(0.05)
+            if sample.local_position_ned is not None:
+                climb_reference_m = -sample.local_position_ned[2]
+                flight["altitude_at_takeoff_ack_m"] = round(climb_reference_m, 3)
+        # The rest of the excitation's climb window -- the part left after the thrust path
+        # opened. Its declared job is to keep feeding while the climb happens (the
+        # estimator latches on the frames the climb produces) so a wall deadline would
+        # make the excitation's length depend on how loaded the host is; it was opened
+        # above, before the takeoff command, because the climb cannot start until the
+        # airframe's own thrust path is open. Measured both ways on this same host: 3.3
+        # simulated seconds of window lifted the aircraft 0.27 m on run
+        # p01l-rel10-4-20260927T201628Z at low load, and the 2.20 simulated seconds the
+        # wall clock bought on run-2026-09-28T02-43-27-442Z lifted it 0.03 m, because
+        # the LAND command arrived before the thrust path's first motor output.
+        while not climb_window.expired():
+            drain()
+            link.drain()
+            refresh_override()
+            note_vehicle_rc_report()
+            sample_motion()
+            risen_m = (
+                max_altitude_m
+                if climb_reference_m is None
+                else max_altitude_m - climb_reference_m
+            )
+            if risen_m >= (
                 EXCITATION_TAKEOFF_ALTITUDE_M - EXCITATION_ALTITUDE_REACHED_MARGIN_M
             ):
+                climb_window.close("altitude_reached")
                 break
             time.sleep(0.05)
-        land_delay_s = time.monotonic() - arm_monotonic
-        flight["land_command_delay_s"] = round(land_delay_s, 3)
-        if land_delay_s > EXCITATION_MAX_AIRTIME_S:
+        flight["climb_rise_m"] = (
+            None
+            if climb_reference_m is None
+            else round(max_altitude_m - climb_reference_m, 3)
+        )
+        # The airtime is read and closed here, at the LAND command, because that is
+        # what it measures: the window is never polled to expiry, so it would otherwise
+        # report the time until the whole bring-up was documented.
+        airtime.close("land_commanded")
+        land_delay_s = airtime.elapsed_simulator_s()
+        land_delay_wall_s = time.monotonic() - arm_monotonic
+        flight["land_command_delay_s"] = (
+            None if land_delay_s is None else round(land_delay_s, 3)
+        )
+        flight["land_command_delay_wall_s"] = round(land_delay_wall_s, 3)
+        flight["land_command_delay_unit"] = (
+            "land_command_delay_s is SIMULATOR seconds, the domain the airtime bound is "
+            "declared in; land_command_delay_wall_s is the same interval on the host's "
+            "clock and is recorded rather than judged"
+        )
+        if land_delay_s is None:
             blockers.append(
-                f"the LAND command went out {land_delay_s:.3f} s after the arm readback, "
-                f"outside the declared {EXCITATION_MAX_AIRTIME_S} s airtime bound"
+                "the excitation's airtime cannot be measured: no frame carrying the "
+                "simulator's own clock was read between the arm readback and the LAND "
+                "command, so the declared airtime bound has nothing to judge"
+            )
+        elif land_delay_s > EXCITATION_MAX_AIRTIME_S:
+            blockers.append(
+                f"the LAND command went out {land_delay_s:.3f} simulated s after the arm "
+                f"readback ({land_delay_wall_s:.3f} wall s on this host), outside the "
+                f"declared {EXCITATION_MAX_AIRTIME_S} s airtime bound"
             )
         session.set_mode("LAND")
         flight["land_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
@@ -3440,8 +4508,13 @@ def _run_ordered_bring_up(
             override["released_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
             )
-        descent_deadline = time.monotonic() + EXCITATION_POST_LAND_DRAIN_S
-        while time.monotonic() < descent_deadline:
+        # The bounded post-LAND drain, in the same seconds as the window it ends: its
+        # declared job is to feed the descent's frames to the estimator, and the descent
+        # is a thing the aircraft does in the aircraft's time.
+        descent_window = window(
+            EXCITATION_POST_LAND_DRAIN_S, "the excitation's post-LAND descent drain"
+        )
+        while not descent_window.expired():
             drain()
             link.drain()
             note_vehicle_rc_report()
@@ -3456,6 +4529,19 @@ def _run_ordered_bring_up(
         flight["motor_output_samples"] = motors["samples"]
         flight["mode_after_window"] = sample.mode_name
         flight["armed_after_window"] = sample.armed
+        # The declared end-state check, sampled at the excitation's own landing:
+        # the post-LAND drain has run, so the newest truth sample is the aircraft
+        # at rest. It lands in the record's flight section, and a tipped or
+        # crash-disarmed rest state is a blocker -- the scored window does not
+        # open on an excitation that ended in a face-plant (declared 2026-09-29,
+        # before any streak flight).
+        _record_excitation_end_state(
+            record,
+            stats,
+            sample,
+            published_attitude(),
+            writer.path("mavlink.jsonl"),
+        )
         if override["sent"] and override["observed_during_window"] != override["sent_pwm"]:
             blockers.append(
                 "the window's throttle override never took effect: the vehicle's own RC "
@@ -3466,10 +4552,17 @@ def _run_ordered_bring_up(
                 "the vehicle's own declared GCS (GCS_Common.cpp:4216-4220), and the "
                 "vehicle's own RC report is what says whether it accepted this one"
             )
-        if max_altitude_m < 0.10:
+        risen_m = (
+            max_altitude_m
+            if climb_reference_m is None
+            else max_altitude_m - climb_reference_m
+        )
+        if risen_m < 0.10:
             blockers.append(
-                f"the excitation produced no measured motion: max altitude readback "
-                f"{max_altitude_m:.3f} m against the commanded "
+                f"the excitation produced no measured motion: the readback rose "
+                f"{risen_m:.3f} m over the takeoff-ack reference "
+                f"({flight.get('altitude_at_takeoff_ack_m')} m at the ack, "
+                f"{max_altitude_m:.3f} m absolute readback) against the commanded "
                 f"{EXCITATION_TAKEOFF_ALTITUDE_M} m climb, so the estimator had nothing "
                 f"to latch on. The airframe's own outputs are recorded beside it: "
                 f"{motors['max_pwm']} us maximum on the four motors over "
@@ -3559,19 +4652,33 @@ def _run_ordered_bring_up(
             )
 
     record["replies"] = list(link.replies)
+    record["simulator_windows"] = [opened.document() for opened in windows]
     record["completed"] = not blockers
     writer.write_json("bring-up.json", record)
     log_lines.append(
         f"ordered bring-up: completed={record['completed']}, "
         f"refusals={record.get('refusals', [])}, "
         f"max altitude readback {record['flight'].get('max_altitude_readback_m')} m, "
-        f"land delay {record['flight'].get('land_command_delay_s')} s, "
+        f"land delay {record['flight'].get('land_command_delay_s')} s of SIMULATOR time "
+        f"({record['flight'].get('land_command_delay_wall_s')} s of wall time; declared "
+        f"bound {EXCITATION_MAX_AIRTIME_S} s), "
         f"throttle override {record['throttle_override']['sent_pwm']} us, "
         f"released={record['throttle_override']['released']}, vehicle RC report "
         f"{record['throttle_override']['observed_during_window']} -> "
         f"{record['throttle_override']['observed_after_release']}, "
         f"window readback {record['readbacks'].get('window')}, "
         f"restored readback {record['readbacks'].get('restored')}"
+    )
+    log_lines.append(
+        "ordered bring-up windows, in SIMULATOR seconds (the simulator's own clock; "
+        "ended_by=simulator means the declared budget was spent, wall_ceiling means the "
+        "host ran it outside the declared realtime envelope): "
+        + "; ".join(
+            f"{row['label']} budget {row['budget_simulator_s']:g} s, spent "
+            f"{row['elapsed_simulator_s']} s in {row['elapsed_wall_s']} wall s, "
+            f"ended_by={row['ended_by']}"
+            for row in record["simulator_windows"]
+        )
     )
     for blocker in blockers:
         log_lines.append(f"UNRESOLVED: {blocker}")
@@ -3594,6 +4701,13 @@ def _bring_up_manifest(record: dict[str, Any]) -> dict[str, Any]:
             for key in ("latitude_deg", "longitude_deg", "altitude_msl_m", "is_a_pose_feed")
         },
         "excitation": record["declaration"]["window"],
+        # The units the declared windows were spent in, and what each one cost. A budget
+        # in simulated seconds with ended_by=simulator is a window that ran its declared
+        # course; ended_by=wall_ceiling is a host that ran it outside the declared
+        # realtime envelope, which is the run's own timing-invalid condition rather than a
+        # claim about the aircraft.
+        "window_clock": record.get("window_clock", {}),
+        "simulator_windows": record.get("simulator_windows", []),
         "arm_attempts": record.get("arm_attempts"),
         "refusals": record.get("refusals", []),
         "flight": record["flight"],
@@ -3854,6 +4968,7 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
             stats.pair_records_dropped += 1
 
     def feed_record(record: Any) -> None:
+        stats.sim_clock.observe(record.sim_time_s)
         if record.kind is Kind.PAIR and record.pair is not None:
             # Only reachable before the reader strips pixels; the sink's queue is
             # the normal path, but a pair that arrives with its planes is fed
@@ -4016,7 +5131,7 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
     carrier_params = settings.compat_estimator_params
     platform = WebotsArduPilot(
         settings,
-        runner=SubprocessRunner(),
+        runner=LowPrioritySubprocessRunner(),
         session=session,
         gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
         evidence=writer,
@@ -4084,10 +5199,29 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
                 "motion, so the question is not answered by this run"
             )
         else:
+            # The same constants, and therefore the same units: the excitation's windows
+            # belong to the aircraft's time here too (EXCITATION_* above). They are spent
+            # against this run's own simulator clock, read beside the frames the observer
+            # feeds, so one constant means one thing in both arms of this stage.
+            def window(budget_s: float, label: str) -> _SimWindow:
+                ceiling = _sim_window_wall_ceiling_s(
+                    budget_s, settings.realtime_ratio_envelope[0]
+                )
+                opened = _SimWindow(
+                    stats.sim_clock, budget_s, label=label, wall_ceiling_s=ceiling
+                )
+                motion_window.setdefault("simulator_windows", []).append(opened)
+                return opened
+
+            airtime = window(
+                EXCITATION_MAX_AIRTIME_S,
+                "the diagnostic excitation's declared airtime, arm readback to LAND",
+            )
             arm_monotonic = time.monotonic()
             flight["armed_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
             )
+            flight["simulator_time_at_arm_s"] = stats.sim_clock.newest_s
             flight["pairs_fed_at_arm"] = stats.pairs
             flight["imu_fed_at_arm"] = stats.imu_samples
             flight["truth_pose_at_arm"] = (
@@ -4098,20 +5232,33 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
             flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
             )
-            climb_deadline = time.monotonic() + EXCITATION_CLIMB_DRAIN_S
-            while time.monotonic() < climb_deadline:
+            climb_window = window(EXCITATION_CLIMB_DRAIN_S, "the diagnostic's climb drain")
+            while not climb_window.expired():
                 drain()
                 if observer["max_altitude_m"] >= (
                     EXCITATION_TAKEOFF_ALTITUDE_M - EXCITATION_ALTITUDE_REACHED_MARGIN_M
                 ):
+                    climb_window.close("altitude_reached")
                     break
                 time.sleep(0.05)
-            land_delay_s = time.monotonic() - arm_monotonic
-            flight["land_command_delay_s"] = round(land_delay_s, 3)
-            if land_delay_s > EXCITATION_MAX_AIRTIME_S:
+            airtime.close("land_commanded")
+            land_delay_s = airtime.elapsed_simulator_s()
+            flight["land_command_delay_s"] = (
+                None if land_delay_s is None else round(land_delay_s, 3)
+            )
+            flight["land_command_delay_wall_s"] = round(
+                time.monotonic() - arm_monotonic, 3
+            )
+            if land_delay_s is None:
                 blockers.append(
-                    f"the LAND command went out {land_delay_s:.3f} s after the arm "
-                    f"readback, outside the declared {EXCITATION_MAX_AIRTIME_S} s "
+                    "the diagnostic excitation's airtime cannot be measured: no frame "
+                    "carrying the simulator's own clock was read between the arm readback "
+                    "and the LAND command"
+                )
+            elif land_delay_s > EXCITATION_MAX_AIRTIME_S:
+                blockers.append(
+                    f"the LAND command went out {land_delay_s:.3f} simulated s after the "
+                    f"arm readback, outside the declared {EXCITATION_MAX_AIRTIME_S} s "
                     "airtime bound"
                 )
             session.set_mode("LAND")
@@ -4124,8 +5271,10 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
             flight["truth_pose_at_land"] = (
                 list(stats.truth_samples[-1][1]) if stats.truth_samples else None
             )
-            descent_deadline = time.monotonic() + EXCITATION_POST_LAND_DRAIN_S
-            while time.monotonic() < descent_deadline:
+            descent_window = window(
+                EXCITATION_POST_LAND_DRAIN_S, "the diagnostic's post-LAND descent drain"
+            )
+            while not descent_window.expired():
                 drain()
                 time.sleep(0.05)
     except Exception as error:  # noqa: BLE001 - the run's outer guard records, never swallows
@@ -4238,15 +5387,77 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
 
 
 def _wait_initialized(
-    machine: loc.HealthMachine, drain: Callable[[], None], wait_s: float
+    machine: loc.HealthMachine,
+    drain: Callable[[], None],
+    wait: _SimWindow,
+    *,
+    poll_s: float = SIM_WINDOW_POLL_S,
 ) -> bool:
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
+    """H5's wait: the estimator's readiness, spent in the simulator's seconds.
+
+    The estimator latches on frames, and frames arrive in the scene's time, so the wait
+    is a wait for simulated work -- the same unit the configuration declares this budget
+    in ("a simulated GPS needs a fix, the EKF needs a home, and the IMU consistency check
+    needs a quiet window, all of which take simulated time"). A wall deadline here would
+    hand a loaded host fewer of the estimator's own seconds than the declaration granted,
+    which is exactly how the excitation beside it was cut off. ``wait`` carries its own
+    wall ceiling, so a stalled simulator ends the wait instead of hanging it.
+    """
+    while not wait.expired():
         drain()
         if machine.state == "healthy":
+            wait.close("estimator_initialized")
             return True
-        time.sleep(0.05)
+        time.sleep(poll_s)
     return False
+
+
+def _wait_for_thrust_path(
+    poll: Callable[[], Sequence[int] | None],
+    wait: _SimWindow,
+    motors: dict[str, Any],
+    clock: _SimulatorClock,
+    *,
+    poll_s: float = SIM_WINDOW_POLL_S,
+) -> float | None:
+    """Wait, inside the declared window, for the airframe's own thrust path to open.
+
+    The gate is the VEHICLE's own report of its motor outputs, compared against the
+    floor the same report read while no spool-up had been requested: the four outputs
+    sit at the airframe's own minimum until a spool state has been asked for and
+    accepted, so "the motors left the floor" is a comparison between two of the
+    vehicle's own readings and this window supplies no PWM value of its own for it.
+
+    Why the takeoff has to wait for it: the takeoff is what pins the mode's alt-hold
+    state machine into its Takeoff state, and that state asks for no spool state at
+    all (``get_alt_hold_state_D_ms``, mode.cpp:1030-1068, tests ``takeoff.running()``
+    before the branch that asks), so the desired spool state it freezes is whichever
+    one was last accepted -- SHUT_DOWN while the motors library is forcing it
+    (AP_MotorsMulticopter.cpp:619-638), which is the whole of Copter's 2.0 s
+    ``ap.in_arming_delay`` after the arm (motors.cpp:59,75).
+
+    Returns the simulator time at which the vehicle's own report first rose above the
+    floor, or ``None`` if ``wait`` ended first -- the caller owes the reader the
+    difference. ``wait`` carries its own wall ceiling, so a stalled simulator ends the
+    wait instead of hanging it.
+    """
+    floor = motors.get("floor_pwm")
+    while not wait.expired():
+        observed = poll()
+        if observed is not None:
+            top = max(observed[:4])
+            if floor is None:
+                # The arm readback carried no servo report, so the first one the window
+                # can compare against is this one -- taken while the thrust path is
+                # still off, which is what makes it a floor rather than a sample.
+                floor = top
+            elif top > floor:
+                motors["floor_pwm"] = floor
+                motors["left_floor_at_simulator_s"] = clock.newest_s
+                return clock.newest_s
+        time.sleep(poll_s)
+    motors["floor_pwm"] = floor
+    return None
 
 def _scene_capture_gate(
     writer: EvidenceWriter,
@@ -4338,8 +5549,9 @@ def _attitude_gate(
     alignment: loc.OdomAlignment,
     stats: _FeedStats,
     log_lines: list[str],
+    seal_time_ns: int | None = None,
 ) -> str | None:
-    """A1, second form: the sealed epoch frame, checked before the arm (0.3 item 5).
+    """A1, second form: the sealed epoch frame, measured at the seal's own instant.
 
     The first textured invocation measured a −180° roll (the missing FLU→FRD body
     map) and the second a +90° yaw (the odom frame's yaw, unobservable and chosen
@@ -4355,23 +5567,56 @@ def _attitude_gate(
     observes it. That the seal absorbs the estimator's own initialization tilt is
     a recorded limitation, not a hidden one: a real tilt error shows up in E1 and
     H3 once the vehicle moves.
+
+    Revised 2026-09-29 (phase plan step 2): the gate read
+    ``stats.truth_attitudes[-1]`` -- the run's LAST truth sample -- and the scored
+    arm's gate runs after the flown excitation, so that sample is the landing.
+    p01l-climbfix-20260928T174608Z's attitude-gate.json is the measured defect:
+    truth_time_ns 28.49 s, the face-planted rest pose, refused the scored arm on
+    the landing A1 was never meant to judge. The gate now measures both compared
+    attitudes at the seal's own instant -- the state published at the seal, and
+    the truth sample nearest that instant inside ATTITUDE_GATE_JOIN_TOLERANCE_NS
+    -- and refuses as unmeasured when no truth sample lies within the join
+    tolerance, rather than substitute another instant's attitude. What this
+    leaves is honest by declaration: A1 no longer judges the landing at all; the
+    declared end-state check does, at both landings, with its own receipt rows.
     """
     declared = tuple(alignment.declared_start_rpy)
     record: dict[str, Any] = {
         "tolerance_deg": ATTITUDE_GATE_TOLERANCE_DEG,
         "declared_start_rpy_rad": list(declared),
+        "seal_time_ns": seal_time_ns,
+        "join_tolerance_ns": ATTITUDE_GATE_JOIN_TOLERANCE_NS,
     }
-    if aligned is None or not stats.truth_attitudes:
+    if aligned is None or seal_time_ns is None:
         reason = (
             "no published state to compare"
             if aligned is None
-            else "no truth attitude arrived on the pose records"
+            else "the alignment carries no seal instant"
         )
         record.update({"state": "unmeasured", "reason": reason})
         writer.write_json("attitude-gate.json", record)
         return f"A1 could not run: {reason}"
+    if not stats.truth_attitudes:
+        reason = "no truth attitude arrived on the pose records"
+        record.update({"state": "unmeasured", "reason": reason})
+        writer.write_json("attitude-gate.json", record)
+        return f"A1 could not run: {reason}"
     published = aligned["attitude_rpy"]
-    truth_time_ns, truth_rpy = stats.truth_attitudes[-1]
+    truth_time_ns, truth_rpy = min(
+        stats.truth_attitudes, key=lambda entry: abs(entry[0] - seal_time_ns)
+    )
+    join_distance_ns = abs(truth_time_ns - seal_time_ns)
+    if join_distance_ns > ATTITUDE_GATE_JOIN_TOLERANCE_NS:
+        reason = (
+            "no truth sample within the "
+            f"{ATTITUDE_GATE_JOIN_TOLERANCE_NS / 1e6:.0f} ms join tolerance of the "
+            f"seal: the nearest is {join_distance_ns / 1e9:.3f} s away, so the "
+            "sealed frame is unmeasured rather than read at another instant"
+        )
+        record.update({"state": "unmeasured", "reason": reason})
+        writer.write_json("attitude-gate.json", record)
+        return f"A1 could not run: {reason}"
     composition_deg = [
         math.degrees(_wrap_angle(p - d)) for p, d in zip(published, declared)
     ]
@@ -4391,6 +5636,7 @@ def _attitude_gate(
             "published_rpy_rad": list(published),
             "truth_rpy_rad": list(truth_rpy),
             "truth_time_ns": truth_time_ns,
+            "truth_join_distance_ns": join_distance_ns,
             "composition_deltas_deg": composition_deg,
             "declaration_deltas_deg": declaration_deg,
             "epoch_yaw_deg": alignment.epoch_yaw_deg(),
@@ -4398,15 +5644,18 @@ def _attitude_gate(
             "note": (
                 "epoch_yaw_deg is recorded, not gated: nothing in this arm observes the "
                 "odom frame's yaw, which the pinned initializer fixes by a "
-                "noise-decided branch; the seal derives it once from the declared start"
+                "noise-decided branch; the seal derives it once from the declared start. "
+                "truth_time_ns is the truth sample nearest the seal inside the join "
+                "tolerance, not the run's last sample (declared end-state checks own "
+                "the landings)"
             ),
         }
     )
     writer.write_json("attitude-gate.json", record)
     log_lines.append(
-        f"A1 attitude gate: composition deltas (deg) {composition_deg}, declaration "
-        f"deltas (deg) {declaration_deg}, epoch yaw {record['epoch_yaw_deg']:.2f} deg, "
-        f"level error {level_error_deg:.3f} deg"
+        f"A1 attitude gate at the seal: composition deltas (deg) {composition_deg}, "
+        f"declaration deltas (deg) {declaration_deg}, epoch yaw "
+        f"{record['epoch_yaw_deg']:.2f} deg, level error {level_error_deg:.3f} deg"
     )
     if passed:
         return None
@@ -4417,6 +5666,154 @@ def _attitude_gate(
         f"{ATTITUDE_GATE_TOLERANCE_DEG} deg tolerance (plan section 0.3 item 5), so the "
         "arm is refused"
     )
+
+
+def _crash_disarm_statustexts(mavlink_log: Path) -> list[str]:
+    """The run's own recorded crash-disarm STATUSTEXTs (crash_check.cpp:93)."""
+    texts: list[str] = []
+    if mavlink_log.is_file():
+        with mavlink_log.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    document = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(document, dict):
+                    continue
+                if document.get("mavpackettype") != "STATUSTEXT":
+                    continue
+                text = str(document.get("text", ""))
+                if text.startswith(CRASH_DISARM_STATUSTEXT_PREFIX):
+                    texts.append(text)
+    return texts
+
+
+def _end_state_record(
+    stats: _FeedStats,
+    published_attitude_rpy: Sequence[float] | None,
+    armed: bool | None,
+    mode_name: str | None,
+    mavlink_log: Path,
+    phase: str,
+) -> dict[str, Any]:
+    """The declared end-state check's sample: level at rest, no crash disarm.
+
+    Declared 2026-09-29, before any streak flight (phase plan step 2), because
+    moving A1's sample point to the seal would otherwise leave the landing
+    unjudged. The judged quantities are the newest truth sample the run has read
+    -- the aircraft at rest after its own landing -- against
+    END_STATE_ATTITUDE_TOLERANCE_DEG on roll and pitch (yaw is heading, not
+    levelness), and the run's own mavlink log for the firmware's crash disarm.
+    The published attitude, the armed state and the mode are recorded beside
+    them and judged by nothing: a tipped airframe's published estimate is the
+    crash's product, not a measurement of how the aircraft is resting.
+    """
+    crash_texts = _crash_disarm_statustexts(mavlink_log)
+    record: dict[str, Any] = {
+        "phase": phase,
+        "tolerance_deg": END_STATE_ATTITUDE_TOLERANCE_DEG,
+        "published_attitude_rpy_rad": (
+            None
+            if published_attitude_rpy is None
+            else [float(value) for value in published_attitude_rpy]
+        ),
+        "armed": armed,
+        "mode": mode_name,
+        "crash_disarm_statustexts": crash_texts,
+    }
+    if not stats.truth_attitudes:
+        record.update(
+            {
+                "state": "unmeasured",
+                "reason": (
+                    "no truth attitude arrived on the pose records, so how the "
+                    "aircraft ended is unmeasured"
+                ),
+            }
+        )
+        return record
+    truth_time_ns, truth_rpy = stats.truth_attitudes[-1]
+    roll_deg = math.degrees(_wrap_angle(truth_rpy[0]))
+    pitch_deg = math.degrees(_wrap_angle(truth_rpy[1]))
+    failures: list[str] = []
+    if max(abs(roll_deg), abs(pitch_deg)) > END_STATE_ATTITUDE_TOLERANCE_DEG:
+        failures.append(
+            f"the aircraft came to rest at roll {roll_deg:.1f} deg, pitch "
+            f"{pitch_deg:.1f} deg against the declared "
+            f"{END_STATE_ATTITUDE_TOLERANCE_DEG} deg end-state tolerance (the four "
+            "proven complete logs 00000135-138 each ended within 0.1 deg)"
+        )
+    for text in crash_texts:
+        failures.append(f"the vehicle's own log carries a crash disarm: {text}")
+    record.update(
+        {
+            "state": "measured_fail" if failures else "measured_pass",
+            "truth_attitude_rpy_rad": [float(value) for value in truth_rpy],
+            "truth_time_ns": truth_time_ns,
+            "roll_deg": roll_deg,
+            "pitch_deg": pitch_deg,
+            "failures": failures,
+        }
+    )
+    return record
+
+
+def _end_state_blocker(record: dict[str, Any]) -> str | None:
+    """The end-state check's refusal for the bring-up record, or None when it passed."""
+    if record["state"] == "measured_pass":
+        return None
+    if record["state"] == "unmeasured":
+        return f"the {record['phase']}'s end state is unmeasured: {record['reason']}"
+    return (
+        f"the {record['phase']}'s end state failed: " + "; ".join(record["failures"])
+    )
+
+
+def _end_state_check_row(record: dict[str, Any]) -> dict[str, str]:
+    """The scored route's end-state check as a row among the predeclared checks."""
+    passed = record["state"] == "measured_pass"
+    if passed:
+        detail = (
+            f"the scored route ended level at rest: roll {record['roll_deg']:.2f} deg, "
+            f"pitch {record['pitch_deg']:.2f} deg against the "
+            f"{END_STATE_ATTITUDE_TOLERANCE_DEG} deg tolerance, no crash disarm"
+        )
+    elif record.get("failures"):
+        detail = "; ".join(record["failures"])
+    else:
+        detail = record["reason"]
+    return {
+        "name": "end_state",
+        "status": "pass" if passed else "fail",
+        "detail": detail,
+    }
+
+
+def _record_excitation_end_state(
+    record: dict[str, Any],
+    stats: _FeedStats,
+    sample: Any,
+    published_attitude_rpy: Sequence[float] | None,
+    mavlink_log: Path,
+) -> None:
+    """Fold the excitation's declared end-state sample into the bring-up record.
+
+    The record carries the end state under ``flight``, and a failed or
+    unmeasured end state is a blocker: the scored window does not open on an
+    excitation that ended tipped over or crash-disarmed.
+    """
+    end_state = _end_state_record(
+        stats,
+        published_attitude_rpy,
+        None if sample is None else sample.armed,
+        None if sample is None else sample.mode_name,
+        mavlink_log,
+        phase="excitation",
+    )
+    record["flight"]["end_state"] = end_state
+    end_state_blocker = _end_state_blocker(end_state)
+    if end_state_blocker:
+        record["blockers"].append(end_state_blocker)
 
 
 def _percentile(values: Sequence[float], fraction: float) -> float:
@@ -4462,6 +5859,12 @@ def _truth_error_statistics(
     truth_times = [time_ns for time_ns, _position in truth]
     horizontal: list[float] = []
     vertical: list[float] = []
+    # Per-sample rows (E1 coupling, 2026-09-30): the aggregates above answer "did it
+    # pass"; they cannot answer "where does the error live" -- bias against scatter,
+    # transit against hold, one shifted distribution against run-to-run noise. The
+    # rows carry both sides of one joined sample so the join is reproducible offline;
+    # truth still reaches nothing but this artifact.
+    samples: list[dict[str, Any]] = []
     unjoined = 0
     for time_ns, estimate in published:
         index = bisect_left(truth_times, time_ns)
@@ -4476,6 +5879,20 @@ def _truth_error_statistics(
             math.hypot(estimate[0] - nearest_position[0], estimate[1] - nearest_position[1])
         )
         vertical.append(abs(estimate[2] - nearest_position[2]))
+        samples.append(
+            {
+                "time_ns": time_ns,
+                "estimate_ned_m": [estimate[0], estimate[1], estimate[2]],
+                "truth_ned_m": [
+                    nearest_position[0],
+                    nearest_position[1],
+                    nearest_position[2],
+                ],
+                "truth_time_ns": nearest_time_ns,
+                "error_horizontal_m": horizontal[-1],
+                "error_vertical_m": vertical[-1],
+            }
+        )
     if not horizontal:
         return {
             "measured": False,
@@ -4499,6 +5916,7 @@ def _truth_error_statistics(
         "p95_vertical_error_m": _percentile(vertical, 0.95),
         "max_horizontal_error_m": max(horizontal),
         "max_vertical_error_m": max(vertical),
+        "samples": samples,
         **bounds,
     }
 

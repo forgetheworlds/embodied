@@ -2486,6 +2486,36 @@ def test_a_settings_value_that_cannot_describe_a_run_is_refused(tmp_path):
         settings_for(path, tmp_path)
     assert "rgb8" in str(refusal.value)
 
+def test_the_sim_wall_clamp_is_off_by_default_and_reaches_the_simulator_process(tmp_path):
+    # The scored path's pacing (owner ruling 2026-09-30): an absent key is the
+    # configuration every earlier run and fixture was measured on, so the clamp
+    # defaults off and the simulator's environment is unchanged.
+    plain = settings_for(write_scene(tmp_path), tmp_path)
+    assert plain.sim_wall_clamp is False
+    assert "EMBODIED_SIM_WALL_CLAMP" not in plain.controller_environment()
+
+    document = yaml.safe_load(Path(write_scene(tmp_path)).read_text(encoding="utf-8"))
+    document["platform"]["sim_wall_clamp"] = True
+    clamped_path = tmp_path / "clamped.yaml"
+    clamped_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    clamped = settings_for(clamped_path, tmp_path)
+    assert clamped.sim_wall_clamp is True
+    assert clamped.controller_environment()["EMBODIED_SIM_WALL_CLAMP"] == "1"
+
+
+def test_the_sim_wall_clamp_refuses_webots_fast_mode(tmp_path):
+    # Fast mode is the owner's iteration mode and the clamp is the scored path's
+    # pacing; a run cannot be both, and a silent precedence would be a substitution.
+    document = yaml.safe_load(Path(write_scene(tmp_path)).read_text(encoding="utf-8"))
+    document["platform"]["webots_mode"] = "fast"
+    document["platform"]["sim_wall_clamp"] = True
+    path = tmp_path / "fast-clamped.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(cli.ConfigError) as refusal:
+        settings_for(path, tmp_path)
+    assert "sim_wall_clamp" in str(refusal.value)
+    assert "fast" in str(refusal.value)
+
 
 def test_the_default_output_directory_is_a_fresh_run_directory():
     first = cli.default_output_directory("p00-compat")
