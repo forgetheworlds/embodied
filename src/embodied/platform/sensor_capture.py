@@ -67,10 +67,12 @@ _HEADER_NAME = "sensor-capture/header.json"
 _FRAMES_DIR = "sensor-capture/frames"
 _FORMAT = "embodied-sensor-capture-1"
 #: How many records may wait for the writer thread before the feed thread drops.
-#: 256 covers the feed's worst burst (the pending-pairs queue holds 16 pairs) many
-#: times over at the luma rate; a stall longer than that costs rows loudly (drop
-#: rows) instead of stalling the feed quietly.
-_QUEUE_DEPTH = 256
+#: Measured: at the declared rates this writer occasionally stalls for up to ~0.5 s
+#: on a memory-pressured host (dirty-page writeback), and a 256-deep queue (0.5 s of
+#: inertial samples) dropped 23 rows over a 60 s soak. 1024 records -- two seconds
+#: of the feed's worst burst many times over -- absorbs that; references only, so
+#: the memory cost is the payloads' own size, and IMU rows dominate the count.
+_QUEUE_DEPTH = 1024
 
 
 class SensorCapture:
@@ -91,31 +93,46 @@ class SensorCapture:
         )
         self._stopped = threading.Event()
         self._drained = threading.Event()
-        writer.write_json(
-            _HEADER_NAME,
-            {
-                "format": _FORMAT,
-                "started_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                "records": _RECORDS_NAME,
-                "frames_dir": _FRAMES_DIR,
-                "queue_depth": _QUEUE_DEPTH,
-                "kinds": {
-                    "imu": "one inertial sample: sim_time_ns, capture_host_ns, gyro[3], accel[3] -- the exact arguments of localization.encode_imu, in feed order",
-                    "pair": "one stereo pair: sim_time_ns, capture_host_ns, width, height, left/right P5 PGM paths carrying the two luma planes exactly as localization.encode_stereo received them, and luma_sha256 over those two planes, in feed order; rgb8 is not retained (see module docstring) -- colour consumers read the run's bounded pairs/ scene capture",
-                    "pose": "one evaluator truth sample, read for scoring and sent nowhere: sim_time_ns, position_xyz (NED), attitude_rpy; structurally unencodable into the estimator's protocol",
-                    "setpoint": "one commanded target the check issued: sim_time_ns (feed clock), wall_ns, target fields as commanded",
-                    "command": "one mode/arm/takeoff/land/override event the check issued: sim_time_ns (feed clock), wall_ns, command name, detail",
-                    "capture_drop": "the feed thread offered a record while the queue was full; that record is missing, and the capture must not be replayed as complete",
-                },
-                "time_base": "sim_time_ns is simulator time in nanoseconds, the one clock the sensors share; capture_host_ns/wall_ns are host monotonic stamps for latency accounting only",
-                "replay": "re-feed imu/pair rows in seq order through localization.encode_imu/encode_stereo (P5 payload IS the luma plane; verify luma_sha256 first); refuse a capture containing capture_drop rows; never feed pose/setpoint/command rows to the estimator",
-            },
+        # Direct file handles, not EvidenceWriter's per-call path()/mkdir()/open():
+        # measured on flights ref3/ref4, re-opening the index and re-statting its
+        # directory for each of the 500 Hz rows is ~1500 syscalls/s under the
+        # writer's RLock, which starved this thread until the queue overflowed
+        # (21 and 25 capture_drop rows) and churned the GIL enough to lift the
+        # feed's published-state ages (p95 32 ms against the ~11 ms baseline).
+        # One persistent append handle and one pre-made frames directory reduce
+        # the steady state to one write() per flushed batch.
+        self._base_dir = writer.directory / "sensor-capture"
+        self._frames_dir = self._base_dir / "frames"
+        self._frames_dir.mkdir(parents=True, exist_ok=True)
+        self._records_handle = (self._base_dir / "records.jsonl").open("a", encoding="utf-8")
+        (self._base_dir / "header.json").write_text(
+            json.dumps(self._header_document(), indent=1, default=str) + "\n",
+            encoding="utf-8",
         )
         self._thread = threading.Thread(
             target=self._write_loop, name="sensor-capture-writer", daemon=True
         )
         self._thread.start()
         atexit.register(self.close)
+
+    def _header_document(self) -> dict[str, Any]:
+        return {
+            "format": _FORMAT,
+            "started_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "records": _RECORDS_NAME,
+            "frames_dir": _FRAMES_DIR,
+            "queue_depth": _QUEUE_DEPTH,
+            "kinds": {
+                "imu": "one inertial sample: sim_time_ns, capture_host_ns, gyro[3], accel[3] -- the exact arguments of localization.encode_imu, in feed order",
+                "pair": "one stereo pair: sim_time_ns, capture_host_ns, width, height, left/right P5 PGM paths carrying the two luma planes exactly as localization.encode_stereo received them, and luma_sha256 over those two planes, in feed order; rgb8 is not retained (see module docstring) -- colour consumers read the run's bounded pairs/ scene capture",
+                "pose": "one evaluator truth sample, read for scoring and sent nowhere: sim_time_ns, position_xyz (NED), attitude_rpy; structurally unencodable into the estimator's protocol",
+                "setpoint": "one commanded target the check issued: sim_time_ns (feed clock), wall_ns, target fields as commanded",
+                "command": "one mode/arm/takeoff/land/override event the check issued: sim_time_ns (feed clock), wall_ns, command name, detail",
+                "capture_drop": "the feed thread offered a record while the queue was full; that record is missing, and the capture must not be replayed as complete",
+            },
+            "time_base": "sim_time_ns is simulator time in nanoseconds, the one clock the sensors share; capture_host_ns/wall_ns are host monotonic stamps for latency accounting only",
+            "replay": "re-feed imu/pair rows in seq order through localization.encode_imu/encode_stereo (P5 payload IS the luma plane; verify luma_sha256 first); refuse a capture containing capture_drop rows; never feed pose/setpoint/command rows to the estimator",
+        }
 
     @classmethod
     def from_env(cls, env: Mapping[str, str], writer: Any) -> "SensorCapture | None":
@@ -209,11 +226,11 @@ class SensorCapture:
 
     def close(self, timeout_s: float = 60.0) -> None:
         """Stop accepting records and wait for the writer to drain what it holds."""
+        if self._stopped.is_set():
+            return
         self._stopped.set()
         self._queue.put(None)
         self._drained.wait(timeout_s)
-
-    # -- the writer thread ---------------------------------------------------------
 
     def _offer(self, kind: str, payload: dict[str, Any]) -> None:
         try:
@@ -224,35 +241,61 @@ class SensorCapture:
     def _write_loop(self) -> None:
         seen_drops = 0
         while True:
+            pending: list[str] = []
             item = self._queue.get()
-            if item is None:
+            batch = [] if item is None else [item]
+            stop = item is None
+            # Drain everything already queued (the queue is the burst absorber),
+            # then write it as one handle write: fewer syscalls and fewer GIL
+            # handoffs than one open/write/close per row, which is what starved
+            # this thread on flights ref3/ref4. The stop sentinel may arrive
+            # inside this drain, so it is detected here and not only from the
+            # blocking get: missing it would leave the flush unreached.
+            while True:
+                try:
+                    entry = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if entry is None:
+                    stop = True
+                else:
+                    batch.append(entry)
+            for entry in batch:
+                if entry is None:
+                    continue
+                kind, payload = entry
+                if self._drops != seen_drops:
+                    delta = self._drops - seen_drops
+                    seen_drops = self._drops
+                    pending.append(
+                        self._line(
+                            {
+                                "kind": "capture_drop",
+                                "dropped": delta,
+                                "total_dropped": self._drops,
+                                "wall_ns": time.monotonic_ns(),
+                            }
+                        )
+                    )
+                if kind == "pair":
+                    pending.append(self._write_pair(payload))
+                else:
+                    pending.append(self._line(payload))
+            if pending:
+                self._records_handle.write("".join(pending))
+            if stop:
+                self._records_handle.flush()
                 self._drained.set()
                 return
-            kind, payload = item
-            if self._drops != seen_drops:
-                delta = self._drops - seen_drops
-                seen_drops = self._drops
-                self._append(
-                    {
-                        "kind": "capture_drop",
-                        "dropped": delta,
-                        "total_dropped": self._drops,
-                        "wall_ns": time.monotonic_ns(),
-                    }
-                )
-            if kind == "pair":
-                self._write_pair(payload)
-            else:
-                self._append(payload)
 
-    def _write_pair(self, payload: dict[str, Any]) -> None:
+    def _write_pair(self, payload: dict[str, Any]) -> str:
         self._seq += 1
         header = f"P5\n{payload['width']} {payload['height']}\n255\n".encode()
         left_name = f"{_FRAMES_DIR}/{self._seq:06d}-left.pgm"
         right_name = f"{_FRAMES_DIR}/{self._seq:06d}-right.pgm"
-        self._writer.write_bytes(left_name, header + payload["left_luma"])
-        self._writer.write_bytes(right_name, header + payload["right_luma"])
-        self._append(
+        (self._base_dir.parent / left_name).write_bytes(header + payload["left_luma"])
+        (self._base_dir.parent / right_name).write_bytes(header + payload["right_luma"])
+        return self._line(
             {
                 "kind": "pair",
                 "sim_time_ns": payload["sim_time_ns"],
@@ -268,8 +311,8 @@ class SensorCapture:
             counted=False,
         )
 
-    def _append(self, row: dict[str, Any], counted: bool = True) -> None:
+    def _line(self, row: dict[str, Any], counted: bool = True) -> str:
         if counted:
             self._seq += 1
         row["seq"] = self._seq
-        self._writer.append_jsonl(_RECORDS_NAME, row)
+        return json.dumps(row) + "\n"
