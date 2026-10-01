@@ -5,12 +5,12 @@ reconstruct the estimator's input -- the ``pairs/`` scene capture keeps only a b
 head of the stereo stream and no per-sample inertial data or feed ordering is retained
 anywhere -- so every estimator change costs a flight to validate. This module records,
 inert by default, the run's own sensor events under the run directory as a GENERAL
-record other consumers can read: the stereo frames as the sensor delivered them (with
-their simulator-time stamps), the inertial samples, the truth poses read for scoring,
-and the setpoints and mode/arm commands the check itself issues.
+record other consumers can read: the stereo frames with their simulator-time stamps,
+the inertial samples, the truth poses read for scoring, and the setpoints and
+mode/arm commands the check itself issues.
 
-The estimator replay is the first consumer, not the only one: the frames are plain P6
-PPMs with per-row stamps, the index is newline-delimited JSON, and no field requires
+The estimator replay is the first consumer, not the only one: the frames are plain
+PGMs with per-row stamps, the index is newline-delimited JSON, and no field requires
 this package to decode. Two properties make the record replayable to the estimator
 BYTE EXACTLY rather than approximately:
 
@@ -18,8 +18,16 @@ BYTE EXACTLY rather than approximately:
    received, at the single seam (``localization_check.feed_record``) through which
    every estimator frame passes, in feed order;
 2. every ``pair`` row carries the SHA-256 of the two luma planes actually handed to
-   ``encode_stereo``, so a replay can verify that its reconstruction (PPM round-trip
-   plus the same pure BT.601 conversion) is bit-identical instead of arguing it.
+   ``encode_stereo``, and the frames ARE those planes (P5 PGM, one channel), so a
+   replay verifies bit-identity against the bytes themselves instead of arguing it.
+
+The frames are the estimator's own grayscale input, not the sensor stream's rgb8.
+That is a measured decision, not a preference: at the rgb8 rate the recorder's writer
+thread could not keep up (flight p01l-replay-ref3-20261001T035216Z recorded 21
+capture_drop rows at 1.84 MB per pair), while the luma planes are a third of the
+bytes and are the exact quantity the estimator consumes. Consumers wanting colour
+take the run's bounded ``pairs/`` scene capture, which the run already writes
+independently of this recorder.
 
 Truth isolation is structural, not procedural: the protocol the estimator speaks has
 no field that can carry a pose, so ``pose`` rows can never be encoded into a frame.
@@ -27,13 +35,13 @@ no field that can carry a pose, so ``pose`` rows can never be encoded into a fra
 Threading (measured, flights p01l-replay-ref/-ref2-20261001T0345/0347): the recorder
 first wrote its PPMs and rows on the feed's single-writer thread, and those disk
 writes -- 1.84 MB per pair -- delayed the inertial stream enough to reproduce the
-known stall shape (published-state age p95 48 ms, max 112 ms, against the 11/30 ms
-clamped baseline; both flights lost mid-route). The fence says the recorder must not
-alter WHEN the adapter sends, so the feed thread now only enqueues references into a
-bounded queue -- a no-block put that drops (and counts) rather than waits -- and one
-dedicated writer thread does every byte of I/O, hashing included. Drops are written
-as their own rows by the writer so a capture with drops is visible, never silently
-short.
+known stall shape (published-state age p95 48 ms, max 112 ms, against the ~11/30 ms
+clamped baseline; both flights lost the route mid-hold). The fence says the recorder
+must not alter WHEN the adapter sends, so the feed thread now only enqueues
+references into a bounded queue -- a no-block put that drops (and counts) rather
+than waits -- and one dedicated writer thread does every byte of I/O, hashing
+included. Drops become their own rows so a holed capture is visible, and the replay
+driver refuses to replay one.
 """
 
 from __future__ import annotations
@@ -45,7 +53,6 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 __all__ = ["CAPTURE_ENV", "SensorCapture"]
@@ -60,9 +67,10 @@ _HEADER_NAME = "sensor-capture/header.json"
 _FRAMES_DIR = "sensor-capture/frames"
 _FORMAT = "embodied-sensor-capture-1"
 #: How many records may wait for the writer thread before the feed thread drops.
-#: 64 covers ~6 s of stereo pairs at the declared 10 Hz; a disk stall longer than
-#: that costs rows loudly (drop rows) instead of stalling the feed quietly.
-_QUEUE_DEPTH = 64
+#: 256 covers the feed's worst burst (the pending-pairs queue holds 16 pairs) many
+#: times over at the luma rate; a stall longer than that costs rows loudly (drop
+#: rows) instead of stalling the feed quietly.
+_QUEUE_DEPTH = 256
 
 
 class SensorCapture:
@@ -93,14 +101,14 @@ class SensorCapture:
                 "queue_depth": _QUEUE_DEPTH,
                 "kinds": {
                     "imu": "one inertial sample: sim_time_ns, capture_host_ns, gyro[3], accel[3] -- the exact arguments of localization.encode_imu, in feed order",
-                    "pair": "one stereo pair: sim_time_ns, capture_host_ns, width, height, left/right P6 PPM paths (rgb8 as the sensor delivered), luma_sha256 of the two planes localization.encode_stereo received, in feed order",
+                    "pair": "one stereo pair: sim_time_ns, capture_host_ns, width, height, left/right P5 PGM paths carrying the two luma planes exactly as localization.encode_stereo received them, and luma_sha256 over those two planes, in feed order; rgb8 is not retained (see module docstring) -- colour consumers read the run's bounded pairs/ scene capture",
                     "pose": "one evaluator truth sample, read for scoring and sent nowhere: sim_time_ns, position_xyz (NED), attitude_rpy; structurally unencodable into the estimator's protocol",
                     "setpoint": "one commanded target the check issued: sim_time_ns (feed clock), wall_ns, target fields as commanded",
                     "command": "one mode/arm/takeoff/land/override event the check issued: sim_time_ns (feed clock), wall_ns, command name, detail",
                     "capture_drop": "the feed thread offered a record while the queue was full; that record is missing, and the capture must not be replayed as complete",
                 },
                 "time_base": "sim_time_ns is simulator time in nanoseconds, the one clock the sensors share; capture_host_ns/wall_ns are host monotonic stamps for latency accounting only",
-                "replay": "re-feed imu/pair rows in seq order through localization.encode_imu/encode_stereo (PPM payload -> grayscale_rgb8 -> encode_stereo; verify luma_sha256 first); refuse a capture containing capture_drop rows; never feed pose/setpoint/command rows to the estimator",
+                "replay": "re-feed imu/pair rows in seq order through localization.encode_imu/encode_stereo (P5 payload IS the luma plane; verify luma_sha256 first); refuse a capture containing capture_drop rows; never feed pose/setpoint/command rows to the estimator",
             },
         )
         self._thread = threading.Thread(
@@ -142,12 +150,10 @@ class SensorCapture:
         capture_host_ns: int,
         width: int,
         height: int,
-        left_rgb: bytes,
-        right_rgb: bytes,
         left_luma: bytes,
         right_luma: bytes,
     ) -> None:
-        # References only: the caller's byte objects already exist (they are what
+        # References only: the caller's plane bytes already exist (they are what
         # encode_stereo consumed), so nothing is copied on the feed thread.
         self._offer(
             "pair",
@@ -156,8 +162,6 @@ class SensorCapture:
                 "capture_host_ns": capture_host_ns,
                 "width": width,
                 "height": height,
-                "left_rgb": left_rgb,
-                "right_rgb": right_rgb,
                 "left_luma": left_luma,
                 "right_luma": right_luma,
             },
@@ -243,11 +247,11 @@ class SensorCapture:
 
     def _write_pair(self, payload: dict[str, Any]) -> None:
         self._seq += 1
-        header = f"P6\n{payload['width']} {payload['height']}\n255\n".encode()
-        left_name = f"{_FRAMES_DIR}/{self._seq:06d}-left.ppm"
-        right_name = f"{_FRAMES_DIR}/{self._seq:06d}-right.ppm"
-        self._writer.write_bytes(left_name, header + payload["left_rgb"])
-        self._writer.write_bytes(right_name, header + payload["right_rgb"])
+        header = f"P5\n{payload['width']} {payload['height']}\n255\n".encode()
+        left_name = f"{_FRAMES_DIR}/{self._seq:06d}-left.pgm"
+        right_name = f"{_FRAMES_DIR}/{self._seq:06d}-right.pgm"
+        self._writer.write_bytes(left_name, header + payload["left_luma"])
+        self._writer.write_bytes(right_name, header + payload["right_luma"])
         self._append(
             {
                 "kind": "pair",

@@ -3305,7 +3305,7 @@ class TestSensorCapture:
         )
         assert header["format"] == "embodied-sensor-capture-1"
 
-    def test_pair_rows_round_trip_bytes_and_hash_the_fed_luma(self, tmp_path: Path):
+    def test_pair_rows_carry_the_fed_luma_planes_verbatim(self, tmp_path: Path):
         import hashlib
 
         writer = self._writer(tmp_path)
@@ -3323,8 +3323,6 @@ class TestSensorCapture:
             8_000_000,
             width,
             height,
-            left_rgb,
-            right_rgb,
             left_luma,
             right_luma,
         )
@@ -3335,16 +3333,11 @@ class TestSensorCapture:
         assert row["kind"] == "pair"
         assert row["width"] == width and row["height"] == height
         assert row["luma_sha256"] == hashlib.sha256(left_luma + right_luma).hexdigest()
-        # The rgb payload must round-trip byte for byte, and the estimator's own
-        # luma conversion of those bytes must reproduce the planes it was fed.
-        header = f"P6\n{width} {height}\n255\n".encode()
-        assert (run / row["left"]).read_bytes() == header + left_rgb
-        assert (run / row["right"]).read_bytes() == header + right_rgb
-        assert (
-            loc.grayscale_rgb8((run / row["left"]).read_bytes()[len(header) :], width, height)
-            == left_luma
-        )
-        assert (
-            loc.grayscale_rgb8((run / row["right"]).read_bytes()[len(header) :], width, height)
-            == right_luma
-        )
+        # The frame files ARE the planes the estimator was fed: a P5 round-trip
+        # hands encode_stereo back its own bytes, which is the byte-exactness the
+        # replay claims, with the hash as its per-frame verifier.
+        header = f"P5\n{width} {height}\n255\n".encode()
+        left_ppm = run / row["left"]
+        right_ppm = run / row["right"]
+        assert left_ppm.read_bytes() == header + left_luma
+        assert right_ppm.read_bytes() == header + right_luma

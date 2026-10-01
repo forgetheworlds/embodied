@@ -106,7 +106,6 @@ def main() -> int:
     frames_dir = capture / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     records = capture / "records.jsonl"
-    header = f"P6\n{WIDTH} {HEIGHT}\n255\n".encode()
 
     with records.open("w", encoding="utf-8") as handle:
         rows = 0
@@ -140,10 +139,11 @@ def main() -> int:
                 left = loc.grayscale_rgb8(left_rgb, WIDTH, HEIGHT)
                 right = loc.grayscale_rgb8(right_rgb, WIDTH, HEIGHT)
                 seq += 1
-                lname = f"sensor-capture/frames/{seq:06d}-left.ppm"
-                rname = f"sensor-capture/frames/{seq:06d}-right.ppm"
-                (out / lname).write_bytes(header + left_rgb)
-                (out / rname).write_bytes(header + right_rgb)
+                lname = f"sensor-capture/frames/{seq:06d}-left.pgm"
+                rname = f"sensor-capture/frames/{seq:06d}-right.pgm"
+                header5 = f"P5\n{WIDTH} {HEIGHT}\n255\n".encode()
+                (out / lname).write_bytes(header5 + left)
+                (out / rname).write_bytes(header5 + right)
                 write(
                     {
                         "kind": "pair",

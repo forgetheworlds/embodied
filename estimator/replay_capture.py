@@ -11,14 +11,14 @@ exactly the CPU speed limit this tool exists to measure.
 
 What is byte-exact and what is reconstructed, stated here because the tool is
 the claim: every IMU frame re-encodes the very values recorded from the
-encoder's arguments, and every stereo frame re-derives its luma planes from the
-run's own rgb8 PPMs through the same pure BT.601 conversion the feed used --
-then VERIFIES the result against the SHA-256 recorded at capture time, so a
-silent reconstruction error is a hard failure, not a diff that quietly grows.
-The frame ORDER is the recorded feed order (the recorder sits at the feed's
-single seam), so the estimator sees the same bytes in the same order as the
-flight, with one honest exception: arrival TIMES are meaningless here by
-design, and nothing downstream may read them.
+encoder's arguments, and every stereo frame's luma planes are read back from
+the capture's own P5 files -- the same bytes encode_stereo consumed -- and then
+VERIFIED against the SHA-256 recorded at capture time, so a corrupted file or a
+format drift is a hard failure, not a diff that quietly grows. The frame ORDER
+is the recorded feed order (the recorder sits at the feed's single seam), so
+the estimator sees the same bytes in the same order as the flight, with one
+honest exception: arrival TIMES are meaningless here by design, and nothing
+downstream may read them.
 
 Truth never enters the replay: pose/setpoint/command rows are read for the
 summary and then skipped -- the ov_stream protocol has no field that can carry
@@ -59,14 +59,12 @@ def _find_capture(root: Path) -> Path:
         if (candidate / "records.jsonl").exists():
             return candidate
     raise SystemExit(f"no sensor-capture/records.jsonl under {root}")
-
-
-def _read_ppm_p6(path: Path, width: int, height: int) -> bytes:
-    """The rgb8 payload of one P6 PPM exactly as the capture wrote it."""
+def _read_pgm_p5(path: Path, width: int, height: int) -> bytes:
+    """The luma payload of one P5 PGM: exactly the plane the estimator was fed."""
     data = path.read_bytes()
-    header = f"P6\n{width} {height}\n255\n".encode()
-    if not data.startswith(header) or len(data) != len(header) + width * height * 3:
-        raise SystemExit(f"{path}: not the P6 {width}x{height} image the capture recorded")
+    header = f"P5\n{width} {height}\n255\n".encode()
+    if not data.startswith(header) or len(data) != len(header) + width * height:
+        raise SystemExit(f"{path}: not the P5 {width}x{height} plane the capture recorded")
     return data[len(header) :]
 
 
@@ -79,10 +77,8 @@ def iter_frames(records_path: Path) -> Iterator[tuple[bytes, dict[str, Any]]]:
             yield loc.encode_imu(row["sim_time_ns"], row["gyro"], row["accel"]), row
         elif kind == "pair":
             base = records_path.parent.parent  # rows carry run-dir-relative paths
-            left_rgb = _read_ppm_p6(base / row["left"], row["width"], row["height"])
-            right_rgb = _read_ppm_p6(base / row["right"], row["width"], row["height"])
-            left = loc.grayscale_rgb8(left_rgb, row["width"], row["height"])
-            right = loc.grayscale_rgb8(right_rgb, row["width"], row["height"])
+            left = _read_pgm_p5(base / row["left"], row["width"], row["height"])
+            right = _read_pgm_p5(base / row["right"], row["width"], row["height"])
             digest = hashlib.sha256(left + right).hexdigest()
             if digest != row["luma_sha256"]:
                 raise SystemExit(

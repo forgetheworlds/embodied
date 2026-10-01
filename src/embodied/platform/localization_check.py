@@ -3032,8 +3032,6 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     pair.capture_host_ns,
                     settings.stereo.width,
                     settings.stereo.height,
-                    bytes(pair.left_bytes),
-                    bytes(pair.right_bytes),
                     left,
                     right,
                 )
