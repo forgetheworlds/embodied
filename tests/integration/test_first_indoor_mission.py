@@ -486,10 +486,15 @@ def test_the_runtime_never_reads_a_truth_pose():
     # Every mention of a truth pose's fields lives in the POSE accounting
     # branch, whose only sinks are the feed statistics the bring-up's declared
     # end-state check reads.
-    pose_lines = [line for line in source.splitlines() if "record.pose" in line]
-    assert pose_lines
+    pose_lines = [line.strip() for line in source.splitlines() if "record.pose" in line]
+    assert len(pose_lines) == 3, pose_lines
+    assert pose_lines[0].startswith("elif record.kind is Kind.POSE"), pose_lines
+    # The two values go into the feed statistics and nowhere else.
+    assert source.count("_stats.truth_samples.append") == 1
+    assert source.count("_stats.truth_attitudes.append") == 1
     for line in pose_lines:
-        assert "_stats" in line
+        for forbidden in ("self.store", "publish", "G.ground", "self._sink", "admit"):
+            assert forbidden not in line, f"a truth pose reaches {forbidden}: {line}"
     # And every record still reaches the bench side's tap.
     assert "self._sensor_tap(record)" in source
 
