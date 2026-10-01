@@ -771,6 +771,11 @@ class MissionRuntime:
         if record is None or record.pair is None:
             return
         pair = record.pair
+        # One clock for the map: its evidence stamps and its freshness clock are
+        # both the controller's capture clock, which is the clock the poses are
+        # transformed on. Stamping the map with simulator time while measuring
+        # its age on the host clock would make every cell read stale the moment
+        # it was written.
         self._capture_clock_ns = max(self._capture_clock_ns or 0, int(pair.capture_host_ns))
         pose = self._capture_pose(record)
         state = self._navigation_state()
@@ -801,16 +806,16 @@ class MissionRuntime:
         except Exception as error:  # a failed depth product clears nothing
             self._refusals_log.append(f"depth_failed: {error}")
             return
+        candidates = () if isinstance(outcome, DetectorUnavailable) else outcome
+        observation = self._record_observation(record, store_payload=bool(candidates))
         self.store.integrate(
             depth,
             pose,
             self.calibration,
-            stamp_ns=sim_time_ns(record.sim_time_s if record.sim_time_s >= 0.0 else 0.0),
-            observation_id=f"{self.episode_id}-obs-{self._observation_counter + 1:05d}",
+            stamp_ns=int(pair.capture_host_ns),
+            observation_id=observation.record_id,
             now_ns=self._now_ns(),
         )
-        candidates = () if isinstance(outcome, DetectorUnavailable) else outcome
-        observation = self._record_observation(record, store_payload=bool(candidates))
         grounded = self._ground_candidates(candidates, observation, depth, pose, state)
         for target in grounded:
             if target.target_id in self._grounded:
@@ -840,9 +845,7 @@ class MissionRuntime:
                 description=f"candidate {candidate.candidate_id} of query {self._query!r}",
                 confidence=None,
             )
-            self._sink(
-                "selection", R.to_dict(selection), observation.receipt_stamp, observation.sim_time_s
-            )
+            self._sink("selection", R.to_dict(selection), self._clock(), observation.sim_time_s)
             target = G.ground(
                 selection, observation, depth, pose, state, self.calibration
             )
@@ -895,7 +898,13 @@ class MissionRuntime:
             quality=_quality_of(pair, self.settings),
             depth_source=None,
         )
-        self._sink("observation", R.to_dict(observation), observation.receipt_stamp, record.sim_time_s)
+        # The EVENT is stamped now; the pair's own capture and receipt stamps
+        # live inside the record. Stamping the event with the receipt instant
+        # would let an event recorded later (a setpoint published while the
+        # frame waited in the perception queue) carry a later stamp than this
+        # one, and the recorder refuses a stream whose order and stamps
+        # disagree.
+        self._sink("observation", R.to_dict(observation), self._clock(), record.sim_time_s)
         self._last_observation_id = observation.record_id
         return observation
 
@@ -980,6 +989,14 @@ class MissionRuntime:
             if ref in self._grounded:
                 resolved.append(self._grounded[ref])
                 continue
+            # A map-derived target is evidence-backed or it is not resolved: a
+            # frontier or the start place is only as good as the observation
+            # that produced the map it is built from. With no recorded
+            # observation there is nothing to cite, so the target is refused
+            # and the step reports blocked rather than flying to a fabricated
+            # citation.
+            if citation is None:
+                continue
             point: tuple[float, float, float] | None = None
             if ref == "start":
                 point = (RETURN_STANDOFF_COMPENSATION_M, 0.0, self.settings.hover_altitude_m)
@@ -995,7 +1012,7 @@ class MissionRuntime:
                     track_id=None,
                     place_id="start" if ref == "start" else None,
                     selection_ids=(f"sel-{ref}",),
-                    observation_ids=(citation or f"obs-{ref}",),
+                    observation_ids=(citation,),
                     geometry=tuple(float(value) for value in point),
                     frame=R.Frame.ODOM,
                     anchor_id=self.store.submap_id,

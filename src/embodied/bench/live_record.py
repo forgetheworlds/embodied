@@ -329,6 +329,71 @@ def target_position_ned(seed: dict[str, Any], name: str) -> tuple[float, float, 
 # ---------------------------------------------------------------------------
 
 
+def world_state_payload(seed: dict[str, Any]) -> dict[str, Any]:
+    """The hidden world state the referee records, in the envelope's own shape.
+
+    ``targets[name]`` holds exactly ``present`` (the bench-side envelope accepts
+    no other key), and the counts ride beside it.
+    """
+    return {
+        "targets": {
+            name: {"present": bool(entry["present"])} for name, entry in seed["targets"].items()
+        },
+        "world_counts": {str(key): int(value) for key, value in seed["world_counts"].items()},
+    }
+
+
+def measure_physical_outcome(
+    collector: "TruthCollector",
+    *,
+    target_ned: tuple[float, float, float],
+    target_id: str,
+    end_state: dict[str, Any],
+    crash_statustexts: list[str],
+    guidance_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The bench side's own per-run physical outcome.
+
+    Measured from the simulator's pose stream and the aircraft's own reported
+    state — never from the mission's report. ``end_state`` is recorded beside
+    the flags so a reader can see what the aircraft was doing at the end.
+    """
+    inspected, inspected_detail = collector.inspected_within(
+        target_ned, radius_m=INSPECT_RADIUS_M, hold_s=INSPECT_HOLD_S
+    )
+    returned, returned_detail = collector.returned_near(radius_m=RETURN_RADIUS_M)
+    violations: list[str] = []
+    if crash_statustexts:
+        violations.append("crash_disarm: " + "; ".join(crash_statustexts[:3]))
+    guidance_losses = [
+        event for event in guidance_events if not event.get("guidance_held")
+    ]
+    if guidance_losses:
+        violations.append(f"guidance_lost:{len(guidance_losses)}")
+    return {
+        "payload": {
+            "inspected": {target_id: inspected},
+            "return_verified": returned,
+            "violations": violations,
+            "takeover": False,
+        },
+        "inspected_detail": inspected_detail,
+        "return_detail": returned_detail,
+        "violations": violations,
+        "end_state": end_state,
+    }
+
+
+def live_mission_driver(**kwargs: Any):
+    """The one driver a real recording uses: the live mission runtime."""
+    from embodied.platform import mission_runtime
+
+    runtime = mission_runtime.MissionRuntime(**kwargs)
+    result = runtime.run()
+    report = mission_runtime.write_final_report(runtime)
+    return result, report
+
+
 def _write_mission_summary(output: Path, payload: dict[str, Any]) -> None:
     (output / "mission.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
@@ -346,6 +411,7 @@ def record(
     platform_config: Path | None = None,
     truth_seed: Path | None = None,
     suite_config: Path | None = None,
+    mission_driver: Any = None,
 ) -> CommandOutcome:
     """Record one live episode for a registered suite; never substitute one."""
     repository = root or repository_root()
@@ -450,10 +516,10 @@ def record(
         suite_document.get("mission_instruction")
         or f"Find the {target_id.replace('_', ' ')}, inspect it, and return to the start."
     )
-    # Imported here, not at module import: the bench package must be importable
-    # without the simulator's own dependencies being exercised.
-    from embodied.platform import mission_runtime
-
+    # ``mission_driver`` exists so the transport itself can be exercised
+    # without a simulator: the CLI every recording goes through passes
+    # nothing, and the default is the live runtime above.
+    driver = mission_driver or live_mission_driver
     episode_dir = output / "episode"
     recorder = Recorder(episode_dir)
     collector = TruthCollector()
@@ -469,19 +535,18 @@ def record(
         config_hash=recorder_module.sha256(suite_config or suite_config_path(root=repository)),
         model_identity=None,  # B0 makes no model call; the field's absence is the fact
     )
-    runtime = mission_runtime.MissionRuntime(
-        settings=settings,
-        config_document=document,
-        episode_dir=episode_dir,
-        evidence_dir=output / "platform",
-        recorder=recorder,
-        instruction=instruction,
-        target_id=target_id,
-        episode_id=episode_id,
-        sensor_tap=collector,
-    )
     try:
-        result = runtime.run()
+        result, report = driver(
+            settings=settings,
+            config_document=document,
+            episode_dir=episode_dir,
+            evidence_dir=output / "platform",
+            recorder=recorder,
+            instruction=instruction,
+            target_id=target_id,
+            episode_id=episode_id,
+            sensor_tap=collector,
+        )
     except Exception as error:  # a crashed runtime is still a recorded attempt
         _write_mission_summary(
             output,
@@ -500,40 +565,28 @@ def record(
             artifacts=("mission.json",),
             sensor_mode=sensor_mode,
         )
-    report = mission_runtime.write_final_report(runtime)
     # The bench side's own physical measurements, from the truth stream and
     # the aircraft's reported state — never from the report.
-    inspected, inspected_detail = collector.inspected_within(
-        target_ned, radius_m=INSPECT_RADIUS_M, hold_s=INSPECT_HOLD_S
+    outcome = measure_physical_outcome(
+        collector,
+        target_ned=target_ned,
+        target_id=target_id,
+        end_state=getattr(result, "end_state", {}),
+        crash_statustexts=list(getattr(result, "crash_statustexts", []) or []),
+        guidance_events=list(getattr(result, "guidance_events", []) or []),
     )
-    returned, returned_detail = collector.returned_near(radius_m=RETURN_RADIUS_M)
-    violations: list[str] = []
-    if result.crash_statustexts:
-        violations.append("crash_disarm: " + "; ".join(result.crash_statustexts[:3]))
-    guidance_losses = [
-        event for event in result.guidance_events if not event.get("guidance_held")
-    ]
-    if guidance_losses:
-        violations.append(f"guidance_lost:{len(guidance_losses)}")
+    inspected = outcome["payload"]["inspected"][target_id]
+    returned = outcome["payload"]["return_verified"]
+    violations = outcome["violations"]
     referee = referee_module.Referee(episode_dir)
     referee.record(
         "world_state",
-        {
-            "targets": {
-                name: {"present": bool(entry["present"])} for name, entry in truth_targets.items()
-            },
-            "world_counts": {str(k): int(v) for k, v in seed["world_counts"].items()},
-        },
+        world_state_payload(seed),
         ClockStamp(host_id=settings.host_id, clock_id=settings.clock_id, monotonic_ns=1),
     )
     referee.record(
         "physical_outcome",
-        {
-            "inspected": {target_id: inspected},
-            "return_verified": returned,
-            "violations": violations,
-            "takeover": False,
-        },
+        outcome["payload"],
         ClockStamp(host_id=settings.host_id, clock_id=settings.clock_id, monotonic_ns=2),
     )
     referee.close()
@@ -557,11 +610,12 @@ def record(
         ],
         "outcome": {
             "inspected": inspected,
-            "inspected_detail": inspected_detail,
+            "inspected_detail": outcome["inspected_detail"],
             "return_verified": returned,
-            "return_detail": returned_detail,
+            "return_detail": outcome["return_detail"],
             "violations": violations,
             "takeover": False,
+            "end_state": outcome["end_state"],
         },
         "publications": result.publications,
         "publish_refusals": result.publish_refusals,
