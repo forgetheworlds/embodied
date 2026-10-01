@@ -288,6 +288,27 @@ invocation takes about 10-15 minutes. The finish line this report claims is
 two consecutive passes, so run it a second time into a second fresh
 directory.
 
+## Run artifacts and retention
+
+`work/runs/` is gitignored, so what is deleted there is gone. The runner keeps
+it from growing on its own: when a run is scored (its `receipt.json` written),
+the stage's runs that have fallen outside the newest-10 window lose their bulky
+artifacts — stereo `pairs/`, `mavlink.jsonl`, `estimator-feed.jsonl`, `imu.jsonl`,
+`pairs.jsonl`, and attempt directories the receipt never scored — and keep the
+receipt level (`receipt.json`, `manifest.json`, `checks.json`, `bring-up.json`,
+the other small JSON records, and every report). Each pruned run carries a
+`prune.json` naming what was removed, because its receipt's artifact hashes
+describe bytes that may no longer be on disk.
+
+Three things keep a run whole: a sensor capture under it (`run-*/sensor-capture`,
+a capture exists to be replayed), a citation (any mention in `README.md`,
+`design/docs/**` or a report under `work/runs/**`, matched by name, brace series
+or elided id), and the operator flag `--keep-artifacts`, which writes a
+`retention-keep` marker so no later pass prunes the run — for a run under
+diagnosis or a capture that must stay replayable. `scripts/prune_runs.py`
+(`inventory` / `apply` / `check-citations`) applies the same rule to a tree that
+accumulated before it and verifies every documented `work/...` path resolves.
+
 ## Troubleshooting
 
 Traps this project hit, so the next person does not have to:

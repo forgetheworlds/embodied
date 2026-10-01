@@ -36,6 +36,7 @@ import sys
 import time
 from typing import Any, Callable, Sequence
 
+from embodied import retention
 from embodied.contracts.records import SensorMode
 
 RECEIPT_VERSION = "receipt-1"
@@ -164,7 +165,16 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     for module_name in COMMAND_MODULES:
         importlib.import_module(module_name)
-    parser = _Parser(prog="embodied", description="Continuous multimodal drone pilot tools.")
+    parser = _Parser(
+        prog="embodied",
+        description="Continuous multimodal drone pilot tools.",
+        epilog=(
+            "every command also accepts --keep-artifacts: keep the run whole "
+            "(write the retention keep marker) so the scoring-time prune never "
+            "removes its bulky artifacts -- for a run under diagnosis or a "
+            "capture that must stay replayable"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
     for spec in sorted(COMMAND_REGISTRY.values(), key=lambda item: item.name):
         subparser = subparsers.add_parser(
@@ -609,6 +619,12 @@ def _summarise(outcome: CommandOutcome, receipt_path: Path) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, run one command, write its receipt and return an exit code."""
     arguments = list(sys.argv[1:] if argv is None else argv)
+    # The retention escape hatch belongs to the runner, not to any one command,
+    # so it is accepted before parsing -- including after a nested subcommand
+    # (``bench replay --keep-artifacts``), which a subparser-owned flag cannot do.
+    keep_artifacts = "--keep-artifacts" in arguments
+    if keep_artifacts:
+        arguments = [argument for argument in arguments if argument != "--keep-artifacts"]
     started_monotonic_s = time.monotonic()
     started_at_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -666,6 +682,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as error:
         print(f"embodied: cannot write the receipt in {output}: {error}", file=sys.stderr)
         return EXIT_CODES[CommandStatus.INVALID]
+
+    # The retention rule: scoring a run is the moment older runs of the same
+    # stage leave the newest-WINDOW_RUNS window and drop to receipt level. A
+    # retention failure must not change a finished run's exit code.
+    if spec is not None:
+        try:
+            retention.apply_on_score(output, repository_root(), keep_all=keep_artifacts)
+        except OSError as error:
+            print(f"embodied: retention skipped: {error}", file=sys.stderr)
 
     print(_summarise(outcome, receipt_path))
     return outcome.exit_code()
