@@ -309,6 +309,21 @@ diagnosis or a capture that must stay replayable. `scripts/prune_runs.py`
 (`inventory` / `apply` / `check-citations`) applies the same rule to a tree that
 accumulated before it and verifies every documented `work/...` path resolves.
 
+A stage in `embodied.retention.CLOSED_STAGES` — a gate that has shipped and
+will not be scored again — has no newest-10 window: its runs have no diagnosis
+headroom to protect, so they drop straight to receipt level unless a capture,
+keep marker or citation protects them.
+
+One offload has happened beside this rule (2026-10-01, owner's decision: space
+was the issue): the reference replay capture
+(`p01l-replay-ref7-20261001T045848Z/run-a/sensor-capture`, the replay gate's
+fixture) and the closed-stage bulk of `p00-airframe` and `p00-compat` live in
+the private companion repo `forgetheworlds/embodied-evidence`, byte-identical
+and restore-verified against the reference numbers. Restore instructions are
+that repo's README and `work/runs/final/DISK-OFFLOAD-REPORT.md`; each affected
+run's `prune.json` names the repo. Every receipt, check and report stayed on
+this machine.
+
 ## Troubleshooting
 
 Traps this project hit, so the next person does not have to:
