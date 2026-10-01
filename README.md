@@ -22,8 +22,8 @@ Works today:
 | Item | Evidence |
 |---|---|
 | Webots/ArduPilot compatibility gate closed: two consecutive invocations, 16/16 checks each, both guided-motion checks green, waypoint holds within 1.8-3.2 cm | receipts for `extnav-it3` and `extnav-it4`, described below |
-| Sensor-derived arm: GPS off at runtime, both waypoints flown and held on a pose from the onboard estimator, landed; E1 accuracy p95 0.086 m / max 0.118 m against 0.10 m / 0.15 m | `work/runs/p01-localization/p01l-rel10-4-20260927T201628Z/run-a/checks.json`, merged to `main` in `0fc5d95`, described below |
-| Test suite: **334 tests, all passing** on `main` | `python -m pytest -q`, see Reproduce it |
+| Sensor-derived arm: GPS off at runtime, both waypoints flown and held on a pose from the onboard estimator, landed; E1 accuracy p95 0.063 m / max 0.124 m against 0.10 m / 0.15 m — four scored receipts at gate pass at revision `3698fd3` | strongest: `work/runs/p01-localization/p01l-e1ab-C1-20260930T173942Z/run-a/checks.json`, merged to `main` in `9d3628f`, described below |
+| Test suite: **374 tests, all passing** on `main` | `python -m pytest -q`, see Reproduce it |
 | Measurement instrument: recorder, referee and grader with structural truth isolation, tested against hand-checkable episodes | `tests/bench/`, `tests/fixtures/bench/` |
 | Stereo calibration pipeline runs end to end; rectification gate (B1) passed; the floor-depth gate (B3) failed its pre-registered criterion and the stage is recorded as blocked rather than passed | `work/runs/p01-calibration/` (local evidence store) |
 
@@ -31,11 +31,15 @@ Not proven yet, stated plainly:
 
 | Gap | Why |
 |---|---|
-| Scoring and robustness of the sensor-derived arm | the arm has flown this route and passed E1, but nothing held-out has been scored against it, and an intermittent load-induced tumble is attributed rather than cured — the merged fix for it has not been proven in flight |
-| The re-declared freshness bound | F2, the published-state age max, was re-declared 20 ms → 40 ms on the owner's ruling (a criterion change with a structural justification, commit `c44c3aa`); no flight has been re-run against the new bound since the merge |
+| Scoring and robustness of the sensor-derived arm | the scored path (realtime, clamped) has four consecutive gate-pass receipts on this route and this scene, but nothing held-out has been scored against it, and the clamp-off control configuration still fails F2 in every completed run and tumbled once at end-of-route — the fix is demonstrated on the scored path's pacing only, not under deliberately induced load |
 | Floor-plane metric depth | 5.4% of floor samples within the declared tolerance against a declared 95% minimum; the criterion itself may be ill-posed for a textureless plane |
 | Autonomy, obstacle avoidance, cloud pilot | not built; the current stage is the airframe-and-transport foundation they need |
 | Real flight | no hardware has been flown |
+
+The re-declared freshness bound (F2, 20 ms → 40 ms, commit `c44c3aa`) is no
+longer an open gap: all four scored receipts measure F2 inside the bound
+(0.028-0.040 s against 0.040 s). The re-declaration's reasoning stays recorded
+beside the value in `configs/first_indoor.yaml`.
 
 ## Results
 
@@ -98,37 +102,45 @@ autopilot's EKF3 as external navigation. Nothing else feeds the autopilot's
 position: the bridge's own truth republish is off for the run, and the receipt
 records `bridge truth poses sent over the whole run: 0`.
 
-In `work/runs/p01-localization/p01l-rel10-4-20260927T201628Z` (merged to
-`main` as `0fc5d95`) the aircraft armed with GPS off, flew both waypoints on
-that pose — commanded at local-NED (2.0, 0.0, -1.5) and (2.0, 1.0, -1.5) —
-held them and landed:
+In `work/runs/p01-localization/p01l-e1ab-C1-20260930T173942Z` — merged to
+`main` as `9d3628f`, the strongest of four scored receipts at revision
+`3698fd3` (C1, C2, C3 and C4b, all at gate pass) — the aircraft armed with
+GPS off, flew both waypoints on that pose — commanded at local-NED
+(2.0, 0.0, -1.5) and (2.0, 1.0, -1.5) — held them and landed:
 
 | Check | Result |
 |---|---|
-| E1 accuracy, scored against the simulator's own pose (read in-process for scoring only, sent to nothing) | p95 horizontal 0.086 m, max 0.118 m against 0.10 / 0.15 m; p95 vertical 0.055 m, max 0.132 m against 0.15 / 0.30 m |
-| GPS off at runtime | 91 `SYS_STATUS` samples without the GPS-present bit, no `GPS_RAW_INT` without a fix |
+| E1 accuracy, scored against the simulator's own pose (read in-process for scoring only, sent to nothing) | p95 horizontal 0.063 m, max 0.124 m against 0.10 / 0.15 m; p95 vertical 0.038 m, max 0.099 m against 0.15 / 0.30 m; over 2264 joined samples, 0 unjoined |
+| GPS off at runtime | 112 `SYS_STATUS` samples without the GPS-present bit, no `GPS_RAW_INT` without a fix |
+| Freshness across the scored window | F1/F3 max publish gap 0.015 s against 0.100 s; F2 published-state age max 0.030 s against the 0.040 s bound |
 | Estimator health across the scored window | valid fraction 1.0000 against 0.99; 0 adapter resets; final health healthy |
+| End state | the scored route ended level at rest: roll -0.00°, pitch -0.00° against the 5.0° tolerance, no crash disarm |
 | Bridge truth republish | off; 0 poses sent for the whole run |
 
 Two honest qualifiers. The route is open-loop — this arm has no obstacle
-avoidance, because that is a later stage. And the one bound that failed was
-F2, the published-state age max: it was re-declared from 20 ms to 40 ms by the
-owner as a criterion change with a structural justification rather than a run
-result — the pose seam publishes on a 10 ms tick, so 20 ms sat exactly on the
-two-tick floor any implementation can reach, and a second declared number (the
-adapter's 300 ms silence watchdog) had never been reconciled with it. The full
-reasoning sits in the comment beside the value in `configs/first_indoor.yaml`
-(commit `c44c3aa`): never a quiet relaxation, and the change is in the public
-tree.
+avoidance, because that is a later stage. And F2, the published-state age max,
+was re-declared from 20 ms to 40 ms by the owner as a criterion change with a
+structural justification rather than a run result — the pose seam publishes on
+a 10 ms tick, so 20 ms sat exactly on the two-tick floor any implementation
+can reach, and a second declared number (the adapter's 300 ms silence
+watchdog) had never been reconciled with it. The full reasoning sits in the
+comment beside the value in `configs/first_indoor.yaml` (commit `c44c3aa`):
+never a quiet relaxation, and the change is in the public tree. The bound has
+since been flown against: all four scored receipts measure F2 inside it
+(0.028-0.040 s against 0.040 s).
 
 One more thing worth stating, because it is in the evidence and not in this
 summary: an intermittent end-of-route tumble was traced to host load. A stalled
 host starves the shared inertial stream, the estimator's state clock freezes
 while the adapter keeps publishing its last pose, and EKF3 receives a stale
-pose followed by a step mid-climb. The fix is merged and is **not yet proven in
-flight** — at low load the baseline already flies, so proving the fix requires
-deliberately induced load, which has not been run. Failing runs are kept: the
-receipts and the reasoning are on disk under `work/runs/p01-localization/`.
+pose followed by a step mid-climb. The fix — the scored path's sim/wall clamp
+(`sim_wall_clamp: true`, realtime) and the estimator feed on its own thread —
+is merged, and all four scored receipts above ended the route level at rest.
+The clamp-off control configuration, kept for the pacing A/B, still fails F2
+in every completed run and tumbled once at end-of-route
+(`p01l-e1ab-U4-20260930T200220Z`); proof under deliberately induced load has
+still not been run. Failing runs are kept: the receipts and the reasoning are
+on disk under `work/runs/p01-localization/`.
 
 ## How it is built
 
@@ -191,7 +203,7 @@ src/embodied/            platform adapter and the estimator seam, contracts, CLI
 configs/                 one YAML per stage; every number is configuration
 scenarios/compat/        Webots world, the scene's controller, parameter files, vehicle model
 estimator/               ov_stream.cpp, the pose seam's source, and its build script
-tests/                   the suite (334 tests), including hand-checkable bench episodes
+tests/                   the suite (374 tests), including hand-checkable bench episodes
 scripts/                 bootstrap.sh and repository checks
 assets/                  the figures in this README, with captions
 ```
@@ -248,7 +260,7 @@ Then run the suite and one gate invocation:
 
 ```sh
 .venv/bin/python -m pytest -q
-# expected: 334 passed, in 7-15 minutes. The spread is host load: this suite is
+# expected: 374 passed, in 7-15 minutes. The spread is host load: this suite is
 # timing-sensitive and the machine swaps under contention. A failure with no
 # assertion text usually means the run was starved, not that the code is wrong.
 
