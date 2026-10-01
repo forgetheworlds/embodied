@@ -23,7 +23,7 @@ Works today:
 |---|---|
 | Webots/ArduPilot compatibility gate closed: two consecutive invocations, 16/16 checks each, both guided-motion checks green, waypoint holds within 1.8-3.2 cm | receipts for `extnav-it3` and `extnav-it4`, described below |
 | Sensor-derived arm: GPS off at runtime, both waypoints flown and held on a pose from the onboard estimator, landed; E1 accuracy p95 0.063 m / max 0.124 m against 0.10 m / 0.15 m — four scored receipts at gate pass at revision `3698fd3` | strongest: `work/runs/p01-localization/p01l-e1ab-C1-20260930T173942Z/run-a/checks.json`, merged to `main` in `9d3628f`, described below |
-| Test suite: **374 tests, all passing** on `main` | `python -m pytest -q`, see Reproduce it |
+| Test suite: **400 tests collected** on `main` at this revision | `python -m pytest -q`, see Reproduce it. The full run needs host headroom: under memory pressure it has died around 76 %, inside the module that spawns the simulator |
 | Measurement instrument: recorder, referee and grader with structural truth isolation, tested against hand-checkable episodes | `tests/bench/`, `tests/fixtures/bench/` |
 | Stereo calibration pipeline runs end to end; rectification gate (B1) passed; the floor-depth gate (B3) failed its pre-registered criterion and the stage is recorded as blocked rather than passed | `work/runs/p01-calibration/` (local evidence store) |
 
