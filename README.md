@@ -203,7 +203,7 @@ src/embodied/            platform adapter and the estimator seam, contracts, CLI
 configs/                 one YAML per stage; every number is configuration
 scenarios/compat/        Webots world, the scene's controller, parameter files, vehicle model
 estimator/               ov_stream.cpp, the pose seam's source, and its build script
-tests/                   the suite (374 tests), including hand-checkable bench episodes
+tests/                   the suite (400 tests), including hand-checkable bench episodes
 scripts/                 bootstrap.sh and repository checks
 assets/                  the figures in this README, with captions
 ```
@@ -260,9 +260,11 @@ Then run the suite and one gate invocation:
 
 ```sh
 .venv/bin/python -m pytest -q
-# expected: 374 passed, in 7-15 minutes. The spread is host load: this suite is
-# timing-sensitive and the machine swaps under contention. A failure with no
-# assertion text usually means the run was starved, not that the code is wrong.
+# expected: 400 passed, in roughly 11-14 minutes on an unloaded host. The spread
+# is host load: this suite is timing-sensitive and the machine swaps under
+# contention, and under memory pressure the full run has died around 76%, inside
+# the module that spawns the simulator. A failure with no assertion text usually
+# means the run was starved, not that the code is wrong.
 
 .venv/bin/python -m embodied compat --config configs/first_indoor.yaml \
     --output work/runs/compat-check-1
