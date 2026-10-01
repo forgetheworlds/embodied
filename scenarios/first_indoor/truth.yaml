@@ -1,0 +1,46 @@
+# EVALUATOR-ONLY — hidden task truth seed for the first-indoor scene.
+#
+# This file is bench-side input to the referee and must never reach the
+# runtime side. The referee reads it at record time and writes the
+# world_state below into the bench-side store beside the episode —
+# `<episode>.truth/truth-events.jsonl`, created by
+# `embodied.bench.referee.Referee` and read only by
+# `embodied.bench.grader` (the store, not this file, is what a score
+# compares against). The agent surface of an episode is the projection in
+# `embodied.bench.recorder.PROJECTION` and structurally cannot reach either
+# this file or the store; `tools/probe_truth_isolation.py` re-proves that
+# against the live code.
+#
+# `world_state` below is verbatim the payload shape of a `world_state`
+# truth event (`embodied.bench.events._check_truth_payload`): targets map
+# name -> {present}, world_counts maps name -> non-negative integer.
+schema: first-indoor-truth-1
+
+world_state:
+  targets:
+    red_block:
+      present: true
+  world_counts:
+    red_block: 1
+
+# Not seeded, on purpose. `physical_outcome` (inspected, return_verified,
+# violations, takeover) records what happened in one live episode; it is
+# measured by the referee/transport at record time, never declared here.
+physical_outcome: null
+
+# Evaluator notes — identity of the target and of scene furniture that is
+# deliberately NOT a truth target. Never written to the store.
+identity:
+  red_block:
+    node: target_block
+    size_m: 0.3
+    base_color: [0.85, 0.05, 0.05]
+    note: the only object of this shade in the scene
+  decoy_box:
+    role: distractor
+    node: decoy_box
+    base_color: [0.72, 0.12, 0.08]
+    in_truth: false
+    note: near-red, wrong shade; a report claiming it as the red block grades
+      against no target (unverifiable), and its presence never counts as a
+      missed present target because the store does not declare it
