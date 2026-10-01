@@ -96,6 +96,12 @@ def iter_frames(records_path: Path) -> Iterator[tuple[bytes, dict[str, Any]]]:
                 ),
                 row,
             )
+        elif kind == "capture_drop":
+            raise SystemExit(
+                "the capture contains capture_drop rows: the feed outran the "
+                "recorder and records are missing, so this capture is not a "
+                "faithful input stream and must not be diffed"
+            )
         else:
             yield b"", row  # pose/setpoint/command: read, never fed
 

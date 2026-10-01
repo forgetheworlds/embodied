@@ -23,12 +23,26 @@ BYTE EXACTLY rather than approximately:
 
 Truth isolation is structural, not procedural: the protocol the estimator speaks has
 no field that can carry a pose, so ``pose`` rows can never be encoded into a frame.
+
+Threading (measured, flights p01l-replay-ref/-ref2-20261001T0345/0347): the recorder
+first wrote its PPMs and rows on the feed's single-writer thread, and those disk
+writes -- 1.84 MB per pair -- delayed the inertial stream enough to reproduce the
+known stall shape (published-state age p95 48 ms, max 112 ms, against the 11/30 ms
+clamped baseline; both flights lost mid-route). The fence says the recorder must not
+alter WHEN the adapter sends, so the feed thread now only enqueues references into a
+bounded queue -- a no-block put that drops (and counts) rather than waits -- and one
+dedicated writer thread does every byte of I/O, hashing included. Drops are written
+as their own rows by the writer so a capture with drops is visible, never silently
+short.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import queue
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,20 +59,30 @@ _RECORDS_NAME = "sensor-capture/records.jsonl"
 _HEADER_NAME = "sensor-capture/header.json"
 _FRAMES_DIR = "sensor-capture/frames"
 _FORMAT = "embodied-sensor-capture-1"
+#: How many records may wait for the writer thread before the feed thread drops.
+#: 64 covers ~6 s of stereo pairs at the declared 10 Hz; a disk stall longer than
+#: that costs rows loudly (drop rows) instead of stalling the feed quietly.
+_QUEUE_DEPTH = 64
 
 
 class SensorCapture:
-    """Writes the per-run sensor record through the run's own evidence writer.
+    """Records the per-run sensor stream through the run's own evidence writer.
 
-    All methods are called from the estimator feed's single-writer thread (sensor
-    rows) or from the choreography's thread (setpoint/command rows); the writer's
-    own lock keeps each row and each frame file atomic, and the sequence numbers
-    order the record exactly as the run produced it.
+    Every public method is safe to call from the estimator feed's single-writer
+    thread: each builds a small tuple of already-existing objects, offers it to a
+    bounded queue, and returns without ever touching a disk. A dedicated writer
+    thread drains the queue in order and performs all file writes and hashing.
     """
 
     def __init__(self, writer: Any) -> None:
         self._writer = writer
         self._seq = 0
+        self._drops = 0
+        self._queue: "queue.Queue[tuple[str, dict[str, Any]] | None]" = queue.Queue(
+            maxsize=_QUEUE_DEPTH
+        )
+        self._stopped = threading.Event()
+        self._drained = threading.Event()
         writer.write_json(
             _HEADER_NAME,
             {
@@ -66,17 +90,24 @@ class SensorCapture:
                 "started_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "records": _RECORDS_NAME,
                 "frames_dir": _FRAMES_DIR,
+                "queue_depth": _QUEUE_DEPTH,
                 "kinds": {
                     "imu": "one inertial sample: sim_time_ns, capture_host_ns, gyro[3], accel[3] -- the exact arguments of localization.encode_imu, in feed order",
                     "pair": "one stereo pair: sim_time_ns, capture_host_ns, width, height, left/right P6 PPM paths (rgb8 as the sensor delivered), luma_sha256 of the two planes localization.encode_stereo received, in feed order",
                     "pose": "one evaluator truth sample, read for scoring and sent nowhere: sim_time_ns, position_xyz (NED), attitude_rpy; structurally unencodable into the estimator's protocol",
                     "setpoint": "one commanded target the check issued: sim_time_ns (feed clock), wall_ns, target fields as commanded",
                     "command": "one mode/arm/takeoff/land/override event the check issued: sim_time_ns (feed clock), wall_ns, command name, detail",
+                    "capture_drop": "the feed thread offered a record while the queue was full; that record is missing, and the capture must not be replayed as complete",
                 },
                 "time_base": "sim_time_ns is simulator time in nanoseconds, the one clock the sensors share; capture_host_ns/wall_ns are host monotonic stamps for latency accounting only",
-                "replay": "re-feed imu/pair rows in seq order through localization.encode_imu/encode_stereo (PPM payload -> grayscale_rgb8 -> encode_stereo; verify luma_sha256 first); never feed pose/setpoint/command rows to the estimator",
+                "replay": "re-feed imu/pair rows in seq order through localization.encode_imu/encode_stereo (PPM payload -> grayscale_rgb8 -> encode_stereo; verify luma_sha256 first); refuse a capture containing capture_drop rows; never feed pose/setpoint/command rows to the estimator",
             },
         )
+        self._thread = threading.Thread(
+            target=self._write_loop, name="sensor-capture-writer", daemon=True
+        )
+        self._thread.start()
+        atexit.register(self.close)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str], writer: Any) -> "SensorCapture | None":
@@ -85,7 +116,7 @@ class SensorCapture:
             return None
         return cls(writer)
 
-    # -- sensor rows (feed order, the estimator's exact inputs) -----------------
+    # -- feed-thread API: enqueue only, never block -------------------------------
 
     def imu(
         self,
@@ -94,14 +125,15 @@ class SensorCapture:
         gyro: Sequence[float],
         accel: Sequence[float],
     ) -> None:
-        self._append(
+        self._offer(
+            "row",
             {
                 "kind": "imu",
                 "sim_time_ns": sim_time_ns,
                 "capture_host_ns": capture_host_ns,
                 "gyro": list(gyro),
                 "accel": list(accel),
-            }
+            },
         )
 
     def pair(
@@ -115,24 +147,20 @@ class SensorCapture:
         left_luma: bytes,
         right_luma: bytes,
     ) -> None:
-        self._seq += 1
-        header = f"P6\n{width} {height}\n255\n".encode()
-        left_name = f"{_FRAMES_DIR}/{self._seq:06d}-left.ppm"
-        right_name = f"{_FRAMES_DIR}/{self._seq:06d}-right.ppm"
-        self._writer.write_bytes(left_name, header + left_rgb)
-        self._writer.write_bytes(right_name, header + right_rgb)
-        self._append(
+        # References only: the caller's byte objects already exist (they are what
+        # encode_stereo consumed), so nothing is copied on the feed thread.
+        self._offer(
+            "pair",
             {
-                "kind": "pair",
                 "sim_time_ns": sim_time_ns,
                 "capture_host_ns": capture_host_ns,
                 "width": width,
                 "height": height,
-                "left": left_name,
-                "right": right_name,
-                "luma_sha256": hashlib.sha256(left_luma + right_luma).hexdigest(),
+                "left_rgb": left_rgb,
+                "right_rgb": right_rgb,
+                "left_luma": left_luma,
+                "right_luma": right_luma,
             },
-            counted=False,
         )
 
     def pose(
@@ -141,25 +169,25 @@ class SensorCapture:
         position_xyz: Sequence[float],
         attitude_rpy: Sequence[float],
     ) -> None:
-        self._append(
+        self._offer(
+            "row",
             {
                 "kind": "pose",
                 "sim_time_ns": sim_time_ns,
                 "position_xyz": list(position_xyz),
                 "attitude_rpy": list(attitude_rpy),
-            }
+            },
         )
 
-    # -- choreography rows (what the run commanded, on the feed's clock) --------
-
     def setpoint(self, sim_time_ns: int | None, target: Mapping[str, Any]) -> None:
-        self._append(
+        self._offer(
+            "row",
             {
                 "kind": "setpoint",
                 "sim_time_ns": sim_time_ns,
                 "wall_ns": time.monotonic_ns(),
                 "target": dict(target),
-            }
+            },
         )
 
     def command(self, name: str, sim_time_ns: int | None, detail: Any = None) -> None:
@@ -171,9 +199,70 @@ class SensorCapture:
         }
         if detail is not None:
             row["detail"] = detail
-        self._append(row)
+        self._offer("row", row)
 
-    # -- internals ---------------------------------------------------------------
+    # -- lifecycle -----------------------------------------------------------------
+
+    def close(self, timeout_s: float = 60.0) -> None:
+        """Stop accepting records and wait for the writer to drain what it holds."""
+        self._stopped.set()
+        self._queue.put(None)
+        self._drained.wait(timeout_s)
+
+    # -- the writer thread ---------------------------------------------------------
+
+    def _offer(self, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            self._queue.put_nowait((kind, payload))
+        except queue.Full:
+            self._drops += 1
+
+    def _write_loop(self) -> None:
+        seen_drops = 0
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._drained.set()
+                return
+            kind, payload = item
+            if self._drops != seen_drops:
+                delta = self._drops - seen_drops
+                seen_drops = self._drops
+                self._append(
+                    {
+                        "kind": "capture_drop",
+                        "dropped": delta,
+                        "total_dropped": self._drops,
+                        "wall_ns": time.monotonic_ns(),
+                    }
+                )
+            if kind == "pair":
+                self._write_pair(payload)
+            else:
+                self._append(payload)
+
+    def _write_pair(self, payload: dict[str, Any]) -> None:
+        self._seq += 1
+        header = f"P6\n{payload['width']} {payload['height']}\n255\n".encode()
+        left_name = f"{_FRAMES_DIR}/{self._seq:06d}-left.ppm"
+        right_name = f"{_FRAMES_DIR}/{self._seq:06d}-right.ppm"
+        self._writer.write_bytes(left_name, header + payload["left_rgb"])
+        self._writer.write_bytes(right_name, header + payload["right_rgb"])
+        self._append(
+            {
+                "kind": "pair",
+                "sim_time_ns": payload["sim_time_ns"],
+                "capture_host_ns": payload["capture_host_ns"],
+                "width": payload["width"],
+                "height": payload["height"],
+                "left": left_name,
+                "right": right_name,
+                "luma_sha256": hashlib.sha256(
+                    payload["left_luma"] + payload["right_luma"]
+                ).hexdigest(),
+            },
+            counted=False,
+        )
 
     def _append(self, row: dict[str, Any], counted: bool = True) -> None:
         if counted:

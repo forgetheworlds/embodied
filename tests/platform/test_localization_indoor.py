@@ -3285,6 +3285,7 @@ class TestSensorCapture:
         capture.pose(2_000_000, (1.0, 2.0, -1.5), (0.0, 0.0, 0.0))
         capture.setpoint(3_000_000, {"position_ned": [2.0, 0.0, -1.5], "yaw_rad": 0.0})
         capture.command("land", 4_000_000)
+        capture.close()
         rows = [
             json.loads(line)
             for line in (tmp_path / "run-a" / "sensor-capture" / "records.jsonl")
@@ -3327,6 +3328,7 @@ class TestSensorCapture:
             left_luma,
             right_luma,
         )
+        capture.close()
         base = tmp_path / "run-a" / "sensor-capture"
         run = tmp_path / "run-a"
         row = json.loads((base / "records.jsonl").read_text().splitlines()[0])
