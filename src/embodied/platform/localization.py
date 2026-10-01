@@ -828,11 +828,11 @@ class OvStreamClient:
 
 
 def publish_period_s() -> float:
-    """The seam cadence: 10 ms (100 Hz), with the EKF delay corrected.
+    """The seam cadence: 10 ms (100 Hz) of the PACING clock, with the EKF delay corrected.
 
     25 ms through FIXER5's first four flights. The declared F2 bound
     (published-state age max 20 ms) is smaller than one 25 ms publish slot on
-    both this tick and ov_stream's PUBLISH_PERIOD_S puts the floor at one slot
+    both this tick and ov_stream's publish divisor puts the floor at one slot
     per side. This is the retry after the first attempt (db3153f, 2026-09-27)
     flew clean twice and then lost two runs mid-route: FIXER5 then measured the
     EKF's ext-nav fusion delay and found it declared 50 ms against a pose that
@@ -846,8 +846,23 @@ def publish_period_s() -> float:
     at the EKF's writeExtNavData gate, while the vision-position health window
     (AP_VisualOdom_Backend.cpp:32-35) is a 300 ms timeout and is unaffected. The
     declared localization.publish.period_ms carries the same 10 ms.
+
+    Since the single clock-maker change (2026-10-01) the period is spent on
+    the sensor stream's simulated time (the simulation is the only clock-maker
+    on the scored path), matching ov_stream's input-driven publish on the same
+    stream: the same run delivers the same publish grid at any host speed, and
+    10 ms of seam cadence means 10 ms of sensor time by construction rather
+    than by the pacing clamp's grace.
     """
     return 0.010
+
+
+# Liveness-only: the publisher's wait between pacing-clock readings, in wall
+# seconds. It bounds the spin while the simulation's clock idles between slots
+# and keeps the machine's wall accounting ticking during a silent feed; it never
+# decides cadence (``_wake`` on every offer does, so a sim that outruns the host
+# still gets one publish per 10 ms of simulated time).
+PUBLISH_IDLE_POLL_S = 0.002
 
 
 class ExternalNavPublisher:
@@ -873,22 +888,43 @@ class ExternalNavPublisher:
         machine: HealthMachine,
         *,
         clock: Callable[[], float] = time.monotonic,
+        accounting_clock: Callable[[], float] = time.monotonic,
         on_publish: Callable[[EstimatorState, dict[str, object]], None] | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._alignment = alignment
         self._machine = machine
+        # Two clocks, one owner each (single clock-maker, 2026-10-01). ``clock``
+        # PACES: it decides when the 10 ms publish slots open and measures the
+        # declared 300 ms silence/freeze bounds (``state_for_publish``). The live
+        # run injects the simulation's clock here, so cadence and staleness are
+        # functions of simulated time and a host that runs at any speed delivers
+        # the same publish grid. ``accounting_clock`` MEASURES: the wall stamps
+        # the machine's F1/F3 publish-gap and H1 window accounting consume,
+        # deliberately left on the host's clock (owner ruling 2026-10-01, the
+        # A4 guard): a wall-measured gap also fails when the host stalls, which
+        # is a property the receipts keep. In a scored run (realtime, clamped to
+        # <= 1x sim/wall) the two coincide in value; they differ only in what
+        # each is FOR.
         self._clock = clock
+        self._accounting_clock = accounting_clock
         self._on_publish = on_publish
         self._latest: EstimatorState | None = None
         self._latest_offer_s: float | None = None
-        # The state clock's freeze watch: the wall time the current state clock was
-        # first seen, so a clock that stops advancing is detected by the same declared
-        # bound that governs a silent feed (see ``state_for_publish``).
+        # The state clock's freeze watch: the pacing-clock reading at which the
+        # current state clock was first seen, so a clock that stops advancing is
+        # detected by the same declared bound that governs a silent feed (see
+        # ``state_for_publish``).
         self._clock_first_seen_s: float | None = None
         self._clock_seen_ns: int | None = None
         self._newest_imu_ns = 0
         self._stop = threading.Event()
+        # Set on every offer: the pacing clock advances in step with the data
+        # (the live clock IS the sensor stream's sim time), so waking on offers
+        # keeps the tick aligned to the data at ANY sim/wall ratio -- a fixed
+        # wall sleep would miss crossings whenever the sim outruns the host
+        # (fast-mode iteration runs) and idle-poll whenever it trails.
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._connection = None
         self.published = 0
@@ -911,6 +947,7 @@ class ExternalNavPublisher:
         self._latest = state
         self._latest_offer_s = self._clock()
         self._newest_imu_ns = max(self._newest_imu_ns, newest_imu_ns)
+        self._wake.set()
 
     def state_for_publish(self, now_s: float) -> EstimatorState | None:
         """The state the machine may act on, or None once the feed has gone silent.
@@ -997,16 +1034,24 @@ class ExternalNavPublisher:
                 self._connection = None
 
     def _loop(self) -> None:
+        # The pacing clock is the simulation's in the live run, so publish slots
+        # open on simulated time and the wait between them is liveness-only: the
+        # quantum bounds the spin (and keeps the machine's wall accounting
+        # ticking while the pacing clock idles), never the cadence. ``_wake`` is
+        # set on every offer, which is what holds the declared 10 ms grid when
+        # the sim outruns the host (fast-mode iteration runs): a fixed wall
+        # sleep would cross several slots per wake and drop the cadence.
         next_send = self._clock()
         while not self._stop.is_set():
             now = self._clock()
             if now < next_send:
-                if self._stop.wait(next_send - now):
-                    return
+                self._wake.wait(PUBLISH_IDLE_POLL_S)
+                self._wake.clear()
                 continue
             next_send = now + publish_period_s()
+            accounted_ns = int(self._accounting_clock() * 1e9)
             state = self.state_for_publish(now)
-            if not self._machine.on_state(state, int(now * 1e9)):
+            if not self._machine.on_state(state, accounted_ns):
                 continue
             # The epoch's one-time rotation: the first state the machine accepts as
             # healthy is the estimator's attitude at the declared stationary start
@@ -1018,10 +1063,11 @@ class ExternalNavPublisher:
             try:
                 self._send_state(state)
             except (OSError, ProtocolError, RuntimeError) as error:
-                self.publish_failures.append(f"{now:.3f}: {error}")
-                self._machine.stop(int(now * 1e9), f"publish failed: {error}")
+                failed_at_ns = int(self._accounting_clock() * 1e9)
+                self.publish_failures.append(f"{failed_at_ns / 1e9:.3f}: {error}")
+                self._machine.stop(failed_at_ns, f"publish failed: {error}")
                 return
-            self._machine.on_published(state, int(now * 1e9), self._newest_imu_ns)
+            self._machine.on_published(state, accounted_ns, self._newest_imu_ns)
             if self._on_publish is not None:
                 self._on_publish(state, self._alignment.aligned_state(state))
             self.published += 1
