@@ -38,7 +38,10 @@ model:
 # AND limits are recorded here. The ceiling is the whole stage's paid-call
 # budget; actual spend is reported against it in every receipt.
 probe:
-  max_calls: 30
+  # Raised 30 -> 60 for the J4 configuration matrix (owner: cost is not the
+  # constraint; latency and decision quality are). The ceiling stays the
+  # runaway guard it always was; measured spend is reported per receipt.
+  max_calls: 60
   spend_ceiling_usd: 10
 
 # Declared pilot parameters. Each is an engineering assumption chosen for

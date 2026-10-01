@@ -52,31 +52,49 @@ class TransportError(Exception):
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """The configured runtime model, recorded rather than assumed."""
+    """The configured runtime model, recorded rather than assumed.
+
+    ``reply_format`` selects the reply-discipline variant of the prompt
+    ("default", or "strict": exactly one tool call, no prose, short
+    arguments). ``generation`` carries optional OpenAI-completions generation
+    parameters (for example ``max_tokens`` or ``reasoning_effort``) that the
+    configuration or a measurement run sets explicitly; an absent mapping adds
+    no fields to the request.
+    """
 
     provider: str
     id: str
     base_url: str
     api: str
     image_transport: str
+    reply_format: str = "default"
+    generation: tuple[tuple[str, Any], ...] = ()
 
     @classmethod
     def from_config(cls, section: dict[str, Any]) -> "ModelConfig":
         for key in ("provider", "id", "base_url", "api", "image_transport"):
             if not isinstance(section.get(key), str) or not section[key].strip():
                 raise ValueError(f"model.{key} must be a non-empty string")
+        reply_format = section.get("reply_format", "default")
+        if reply_format not in ("default", "strict"):
+            raise ValueError("model.reply_format must be 'default' or 'strict'")
+        generation_section = section.get("generation") or {}
+        if not isinstance(generation_section, dict):
+            raise ValueError("model.generation must be a mapping when present")
+        generation = tuple(sorted((str(k), v) for k, v in generation_section.items()))
         return cls(
             provider=section["provider"],
             id=section["id"],
             base_url=section["base_url"],
             api=section["api"],
             image_transport=section["image_transport"],
+            reply_format=reply_format,
+            generation=generation,
         )
 
     @property
     def identity(self) -> str:
         return self.id
-
 
 # ---------------------------------------------------------------------------
 # Request envelope
@@ -84,10 +102,28 @@ class ModelConfig:
 
 
 def encode_image_data_uri(payload: bytes) -> str:
-    """One base64 data URI. The only image transport this project uses."""
+    """One base64 data URI, PNG. The only image transport this project uses.
+
+    The pinned commandcode route rejects ``image/ppm`` data URIs with HTTP 400
+    regardless of size (measured 2026-10-01, the J3 diagnostic matrix: a 5.6 KB
+    fixture PPM and a 2.46 MB captured stereo pair both refused; the same
+    frames as PNG answered). Captures are P6 PPM, so they are re-encoded with
+    Pillow — which also shrinks the upload about 4x. A payload that is already
+    PNG passes through unchanged.
+    """
     import base64
 
-    return "data:image/ppm;base64," + base64.b64encode(payload).decode("ascii")
+    if payload[:8] == b"\x89PNG\r\n\x1a\n":
+        encoded = payload
+    else:
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.open(io.BytesIO(payload)).save(buffer, format="PNG")
+        encoded = buffer.getvalue()
+    return "data:image/png;base64," + base64.b64encode(encoded).decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -112,11 +148,11 @@ def build_request_document(
     config: ModelConfig, packet: RequestPacket, tool_schemas: Sequence[dict[str, Any]]
 ) -> dict[str, Any]:
     """One OpenAI-completions chat document carrying text and base64 images."""
-    content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_text(packet)}]
+    content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_text(packet, config.reply_format)}]
     for observation_id, data_uri in packet.image_parts:
         content.append({"type": "text", "text": f"image for observation {observation_id}:"})
         content.append({"type": "image_url", "image_url": {"url": data_uri}})
-    return {
+    document = {
         "model": config.id,
         "messages": [{"role": "user", "content": content}],
         "tools": list(tool_schemas),
@@ -127,24 +163,38 @@ def build_request_document(
             "base_goal_revision": packet.request.base_goal_revision,
         },
     }
+    # Generation parameters are explicit and recorded (configs/runtime-model.yaml
+    # model.generation, or a measurement run's override); never inferred.
+    document.update(dict(config.generation))
+    return document
 
 
-def _prompt_text(packet: RequestPacket) -> str:
+_STRICT_REPLY_LINES = (
+    "Reply with EXACTLY ONE tool call and no prose. Keep every argument under 30 words.",
+)
+
+
+def _prompt_text(packet: RequestPacket, reply_format: str = "default") -> str:
     lines = [
         "You are the cloud pilot of an indoor drone. Reply with tool calls and, "
         "when a spatial objective should change, a spatial_goal proposal. "
         "You never command motion directly; the local supervisor owns admission.",
-        f"mission instruction: {packet.mission_instruction}",
-        f"mission revision: {packet.request.mission_revision}",
-        f"active goal revision: {packet.request.base_goal_revision}",
-        f"navigation status: {packet.navigation_status}",
-        f"target references: {', '.join(packet.target_refs) or 'none'}",
-        f"uncertainty: {packet.uncertainty_summary}",
     ]
+    if reply_format == "strict":
+        lines.extend(_STRICT_REPLY_LINES)
+    lines.extend(
+        [
+            f"mission instruction: {packet.mission_instruction}",
+            f"mission revision: {packet.request.mission_revision}",
+            f"active goal revision: {packet.request.base_goal_revision}",
+            f"navigation status: {packet.navigation_status}",
+            f"target references: {', '.join(packet.target_refs) or 'none'}",
+            f"uncertainty: {packet.uncertainty_summary}",
+        ]
+    )
     if packet.explicit_question:
         lines.append(f"explicit question: {packet.explicit_question}")
     return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # Transports
@@ -193,6 +243,17 @@ class LiveTransport:
                 with urllib.request.urlopen(request, timeout=self._timeout_s) as handle:
                     response = json.loads(handle.read().decode("utf-8"))
             self._completed.append((sent_at, response))
+        except urllib.error.HTTPError as error:
+            # The body is the diagnosis: a 400 from this edge carries the
+            # reason ("invalid_request_error: unsupported image media type")
+            # that "transport failed: HTTP Error 400" hides. Bounded read.
+            try:
+                body = error.read(2048).decode("utf-8", "replace")
+            except Exception:  # pragma: no cover - best-effort body recovery
+                body = ""
+            self._completed.append(
+                (sent_at, TransportError(f"HTTP {error.code}: {body[:1000] or error.reason}"))
+            )
         except (urllib.error.URLError, OSError, ValueError) as error:
             self._completed.append((sent_at, TransportError(f"transport failed: {error}")))
 

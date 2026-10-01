@@ -481,20 +481,10 @@ def load_stereo_pairs(pairs_dir: Path, count: int) -> list[tuple[str, bytes, byt
     return pairs
 
 def _encode_png_uri(payload: bytes) -> str:
-    """PNG data URI. The pinned commandcode route rejects ``image/ppm`` data
-    URIs with HTTP 400 regardless of size (measured, the J3 diagnostic matrix:
-    a 1 KB fixture PPM and a 1.2 MB captured PPM both refused; the same frame
-    as PNG answered). Pillow re-encodes the captured P6 frames, which also
-    shrinks the upload about 4x.
-    """
-    import base64
-    import io
-
-    from PIL import Image
-
-    buffer = io.BytesIO()
-    Image.open(io.BytesIO(payload)).save(buffer, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    """Deprecated alias kept for the sampler's callers; the single encoding
+    path is :func:`embodied.pilot.provider.encode_image_data_uri` (PNG, with
+    PPM re-encoded), which this now forwards to."""
+    return encode_image_data_uri(payload)
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -505,17 +495,44 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
+def _scale_frame(payload: bytes, scale: float) -> bytes:
+    """Downscale one captured frame and return PNG bytes.
+
+    Measurement-only: the checked-in observation contract sends the captured
+    resolution. This exists so the reply-time decomposition can separate the
+    image payload's cost (upload plus image prefill) from the transport's own
+    cost, which no amount of prompt discipline can move.
+    """
+    import io
+
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(payload))
+    width = max(1, round(image.width * scale))
+    height = max(1, round(image.height * scale))
+    buffer = io.BytesIO()
+    image.resize((width, height)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def execute_tactical_sample(
     config: dict[str, Any],
     pairs: list[tuple[str, bytes, bytes]],
     transport,
     samples: int,
+    *,
+    image_scale: float = 1.0,
+    with_image: bool = True,
 ) -> dict[str, Any]:
     """Send ``samples`` realistic image+task requests through the live transport.
 
     One frame pair per request, real monotonic stamps, every reply retained.
     The caller has already enforced the budget; this function never exceeds
-    ``samples`` calls.
+    ``samples`` calls. Generation knobs (reply format, max tokens, reasoning
+    effort, model id) are whatever the caller loaded into ``config['model']``:
+    they flow through :class:`ModelConfig` into the request document and are
+    recorded in the report's ``effective_model``, so a receipt always names
+    the exact request shape that produced its numbers.
     """
     model = ModelConfig.from_config(config["model"])
     parameters = PilotParameters.from_config(config["pilot"])
@@ -535,16 +552,19 @@ def execute_tactical_sample(
             model_identity=model.identity,
         )
         encode_start_ns = time.monotonic_ns()
-        left_uri = _encode_png_uri(left)
-        right_uri = _encode_png_uri(right)
+        image_parts: tuple[tuple[str, str], ...] = ()
+        if with_image:
+            left_payload = _scale_frame(left, image_scale) if image_scale != 1.0 else left
+            right_payload = _scale_frame(right, image_scale) if image_scale != 1.0 else right
+            image_parts = (
+                (pair_id, _encode_png_uri(left_payload)),
+                (pair_id, _encode_png_uri(right_payload)),
+            )
         encode_ms = (time.monotonic_ns() - encode_start_ns) / 1_000_000
         packet = RequestPacket(
             request=request,
             mission_instruction=SAMPLE_MISSION_INSTRUCTION,
-            image_parts=(
-                (pair_id, left_uri),
-                (pair_id, right_uri),
-            ),
+            image_parts=image_parts,
             navigation_status=SAMPLE_NAV_STATUS[index % len(SAMPLE_NAV_STATUS)],
             uncertainty_summary="pose sigma 0.05 m horizontal; stereo depth invalid on the textureless floor",
             explicit_question=SAMPLE_QUESTIONS[index % len(SAMPLE_QUESTIONS)],
@@ -601,6 +621,19 @@ def execute_tactical_sample(
     completion_tokens = [int(u.get("completion_tokens", 0)) for u in usages if u.get("completion_tokens") is not None]
     return {
         "model_identity": model.identity,
+        "effective_model": {
+            "id": model.id,
+            "reply_format": model.reply_format,
+            "generation": dict(model.generation),
+        },
+        "measurement": {
+            "image_scale": image_scale,
+            "with_image": with_image,
+            "reasoning_tokens": [
+                int((u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0))
+                for u in usages
+            ],
+        },
         "calls": calls,
         "summary": {
             "calls": len(calls),
@@ -631,10 +664,13 @@ def _host_state() -> dict[str, str]:
 
 
 def _main() -> int:
-    """Run the sampler as ``python -m embodied.pilot.probe`` without touching dispatch.
+    """Run the sampler as ``python -m embodied.pilot.probe`` or via the
+    registered ``pilot-probe`` dispatch line.
 
     The budget refusal mirrors the registered command's: no call happens unless
-    --max-calls is given AND the config records limits.
+    --max-calls is given AND the config records limits. The generation knobs
+    override ``config['model']`` for this run only and are recorded verbatim in
+    the output, so a receipt always names the request shape that produced it.
     """
     parser = argparse.ArgumentParser(description="live tactical-decision latency sampler")
     parser.add_argument("--config", type=Path, required=True)
@@ -643,6 +679,40 @@ def _main() -> int:
     parser.add_argument("--max-calls", type=int, default=None)
     parser.add_argument("--api-key-env", default="COMMAND_CODE_API_KEY")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--reply-format",
+        choices=("default", "strict"),
+        default=None,
+        help="override model.reply_format for this run (strict: exactly one tool call, no prose)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="hard completion-token cap sent as max_tokens (a reasoning model may spend it before answering: quality is measured, not assumed)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        help="reasoning effort sent in the request body (accepted spellings are the API's; an unknown field surfaces as a recorded HTTP error)",
+    )
+    parser.add_argument(
+        "--model-id",
+        default=None,
+        help="CANDIDATE route override for measurement only; the checked-in route stays owner-pinned",
+    )
+    parser.add_argument("--label", default=None, help="run label recorded into the output and printed")
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=1.0,
+        help="MEASUREMENT-ONLY frame downscale before encoding (1.0 = captured resolution)",
+    )
+    parser.add_argument(
+        "--no-image",
+        action="store_true",
+        help="MEASUREMENT-ONLY: send the same request with no frame, to separate transport cost from image cost",
+    )
     args = parser.parse_args()
 
     config = load_runtime_config(args.config)
@@ -658,20 +728,62 @@ def _main() -> int:
         print(f"refused: --samples must be within the recorded budget (max {min(args.max_calls, limits[0])})")
         return 2
 
+    overrides: dict[str, Any] = {}
+    if args.reply_format is not None:
+        overrides["reply_format"] = args.reply_format
+    generation: dict[str, Any] = dict((config["model"] or {}).get("generation") or {})
+    if args.max_tokens is not None:
+        if args.max_tokens < 1:
+            print("refused: --max-tokens must be positive")
+            return 2
+        generation["max_tokens"] = args.max_tokens
+    if args.reasoning_effort is not None:
+        generation["reasoning_effort"] = args.reasoning_effort
+    if generation:
+        overrides["generation"] = generation
+    if args.model_id is not None:
+        overrides["id"] = args.model_id
+    if args.image_scale != 1.0:
+        if not 0.0 < args.image_scale <= 1.0:
+            print("refused: --image-scale must be in (0, 1]")
+            return 2
+        overrides["image_scale"] = args.image_scale
+    if args.no_image:
+        overrides["with_image"] = False
+    if overrides:
+        config["model"] = {**config["model"], **overrides}
+
     pairs = load_stereo_pairs(args.pairs_dir, args.samples)
     if not pairs:
         print(f"refused: no stereo pairs found under {args.pairs_dir}")
         return 2
     host_before = _host_state()
     transport = LiveTransport(ModelConfig.from_config(config["model"]), api_key_env=args.api_key_env)
-    report = execute_tactical_sample(config, pairs, transport, min(args.samples, len(pairs)))
+    report = execute_tactical_sample(
+        config,
+        pairs,
+        transport,
+        min(args.samples, len(pairs)),
+        image_scale=args.image_scale,
+        with_image=not args.no_image,
+    )
+    report["overrides"] = {k: v for k, v in overrides.items() if k not in ("image_scale", "with_image")} or "none"
+    if args.image_scale != 1.0 or args.no_image:
+        report["overrides"] = {
+            "model": report["overrides"],
+            "image_scale": args.image_scale,
+            "with_image": not args.no_image,
+        }
     report["host"] = {"before": host_before, "after": _host_state()}
     report["limits"] = {"max_calls": limits[0], "spend_ceiling_usd": limits[1]}
+    if args.label:
+        report["label"] = args.label
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = report["summary"]
+    label = f"[{args.label}] " if args.label else ""
     print(
-        f"{summary['calls']} calls, {summary['replied']} replied, "
+        f"{label}{summary['calls']} calls, {summary['replied']} replied, "
         f"{summary['usable_decisions']} usable decisions; "
         f"p50 {summary['latency_s']['p50']}s p95 {summary['latency_s']['p95']}s max {summary['latency_s']['max']}s"
     )
