@@ -29,6 +29,7 @@ from embodied.cli import CommandError, build_parser
 from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
 from embodied.platform import webots_ardupilot as bridge
+from embodied.platform import sensor_capture
 from embodied.platform import localization_check as check
 from embodied.platform.webots_ardupilot import EvidenceWriter as bridge_EvidenceWriter
 from embodied.platform.webots_ardupilot import PlatformSettings
@@ -3248,3 +3249,95 @@ class TestE1PerSampleRows:
         assert row["estimate_ned_m"] == [1.0, 2.0, -1.5]
         assert row["truth_ned_m"] == [1.02, 1.99, -1.48]
         assert row["time_ns"] == row["truth_time_ns"] == 7_000_000_000
+
+
+# ---------------------------------------------------------------------------
+# The per-run sensor capture (replay surface, 2026-09-30)
+# ---------------------------------------------------------------------------
+
+
+class TestSensorCapture:
+    """The general per-run sensor record: what a capture must carry to be replayable.
+
+    The capture's contract is threefold, and each test below pins one leg:
+    inert by default (no environment flag, no files), a row per sensor event
+    under the run's own directory with the exact arguments the estimator's feed
+    encoders received, and frames written so the rgb bytes round-trip and the
+    luma the estimator saw is verifiable from them.
+    """
+
+    def _writer(self, tmp_path: Path) -> bridge_EvidenceWriter:
+        return bridge_EvidenceWriter(tmp_path, "run-a")
+
+    def test_capture_is_absent_without_the_environment_flag(self, tmp_path: Path):
+        writer = self._writer(tmp_path)
+        capture = sensor_capture.SensorCapture.from_env({}, writer)
+        assert capture is None
+        assert not (tmp_path / "run-a" / "sensor-capture").exists()
+
+    def test_capture_enabled_by_flag_writes_header_and_rows(self, tmp_path: Path):
+        writer = self._writer(tmp_path)
+        capture = sensor_capture.SensorCapture.from_env(
+            {"EMBODIED_SENSOR_CAPTURE": "1"}, writer
+        )
+        assert capture is not None
+        capture.imu(1_000_000, 7_000_000, (0.1, 0.2, 0.3), (-9.8, 0.0, 0.1))
+        capture.pose(2_000_000, (1.0, 2.0, -1.5), (0.0, 0.0, 0.0))
+        capture.setpoint(3_000_000, {"position_ned": [2.0, 0.0, -1.5], "yaw_rad": 0.0})
+        capture.command("land", 4_000_000)
+        capture.close()
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / "run-a" / "sensor-capture" / "records.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert [row["kind"] for row in rows] == ["imu", "pose", "setpoint", "command"]
+        assert [row["seq"] for row in rows] == [1, 2, 3, 4]
+        assert rows[0]["sim_time_ns"] == 1_000_000
+        assert rows[0]["capture_host_ns"] == 7_000_000
+        assert rows[0]["gyro"] == [0.1, 0.2, 0.3]
+        assert rows[0]["accel"] == [-9.8, 0.0, 0.1]
+        assert rows[1]["position_xyz"] == [1.0, 2.0, -1.5]
+        assert rows[3]["command"] == "land"
+        header = json.loads(
+            (tmp_path / "run-a" / "sensor-capture" / "header.json").read_text()
+        )
+        assert header["format"] == "embodied-sensor-capture-1"
+
+    def test_pair_rows_carry_the_fed_luma_planes_verbatim(self, tmp_path: Path):
+        import hashlib
+
+        writer = self._writer(tmp_path)
+        capture = sensor_capture.SensorCapture.from_env(
+            {"EMBODIED_SENSOR_CAPTURE": "1"}, writer
+        )
+        assert capture is not None
+        width, height = 4, 2
+        left_rgb = bytes([255, 0, 0]) * (width * height)
+        right_rgb = bytes([0, 0, 255]) * (width * height)
+        left_luma = loc.grayscale_rgb8(left_rgb, width, height)
+        right_luma = loc.grayscale_rgb8(right_rgb, width, height)
+        capture.pair(
+            5_000_000,
+            8_000_000,
+            width,
+            height,
+            left_luma,
+            right_luma,
+        )
+        capture.close()
+        base = tmp_path / "run-a" / "sensor-capture"
+        run = tmp_path / "run-a"
+        row = json.loads((base / "records.jsonl").read_text().splitlines()[0])
+        assert row["kind"] == "pair"
+        assert row["width"] == width and row["height"] == height
+        assert row["luma_sha256"] == hashlib.sha256(left_luma + right_luma).hexdigest()
+        # The frame files ARE the planes the estimator was fed: a P5 round-trip
+        # hands encode_stereo back its own bytes, which is the byte-exactness the
+        # replay claims, with the hash as its per-frame verifier.
+        header = f"P5\n{width} {height}\n255\n".encode()
+        left_ppm = run / row["left"]
+        right_ppm = run / row["right"]
+        assert left_ppm.read_bytes() == header + left_luma
+        assert right_ppm.read_bytes() == header + right_luma

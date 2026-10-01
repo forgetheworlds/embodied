@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import os
 from bisect import bisect_left
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -62,6 +63,7 @@ from embodied.cli import (
 )
 from embodied.contracts.records import SensorMode
 from embodied.platform import localization as loc
+from embodied.platform import sensor_capture
 from embodied.platform.sensors import SensorSample, capture_latency_ns, sim_time_ns
 from embodied.platform.webots_ardupilot import (
     BringUpLink,
@@ -2982,6 +2984,17 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         f"parameter layer: {[str(path) for path in settings.estimator_params]}",
     ]
 
+    # The per-run sensor capture (replay surface, 2026-09-30): one flight's whole
+    # sensor stream on disk, inert unless EMBODIED_SENSOR_CAPTURE=1 asks for it. It
+    # records at THIS seam on purpose -- every frame the estimator receives passes
+    # through feed_record as the exact arguments of the encoders below, in feed
+    # order, so a replay of the record reproduces the estimator's input byte for
+    # byte (verified per pair by the recorded luma hash) instead of approximately.
+    # The rows also carry the truth poses read for scoring and the check's own
+    # setpoint/mode commands, on the run's simulator clock, so the record is a
+    # general sensor record rather than an estimator-specific one.
+    capture = sensor_capture.SensorCapture.from_env(os.environ, writer)
+
     def feed_record(record: Any) -> None:
         # Every frame carries the simulator's own clock, and every wait this stage
         # declares in simulated seconds is measured against it. Reading it here, on the
@@ -3013,6 +3026,15 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 )
             )
             stats.pairs += 1
+            if capture is not None:
+                capture.pair(
+                    sim_time_ns(record.sim_time_s),
+                    pair.capture_host_ns,
+                    settings.stereo.width,
+                    settings.stereo.height,
+                    left,
+                    right,
+                )
         elif record.kind is Kind.IMU and record.imu is not None:
             imu = record.imu
             sample = SensorSample(
@@ -3026,6 +3048,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             stats.newest_imu_ns = max(stats.newest_imu_ns, stamp_ns)
             client.send(loc.encode_imu(stamp_ns, imu.gyro, imu.accelerometer))
             stats.imu_samples += 1
+            if capture is not None:
+                capture.imu(stamp_ns, imu.capture_host_ns, imu.gyro, imu.accelerometer)
         elif record.kind is Kind.POSE and record.pose is not None:
             # Evaluator truth, read for scoring and sent nowhere. The estimator's feed
             # handles PAIR and IMU only, so this branch cannot reach it; the sample is
@@ -3037,6 +3061,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             stats.truth_attitudes.append(
                 (sim_time_ns(record.sim_time_s), tuple(record.pose.attitude_rpy))
             )
+            if capture is not None:
+                capture.pose(
+                    sim_time_ns(record.sim_time_s),
+                    record.pose.position_xyz,
+                    record.pose.attitude_rpy,
+                )
 
     last_telemetry_sample = 0.0
 
@@ -3306,6 +3336,7 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 published_attitude=lambda: (
                     None if latest_aligned is None else latest_aligned["attitude_rpy"]
                 ),
+                capture=capture,
             )
             live_blockers.extend(bring_up["blockers"])
         # H5's wait, in the declared budget's own unit: the estimator's readiness is
@@ -3346,6 +3377,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             # so the flight is not spent: nothing is substituted to get past it.
             log_lines.append("not arming: a precondition of the scored arm failed")
         else:
+            if capture is not None:
+                capture.command(
+                    "arm_and_guided",
+                    _capture_clock_ns(stats),
+                    {"timeout_s": settings.step_timeout_s.flight},
+                )
             control = platform.arm_and_guided(settings.step_timeout_s.flight, drain=drain)
             if control.refused:
                 live_blockers.append(
@@ -3431,6 +3468,18 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                                     certificate_ref=None,
                                 )
                             )
+                            if capture is not None:
+                                capture.setpoint(
+                                    _capture_clock_ns(stats),
+                                    {
+                                        "position_ned": list(target),
+                                        "velocity_ned": [0.0, 0.0, 0.0],
+                                        "yaw_rad": ROUTE_YAW_HOLD_RAD,
+                                        "deadline_s": settings.hold_per_waypoint_s,
+                                        "sent": sent is not None,
+                                        "hold": index,
+                                    },
+                                )
                             if sent is None:
                                 live_blockers.append(
                                     f"Guided flight was lost while holding waypoint {index} at "
@@ -3442,6 +3491,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                         time.sleep(0.005)
                     sample_disagreement(f"hold-{index}")
                 log_lines.append("route complete; commanding LAND")
+                if capture is not None:
+                    capture.command("land", _capture_clock_ns(stats), {"phase": "scored-route"})
                 session.set_mode("LAND")
                 # The FLIGHT ends here, at the LAND command. The freshness metrics --
                 # F1's publish gaps and F2's published-state age -- stop being recorded,
@@ -3694,6 +3745,11 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     )
 
 
+def _capture_clock_ns(stats: _FeedStats) -> int | None:
+    """The feed's newest simulator stamp, the shared time base of capture rows."""
+    newest = stats.sim_clock.newest_s
+    return None if newest is None else sim_time_ns(newest)
+
 def _simulator_pacing_document(
     settings: PlatformSettings,
     controller_pacing: Any,
@@ -3760,6 +3816,7 @@ def _run_ordered_bring_up(
     log_lines: list[str],
     stats: _FeedStats,
     published_attitude: Callable[[], object | None],
+    capture: sensor_capture.SensorCapture | None = None,
 ) -> dict[str, Any]:
     """The declared ordered bring-up: datum, exception window, excitation, restoration.
 
@@ -4158,6 +4215,12 @@ def _run_ordered_bring_up(
             record["arm_attempts"] += 1
             session.set_mode(BRING_UP_MODE)
             session.arm()
+            if capture is not None:
+                capture.command(
+                    "bring_up_arm",
+                    _capture_clock_ns(stats),
+                    {"mode": BRING_UP_MODE, "attempt": record["arm_attempts"]},
+                )
             settle_until = time.monotonic() + BRING_UP_ARM_SETTLE_S
             while time.monotonic() < settle_until:
                 drain()
@@ -4234,6 +4297,12 @@ def _run_ordered_bring_up(
             record["sent"].append(
                 link.send_rc_channels_override(int(override["sent_pwm"]))
             )
+            if capture is not None:
+                capture.command(
+                    "rc_override",
+                    _capture_clock_ns(stats),
+                    {"pwm": int(override["sent_pwm"])},
+                )
             override["sent"] = True
             override["sent_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
@@ -4366,6 +4435,12 @@ def _run_ordered_bring_up(
             record["sent"].append(
                 link.takeoff_without_horizontal_position(EXCITATION_TAKEOFF_ALTITUDE_M)
             )
+            if capture is not None:
+                capture.command(
+                    "takeoff",
+                    _capture_clock_ns(stats),
+                    {"altitude_m": EXCITATION_TAKEOFF_ALTITUDE_M, "attempt": attempt},
+                )
             if attempt == 1:
                 flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
                     timespec="milliseconds"
@@ -4491,6 +4566,8 @@ def _run_ordered_bring_up(
                 f"readback ({land_delay_wall_s:.3f} wall s on this host), outside the "
                 f"declared {EXCITATION_MAX_AIRTIME_S} s airtime bound"
             )
+        if capture is not None:
+            capture.command("land", _capture_clock_ns(stats), {"phase": "excitation"})
         session.set_mode("LAND")
         flight["land_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
             timespec="milliseconds"
@@ -4504,6 +4581,12 @@ def _run_ordered_bring_up(
         # override's value.
         if override["sent"]:
             record["sent"].append(link.send_rc_channels_override(RC_THROTTLE_RELEASE_PWM))
+            if capture is not None:
+                capture.command(
+                    "rc_override_release",
+                    _capture_clock_ns(stats),
+                    {"pwm": RC_THROTTLE_RELEASE_PWM},
+                )
             override["released"] = True
             override["released_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
