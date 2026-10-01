@@ -59,13 +59,29 @@ def _find_capture(root: Path) -> Path:
         if (candidate / "records.jsonl").exists():
             return candidate
     raise SystemExit(f"no sensor-capture/records.jsonl under {root}")
-def _read_pgm_p5(path: Path, width: int, height: int) -> bytes:
-    """The luma payload of one P5 PGM: exactly the plane the estimator was fed."""
+
+
+def _read_frame(path: Path, width: int, height: int) -> bytes:
+    """The luma plane from one recorded frame file, whatever variant wrote it.
+
+    The capture writes P5 luma planes (what the estimator was fed). The first two
+    reference flights predate that and hold P6 rgb8, which the estimator's own
+    pure BT.601 conversion turns back into the plane -- and the row's recorded
+    SHA-256 verifies either path, so the format's history cannot produce a
+    silently different stream.
+    """
     data = path.read_bytes()
-    header = f"P5\n{width} {height}\n255\n".encode()
-    if not data.startswith(header) or len(data) != len(header) + width * height:
-        raise SystemExit(f"{path}: not the P5 {width}x{height} plane the capture recorded")
-    return data[len(header) :]
+    if data[:2] == b"P5":
+        header = f"P5\n{width} {height}\n255\n".encode()
+        if not data.startswith(header) or len(data) != len(header) + width * height:
+            raise SystemExit(f"{path}: not the P5 {width}x{height} plane the capture recorded")
+        return data[len(header) :]
+    if data[:2] == b"P6":
+        header = f"P6\n{width} {height}\n255\n".encode()
+        if not data.startswith(header) or len(data) != len(header) + width * height * 3:
+            raise SystemExit(f"{path}: not the P6 {width}x{height} image the capture recorded")
+        return loc.grayscale_rgb8(data[len(header) :], width, height)
+    raise SystemExit(f"{path}: neither a P5 nor a P6 frame the capture can replay")
 
 
 def iter_frames(records_path: Path) -> Iterator[tuple[bytes, dict[str, Any]]]:
@@ -77,8 +93,8 @@ def iter_frames(records_path: Path) -> Iterator[tuple[bytes, dict[str, Any]]]:
             yield loc.encode_imu(row["sim_time_ns"], row["gyro"], row["accel"]), row
         elif kind == "pair":
             base = records_path.parent.parent  # rows carry run-dir-relative paths
-            left = _read_pgm_p5(base / row["left"], row["width"], row["height"])
-            right = _read_pgm_p5(base / row["right"], row["width"], row["height"])
+            left = _read_frame(base / row["left"], row["width"], row["height"])
+            right = _read_frame(base / row["right"], row["width"], row["height"])
             digest = hashlib.sha256(left + right).hexdigest()
             if digest != row["luma_sha256"]:
                 raise SystemExit(

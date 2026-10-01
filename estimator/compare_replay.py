@@ -229,6 +229,55 @@ def compare_live_to_replay(
             f"within {sum(1 for v in values if v <= tolerance_value)}/{len(values)}"
         )
 
+    # The anchor-matched axis: the first state after each camera update is a pure
+    # function of the input prefix up to that image, so it is comparable across
+    # two DIFFERENT publish grids. Where the wall-sampled axis above can diverge
+    # at a fast transient (each sequence samples it at its own instants), this
+    # axis cannot: same image, same state, or the capture is not faithful.
+    def first_by_anchor(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        ordered: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            ordered.setdefault(row["t_last_visual_ns"], row)
+        return ordered
+
+    live_by_anchor = first_by_anchor(live_rows)
+    replay_by_anchor = first_by_anchor(replay)
+    shared = sorted(set(live_by_anchor) & set(replay_by_anchor))
+    anchor_pos: list[float] = []
+    anchor_att: list[float] = []
+    anchor_vel: list[float] = []
+    anchor_sigma: list[float] = []
+    anchor_tracks: list[int] = []
+    for anchor in shared:
+        live_row = live_by_anchor[anchor]
+        state = replay_by_anchor[anchor]
+        position = alignment.aligned_position_ned(state["position_m"])
+        velocity = alignment.aligned_velocity_ned(state["velocity_mps"])
+        rpy = alignment.aligned_attitude_rpy(state["quat_wxyz"])
+        anchor_pos.append(
+            float(np.linalg.norm(np.asarray(position) - np.asarray(live_row["position_ned_m"])))
+        )
+        anchor_att.append(
+            float(np.linalg.norm(np.asarray(rpy) - np.asarray(live_row["attitude_rpy"])))
+        )
+        anchor_vel.append(
+            float(
+                np.linalg.norm(
+                    np.asarray(velocity) - np.asarray(live_row["velocity_ned_mps"])
+                )
+            )
+        )
+        anchor_sigma.append(
+            float(max(abs(a - b) for a, b in zip(state["sigma_pos_m"], live_row["sigma_pos_m"])))
+        )
+        anchor_tracks.append(int(state["n_tracks"]) - int(live_row["n_tracks"]))
+    print(f"anchor-matched (first state after each shared camera update): {len(shared)} anchors")
+    report("  anchor position delta m", anchor_pos, tolerance["position_m"])
+    report("  anchor attitude delta rad", anchor_att, tolerance["attitude_rad"])
+    report("  anchor velocity delta m/s", anchor_vel, tolerance["velocity_mps"])
+    report("  anchor sigma delta m", anchor_sigma, tolerance["sigma_m"])
+    print(f"  anchor tracks delta max: {max((abs(v) for v in anchor_tracks), default=0)}")
+
     print(f"matched within {window_ms:.0f} ms: {matched}/{len(live_rows)} (unmatched {unmatched})")
     report("position delta m", position_deltas, tolerance["position_m"])
     report("attitude delta rad", attitude_deltas, tolerance["attitude_rad"])
