@@ -443,6 +443,16 @@ class MissionRuntime:
             )
             return self.result
         client = loc.OvStreamClient("127.0.0.1", int(estimator["socket_port"]))
+        try:
+            client.connect()
+        except (OSError, loc.ProtocolError) as error:
+            self.result.termination_reason = "estimator_unavailable"
+            self.result.blockers.append(
+                f"the adapter could not connect to the estimator on 127.0.0.1:"
+                f"{estimator['socket_port']}: {error}"
+            )
+            estimator_process.terminate()
+            return self.result
         feed_stop = threading.Event()
         feed_failures: list[str] = []
         pending_pairs: queue.Queue = queue.Queue(maxsize=PAIR_QUEUE_FRAMES)
