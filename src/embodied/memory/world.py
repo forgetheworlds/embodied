@@ -459,6 +459,51 @@ class MapStore:
             counts[self.classify(cell, now_ns=clock)] += 1
         return counts
 
+    def evidence_breakdown(self, *, now_ns: int) -> dict[str, int]:
+        """How the cells holding evidence divide among the rules. Diagnostic only.
+
+        ``map_summary`` reports free cells and search cells, and a map can hold
+        many of the first and none of the second. This says which rule withheld
+        the rest — the surface band, staleness, a score that never reached the
+        free threshold, too few clearing rays — using the same order as
+        :meth:`classify` so the tally and the classification cannot disagree.
+
+        It counts and returns; no decision reads it.
+        """
+        counts = {
+            "observed": 0,
+            FREE: 0,
+            OCCUPIED: 0,
+            STALE: 0,
+            SURFACE_BAND: 0,
+            "score_below_threshold": 0,
+            "clearing_rays_short": 0,
+            "unstamped": 0,
+        }
+        for evidence in self._cells.values():
+            counts["observed"] += 1
+            age = self._age_s(evidence, now_ns)
+            if age is None:
+                counts["unstamped"] += 1
+                continue
+            if evidence.score >= self.config.occupied_threshold:
+                counts[OCCUPIED] += 1
+                continue
+            if evidence.band:
+                counts[SURFACE_BAND] += 1
+                continue
+            if age > self.config.freshness_s:
+                counts[STALE] += 1
+                continue
+            if evidence.score > -self.config.free_threshold:
+                counts["score_below_threshold"] += 1
+                continue
+            if evidence.clearing_rays < self.config.min_clearing_rays:
+                counts["clearing_rays_short"] += 1
+                continue
+            counts[FREE] += 1
+        return counts
+
 
 _NEIGHBOUR_OFFSETS = (
     (1, 0, 0),
