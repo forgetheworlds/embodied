@@ -25,6 +25,7 @@ cloud never commands motion.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,6 +57,41 @@ PLAN_STEP_ATTEMPTS_CAP = 2
 PLAN_RESOURCE_CEILING_CAP = 6.0
 
 _TARGET_KINDS = ("candidate", "frontier", "place")
+
+# The worked example the plan question shows. Its values are illustrative and
+# its vocabulary is the runner's own, so a reply that copies this shape is
+# already in the language plan_from_reply validates. Built from a literal so
+# it is also what the drift test compares against.
+_EXAMPLE_REPLY = json.dumps(
+    {
+        "mission_recipe": {
+            "steps": [
+                {
+                    "action": "explore",
+                    "target_kind": "frontier",
+                    "target_ref": "next_unvisited",
+                    "guard_kind": "always",
+                    "max_attempts": 2,
+                },
+                {
+                    "action": "inspect",
+                    "target_kind": "candidate",
+                    "target_ref": "next_uninspected",
+                    "guard_kind": "candidate_present",
+                    "max_attempts": 2,
+                },
+                {
+                    "action": "return",
+                    "target_kind": "place",
+                    "target_ref": "start",
+                    "guard_kind": "always",
+                    "max_attempts": 1,
+                },
+            ],
+            "bounds": {"max_steps": 3, "resource_ceiling": 3},
+        }
+    }
+)
 
 
 class PlanRefused(Exception):
@@ -102,18 +138,17 @@ def plan_question(instruction: str) -> str:
     imported from the runner, so the question cannot drift from what
     :func:`plan_from_reply` accepts.
 
-    Two measured failures shaped this text (2026-10-01, same route and frame):
-    with the generic pilot prompt the model proposed no recipe at all, and
-    with the schema stated only loosely it answered with its own inner keys —
-    ``objective``, ``start_pose``, ``frame`` — instead of ``steps``/``bounds``.
-    So the shape is stated exactly, and the reply is confined to it.
+    Three measured failures shaped this text (2026-10-01, one route, one frame):
+    with the generic pilot prompt the model proposed no recipe at all; asked
+    for a schema written with ``<placeholder>`` terms it answered with its own
+    inner keys (``objective``, ``start_pose``, ``frame``); and it wrapped the
+    object in a markdown fence. So the shape is shown as a concrete worked
+    example in the runner's own vocabulary, and it is the entire reply.
     """
     return (
         "You are on the ground before takeoff and nothing has moved yet. Your entire reply "
-        "is ONE JSON object and no prose, in exactly this shape: "
-        '{"mission_recipe": {"steps": [{"action": <intent>, "target_kind": <kind>, '
-        '"target_ref": <ref>, "guard_kind": <guard>, "max_attempts": <1 or 2>}], '
-        '"bounds": {"max_steps": <int>, "resource_ceiling": <number>}}}. '
+        "is ONE JSON object, with no prose and no markdown fence, whose exact shape is this "
+        f"example (values illustrative): {_EXAMPLE_REPLY} "
         'mission_recipe has exactly the two keys "steps" and "bounds" and no others; the '
         "reply has no other top-level keys. "
         f"action must be one of: {', '.join(INTENTS)}. "

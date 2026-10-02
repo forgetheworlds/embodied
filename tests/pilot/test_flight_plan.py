@@ -224,3 +224,33 @@ def test_the_initial_prompt_names_the_plan_class_it_is_asking_for():
     prompt = transport.sent_documents[0]["messages"][0]["content"][0]["text"]
     assert "initial mission plan" in prompt
     assert "mission_recipe" in prompt
+
+def test_a_fenced_json_reply_is_parsed_not_discarded():
+    """Measured: the third live reply was valid JSON inside a ```json fence."""
+    planner, transport, _ = make_planner()
+    fenced = {
+        "choices": [
+            {
+                "message": {
+                    "content": "```json\n"
+                    + json.dumps({"mission_recipe": GOOD_RECIPE})
+                    + "\n```"
+                }
+            }
+        ]
+    }
+    transport.schedule(ScriptedReply(document=fenced))
+    plan = run_plan(planner)
+    assert plan.usable is True
+    assert [step.action for step in plan.recipe.steps] == ["explore", "inspect", "return"]
+
+
+def test_the_question_shows_an_example_the_validator_accepts():
+    """The prompt cannot demonstrate a shape plan_from_reply would refuse."""
+    from embodied.pilot.flight_plan import _EXAMPLE_REPLY
+
+    parsed = type(
+        "Parsed", (), {"mission_recipe": json.loads(_EXAMPLE_REPLY)["mission_recipe"]}
+    )()
+    recipe = plan_from_reply(parsed)
+    assert [step.action for step in recipe.steps] == ["explore", "inspect", "return"]

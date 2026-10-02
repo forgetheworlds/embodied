@@ -503,6 +503,26 @@ class ParsedReply:
     malformed_reason: str | None = None
 
 
+def _unfence(content: str) -> str:
+    """Strip a markdown code fence from a reply's JSON block.
+
+    Measured 2026-10-01 on the pinned route: asked for one JSON object, the
+    model returned it inside a ```json fence, so ``json.loads`` saw no JSON at
+    all and a perfectly well-formed plan read as absent. The fence is a reply
+    formatting artifact, not content: removing it changes what is parsed,
+    never what is accepted — the parsed document still has to satisfy the
+    record's own validation.
+    """
+    text = content.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    lines = lines[1:] if lines else lines
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def parse_reply(document: dict[str, Any], request: DecisionRequest) -> ParsedReply:
     try:
         choice = document["choices"][0]["message"]
@@ -518,7 +538,7 @@ def parse_reply(document: dict[str, Any], request: DecisionRequest) -> ParsedRep
     recipe: dict[str, Any] | None = None
     malformed: list[str] = []
     try:
-        structured = json.loads(content) if isinstance(content, str) else content
+        structured = json.loads(_unfence(content)) if isinstance(content, str) else content
     except json.JSONDecodeError:
         # Free text is a valid answer: only a structured block that fails its
         # record's own validation is malformed.
