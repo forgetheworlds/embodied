@@ -191,10 +191,6 @@ PERCEPTION_PUMP_SLEEP_S = 0.02
 # The most observation ids a step may cite. A bounded citation list keeps a
 # long mission's report readable without letting a claim grow without limit.
 MAX_CITED_OBSERVATIONS = 256
-# Distinct perception-refusal reasons written into a run's record. The summary
-# is bounded so a pathological scene cannot turn the log into a wall of text;
-# the counts still say how many of each there were.
-MAX_PERSISTED_REFUSAL_REASONS = 12
 # How many times one blocked phase may gather again before the mission moves on.
 # Retrying without a bound is what spent the whole 300 s mission budget inside
 # `explore` on live-vision-1 and starved `inspect` and `return`, so the mission
@@ -1099,15 +1095,6 @@ class MissionRuntime:
                 f"perception refusals: {total} over "
                 f"{len(self._perception_refusal_counts)} distinct reason(s)"
             )
-            ranked = sorted(
-                self._perception_refusal_counts.items(), key=lambda item: (-item[1], item[0])
-            )
-            for reason, count in ranked[:MAX_PERSISTED_REFUSAL_REASONS]:
-                self.result.log.append(f"  x{count} {reason}")
-            if len(ranked) > MAX_PERSISTED_REFUSAL_REASONS:
-                self.result.log.append(
-                    f"  ... and {len(ranked) - MAX_PERSISTED_REFUSAL_REASONS} more reason(s)"
-                )
         # Always reported, refusals or none: it is the number that separates
         # "the mission looked and found nothing to aim at" from "the mission
         # never looked", and the two failures have nothing in common.
