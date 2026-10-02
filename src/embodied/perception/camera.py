@@ -71,6 +71,20 @@ FOCAL_LENGTH_PX = 554.2562584220407  # == _DECLARED_WIDTH_PX / (2 tan(pi/6)); as
 assert abs(FOCAL_LENGTH_PX - _DECLARED_WIDTH_PX / (2.0 * math.tan(_DECLARED_FOV_RAD / 2.0))) < 1e-9
 PRINCIPAL_POINT_PX = (_DECLARED_WIDTH_PX / 2.0, _DECLARED_HEIGHT_PX / 2.0)
 
+# ORB's FAST corner threshold. It is NOT declared: the config's ``features``
+# section carries detector, nfeatures, scale_factor, nlevels and
+# descriptor_ratio_threshold (cli.py's schema admits exactly those), and
+# ``cv2.ORB_create`` leaves the rest at OpenCV's defaults — so this value is what
+# has actually been in force for every B1 number this project has reported.
+# It is the parameter that decides how many features a scene yields, and on a
+# low-contrast, finely-textured scene it is the operative constraint: the
+# mission scene returns 36 keypoints at this value and 951 at 5, while the
+# compat scene returns 25 either way. It is named here so it is visible in the
+# code and recorded in the evidence; the value is deliberately NOT changed,
+# because choosing it is a declared-parameter decision (R2). The measurement
+# that bears on that choice is work/runs/p05/J18-rectify-REPORT.md.
+OPENCV_DEFAULT_FAST_THRESHOLD = 20
+
 _PIXEL_CONVENTION = (
     "top-left origin, [column, row]; columns run along body -y (rightward) and rows "
     "run along body -z (down), because a Webots camera's optical axis is its own +x; "
@@ -485,38 +499,50 @@ def match_keypoints(
     """ORB detect + ratio-test match, then the B1 geometry summary.
 
     Returns retained-match row residuals (``x_left - x_right`` row difference),
-    their horizontal disparities, and the counts. The ratio test is Lowe's
-    standard 0.8; parameters come from the pre-registered config section.
+    their horizontal disparities, and the counts, together with the detector
+    settings actually used (``settings``) so a reader of the evidence can see
+    which parameters produced the numbers — including the FAST threshold, which
+    is not declared in the config and therefore defaults to OpenCV's own
+    (OPENCV_DEFAULT_FAST_THRESHOLD above).
     """
     import cv2  # lazy
 
+    settings = {
+        "detector": str(features.get("detector", "ORB")),
+        "nfeatures": int(features["nfeatures"]),
+        "scale_factor": float(features["scale_factor"]),
+        "nlevels": int(features["nlevels"]),
+        "fast_threshold": int(
+            features.get("fast_threshold", OPENCV_DEFAULT_FAST_THRESHOLD)
+        ),
+        "descriptor_ratio_threshold": float(features["descriptor_ratio_threshold"]),
+    }
+    # Every return carries the same settings, so a pair that retains nothing is
+    # still readable as "these parameters retained nothing".
+    empty = {
+        "n_retained": 0,
+        "row_residual_median_px": None,
+        "row_residual_p95_px": None,
+        "positive_disparity_fraction": None,
+        "disparity_median_px": None,
+        "settings": settings,
+    }
     orb = cv2.ORB_create(
-        nfeatures=int(features["nfeatures"]),
-        scaleFactor=float(features["scale_factor"]),
-        nlevels=int(features["nlevels"]),
+        nfeatures=settings["nfeatures"],
+        scaleFactor=settings["scale_factor"],
+        nlevels=settings["nlevels"],
+        fastThreshold=settings["fast_threshold"],
     )
     key_left, desc_left = orb.detectAndCompute(left_gray, None)
     key_right, desc_right = orb.detectAndCompute(right_gray, None)
     if desc_left is None or desc_right is None:
-        return {
-            "n_retained": 0,
-            "row_residual_median_px": None,
-            "row_residual_p95_px": None,
-            "positive_disparity_fraction": None,
-            "disparity_median_px": None,
-        }
+        return dict(empty)
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
     pairs = matcher.knnMatch(desc_left, desc_right, k=2)
-    ratio = float(features["descriptor_ratio_threshold"])
+    ratio = settings["descriptor_ratio_threshold"]
     retained = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < ratio * n.distance]
     if not retained:
-        return {
-            "n_retained": 0,
-            "row_residual_median_px": None,
-            "row_residual_p95_px": None,
-            "positive_disparity_fraction": None,
-            "disparity_median_px": None,
-        }
+        return dict(empty)
     rows = np.array(
         [
             key_left[m.queryIdx].pt[1] - key_right[m.trainIdx].pt[1]
@@ -535,6 +561,7 @@ def match_keypoints(
         "row_residual_p95_px": float(np.percentile(np.abs(rows), 95)),
         "positive_disparity_fraction": float((disparities > 0).mean()),
         "disparity_median_px": float(np.median(disparities)),
+        "settings": settings,
     }
 
 
