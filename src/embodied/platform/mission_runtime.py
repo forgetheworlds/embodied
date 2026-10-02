@@ -201,6 +201,13 @@ MAX_PERSISTED_REFUSAL_REASONS = 12
 # never returned and its own report said so. The mission may look again; it may
 # not look so long that the later phases lose their budget.
 MAX_PHASE_REGATHERS = 3
+# One recorded commanded setpoint per this much SIMULATOR time, and the most
+# that are kept. A mission publishes tens of times a second and records only a
+# COUNT, so a reader could not see whether the aircraft was told to climb; one
+# sample per second puts the commanded vertical target beside the achieved
+# altitude without turning the run record into a setpoint log.
+COMMANDED_SAMPLE_SIM_S = 1.0
+MAX_COMMANDED_SAMPLES = 512
 # The cold-start perception window: bounded, in simulator seconds, before the
 # mission's phases begin. It exists to break the bootstrap on the mission's
 # first flight — the map a frontier is resolved from can only be built from the
@@ -381,6 +388,17 @@ class MissionRuntime:
         self._observation_ids: list[str] = []
         self._perception_refusal_counts: dict[str, int] = {}
         self._frames_without_candidate = 0
+        # Where a perception cycle's wall time actually goes. live-vision-3
+        # spent 3.93 wall seconds per cycle against a declared cadence of 0.30,
+        # so the cadence was not honoured and the reason was inside the cycle.
+        # Splitting drain from depth makes that readable instead of a guess.
+        self._perception_drain_s = 0.0
+        self._perception_depth_s = 0.0
+        # One commanded setpoint per declared sim interval, bounded. The run
+        # recorded only the COUNT of publications, so no artifact could show
+        # whether the aircraft was told to climb.
+        self._commanded: list[dict[str, object]] = []
+        self._last_commanded_sim_s: float | None = None
         self._state_ring: list[tuple[int, loc.EstimatorState]] = []
         self._latest_state: loc.EstimatorState | None = None
         self._latest_aligned: dict[str, object] | None = None
@@ -817,6 +835,14 @@ class MissionRuntime:
                 "perception_observations": self._observation_counter,
                 "perception_interval_s": MIN_PERCEPTION_INTERVAL_S,
                 "perception_refusal_reasons": len(self._perception_refusal_counts),
+                # Where a perception cycle's wall time went, and what was
+                # actually commanded. Both exist because a run that says only
+                # "85 cycles" and "0 publications" cannot be read: the first
+                # hides whether the cadence was honoured and why not, the second
+                # hides whether the aircraft was ever told to go anywhere.
+                "perception_drain_s": round(self._perception_drain_s, 3),
+                "perception_depth_s": round(self._perception_depth_s, 3),
+                "commanded_setpoints": list(self._commanded),
                 "publisher_published": getattr(publisher, "published", None),
                 "publisher_failures": list(getattr(publisher, "publish_failures", [])),
             }
@@ -1138,9 +1164,14 @@ class MissionRuntime:
             now = time.monotonic()
             if now >= next_cycle:
                 next_cycle = now + MIN_PERCEPTION_INTERVAL_S
+                t_drain_start = time.monotonic()
                 drain()
+                t_frame_start = time.monotonic()
                 before = self._perception_cycles
                 self.perceive_if_due()
+                t_end = time.monotonic()
+                self._perception_drain_s += t_frame_start - t_drain_start
+                self._perception_depth_s += t_end - t_frame_start
                 if self._perception_cycles > before:
                     cycles += 1
                     if until is not None and until():
@@ -1376,9 +1407,56 @@ class MissionRuntime:
             self._publish_refusal_count += 1
             return "guided_flight_lost"
         self._publication_count += 1
+        self._record_commanded_setpoint(
+            position_ned=position_ned,
+            velocity_ned=velocity_ned,
+            certificate_ref=certificate_ref,
+            goal_ref=active.goal_id,
+        )
         active.setpoints = (*active.setpoints[-3:], sent.setpoint)
         self._sink("setpoint", R.to_dict(sent.setpoint), sent.published_stamp, None)
         return None
+
+    def _record_commanded_setpoint(
+        self,
+        *,
+        position_ned,
+        velocity_ned,
+        certificate_ref: str,
+        goal_ref: str,
+    ) -> None:
+        """Record what was actually commanded, not merely that something was.
+
+        The run kept a COUNT of publications, so no artifact could answer
+        whether the aircraft was told to climb and never went anywhere: the
+        commanded vertical target was written down nowhere. One sample per
+        COMMANDED_SAMPLE_SIM_S of simulator time is enough to put the command
+        beside the achieved altitude. Nothing here changes what is sent; it
+        records it, in the frame it was sent in, with the goal and certificate
+        it came from.
+        """
+        sim_now = self._stats.sim_clock.newest_s
+        if sim_now is None:
+            return
+        if (
+            self._last_commanded_sim_s is not None
+            and sim_now - self._last_commanded_sim_s < COMMANDED_SAMPLE_SIM_S
+        ):
+            return
+        self._last_commanded_sim_s = sim_now
+        self._commanded.append(
+            {
+                "sim_s": round(float(sim_now), 3),
+                "frame": "local_ned",
+                "position_m": [round(float(value), 4) for value in position_ned],
+                "velocity_mps": [round(float(value), 4) for value in velocity_ned],
+                "yaw_rad": MISSION_YAW_HOLD_RAD,
+                "goal_ref": goal_ref,
+                "certificate_ref": certificate_ref,
+            }
+        )
+        if len(self._commanded) > MAX_COMMANDED_SAMPLES:
+            del self._commanded[0]
 
     def _log_certificate_shape(self, certificate) -> None:
         """Record once, per certificate, what it actually commands.
