@@ -593,6 +593,39 @@ BRING_UP_CLIMB_RATE_PARAMETER = "PILOT_SPD_UP"
 BRING_UP_CLIMB_RATE_WINDOW_VALUE = 0.3  # re-declared from 0.5, see the 2026-09-29 note above
 BRING_UP_CLIMB_RATE_RESTORE_VALUE = 2.5  # the pin's own default
 
+# The window's sixth parameter, and the one the whole excitation turns on: the
+# arm's own survival on the ground.
+#
+# THE MEASURED DEFECT (live-20, 2026-10-02, read from that run's own heartbeat
+# stream and its motor-output record). The bring-up arms the aircraft on the
+# ground and then opens a thrust path before it commands the takeoff -- by design,
+# and the design is right. Copter's housekeeping timer runs against that arm:
+# Copter::auto_disarm_check (ArduCopter/motors.cpp:11-58) disarms once the vehicle
+# has been landed on a low throttle for DISARM_DELAY, with two provisions that
+# decide this window. While the motor interlock is engaged-and-down -- and Copter
+# holds it down for its own 2.0 s ap.in_arming_delay after arming
+# (motors.cpp:59,75) -- the delay is HALVED and the timer is NOT reset
+# (motors.cpp:31-36), so the arm gets 10/2 = 5 s; and the motors library FORCES the
+# spool to SHUT_DOWN while the interlock is down (AP_MotorsMulticopter.cpp:619-638),
+# so nothing can request the spool-up that would inhibit the timer during those same
+# 2 s. About 3 s are left for the thrust path to open before the arm is discarded.
+# Measured: live-20's heartbeats read armed=True for 4.70 s and then armed=False,
+# its four motor outputs never left 1000 us, the takeoff then arrived with the
+# vehicle already disarmed, and the run could not recover -- 15 arm attempts, none
+# holding.
+#
+# THE VALUE. 60 s, for the window only. This is not a check and not one of this
+# project's declared budgets: it is a housekeeping timer for a forgotten armed
+# vehicle, and this window arms deliberately, on the ground, for a bounded and
+# declared interval (EXCITATION_MAX_AIRTIME_S) before it climbs. Declaring it here
+# removes a race the window should not have to win. It does not enable a refused
+# arm -- the arming checks are untouched and still refuse whatever they refuse.
+# Restored to the firmware's own default (10, AUTO_DISARMING_DELAY at
+# ArduCopter/config.h:546) and read back before the claimed arm.
+BRING_UP_DISARM_DELAY_PARAMETER = "DISARM_DELAY"
+BRING_UP_DISARM_DELAY_WINDOW_VALUE = 60.0
+BRING_UP_DISARM_DELAY_RESTORE_VALUE = 10.0  # ArduCopter/config.h:546, the pin's default
+
 
 BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
     (
@@ -692,6 +725,21 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
         "exit at the unstick itself and the closed-loop wind-up never runs while "
         "stuck. Restored to the firmware's own default 2.0 before the scored "
         "window opens",
+    ),
+    (
+        BRING_UP_DISARM_DELAY_PARAMETER,
+        BRING_UP_DISARM_DELAY_WINDOW_VALUE,
+        BRING_UP_DISARM_DELAY_RESTORE_VALUE,
+        "the arm's own survival on the ground while the thrust path is opened: "
+        "Copter::auto_disarm_check (ArduCopter/motors.cpp:11-58) halves the delay "
+        "and stops resetting its timer while the motor interlock is down "
+        "(motors.cpp:31-36), and Copter holds that interlock down for its own 2.0 s "
+        "ap.in_arming_delay after arming (motors.cpp:59,75) while the motors library "
+        "forces the spool to SHUT_DOWN (AP_MotorsMulticopter.cpp:619-638) -- so only "
+        "about 3 s remain for the thrust path to open and inhibit the timer, and "
+        "live-20 lost that race with the arm discarded after 4.70 s. Housekeeping, "
+        "not a check: the arming path is unchanged. Restored to the pin's default 10 "
+        "before the claimed arm",
     ),
 )
 
@@ -795,7 +843,21 @@ BRING_UP_GCS_CONNECT_TIMEOUT_S = 15.0
 # and this loop is the window's, not the claimed arm's, so they are declared
 # here rather than borrowed.
 BRING_UP_ARM_SETTLE_S = 1.0
-BRING_UP_ARM_RETRY_S = 5.0
+# The arm retry cadence, and why it is this short. The autopilot cannot arm until
+# its own IMU-consistency window has elapsed: ins_accels_consistent
+# (AP_Arming.cpp:462-480) returns false until AP_ARMING_IMU_CONSISTENCY_CHECK_TIME_MS
+# (10000, AP_Arming.cpp:113-114) has passed since the first check that found the
+# accelerometers consistent, and the message it emits while waiting is "Arm: Accels
+# inconsistent". Measured across 22 retained flights, the two accelerometers agree to
+# 0.0033-0.0054 m/s^2 against the declared 0.75 m/s^2 (ARMING_ACCTHRESH,
+# AP_Arming.cpp:79) throughout the pre-arm window -- zero samples over threshold,
+# ever -- so the refusal is that warm-up and not a sensor fault. At the previous
+# 5.0 s cadence (1.0 s settle + 5.0 s retry) an attempt arrived only every 6 s, so
+# the third attempt was the first that could succeed and the arm was taken up to 6 s
+# after the autopilot would have given it. At 1.0 s the attempt cadence is 2 s, so
+# the arm is taken as soon as the autopilot will give it and the whole post-arm
+# phase keeps its margin.
+BRING_UP_ARM_RETRY_S = 1.0
 # How long the window waits for the vehicle's own answer to each declaration:
 # the GPS_GLOBAL_ORIGIN echo that proves the origin was accepted, and the
 # COMMAND_ACK that carries the takeoff's result.
