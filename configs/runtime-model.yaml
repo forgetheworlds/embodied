@@ -26,6 +26,37 @@ model:
   api: openai-completions
   base_url: https://api.commandcode.ai/provider/v1
   image_transport: base64         # APPROVAL-RECORD.md:46 — URL fetch fails server-side; base64 measured working
+  # The owner's ruling of 2026-10-01 splits the two classes of cloud call: the
+  # initial mission interpretation reasons, but the tactical updates that
+  # arrive while the aircraft is moving must fit the decision budget or the
+  # continuous-cloud arm cannot exist. `image_scale` is the one reserved key in
+  # a profile; every other key is a generation parameter passed straight into
+  # the request. Callers that predate the split are unchanged: an undeclared
+  # class gets the base `generation` and the captured frame.
+  #
+  # Measured on this route 2026-10-01 (J4, ten frames of a real captured
+  # stereo pair, decision quality scored beside every number):
+  #   captured resolution, reasoning on    p50 11.64 s   quality 11/11
+  #   captured resolution, reasoning off   p50  5.35 s   quality 10/10
+  #   quarter scale,       reasoning off   p50  2.67 s   quality 10/10
+  # `reasoning_effort: low` measured NO reduction (16.27 s with 1,544
+  # reasoning tokens), so no profile uses it. The residual floor is transport
+  # plus text prefill, not the model. The declared `latency_budget_s` below is
+  # NOT changed by any of this; the floor and the measurement are reported in
+  # work/runs/p05/J6-cloud-effort-REPORT.md.
+  call_profiles:
+    initial:
+      image_scale: 1.0
+      reasoning_effort: high
+    continuous:
+      image_scale: 0.25
+      reasoning_effort: "off"
+
+  # NOTE: quote it. YAML 1.1 reads an unquoted `off` as the boolean false, so
+  # `reasoning_effort: off` would put `false` in the request body instead of
+  # the string the API accepts, and nothing downstream would complain.
+  # `provider.parse_call_profiles` now refuses a non-string reasoning_effort
+  # for exactly this reason.
   alternates:
     - id: opencode-go/deepseek-v4.1-flash
       source: the previously declared route (2026-09-26); superseded by the owner's 2026-10-01 pin of commandcode, kept for provenance

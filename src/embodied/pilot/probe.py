@@ -40,6 +40,7 @@ from embodied.cli import (
 from embodied.contracts.records import ClockStamp, DecisionRequest, Observation, from_dict
 from embodied.pilot.decisions import PilotParameters
 from embodied.pilot.provider import (
+    CALL_CONTINUOUS,
     LiveTransport,
     ModelConfig,
     Provider,
@@ -480,12 +481,6 @@ def load_stereo_pairs(pairs_dir: Path, count: int) -> list[tuple[str, bytes, byt
             pairs.append((left.name.replace("-left.ppm", ""), left.read_bytes(), right.read_bytes()))
     return pairs
 
-def _encode_png_uri(payload: bytes) -> str:
-    """Deprecated alias kept for the sampler's callers; the single encoding
-    path is :func:`embodied.pilot.provider.encode_image_data_uri` (PNG, with
-    PPM re-encoded), which this now forwards to."""
-    return encode_image_data_uri(payload)
-
 
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
@@ -495,32 +490,13 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
-def _scale_frame(payload: bytes, scale: float) -> bytes:
-    """Downscale one captured frame and return PNG bytes.
-
-    Measurement-only: the checked-in observation contract sends the captured
-    resolution. This exists so the reply-time decomposition can separate the
-    image payload's cost (upload plus image prefill) from the transport's own
-    cost, which no amount of prompt discipline can move.
-    """
-    import io
-
-    from PIL import Image
-
-    image = Image.open(io.BytesIO(payload))
-    width = max(1, round(image.width * scale))
-    height = max(1, round(image.height * scale))
-    buffer = io.BytesIO()
-    image.resize((width, height)).save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
 def execute_tactical_sample(
     config: dict[str, Any],
     pairs: list[tuple[str, bytes, bytes]],
     transport,
     samples: int,
     *,
+    call_class: str | None = None,
     image_scale: float = 1.0,
     with_image: bool = True,
 ) -> dict[str, Any]:
@@ -532,10 +508,19 @@ def execute_tactical_sample(
     effort, model id) are whatever the caller loaded into ``config['model']``:
     they flow through :class:`ModelConfig` into the request document and are
     recorded in the report's ``effective_model``, so a receipt always names
-    the exact request shape that produced its numbers.
+    the exact request shape that produced its numbers. When ``call_class`` is
+    given, the declared profile for that class supplies the reasoning effort
+    and the frame scale: that is the difference between measuring a shape the
+    mission will actually use and measuring a shape only this probe can make.
     """
     model = ModelConfig.from_config(config["model"])
     parameters = PilotParameters.from_config(config["pilot"])
+    # A declared class supplies both the reasoning effort and the frame scale.
+    # An explicit measurement override still wins, and an undeclared class is
+    # exactly the base configuration every class-less caller already had.
+    resolved_scale = model.image_scale_for(call_class) if call_class else 1.0
+    if image_scale != 1.0:
+        resolved_scale = image_scale
     provider = Provider(model, transport, TOOL_SCHEMAS)
     calls: list[dict[str, Any]] = []
 
@@ -554,11 +539,9 @@ def execute_tactical_sample(
         encode_start_ns = time.monotonic_ns()
         image_parts: tuple[tuple[str, str], ...] = ()
         if with_image:
-            left_payload = _scale_frame(left, image_scale) if image_scale != 1.0 else left
-            right_payload = _scale_frame(right, image_scale) if image_scale != 1.0 else right
             image_parts = (
-                (pair_id, _encode_png_uri(left_payload)),
-                (pair_id, _encode_png_uri(right_payload)),
+                (pair_id, encode_image_data_uri(left, scale=resolved_scale)),
+                (pair_id, encode_image_data_uri(right, scale=resolved_scale)),
             )
         encode_ms = (time.monotonic_ns() - encode_start_ns) / 1_000_000
         packet = RequestPacket(
@@ -568,6 +551,7 @@ def execute_tactical_sample(
             navigation_status=SAMPLE_NAV_STATUS[index % len(SAMPLE_NAV_STATUS)],
             uncertainty_summary="pose sigma 0.05 m horizontal; stereo depth invalid on the textureless floor",
             explicit_question=SAMPLE_QUESTIONS[index % len(SAMPLE_QUESTIONS)],
+            call_class=call_class or CALL_CONTINUOUS,
         )
         send_ns = time.monotonic_ns()
         provider.submit(request, packet, ClockStamp(SAMPLE_HOST, "monotonic", send_ns))
@@ -624,10 +608,13 @@ def execute_tactical_sample(
         "effective_model": {
             "id": model.id,
             "reply_format": model.reply_format,
-            "generation": dict(model.generation),
+            "call_class": call_class,
+            "generation": dict(model.generation_for(call_class or CALL_CONTINUOUS)),
+            "base_generation": dict(model.generation),
         },
         "measurement": {
-            "image_scale": image_scale,
+            "call_class": call_class,
+            "image_scale": resolved_scale,
             "with_image": with_image,
             "reasoning_tokens": [
                 int((u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0))
@@ -703,6 +690,11 @@ def _main() -> int:
     )
     parser.add_argument("--label", default=None, help="run label recorded into the output and printed")
     parser.add_argument(
+        "--call-class",
+        default=None,
+        help="measure the declared profile for one call class (initial: reasons, captured frame; continuous: no reasoning, reduced frame) instead of the base configuration",
+    )
+    parser.add_argument(
         "--image-scale",
         type=float,
         default=1.0,
@@ -753,6 +745,17 @@ def _main() -> int:
     if overrides:
         config["model"] = {**config["model"], **overrides}
 
+    # A call class is resolved from the checked-in configuration, never
+    # invented on the command line: an undeclared class would silently measure
+    # the base shape while the receipt claimed otherwise.
+    declared_classes = sorted(name for name, _ in ModelConfig.from_config(config["model"]).call_profiles)
+    if args.call_class is not None and args.call_class not in declared_classes:
+        print(
+            f"refused: --call-class {args.call_class!r} is not declared in {args.config} "
+            f"(declared: {', '.join(declared_classes) or 'none'})"
+        )
+        return 2
+
     pairs = load_stereo_pairs(args.pairs_dir, args.samples)
     if not pairs:
         print(f"refused: no stereo pairs found under {args.pairs_dir}")
@@ -764,13 +767,15 @@ def _main() -> int:
         pairs,
         transport,
         min(args.samples, len(pairs)),
+        call_class=args.call_class,
         image_scale=args.image_scale,
         with_image=not args.no_image,
     )
     report["overrides"] = {k: v for k, v in overrides.items() if k not in ("image_scale", "with_image")} or "none"
-    if args.image_scale != 1.0 or args.no_image:
+    if args.image_scale != 1.0 or args.no_image or args.call_class is not None:
         report["overrides"] = {
             "model": report["overrides"],
+            "call_class": args.call_class,
             "image_scale": args.image_scale,
             "with_image": not args.no_image,
         }
