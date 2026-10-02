@@ -132,6 +132,26 @@ class FakeClock:
         self.now += max(float(seconds), self.step_s)
 
 
+
+class TickingClock(FakeClock):
+    """A clock that advances on every read, for a valve measured against wall time.
+
+    The drain valve is wall time on the consumer: ``_read_records`` reads the
+    clock once per drained record and stops when SENSOR_DRAIN_LIMIT_S has
+    elapsed. With the real clock, whether the valve fires before the record
+    bound is reached depends on how fast this host produced records relative to
+    how fast the consumer drained them — so the assertion about
+    ``drains_stopped_early`` measured the machine, and the test returned
+    failed, passed, failed across three runs at one commit.
+
+    Reading advances the clock by a fixed step, so the valve fires after a
+    fixed number of records on any host.
+    """
+
+    def monotonic(self):
+        self.now += self.step_s
+        return self.now
+
 class FakeRunner:
     """Spawns nothing, and remembers what it was asked to spawn and terminate."""
 
@@ -2845,21 +2865,24 @@ def test_records_read_while_the_consumer_is_elsewhere_are_all_kept(tmp_path):
 def test_the_consumer_pass_reports_when_its_own_valve_stops_it(tmp_path):
     """The drain bounds cap the consumer's pass, not the socket.
 
-    The valve is wall time on the consumer, so this rig runs on the real clock.
+    The valve is wall time on the consumer, so the clock is injected. It advances
+    on each read, which fires the valve after a fixed number of records on any
+    host instead of after however long this machine took to produce them.
     A pass that gives up must leave the stream still being read: the next pass
     gets records the reader gathered while this one had given up, and the pass's
     own accounting says it stopped early.
     """
     settings = settings_for(write_scene(tmp_path), tmp_path)
+    clock = TickingClock()
     probe = W.CompatibilityProbe(
         settings,
         output_dir=tmp_path / "out",
         runner_factory=FakeRunner,
         session_factory=lambda: ScriptedMavlinkSession(FakeClock()),
         gateway_factory=lambda: EndlessGateway(FakeClock()),
-        monotonic_ns=time.monotonic_ns,
-        monotonic=time.monotonic,
-        sleep=time.sleep,
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
     )
     writer = W.EvidenceWriter(tmp_path / "out", "run-a")
     adapter = probe._new_adapter(writer, "run-a", ())
