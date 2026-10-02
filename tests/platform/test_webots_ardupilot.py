@@ -812,12 +812,15 @@ def test_the_iteration_no_rendering_knob_reaches_the_simulator_argv(tmp_path, mo
 
     It appends Webots' own ``--no-rendering``, which disables the main 3D view and
     leaves the Camera devices that feed the estimator alone; the harness never sets
-    it, so a scored run's argv is the same six arguments with or without the knob.
+    it, so a scored run's argv is the same arguments with or without the knob.
+    ``--minimize`` is always present: ``--batch`` only suppresses blocking pop-up
+    windows (Webots R2025a ``--help``), and without ``--minimize`` the main window
+    appeared on the owner's screen on every run.
     """
     config_path = write_scene(tmp_path)
     baseline = settings_for(config_path, tmp_path).simulator_argv()
     assert "--no-rendering" not in baseline
-    assert baseline[1:3] == ("--batch", "--mode=realtime")
+    assert baseline[1:4] == ("--batch", "--minimize", "--mode=realtime")
     assert baseline[-1].endswith(".wbt")
     monkeypatch.setenv("EMBODIED_WEBOTS_NO_RENDERING", "1")
     with_flag = settings_for(config_path, tmp_path).simulator_argv()

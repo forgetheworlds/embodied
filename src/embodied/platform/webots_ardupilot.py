@@ -1148,18 +1148,25 @@ class PlatformSettings:
             raise ConfigError("platform.endpoints ports must be positive integers")
 
     def simulator_argv(self) -> tuple[str, ...]:
-        """The exact Webots command line, headless at the configured simulation mode.
+        """The exact Webots command line, with its window kept out of the way.
+
+        ``--batch`` only prevents Webots from creating blocking pop-up windows
+        (Webots R2025a ``--help``). It does not stop the main window being created,
+        which is why a run appeared on the owner's screen every time. ``--minimize``
+        starts that window minimised. Neither flag changes what the simulation
+        computes.
 
         ``EMBODIED_WEBOTS_NO_RENDERING=1`` appends Webots' own ``--no-rendering``,
         an ITERATION-ONLY speed knob the harness never sets: it disables rendering
         of the main 3D view (Webots R2025a ``--help``: "Disable rendering in the
         main 3D view"), while the Camera devices the estimator is fed from render
-        on their own pipeline. A scored run's argv is therefore unchanged, and the
-        manifest records the argv actually used (``webots.argv``).
+        on their own pipeline. The manifest records the argv actually used
+        (``webots.argv``).
         """
         argv = [
             str(self.webots_binary),
             "--batch",
+            "--minimize",
             f"--mode={self.webots_mode}",
             "--stdout",
             "--stderr",
