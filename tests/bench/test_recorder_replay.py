@@ -328,7 +328,7 @@ def test_record_refuses_a_suite_that_is_not_registered(tmp_path):
             "bench",
             "record",
             "--suite",
-            "first-indoor",
+            "not-registered-in-this-build",
             "--sensor-mode",
             "sensor-derived",
             "--arm",
@@ -341,6 +341,9 @@ def test_record_refuses_a_suite_that_is_not_registered(tmp_path):
     receipt = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
     assert receipt["status"] == "blocked"
     assert receipt["gate_status"] == "not_applicable"
+    # The requested name is the one refused; the hint then names the suite that
+    # IS registered (first-indoor, P05) so a reader knows what to ask for.
+    assert "not-registered-in-this-build" in receipt["reasons"][0]
     assert "first-indoor" in receipt["reasons"][0]
     assert "P05" in receipt["reasons"][0]
     assert receipt["sensor_mode"] == "sensor-derived"
