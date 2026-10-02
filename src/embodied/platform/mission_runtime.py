@@ -936,9 +936,17 @@ class MissionRuntime:
         # its age on the host clock would make every cell read stale the moment
         # it was written.
         self._capture_clock_ns = max(self._capture_clock_ns or 0, int(pair.capture_host_ns))
-        pose = self._capture_pose(record)
+        # The alignment has to be sealed before a capture-time pose can be built:
+        # an unsealed one has no odom rotation, and its own accessor refuses
+        # rather than guessing the frame's unobservable yaw. So ask for the
+        # navigation state FIRST and record nothing until the estimator has
+        # defined the epoch. Perception now starts during the bring-up, on the
+        # way up, so "not sealed yet" is the ordinary case rather than an error.
         state = self._navigation_state()
-        if pose is None or state is None:
+        if state is None:
+            return
+        pose = self._capture_pose(record)
+        if pose is None:
             return
         try:
             left = np.frombuffer(pair.left_bytes, dtype=np.uint8).reshape(
@@ -1046,7 +1054,18 @@ class MissionRuntime:
             ),
             receipt_stamp=record.received_stamp,
             sim_time_s=record.sim_time_s if record.sim_time_s >= 0.0 else None,
-            pair_id=f"{self.episode_id}-pair-{pair.pair_id:06d}",
+            # The pair id travels with the payloads or not at all: the observation
+            # record requires all three or none of them (records.py, "an
+            # observation carries the pair id and both payloads, or none of
+            # them"), and this runtime stores the frames only for an observation
+            # that grounded a candidate — the evidence a claim can cite. Setting
+            # the id unconditionally is a half-reference the recorder refuses,
+            # and it was invisible while perception never ran.
+            pair_id=(
+                f"{self.episode_id}-pair-{pair.pair_id:06d}"
+                if left_payload is not None
+                else None
+            ),
             left_payload=left_payload,
             right_payload=right_payload,
             encoding=pair.encoding,
