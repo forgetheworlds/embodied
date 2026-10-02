@@ -588,22 +588,23 @@ class MissionRuntime:
                     return
 
         last_telemetry = 0.0
-        next_perception_pump = 0.0
 
         def drain() -> None:
-            nonlocal last_telemetry, next_perception_pump
-            now = time.monotonic()
-            # Perception is a continuous responsibility (specification 3.3),
-            # not step-scoped work: the map and the candidate stream have to
-            # exist before a goal is proposed. Pumping it only from inside a
-            # step deadlocked the mission against its own empty map, because
-            # the first step could not resolve a target and so never ran.
-            if now >= next_perception_pump:
-                next_perception_pump = now + MIN_PERCEPTION_INTERVAL_S
-                self.perceive_if_due()
-            if now - last_telemetry < 0.2:
+            nonlocal last_telemetry
+            # Deliberately NOT a perception pump. `drain` runs inside the
+            # ordered bring-up, whose RC-throttle override must be refreshed
+            # every 0.5 s inside the firmware's own 3.0 s override timeout.
+            # Running stereo depth here (SGBM, 128 disparities over 640x480)
+            # starved that refresh: on live-10 the vehicle's own RC report read
+            # 1000 us while the window sent 1899 us, so the excitation had no
+            # thrust path at all, the open-loop takeoff ramp then ran unbounded
+            # to 1.19 m, and the aircraft tipped over at roll -90 deg.
+            # Perception is pumped where it belongs instead: a bounded
+            # cold-start window before the phases, and inside each step's own
+            # loop, which is where the map is built from flown observation.
+            if time.monotonic() - last_telemetry < 0.2:
                 return
-            last_telemetry = now
+            last_telemetry = time.monotonic()
             try:
                 platform.telemetry()
             except Exception as error:
@@ -1255,6 +1256,11 @@ class _LiveAdmission:
             mission_revision=runtime.contract.revision,
             snapshot_id=runtime.store.snapshot_id,
             now_ns=runtime._now_ns(),
+            # The one declared pose-validity parameter, taken from the module
+            # that owns it rather than restated here (R2: a declared value has
+            # one home). It bounds how old a pose may be before a selection
+            # transformed with it is refused.
+            pose_validity_s=G.POSE_VALIDITY_S,
         )
         if result.accepted is None:
             for ref in proposal.target_refs:
@@ -1501,6 +1507,7 @@ class _LiveRunnerWorld:
             mission_revision=runtime.contract.revision,
             snapshot_id=runtime.store.snapshot_id,
             now_ns=runtime._now_ns(),
+            pose_validity_s=G.POSE_VALIDITY_S,
         )
         if result.accepted is not None and result.certificate is not None:
             active.certificate = result.certificate
