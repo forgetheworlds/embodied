@@ -987,11 +987,14 @@ def test_pilot_probe_with_a_fake_transport_records_its_checks_and_no_credentials
     assert len(report.latency) == 3
     assert all(record["round_trip_unseparated"] is True for record in report.latency)
     assert report.latency[0]["usage"] == {"total_tokens": 120}
-    # The image really travelled: the transport saw a base64 data URI.
+    # The image really travelled: the transport saw a base64 data URI, PNG —
+    # the pinned commandcode route rejects image/ppm data URIs outright
+    # (measured 2026-10-01), so the single encoding path emits PNG and
+    # re-encodes the P3 fixture through Pillow on the way.
     first_document = transport.sent_documents[0]
     parts = first_document["messages"][0]["content"]
     assert any(
-        part.get("image_url", {}).get("url", "").startswith("data:image/ppm;base64,")
+        part.get("image_url", {}).get("url", "").startswith("data:image/png;base64,")
         for part in parts
     )
     # No credential text is anywhere in the recorded output.

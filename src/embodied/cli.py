@@ -125,6 +125,10 @@ COMMAND_MODULES = (
     "embodied.platform.webots_ardupilot",
     "embodied.bench.cli",
     "embodied.platform.localization_check",
+    # Registered for P05 by the integrator (2026-10-01, R9 serialized
+    # registration): the pilot provider probe existed, was tested, and could
+    # not be invoked because dispatch never imported it.
+    "embodied.pilot.probe",
 )
 
 

@@ -7,38 +7,42 @@
 # this file is a measurement.
 
 model:
-  provider: opencode-go
-  # Catalog-exact id for the requested route (provider opencode-go, model
-  # DeepSeek V4.1 Flash). The verbatim requested string
-  # `opencode-go/deepseek/deepseek-v4.1-flash` is NOT in the configured
-  # catalog (models-store.json / models.json, verified 2026-09-26) — recorded
-  # here, not substituted silently. If the owner rules the verbatim string
-  # must exist as typed, this stage blocks on that decision.
-  id: opencode-go/deepseek-v4.1-flash
-  requested_verbatim: opencode-go/deepseek/deepseek-v4.1-flash (not present in the configured catalog; recorded, not substituted)
+  # Owner ruling 2026-10-01: the runtime route is PINNED to Command Code's
+  # DeepSeek V4.1 Flash and the paid-call ceiling is raised to US$10 (the
+  # original grant was US$5, LIVE-RULINGS R7). Catalog evidence:
+  # ~/.atomic/agent/models.json — provider `commandcode`,
+  # baseUrl https://api.commandcode.ai/provider/v1, api openai-completions,
+  # auth $COMMAND_CODE_API_KEY, model `deepseek/deepseek-v4.1-flash`
+  # (reasoning, context 1M, maxTokens 16384). The ten dollars is a ceiling,
+  # not a target: every call is retained with its reason and actual spend.
+  provider: commandcode
+  id: deepseek/deepseek-v4.1-flash
+  identity_verbatim: commandcode/deepseek/deepseek-v4.1-flash
   source:
-    - Atomic catalog ~/.atomic/agent/models-store.json and ~/.atomic/agent/models.json, verified 2026-09-26
-    - work/runs/p04/plan.md section 2 (catalog verification, no model calls)
-    - design/docs/APPROVAL-RECORD.md:35,46,849 (project-measured route via commandcode)
+    - Atomic catalog ~/.atomic/agent/models.json (commandcode provider entry, verified 2026-10-01)
+    - owner ruling 2026-10-01 ("budget of 10 bucks on command code deepseek v4.1")
+    - design/docs/APPROVAL-RECORD.md:35,46,849 (this route was already the project-measured image route: 232+ prompt tokens, correct answers, p50 1.93s over 20 samples with the small fixture image)
   declared_input: [text, image]   # declared by the catalog; live image+tool support is the probe's job
   api: openai-completions
-  base_url: https://opencode.ai/zen/go/v1
+  base_url: https://api.commandcode.ai/provider/v1
   image_transport: base64         # APPROVAL-RECORD.md:46 — URL fetch fails server-side; base64 measured working
   alternates:
-    - id: commandcode/deepseek/deepseek-v4.1-flash
-      source: APPROVAL-RECORD.md:35,46,849 — project-measured image route (232+ prompt tokens, correct answers, p50 1.93s over 20 samples)
+    - id: opencode-go/deepseek-v4.1-flash
+      source: the previously declared route (2026-09-26); superseded by the owner's 2026-10-01 pin of commandcode, kept for provenance
     - id: opencode-go/mimo-v2.6-flash
       source: catalog entry, input [text, image], $0.14/$0.28 per M tokens (declared, unverified)
   never: deepseek-v4-pro or any pro-tier escalation (APPROVAL-RECORD.md:35; AGENTS.md)
 
-# Live-probe budget. Both keys ship absent on purpose: pilot-probe refuses a
-# live call unless an explicit --max-calls is also passed AND a ceiling is
-# recorded here. The owner records the limits when budgeting the live probe
-# (slice: no paid call beyond the kickoff budget; the recorded project context
-# is the Entry-2 $5 ceiling).
+# Live-call budget, recorded by the owner's 2026-10-01 ruling: pilot-probe (and
+# the sampler) refuse a live call unless an explicit --max-calls is also passed
+# AND limits are recorded here. The ceiling is the whole stage's paid-call
+# budget; actual spend is reported against it in every receipt.
 probe:
-  max_calls:            # absent by default
-  spend_ceiling_usd:    # absent by default
+  # Raised 30 -> 60 for the J4 configuration matrix (owner: cost is not the
+  # constraint; latency and decision quality are). The ceiling stays the
+  # runaway guard it always was; measured spend is reported per receipt.
+  max_calls: 60
+  spend_ceiling_usd: 10
 
 # Declared pilot parameters. Each is an engineering assumption chosen for
 # development, not a measured frequency or latency; workload tests must
