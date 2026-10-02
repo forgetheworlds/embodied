@@ -153,6 +153,17 @@ PLAN_CONFIG = PL.PlanConfig(
 # Frontier cells are clustered into one excursion target per 0.6 m block, so
 # the neighbouring boundary cells of one doorway are one frontier, not eight.
 FRONTIER_CLUSTER_CELLS = 6
+# How a frontier becomes a flyable goal. A frontier is a free cell touching
+# unknown space, so the standoff region the executor builds around it — one
+# metre back along the view direction, inflated by the envelope — can overlap
+# space the map has no evidence for, and the planner refuses that correctly: a
+# larger margin cannot turn unseen space into measured free space
+# (specification 7.1). The vantage is therefore walked back toward the aircraft,
+# which stands in known free space by construction, until that standoff region
+# is entirely supported. The direction matches the executor's own, so the region
+# this search clears is the region the planner will check.
+FRONTIER_VIEW_DIRECTION = (1.0, 0.0, 0.0)
+FRONTIER_VANTAGE_STEP_M = 0.2
 # The mission's own budget, in the simulator's seconds (the clock the bring-up
 # and route windows spend, owner ruling 2026-09-28).
 MISSION_BUDGET_SIM_S = 300.0
@@ -1149,6 +1160,52 @@ class MissionRuntime:
             )
         return regions
 
+    def _frontier_vantage(
+        self, region: GE.BoxRegion
+    ) -> tuple[float, float, float]:
+        """The point to fly toward in order to observe this frontier.
+
+        A frontier is a boundary between observed free space and unknown space:
+        an observation opportunity, not a destination (specification 11). A goal
+        AT the boundary cannot be admitted, because the standoff region the
+        executor builds around it overlaps space the map has no evidence for —
+        which is exactly how live-12's two explore goals were refused. So the
+        vantage is searched back along the line to the aircraft, which stands in
+        known free space by construction, and the first point the planner could
+        admit is preferred.
+
+        When no such point exists the cluster's own centre is returned anyway:
+        resolution holds the target, and the support question belongs to
+        admission, which refuses with its own named reason rather than being
+        pre-empted here.
+        """
+        centre = tuple(float(value) for value in region.center())
+        here = self._position_odom()
+        if here is None:
+            return centre
+        direction = np.asarray(FRONTIER_VIEW_DIRECTION, dtype=np.float64)
+        ideal = np.asarray(centre, dtype=np.float64) - GE.STANDOFF_M * direction
+        toward = np.asarray(here, dtype=np.float64)
+        span = float(np.linalg.norm(toward - ideal))
+        steps = max(1, int(span / FRONTIER_VANTAGE_STEP_M))
+        # The planner admits a goal when at least one cell of its goal region is
+        # supported free space (`planner.py`: `goal_cells` non-empty), so the
+        # vantage search asks exactly that question rather than a stricter one.
+        # Demanding every cell of the standoff region be supported would refuse
+        # vantages the planner would happily fly.
+        searchable = GE.inflated_free_cells(self.store, ENVELOPE, now_ns=self._now_ns())
+        for index in range(steps + 1):
+            vantage = ideal + (index / steps) * (toward - ideal)
+            target = vantage + GE.STANDOFF_M * direction
+            approach = GE.approach_region(
+                tuple(float(value) for value in target),
+                ENVELOPE,
+                direction=FRONTIER_VIEW_DIRECTION,
+            )
+            if any(cell in searchable for cell in approach.cells(self.store.config)):
+                return tuple(float(value) for value in target)
+        return centre
+
     def resolve_targets(self, proposal: R.SpatialGoal) -> tuple[R.GroundedTarget, ...]:
         """Resolve a proposal's target refs into grounded targets this runtime holds.
 
@@ -1191,7 +1248,9 @@ class MissionRuntime:
             else:
                 region = self.frontier_regions().get(ref)
                 if region is not None:
-                    point = region.center()
+                    # Not the region's own centre: a frontier cell sits beside
+                    # unknown space, and a goal AT it is refused as unsupported.
+                    point = self._frontier_vantage(region)
             if point is None:
                 continue
             resolved.append(
