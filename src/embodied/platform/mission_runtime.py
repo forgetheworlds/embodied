@@ -83,6 +83,7 @@ from embodied.platform.localization_check import (
     PARAMETER_READ_TIMEOUT_S,
     VEHICLE_REQUIREMENTS,
     _autopilot_feed_endpoint,
+    OrderedPairFeed,
     _crash_disarm_statustexts,
     _declared_start_attitude,
     _declared_start_origin,
@@ -572,6 +573,14 @@ class MissionRuntime:
                 self._stats.truth_attitudes.append(
                     (sim_time_ns(record.sim_time_s), tuple(record.pose.attitude_rpy))
                 )
+        # One stereo frame may wait here for the inertial samples that must precede it;
+        # see OrderedPairFeed for what sending it early does to the estimator.
+        ordered_pairs = OrderedPairFeed(
+            pending_pairs,
+            sim_time_ns_of=lambda held: sim_time_ns(held.sim_time_s),
+            feed_one=feed_record,
+            stats=self._stats,
+        )
 
         def feed_cycle() -> None:
             while True:
@@ -579,11 +588,14 @@ class MissionRuntime:
                 if record is None:
                     break
                 feed_record(record)
-            try:
-                while True:
-                    feed_record(pending_pairs.get_nowait())
-            except queue.Empty:
-                pass
+            # A queued image may still be ahead of the inertial samples that must precede
+            # it, because the sink files a pair the moment the reader sends it while the
+            # inertial sample that follows it in the stream arrives on the other queue a
+            # moment later. The guard holds such a frame until its own samples have gone:
+            # an image with an empty inertial interval is dropped by the pin, and a run of
+            # those freezes the filter -- which is the state that later diverges and drags
+            # the EKF, the controller and the vehicle down with it.
+            ordered_pairs.drain(self._stats.newest_imu_ns)
             state = client.poll_state()
             if state is not None:
                 self._on_state(state)
@@ -754,6 +766,9 @@ class MissionRuntime:
             self.result.stream = {
                 "pairs": self._stats.pairs,
                 "pair_records_filed": self._stats.pair_records_filed,
+                "pair_records_dropped": self._stats.pair_records_dropped,
+                "pairs_held_for_imu": self._stats.pairs_held_for_imu,
+                "max_pair_hold_s": round(self._stats.max_pair_hold_s, 6),
                 "imu_samples": self._stats.imu_samples,
                 "truth_samples": len(self._stats.truth_samples),
                 "sim_clock_frames": self._stats.sim_clock.frames,
