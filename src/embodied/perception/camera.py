@@ -300,6 +300,26 @@ def static_start_provenance(world_ref: str) -> PoseProvenance:
         ),
     )
 
+def declared_pose_provenance(evidence: dict) -> PoseProvenance:
+    """Where the declared capture-time pose came from, labelled truthfully.
+
+    The compat evidence's pose is the simulator scene's declared static start, and that
+    is the default here. A capture whose pose is instead the run's own published estimate
+    declares ``pose_source: measured_published_pose`` with a ``pose_source_detail``, and is
+    labelled ``SENSOR_DERIVED`` — the same class the mission runtime stamps on its live
+    depth products. The label is not decoration: it decides whether a reader may treat the
+    declared depth as independent of the estimator. A measured pose that cannot state
+    itself is refused rather than mislabelled as scene truth.
+    """
+    if evidence.get("pose_source") == "measured_published_pose":
+        detail = evidence.get("pose_source_detail")
+        if not isinstance(detail, str) or not detail.strip():
+            raise R.RecordError(
+                "a measured pose source must state its provenance in pose_source_detail"
+            )
+        return PoseProvenance(label="SENSOR_DERIVED", detail=detail)
+    return static_start_provenance(str(evidence["world"]))
+
 
 # ---------------------------------------------------------------------------
 # Depth products bound to their capture instant
@@ -912,7 +932,7 @@ def run_validation(config_path: Path, *, code_revision: str) -> int:
     inside_border[:, :margin] = False
     inside_border[:, -margin:] = False
 
-    provenance = static_start_provenance(str(evidence["world"]))
+    provenance = declared_pose_provenance(evidence)
 
     # --- per-pair B1 / B2, pooled B3 ---------------------------------------
     rectification_evidence = []
@@ -1019,7 +1039,14 @@ def run_validation(config_path: Path, *, code_revision: str) -> int:
         within_fraction = (within_count / count) if count else None
         report = {
             "surface": surface.name,
-            "declared_source": "scenarios/compat/worlds/compat_stereo.wbt (sha256 in inputs.json) — REFEREE TRUTH from the scene declaration, never an input to the calibration values",
+            # The geometry's source is the configuration's referee section, and the
+            # frames' scene is whichever world the evidence names. Naming the compat
+            # world unconditionally told every non-compat run a false provenance.
+            "declared_source": (
+                f"{evidence['world']} (sha256 in inputs.json) — the referee surfaces are "
+                "declared in this configuration's referee section from that world's "
+                "declaration; REFEREE TRUTH, never an input to the calibration values"
+            ),
             "eligible_pixels_in_window": eligible,
             "gate_eligible": gate_eligible,
             "n_compared": count,
