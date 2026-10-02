@@ -417,6 +417,93 @@ def world_state_payload(seed: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# The mode a mission flies under, and the mode its declared termination lands in.
+GUIDED_MODE = "GUIDED"
+LANDING_MODE = "LAND"
+
+
+def _guidance_departures(
+    events: list[dict[str, Any]], end_state: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split the platform's control events into control losses and ordinary changes.
+
+    The platform records one event for every change of mode or arming state and
+    reports whether the aircraft was under armed Guided control *after* the change
+    (``webots_ardupilot.drain``). That is the right raw material and the wrong
+    count. A mission necessarily changes mode while it is not yet flying — the
+    declared bring-up, which is disarmed — changes mode once to take control, and
+    changes mode again to land. None of those is a loss of control, and counting
+    them reported a violation on every run that had not committed one: a
+    ``guidance_lost:7`` stood in the receipt of ``live-motion-8`` while the
+    aircraft in fact never left armed Guided control except to land.
+
+    A **departure** is a change that leaves armed Guided control: the aircraft was
+    flying under it immediately before and is not after. Transitions before any
+    telemetry arrived (``from_mode`` is None — a report artifact, since the
+    aircraft was flying nothing yet) and transitions while not armed fall outside
+    that definition by themselves, so neither needs a special case.
+
+    Of the departures, all but the terminal one are losses, because the aircraft
+    came back: an autopilot that takes control away mid-flight and later returns it
+    still took it away. The terminal departure is the end of the flight and is
+    excused only when the run ended in the mission's declared landing state (in
+    ``LAND``, disarmed) **and** the departure is into that landing or is the
+    shutdown while still in Guided. A terminal departure to anything else —
+    ``LOITER``, ``RTL`` — stays a loss, which is the case this detector exists to
+    catch.
+    """
+    ordered = sorted(events, key=lambda event: int(event.get("at_monotonic_ns") or 0))
+    departures = [
+        event
+        for event in ordered
+        if event.get("armed_before") is True
+        and event.get("from_mode") == GUIDED_MODE
+        and not (event.get("armed_after") and event.get("to_mode") == GUIDED_MODE)
+    ]
+    declared_landing = (
+        str(end_state.get("mode") or "") == LANDING_MODE
+        and end_state.get("armed") is False
+    )
+    losses: list[dict[str, Any]] = []
+    for index, event in enumerate(departures):
+        terminal = index == len(departures) - 1
+        ends_the_mission = str(event.get("to_mode") or "") in (LANDING_MODE, GUIDED_MODE)
+        if terminal and declared_landing and ends_the_mission:
+            continue
+        losses.append(event)
+    return losses, departures
+
+
+def _guidance_record(
+    losses: list[dict[str, Any]], departures: list[dict[str, Any]], seen: int
+) -> dict[str, Any]:
+    """What the run's control events were, in a form a reader can audit.
+
+    The count alone cannot say whether it was earned, and the platform's events are
+    not persisted anywhere else, so the departures and the losses travel with the
+    outcome — a count with no evidence behind it is what went unnoticed here.
+    """
+
+    def short(event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: event.get(key)
+            for key in (
+                "at_monotonic_ns",
+                "from_mode",
+                "to_mode",
+                "armed_before",
+                "armed_after",
+            )
+        }
+
+    return {
+        "events": seen,
+        "departures_from_armed_guided": len(departures),
+        "losses": len(losses),
+        "lost": [short(event) for event in losses],
+    }
+
+
 def measure_physical_outcome(
     collector: "TruthCollector",
     *,
@@ -448,9 +535,9 @@ def measure_physical_outcome(
     violations: list[str] = []
     if crash_statustexts:
         violations.append("crash_disarm: " + "; ".join(crash_statustexts[:3]))
-    guidance_losses = [
-        event for event in guidance_events if not event.get("guidance_held")
-    ]
+    guidance_losses, guidance_departures = _guidance_departures(
+        guidance_events, end_state
+    )
     if guidance_losses:
         violations.append(f"guidance_lost:{len(guidance_losses)}")
     return {
@@ -464,6 +551,9 @@ def measure_physical_outcome(
         "return_detail": returned_detail,
         "violations": violations,
         "end_state": end_state,
+        "guidance": _guidance_record(
+            guidance_losses, guidance_departures, len(guidance_events)
+        ),
     }
 
 
@@ -732,6 +822,18 @@ def record(
     )
     if result.blockers:
         reasons = (*reasons, f"blockers: {'; '.join(result.blockers[:3])}")
+    guidance = outcome.get("guidance") or {}
+    if guidance.get("events"):
+        # The count is no longer the whole story, so the story travels with it: a
+        # reader can see how many control events the run had and how many of them
+        # actually left armed Guided control, rather than being asked to trust a
+        # number that a declared landing used to inflate.
+        reasons = (
+            *reasons,
+            f"guidance: {guidance['events']} control event(s), "
+            f"{guidance['departures_from_armed_guided']} departure(s) from armed Guided, "
+            f"{guidance['losses']} loss(es)",
+        )
     return CommandOutcome(
         status=CommandStatus.COMPLETE,
         gate_status=GateStatus.PASS if result.flew else GateStatus.FAIL,
