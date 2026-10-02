@@ -1130,6 +1130,7 @@ class MissionRuntime:
             sample_t = min(time.monotonic(), certificate.t_end_s)
             position_ned, velocity_ned, _acceleration = certificate.sample(sample_t)
             certificate_ref = certificate.certificate_id
+            self._log_certificate_shape(certificate)
         elif active.hold_position_odom is not None:
             position_ned = active.hold_position_odom
             velocity_ned = (0.0, 0.0, 0.0)
@@ -1152,6 +1153,34 @@ class MissionRuntime:
         active.setpoints = (*active.setpoints[-3:], sent.setpoint)
         self._sink("setpoint", R.to_dict(sent.setpoint), sent.published_stamp, None)
         return None
+
+    def _log_certificate_shape(self, certificate) -> None:
+        """Record once, per certificate, what it actually commands.
+
+        ``publish_active`` samples the certified prefix at ``time.monotonic()``,
+        so the question "is this trajectory a hover?" is answered by the
+        certificate's own endpoints. live-17 published the aircraft's own
+        position with zero velocity for a whole flight, and the shape of the
+        curve is the evidence that says why.
+        """
+        if getattr(self, "_logged_certificate", None) == certificate.certificate_id:
+            return
+        self._logged_certificate = certificate.certificate_id
+        first = certificate.sample(certificate.t_start_s)
+        last = certificate.sample(certificate.t_end_s)
+        now = time.monotonic()
+        self.result.log.append(
+            "certificate {cid}: t {t0:.3f}..{t1:.3f}, wall now {now:.3f} "
+            "(first sample ({a0:.2f},{a1:.2f},{a2:.2f}) |t0, "
+            "({b0:.2f},{b1:.2f},{b2:.2f}) |t1)".format(
+                cid=certificate.certificate_id,
+                t0=certificate.t_start_s,
+                t1=certificate.t_end_s,
+                now=now,
+                a0=first[0][0], a1=first[0][1], a2=first[0][2],
+                b0=last[0][0], b1=last[0][1], b2=last[0][2],
+            )
+        )
 
     # -- frontier helpers ------------------------------------------------------
 
@@ -1434,6 +1463,26 @@ class _LiveAdmission:
                 f"{result.status.reason}"
             )
             return result.status
+        if result.certificate is not None:
+            region = _terminal_region_for(targets)
+            start = runtime._position_odom()
+            runtime.result.log.append(
+                "admitted {intent} {refs}: goal region x[{lx:.2f},{hx:.2f}] "
+                "y[{ly:.2f},{hy:.2f}] z[{lz:.2f},{hz:.2f}]; aircraft "
+                "({px:.2f},{py:.2f},{pz:.2f}) inside={inside}; certificate "
+                "t {t0:.3f}..{t1:.3f} ({dur:.3f} s)".format(
+                    intent=proposal.intent,
+                    refs=list(proposal.target_refs),
+                    lx=region.low[0], hx=region.high[0],
+                    ly=region.low[1], hy=region.high[1],
+                    lz=region.low[2], hz=region.high[2],
+                    px=start[0], py=start[1], pz=start[2],
+                    inside=region.contains(start),
+                    t0=result.certificate.t_start_s,
+                    t1=result.certificate.t_end_s,
+                    dur=result.certificate.t_end_s - result.certificate.t_start_s,
+                )
+            )
         runtime._active_goal = _ActiveGoal(
             goal_id=result.accepted.goal_id,
             proposal=proposal,
