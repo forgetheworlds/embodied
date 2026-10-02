@@ -50,6 +50,27 @@ class TransportError(Exception):
 # ---------------------------------------------------------------------------
 
 
+CALL_INITIAL = "initial"
+CALL_CONTINUOUS = "continuous"
+CALL_CLASSES = (CALL_INITIAL, CALL_CONTINUOUS)
+
+
+@dataclass(frozen=True)
+class CallProfile:
+    """The declared shape of one class of cloud call.
+
+    The owner's ruling of 2026-10-01 is the reason this exists: the initial
+    mission interpretation needs deliberation, but the tactical updates that
+    arrive while the aircraft is moving must fit the decision budget or the
+    continuous-cloud arm cannot exist at all. One class therefore reasons and
+    sees the captured frame; the other does not reason and delivers a smaller
+    frame. The base ``model.generation`` still applies underneath both.
+    """
+
+    generation: tuple[tuple[str, Any], ...] = ()
+    image_scale: float = 1.0
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """The configured runtime model, recorded rather than assumed.
@@ -59,7 +80,9 @@ class ModelConfig:
     arguments). ``generation`` carries optional OpenAI-completions generation
     parameters (for example ``max_tokens`` or ``reasoning_effort``) that the
     configuration or a measurement run sets explicitly; an absent mapping adds
-    no fields to the request.
+    no fields to the request. ``call_profiles`` carries those same parameters
+    per call class, so the effort and the frame scale are a property of the
+    call rather than of the process.
     """
 
     provider: str
@@ -69,6 +92,7 @@ class ModelConfig:
     image_transport: str
     reply_format: str = "default"
     generation: tuple[tuple[str, Any], ...] = ()
+    call_profiles: tuple[tuple[str, CallProfile], ...] = ()
 
     @classmethod
     def from_config(cls, section: dict[str, Any]) -> "ModelConfig":
@@ -90,19 +114,106 @@ class ModelConfig:
             image_transport=section["image_transport"],
             reply_format=reply_format,
             generation=generation,
+            call_profiles=parse_call_profiles(section.get("call_profiles")),
         )
+
+    def profile(self, call_class: str) -> CallProfile:
+        """The declared profile for one call class.
+
+        An undeclared class returns an empty profile, which is the correct
+        answer for a configuration that draws no distinction and for every
+        caller that predates the distinction: base generation, full frame.
+        """
+        for name, profile in self.call_profiles:
+            if name == call_class:
+                return profile
+        return CallProfile()
+
+    def generation_for(self, call_class: str) -> tuple[tuple[str, Any], ...]:
+        """Base generation parameters with the class profile applied over them."""
+        merged = dict(self.generation)
+        merged.update(dict(self.profile(call_class).generation))
+        return tuple(sorted(merged.items()))
+
+    def image_scale_for(self, call_class: str) -> float:
+        """The frame scale this class delivers its evidence at."""
+        return self.profile(call_class).image_scale
 
     @property
     def identity(self) -> str:
         return self.id
+
+
+def parse_call_profiles(raw: Any) -> tuple[tuple[str, CallProfile], ...]:
+    """Parse ``model.call_profiles``: class -> {image_scale, <generation>}.
+
+    ``image_scale`` is the one reserved key; every other key in a profile is a
+    generation parameter, so the configuration reads as one description of a
+    call rather than two parallel tables that can drift apart.
+    """
+    if raw in (None, {}):
+        return ()
+    if not isinstance(raw, dict):
+        raise ValueError("model.call_profiles must be a mapping when present")
+    profiles: list[tuple[str, CallProfile]] = []
+    for name, body in raw.items():
+        if not isinstance(body, dict):
+            raise ValueError(f"model.call_profiles.{name} must be a mapping")
+        scale = body.get("image_scale", 1.0)
+        if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not 0.0 < float(scale) <= 1.0:
+            raise ValueError(f"model.call_profiles.{name}.image_scale must be a number in (0, 1]")
+        generation: list[tuple[str, Any]] = []
+        for key, value in body.items():
+            if key == "image_scale":
+                continue
+            # YAML 1.1 reads an unquoted `off`/`on`/`no`/`yes` as a boolean, so
+            # `reasoning_effort: off` would reach the request body as `false`
+            # rather than the string the API accepts, and nothing downstream
+            # would complain. Measured the hard way on 2026-10-01.
+            if key == "reasoning_effort" and not isinstance(value, str):
+                raise ValueError(
+                    f"model.call_profiles.{name}.reasoning_effort must be a quoted string "
+                    f"(got {value!r}; an unquoted 'off' reads as the boolean false)"
+                )
+            generation.append((str(key), value))
+        profiles.append(
+            (str(name), CallProfile(generation=tuple(sorted(generation)), image_scale=float(scale)))
+        )
+    return tuple(sorted(profiles))
 
 # ---------------------------------------------------------------------------
 # Request envelope
 # ---------------------------------------------------------------------------
 
 
-def encode_image_data_uri(payload: bytes) -> str:
-    """One base64 data URI, PNG. The only image transport this project uses.
+def scale_frame_payload(payload: bytes, scale: float) -> bytes:
+    """Downscale one captured frame and return PNG bytes; 1.0 passes through.
+
+    This is the production path for the frame-scale lever, not a measurement
+    knob. The continuous call class delivers its frame at the measured scale
+    and the initial plan at captured resolution; both go through here, so what
+    was measured is what a mission sends. Measured 2026-10-01 (J4): quarter
+    scale took the continuous p50 from 5.35 s to 2.67 s with 10/10 decisions
+    still naming real scene content. It does reduce the evidence the cloud
+    sees, which is why the initial plan does not use it.
+    """
+    if scale == 1.0:
+        return payload
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(payload)) as image:
+        width = max(1, round(image.width * scale))
+        height = max(1, round(image.height * scale))
+        resized = image.resize((width, height))
+        buffer = io.BytesIO()
+        resized.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def encode_image_data_uri(payload: bytes, *, scale: float = 1.0) -> str:
+    """One base64 data URI, PNG, optionally downscaled first.
 
     The pinned commandcode route rejects ``image/ppm`` data URIs with HTTP 400
     regardless of size (measured 2026-10-01, the J3 diagnostic matrix: a 5.6 KB
@@ -113,6 +224,7 @@ def encode_image_data_uri(payload: bytes) -> str:
     """
     import base64
 
+    payload = scale_frame_payload(payload, scale)
     if payload[:8] == b"\x89PNG\r\n\x1a\n":
         encoded = payload
     else:
@@ -133,6 +245,11 @@ class RequestPacket:
     ``image_parts`` pairs an observation id with the encoded data URI of the
     frame actually delivered; the mapping back to sensor pixels is retained by
     the caller that built the packet.
+
+    ``call_class`` names which declared profile this call belongs to
+    (``"initial"`` for the one-shot mission interpretation, ``"continuous"``
+    for everything that arrives during motion). It defaults to continuous, so
+    a packet built by a caller that predates the split is unchanged.
     """
 
     request: DecisionRequest
@@ -142,6 +259,7 @@ class RequestPacket:
     navigation_status: str = "unknown"
     uncertainty_summary: str = "none recorded"
     explicit_question: str | None = None
+    call_class: str = CALL_CONTINUOUS
 
 
 def build_request_document(
@@ -164,8 +282,10 @@ def build_request_document(
         },
     }
     # Generation parameters are explicit and recorded (configs/runtime-model.yaml
-    # model.generation, or a measurement run's override); never inferred.
-    document.update(dict(config.generation))
+    # model.generation, with the packet's call class applied over it); never
+    # inferred. The class is what makes "reason for the plan, but not for the
+    # tactical update" a property of the call rather than of the process.
+    document.update(dict(config.generation_for(packet.call_class)))
     return document
 
 

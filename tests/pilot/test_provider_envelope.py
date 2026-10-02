@@ -25,6 +25,8 @@ from embodied.pilot.provider import (
     RequestPacket,
     build_request_document,
     encode_image_data_uri,
+    parse_call_profiles,
+    scale_frame_payload,
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -133,3 +135,143 @@ def test_the_default_request_carries_no_generation_parameters():
     assert "reasoning_effort" not in document
     assert "max_tokens" not in document
     assert "EXACTLY ONE tool call" not in document["messages"][0]["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# The call classes: the initial plan reasons, the continuous update does not
+# (owner ruling 2026-10-01). Each of these pins a way the split can silently
+# fail: a class that never reaches the body, a base parameter lost under a
+# profile, or an unquoted YAML `off` arriving as a boolean.
+# ---------------------------------------------------------------------------
+
+
+def _config(**overrides):
+    section = {
+        "provider": "test",
+        "id": "test/model",
+        "base_url": "https://example.invalid/v1",
+        "api": "openai-completions",
+        "image_transport": "base64",
+    }
+    section.update(overrides)
+    return ModelConfig.from_config(section)
+
+
+def _packet_of(call_class: str) -> RequestPacket:
+    from embodied.contracts.records import DecisionRequest
+
+    request = DecisionRequest(
+        request_id="req-0",
+        sequence=0,
+        mission_revision=0,
+        base_goal_revision=0,
+        observation_ids=(),
+        snapshot_id=None,
+        response_deadline_s=4.0,
+        model_identity="test/model",
+    )
+    return RequestPacket(request=request, mission_instruction="probe", call_class=call_class)
+
+
+def test_each_call_class_carries_its_own_reasoning_effort():
+    config = _config(
+        call_profiles={
+            "initial": {"image_scale": 1.0, "reasoning_effort": "high"},
+            "continuous": {"image_scale": 0.25, "reasoning_effort": "off"},
+        }
+    )
+
+    assert build_request_document(config, _packet_of("initial"), ())["reasoning_effort"] == "high"
+    assert build_request_document(config, _packet_of("continuous"), ())["reasoning_effort"] == "off"
+
+
+def test_each_call_class_carries_its_own_frame_scale():
+    config = _config(
+        call_profiles={
+            "initial": {"image_scale": 1.0, "reasoning_effort": "high"},
+            "continuous": {"image_scale": 0.25, "reasoning_effort": "off"},
+        }
+    )
+
+    assert config.image_scale_for("initial") == 1.0
+    assert config.image_scale_for("continuous") == 0.25
+
+
+def test_the_base_generation_still_applies_under_a_class_profile():
+    config = _config(
+        generation={"max_tokens": 512},
+        call_profiles={"continuous": {"reasoning_effort": "off"}},
+    )
+    document = build_request_document(config, _packet_of("continuous"), ())
+
+    assert document["max_tokens"] == 512
+    assert document["reasoning_effort"] == "off"
+
+
+def test_an_undeclared_class_gets_the_base_configuration_and_the_full_frame():
+    config = _config(
+        generation={"max_tokens": 512},
+        call_profiles={"continuous": {"reasoning_effort": "off", "image_scale": 0.25}},
+    )
+    document = build_request_document(config, _packet_of("initial"), ())
+
+    assert "reasoning_effort" not in document
+    assert document["max_tokens"] == 512
+    assert config.image_scale_for("initial") == 1.0
+
+
+def test_a_packet_that_names_no_class_is_a_continuous_call():
+    config = _config(call_profiles={"continuous": {"reasoning_effort": "off"}})
+
+    assert build_request_document(config, _packet(), ())["reasoning_effort"] == "off"
+
+
+def test_an_unquoted_yaml_off_is_refused_rather_than_read_as_false():
+    """YAML 1.1 reads `off` as the boolean false, which would reach the request
+    body as `false` while the config looked correct to a reader."""
+    import pytest
+
+    with pytest.raises(ValueError, match="quoted string"):
+        parse_call_profiles({"continuous": {"reasoning_effort": False}})
+
+
+def test_a_scale_below_one_shrinks_the_delivered_image():
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 48), (200, 30, 30)).save(buffer, format="PPM")
+    captured = buffer.getvalue()
+
+    def delivered_size(uri: str):
+        return Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))).size
+
+    assert delivered_size(encode_image_data_uri(captured)) == (64, 48)
+    assert delivered_size(encode_image_data_uri(captured, scale=0.25)) == (16, 12)
+
+
+def test_scale_one_passes_the_payload_through_untouched():
+    payload = _ppm()
+
+    assert scale_frame_payload(payload, 1.0) is payload
+
+
+def test_the_checked_in_configuration_declares_both_call_classes():
+    """The split is checked-in configuration, not a convention.
+
+    This fails if the file loses a class, if a class stops carrying its own
+    effort, or if `off` is written unquoted again (YAML reads that as the
+    boolean false, which is what the guard above exists to catch).
+    """
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    section = yaml.safe_load((root / "configs" / "runtime-model.yaml").read_text(encoding="utf-8"))["model"]
+    config = ModelConfig.from_config(section)
+
+    assert [name for name, _ in config.call_profiles] == ["continuous", "initial"]
+    assert dict(config.generation_for("initial"))["reasoning_effort"] == "high"
+    assert dict(config.generation_for("continuous"))["reasoning_effort"] == "off"
+    assert config.image_scale_for("initial") == 1.0
+    assert config.image_scale_for("continuous") < config.image_scale_for("initial")
