@@ -171,6 +171,15 @@ MISSION_YAW_HOLD_RAD = 0.0
 # the newest pair, at most this often (wall seconds). The estimator feed is on
 # its own thread and never waits behind this.
 MIN_PERCEPTION_INTERVAL_S = 0.3
+# The cold-start perception window: bounded, in simulator seconds, before the
+# mission's phases begin. It exists to break the bootstrap on the mission's
+# first flight — the map a frontier is resolved from can only be built from the
+# aircraft's own frames, so with an empty store no goal can resolve a target and
+# no step ever runs. Eight seconds is this stage's declared engineering
+# parameter (R2): long enough for the first frames to arrive, be depth-validated
+# and integrated, and short enough that an aircraft which sees nothing useful
+# says so well inside the mission budget.
+COLD_START_PERCEPTION_SIM_S = 8.0
 # Certificate renewal cadence: the planner is re-run against the newest map at
 # most this often (wall seconds). The cost is real (the P03 inflation pass runs
 # over the whole grid: ~70 ms at this scene's declared bounds), so renewal is
@@ -324,6 +333,11 @@ class MissionRuntime:
             ),
         )
         self._perception_queue: queue.Queue = queue.Queue(maxsize=4)
+        # Perception frames dropped because the perception queue was full. A
+        # count that stays at zero says the map saw every frame; anything else
+        # says the map was built from a subset, which a reader of the receipt
+        # needs to know before trusting a frontier.
+        self._perception_frames_dropped = 0
         self._state_ring: list[tuple[int, loc.EstimatorState]] = []
         self._latest_state: loc.EstimatorState | None = None
         self._latest_aligned: dict[str, object] | None = None
@@ -486,6 +500,7 @@ class MissionRuntime:
                 pending_pairs.put_nowait(record)
             except queue.Full:
                 self._stats.pair_records_dropped += 1
+            self._offer_to_perception(record)
 
         platform.record_sink = file_record
 
@@ -573,12 +588,22 @@ class MissionRuntime:
                     return
 
         last_telemetry = 0.0
+        next_perception_pump = 0.0
 
         def drain() -> None:
-            nonlocal last_telemetry
-            if time.monotonic() - last_telemetry < 0.2:
+            nonlocal last_telemetry, next_perception_pump
+            now = time.monotonic()
+            # Perception is a continuous responsibility (specification 3.3),
+            # not step-scoped work: the map and the candidate stream have to
+            # exist before a goal is proposed. Pumping it only from inside a
+            # step deadlocked the mission against its own empty map, because
+            # the first step could not resolve a target and so never ran.
+            if now >= next_perception_pump:
+                next_perception_pump = now + MIN_PERCEPTION_INTERVAL_S
+                self.perceive_if_due()
+            if now - last_telemetry < 0.2:
                 return
-            last_telemetry = time.monotonic()
+            last_telemetry = now
             try:
                 platform.telemetry()
             except Exception as error:
@@ -723,6 +748,7 @@ class MissionRuntime:
                 "sim_clock_newest_s": self._stats.sim_clock.newest_s,
                 "first_record_kind": self._first_record_kind,
                 "feed_failures": list(feed_failures),
+                "perception_frames_dropped": self._perception_frames_dropped,
                 "publisher_published": getattr(publisher, "published", None),
                 "publisher_failures": list(getattr(publisher, "publish_failures", [])),
             }
@@ -742,11 +768,38 @@ class MissionRuntime:
         world = _LiveRunnerWorld(self)
         runner = RecipeRunner(self.broker, world, now=self._clock, sink=self._sink)
         termination = "mission_completed"
-        candidates_at_start = world.discovered_candidates()
+        # Look before leaping. A frontier is resolved out of the map, the map
+        # is built from the aircraft's own frames, and an empty store resolves
+        # nothing — so the first goal could never resolve a target, the step
+        # never ran, perception never ran, and the mission was blocked against
+        # its own empty map. Pump perception on its own cadence for a bounded
+        # window before the phases begin, so the first goal resolves against a
+        # real snapshot.
+        cold_start = _SimWindow(
+            self._stats.sim_clock,
+            COLD_START_PERCEPTION_SIM_S,
+            label="the cold-start perception window",
+            wall_ceiling_s=_sim_window_wall_ceiling_s(
+                COLD_START_PERCEPTION_SIM_S, self.settings.realtime_ratio_envelope[0]
+            ),
+        )
+        while not cold_start.expired():
+            if self._candidate_targets or self.frontier_regions():
+                break
+            drain()
+            self.perceive_if_due()
+            time.sleep(0.02)
+        self.result.log.append(
+            f"cold start: {len(self.frontier_regions())} frontier region(s), "
+            f"{len(self._candidate_targets)} grounded candidate(s), "
+            f"{self._observation_counter} observation(s) seen"
+        )
+        # The inspect phase's own step guard (candidate_present) decides whether
+        # there is anything to inspect, evaluated when that phase is reached. The
+        # skip that used to live here read a snapshot taken BEFORE exploration
+        # ran, so it could only ever skip the phase that exploration exists to
+        # feed.
         for phase, recipe in zip(("explore", "inspect", "return"), mission_module.build_b0_recipes()):
-            if phase == "inspect" and not candidates_at_start:
-                self.result.log.append("inspect phase skipped: no discovered candidate")
-                continue
             if mission_window.expired():
                 termination = "mission_budget_exhausted"
                 break
@@ -834,6 +887,33 @@ class MissionRuntime:
         self._latest_aligned = aligned
 
     # -- perception ----------------------------------------------------------
+
+    def _offer_to_perception(self, record: Any) -> None:
+        """Hand one stereo pair to the perception queue, newest frame wins.
+
+        A full queue drops its OLDEST frame rather than refusing the new one:
+        an old image snapshot is worth less than the current one
+        (specification 3.1, "drop replaceable old image snapshots rather than
+        allow backlog"), and blocking here would stall the thread the frames
+        arrive on. This method exists because the queue was once declared and
+        drained but never fed, and the omission was invisible: perception
+        simply never ran, so no observation, map, candidate or frontier was
+        ever produced, and the mission deadlocked against its own empty map.
+        """
+        try:
+            self._perception_queue.put_nowait(record)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._perception_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._perception_frames_dropped += 1
+        try:
+            self._perception_queue.put_nowait(record)
+        except queue.Full:
+            self._perception_frames_dropped += 1
 
     def perceive_if_due(self) -> None:
         """Depth, candidates and map integration on the newest queued pair.
