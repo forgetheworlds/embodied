@@ -1189,11 +1189,18 @@ class MissionRuntime:
         span = float(np.linalg.norm(toward - ideal))
         steps = max(1, int(span / FRONTIER_VANTAGE_STEP_M))
         # The planner admits a goal when at least one cell of its goal region is
-        # supported free space (`planner.py`: `goal_cells` non-empty), so the
-        # vantage search asks exactly that question rather than a stricter one.
-        # Demanding every cell of the standoff region be supported would refuse
-        # vantages the planner would happily fly.
-        searchable = GE.inflated_free_cells(self.store, ENVELOPE, now_ns=self._now_ns())
+        # in the set it may search, so this asks exactly that and no weaker
+        # question: the same inflation, the same extra margin the planner adds,
+        # and the aircraft's own position excluded as an obstacle. A weaker test
+        # clears vantages the planner then refuses, which is how live-14's
+        # explore goals were still rejected after the first attempt at this.
+        searchable = GE.inflated_free_cells(
+            self.store,
+            ENVELOPE,
+            now_ns=self._now_ns(),
+            self_occupied_origin_odom_m=here,
+            extra_margin_m=self.store.config.voxel_m / 4.0,
+        )
         for index in range(steps + 1):
             vantage = ideal + (index / steps) * (toward - ideal)
             target = vantage + GE.STANDOFF_M * direction
