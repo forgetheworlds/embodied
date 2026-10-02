@@ -1422,13 +1422,25 @@ class _LiveRunnerWorld:
     def completion(self, action: str, target_ref: str | None) -> tuple[str, tuple[str, ...]]:
         runtime = self._runtime
         active = runtime._active_goal
-        evidence = tuple(dict.fromkeys(self._step_observations))[:4]
+        observations = tuple(dict.fromkeys(self._step_observations))[:4]
         if active is None or active.certificate is None or active.terminal_region is None:
-            return "blocked", evidence
+            return "blocked", observations
         position = runtime._position_odom()
         if position is None:
-            return "blocked", evidence
+            return "blocked", observations
         nav_state = runtime._navigation_state()
+        # A completion is a claim, and a claim cites. What the step observed is
+        # the first choice of citation; when a step reaches its declared
+        # condition without grounding a candidate — an explore step arriving at
+        # a frontier, or the return to a start the aircraft already occupies —
+        # the citation is the navigation state whose position and speed the
+        # arrival was measured from. Handing the runner an empty tuple is what
+        # raised "a completion is a claim with evidence" on live-12; the
+        # mission's own claim evidence below stays observation-only, so the
+        # found/inspected/returned claims never cite a state string.
+        cited = observations or (
+            f"state:{nav_state.state_sequence if nav_state is not None else 0}",
+        )
         status = EX.completion_status(
             active.accepted,
             active.certificate,
@@ -1438,17 +1450,16 @@ class _LiveRunnerWorld:
             terminal_region=active.terminal_region,
             settle_position_tolerance_m=ENVELOPE.inflation_m,
             settle_speed_tolerance_mps=SETTLE_SPEED_MPS,
-            evidence=evidence
-            or (f"state:{nav_state.state_sequence if nav_state is not None else 0}",),
+            evidence=cited,
         )
         if status.disposition is not R.ExecutionDisposition.COMPLETED:
-            return "blocked", evidence
+            return "blocked", observations
         if action == "return":
             runtime._return_settled = True
-            runtime._return_evidence.extend(evidence)
+            runtime._return_evidence.extend(observations)
         if action == "inspect":
-            runtime._inspect_evidence.extend(evidence)
-        return "achieved", evidence
+            runtime._inspect_evidence.extend(observations)
+        return "achieved", cited
 
     # -- internals ---------------------------------------------------------------
 
