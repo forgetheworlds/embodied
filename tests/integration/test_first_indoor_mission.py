@@ -5,7 +5,9 @@ recording rather than a re-implementation of it:
 
 * the suite registers only from its own declaration, and a build without that
   declaration still refuses (the P02 refusal path survives registration);
-* the host gate blocks a loaded host before anything is started;
+* the host gate blocks a loaded host before anything is started, and is wired into
+  the run rather than merely present; the tests that record supply their own host
+  state so a busy machine cannot fail them;
 * ``bench record``'s admission rules (arm, declared sensor mode) are the run's
   blockers, not silently-overridden choices;
 * the transport assembles a real episode — agent stream, manifest, bench-side
@@ -58,6 +60,25 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 REAL_PLATFORM_CONFIG = REPOSITORY / "configs" / "first_indoor.yaml"
 FIXTURE_SUITE_NAME = "first-indoor-fixture"
 HOST, CLOCK = "p05-integration-0", "monotonic"
+
+
+@pytest.fixture(autouse=True)
+def _healthy_host(monkeypatch):
+    """Keep the host gate out of these tests, without losing it.
+
+    The transport reads the real machine through ``uptime`` and ``sysctl`` and
+    refuses a loaded one. These tests prove the episode chain, not the machine
+    the suite happens to run on — and a full suite run loads the host enough to
+    trip the gate inside itself, which made four of them fail while passing in
+    isolation. The gate's logic is still exercised with declared states in
+    ``test_a_loaded_host_is_blocked_before_anything_starts``, and its wiring
+    into the run in ``test_record_refuses_a_loaded_host``.
+    """
+    monkeypatch.setattr(
+        live_record,
+        "host_state",
+        lambda: {"load_1m": 1.0, "swap_free_mb": 4000.0},
+    )
 
 
 def _stamp(ns: int) -> ClockStamp:
@@ -156,6 +177,20 @@ def test_a_loaded_host_is_blocked_before_anything_starts():
     assert any("swap" in reason for reason in loaded)
     unmeasured = live_record.host_blockers({"load_1m": None, "swap_free_mb": None})
     assert len(unmeasured) == 2
+
+
+def test_record_refuses_a_loaded_host(tmp_path, monkeypatch):
+    """The gate stops a run, so it is wired in and not merely a function."""
+    monkeypatch.setattr(
+        live_record,
+        "host_state",
+        lambda: {"load_1m": 23.7, "swap_free_mb": 400.0},
+    )
+    outcome, output = _record_scripted(tmp_path)
+    assert outcome.status.value == "blocked"
+    assert any("load" in reason for reason in outcome.reasons)
+    assert any("freeze-blocked" in limitation for limitation in outcome.limitations)
+    assert not (output / "episode").exists()
 
 
 def test_registration_is_idempotent_and_a_foreign_claim_is_refused(tmp_path):
