@@ -253,3 +253,25 @@ def test_scale_one_passes_the_payload_through_untouched():
     payload = _ppm()
 
     assert scale_frame_payload(payload, 1.0) is payload
+
+
+def test_the_checked_in_configuration_declares_both_call_classes():
+    """The split is checked-in configuration, not a convention.
+
+    This fails if the file loses a class, if a class stops carrying its own
+    effort, or if `off` is written unquoted again (YAML reads that as the
+    boolean false, which is what the guard above exists to catch).
+    """
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    section = yaml.safe_load((root / "configs" / "runtime-model.yaml").read_text(encoding="utf-8"))["model"]
+    config = ModelConfig.from_config(section)
+
+    assert [name for name, _ in config.call_profiles] == ["continuous", "initial"]
+    assert dict(config.generation_for("initial"))["reasoning_effort"] == "high"
+    assert dict(config.generation_for("continuous"))["reasoning_effort"] == "off"
+    assert config.image_scale_for("initial") == 1.0
+    assert config.image_scale_for("continuous") < config.image_scale_for("initial")
