@@ -100,16 +100,22 @@ def plan_question(instruction: str) -> str:
     Written here rather than in the provider's prompt because this module owns
     the recipe vocabulary: the actions, target kinds and guards it names are
     imported from the runner, so the question cannot drift from what
-    :func:`plan_from_reply` accepts. Measured on 2026-10-01: without this the
-    model answered the generic pilot prompt with tool calls and proposed no
-    ``mission_recipe`` at all, and the plan was refused after a 20.45 s call.
+    :func:`plan_from_reply` accepts.
+
+    Two measured failures shaped this text (2026-10-01, same route and frame):
+    with the generic pilot prompt the model proposed no recipe at all, and
+    with the schema stated only loosely it answered with its own inner keys —
+    ``objective``, ``start_pose``, ``frame`` — instead of ``steps``/``bounds``.
+    So the shape is stated exactly, and the reply is confined to it.
     """
     return (
-        "You are on the ground before takeoff and nothing has moved yet. Propose the "
-        "mission plan for the instruction below as ONE JSON object, no prose: "
+        "You are on the ground before takeoff and nothing has moved yet. Your entire reply "
+        "is ONE JSON object and no prose, in exactly this shape: "
         '{"mission_recipe": {"steps": [{"action": <intent>, "target_kind": <kind>, '
         '"target_ref": <ref>, "guard_kind": <guard>, "max_attempts": <1 or 2>}], '
         '"bounds": {"max_steps": <int>, "resource_ceiling": <number>}}}. '
+        'mission_recipe has exactly the two keys "steps" and "bounds" and no others; the '
+        "reply has no other top-level keys. "
         f"action must be one of: {', '.join(INTENTS)}. "
         "target_kind must be one of: candidate, frontier, place. "
         f"guard_kind must be one of: {', '.join(GUARDS)}. "
