@@ -30,11 +30,10 @@ from typing import Any
 
 from embodied.contracts.records import ClockStamp, DecisionRequest
 from embodied.pilot.mission_packet import MissionPacketBuilder
-from embodied.pilot.provider import (
-    CALL_INITIAL,
-    Provider,
-)
+from embodied.pilot.provider import CALL_INITIAL, Provider
 from embodied.pilot.recipe_runner import (
+    GUARDS,
+    INTENTS,
     Guard,
     MissionRecipe,
     RecipeStep,
@@ -95,6 +94,33 @@ class FlightPlan:
         }
 
 
+def plan_question(instruction: str) -> str:
+    """The plan request, carrying the schema the runner will actually enforce.
+
+    Written here rather than in the provider's prompt because this module owns
+    the recipe vocabulary: the actions, target kinds and guards it names are
+    imported from the runner, so the question cannot drift from what
+    :func:`plan_from_reply` accepts. Measured on 2026-10-01: without this the
+    model answered the generic pilot prompt with tool calls and proposed no
+    ``mission_recipe`` at all, and the plan was refused after a 20.45 s call.
+    """
+    return (
+        "You are on the ground before takeoff and nothing has moved yet. Propose the "
+        "mission plan for the instruction below as ONE JSON object, no prose: "
+        '{"mission_recipe": {"steps": [{"action": <intent>, "target_kind": <kind>, '
+        '"target_ref": <ref>, "guard_kind": <guard>, "max_attempts": <1 or 2>}], '
+        '"bounds": {"max_steps": <int>, "resource_ceiling": <number>}}}. '
+        f"action must be one of: {', '.join(INTENTS)}. "
+        "target_kind must be one of: candidate, frontier, place. "
+        f"guard_kind must be one of: {', '.join(GUARDS)}. "
+        "Use at most 6 steps and at most 2 attempts per step, and set bounds.max_steps no "
+        "larger than the number of steps. A step says where to act relative to evidence the "
+        "local system will find later — a frontier, the next uninspected candidate, or the "
+        "start place. Do not name a route, a doorway order, a position or where any object is. "
+        f"Instruction: {instruction}"
+    )
+
+
 def plan_from_reply(parsed, *, source: str = "cloud-initial") -> MissionRecipe:
     """Validate a reply's ``mission_recipe`` into a bounded MissionRecipe.
 
@@ -122,8 +148,7 @@ def plan_from_reply(parsed, *, source: str = "cloud-initial") -> MissionRecipe:
         if kind:
             if kind not in _TARGET_KINDS:
                 raise PlanRefused(
-                    f"steps[{index}].target_kind {kind!r} is not one of "
-                    f"{', '.join(_TARGET_KINDS)}"
+                    f"steps[{index}].target_kind {kind!r} is not one of {', '.join(_TARGET_KINDS)}"
                 )
             target = TargetSelector(kind, str(raw.get("target_ref", "")))
         attempts = int(raw.get("max_attempts", 1))
@@ -203,6 +228,7 @@ class PreflightPlanner:
         moved by this module. The planner polls at the deadline, so the
         caller's clock decides and no wall read hides in here.
         """
+        question = explicit_question or plan_question(self.builder.instruction)
         attempt = 0
         last_failure: str | None = None
         while attempt <= self.retry_budget:
@@ -224,17 +250,21 @@ class PreflightPlanner:
                 payloads=payloads,
                 call_class=CALL_INITIAL,
                 navigation_status="on ground, pre-flight",
-                explicit_question=explicit_question,
+                explicit_question=question,
             )
             self.provider.submit(request, packet, now)
             arrivals = self.provider.poll(
-                ClockStamp(now.host_id, now.clock_id, now.monotonic_ns + int(deadline_s * 1_000_000_000))
+                ClockStamp(
+                    now.host_id, now.clock_id, now.monotonic_ns + int(deadline_s * 1_000_000_000)
+                )
             )
             attempt += 1
             if arrivals:
                 reply = arrivals[-1]
                 if reply.parsed.malformed_reason:
-                    return self._refused(request_id, trace, attempt, reply.parsed.malformed_reason, reply)
+                    return self._refused(
+                        request_id, trace, attempt, reply.parsed.malformed_reason, reply
+                    )
                 try:
                     recipe = plan_from_reply(reply.parsed)
                 except PlanRefused as error:

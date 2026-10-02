@@ -302,6 +302,16 @@ def _prompt_text(packet: RequestPacket, reply_format: str = "default") -> str:
     ]
     if reply_format == "strict":
         lines.extend(_STRICT_REPLY_LINES)
+    if packet.call_class == CALL_INITIAL:
+        # The initial class is the one planning call, made on the ground before
+        # takeoff. It answers with a mission_recipe document, and the question
+        # that carries its schema is built by the caller that owns the recipe
+        # vocabulary (pilot.flight_plan), so the vocabulary lives in one place.
+        lines.append(
+            "this call is the initial mission plan, made on the ground before takeoff: "
+            "answer it with the mission_recipe JSON object the explicit question specifies, "
+            "not with tool calls"
+        )
     lines.extend(
         [
             f"mission instruction: {packet.mission_instruction}",

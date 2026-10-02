@@ -199,3 +199,28 @@ def test_no_plan_can_be_made_once_the_aircraft_is_airborne():
     builder.mark_airborne("guided takeoff")
     with pytest.raises(ReasonedInFlightRefused):
         run_plan(planner)
+
+
+
+def test_the_plan_question_carries_the_runners_own_vocabulary():
+    """The question cannot drift from what the validator accepts."""
+    from embodied.pilot.flight_plan import plan_question
+    from embodied.pilot.recipe_runner import GUARDS, INTENTS
+
+    question = plan_question("Find the red block, inspect it, and return to the start.")
+    for intent in INTENTS:
+        assert intent in question, f"the plan question never names the intent {intent}"
+    for guard in GUARDS:
+        assert guard in question, f"the plan question never names the guard {guard}"
+    assert "mission_recipe" in question
+    assert "Do not name a route" in question
+
+
+def test_the_initial_prompt_names_the_plan_class_it_is_asking_for():
+    """Measured cause of the first live refusal: the prompt never asked for a plan."""
+    planner, transport, _ = make_planner()
+    transport.schedule(ScriptedReply(document=reply_with_recipe(GOOD_RECIPE)))
+    run_plan(planner)
+    prompt = transport.sent_documents[0]["messages"][0]["content"][0]["text"]
+    assert "initial mission plan" in prompt
+    assert "mission_recipe" in prompt
