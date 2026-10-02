@@ -70,9 +70,14 @@ SUITE_CONFIG_RELATIVE = Path("configs/suites/first-indoor.yaml")
 SUITE_DIR_RELATIVE = Path("configs/suites")
 PLATFORM_CONFIG_RELATIVE = Path("configs/first_indoor.yaml")
 TRUTH_SEED_RELATIVE = Path("scenarios/first_indoor/truth.yaml")
-# The one arm this transport admits. B1/B2 are P06's comparison arms, gated on
-# a recorded budget cap; refusing them here is the arm's own admission rule.
-ADMITTED_ARMS = ("B0",)
+# The arms this transport can run. B0 is the conventional arm and makes no
+# cloud call at all. The cloud arms are the ones MissionPilot itself admits
+# (``pilot/mission_executive.CLOUD_ARMS`` — the one place the arm rule lives,
+# so it is read from there rather than repeated here); they spend money on
+# every run, so they are admitted only against a budget cap recorded for them.
+# B3 is deferred with written rationale (R6) and is not an arm this transport
+# can run.
+CONVENTIONAL_ARM = "B0"
 
 # Declared physical predicates (R2). Justifications are in the module docstring.
 INSPECT_RADIUS_M = 1.5
@@ -618,6 +623,35 @@ def _write_mission_summary(output: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def recorded_budget_cap(repository: Path) -> tuple[tuple[int, float] | None, str]:
+    """The cloud arms' recorded (``max_calls``, ``spend_ceiling_usd``), and why not.
+
+    The cap a paid arm's spend is governed by is the runtime-model
+    configuration's own ``probe`` section, and ``pilot/probe.py`` already owns
+    both the load and the validation of that file, so this reuses those rather
+    than reading the section a second way.
+
+    Absent, unreadable or unusable is not a recorded cap. An unbudgeted cloud
+    run is exactly what this gate exists to prevent, so anything other than a
+    usable pair refuses and says which.
+    """
+    from embodied.pilot import probe as probe_module
+    from embodied.platform import mission_runtime
+
+    path = repository / mission_runtime.RUNTIME_MODEL_CONFIG_RELATIVE
+    try:
+        document = probe_module.load_runtime_config(path)
+        limits = probe_module.probe_limits(document)
+    except probe_module.ProbeConfigError as error:
+        return None, str(error)
+    if limits is None:
+        return None, (
+            f"{path} records no probe.max_calls and probe.spend_ceiling_usd, "
+            "which is what a cloud arm's spend is capped by"
+        )
+    return limits, ""
+
+
 def record(
     *,
     suite_name: str,
@@ -645,19 +679,41 @@ def record(
         "sensor_mode": sensor_mode.value,
         "host_state": host_state(),
     }
-    if arm not in ADMITTED_ARMS:
+    from embodied.pilot import mission_executive as executive_module
+
+    if arm != CONVENTIONAL_ARM and arm not in executive_module.CLOUD_ARMS:
         return CommandOutcome(
             status=CommandStatus.BLOCKED,
             gate_status=GateStatus.NOT_APPLICABLE,
             reasons=(
-                f"arm {arm!r} is not admitted by this transport: "
-                f"admitted arms are {', '.join(ADMITTED_ARMS)}; the cloud arms are P06's "
-                "comparison and need a recorded budget cap",
+                f"arm {arm!r} is not one this transport can run: {CONVENTIONAL_ARM} is the "
+                f"conventional arm and {', '.join(executive_module.CLOUD_ARMS)} are the cloud "
+                "arms, and B3 is deferred with written rationale (R6)",
             ),
             limitations=limitations,
             manifest=manifest_common,
             sensor_mode=sensor_mode,
         )
+    if arm in executive_module.CLOUD_ARMS:
+        limits, problem = recorded_budget_cap(repository)
+        if limits is None:
+            return CommandOutcome(
+                status=CommandStatus.BLOCKED,
+                gate_status=GateStatus.NOT_APPLICABLE,
+                reasons=(
+                    f"arm {arm!r} spends money and is admitted only against a recorded "
+                    f"budget cap, and none is usable: {problem}",
+                ),
+                limitations=limitations,
+                manifest=manifest_common,
+                sensor_mode=sensor_mode,
+            )
+        # Recorded on the run itself, so a receipt names the cap that governed
+        # the spend rather than leaving a reader to find that day's config.
+        manifest_common["provider_budget"] = {
+            "max_calls": limits[0],
+            "spend_ceiling_usd": limits[1],
+        }
     blockers = host_blockers(manifest_common["host_state"]) + port_blockers()
     manifest_common["ports_blocked"] = [
         reason for reason in blockers if reason.startswith("port ")
@@ -768,6 +824,7 @@ def record(
     try:
         result, report = driver(
             settings=settings,
+            arm=arm,
             config_document=document,
             episode_dir=episode_dir,
             evidence_dir=output / "platform",

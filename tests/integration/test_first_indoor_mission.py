@@ -294,15 +294,45 @@ def _run_record(tmp_path, monkeypatch, suite_path: Path, suite_name: str, *extra
     return code, receipt
 
 
-def test_a_cloud_arm_is_blocked_before_the_host_gate(tmp_path, monkeypatch):
+def test_a_cloud_arm_is_admitted_only_against_a_recorded_budget_cap(tmp_path, monkeypatch):
+    """A paid arm runs against a recorded cap, and is refused by name without one.
+
+    The arm gate's own condition is a recorded budget cap, so a capped cloud arm
+    being admitted is that rule satisfied rather than an exemption from it. And
+    the arm must reach the driver: an admitted arm that is handed through as B0
+    would produce a confident, wrong comparison rather than a refusal.
+    """
+    seen: dict = {}
+
+    def driver(**kwargs):
+        seen["arm"] = kwargs.get("arm")
+        return _scripted_driver(**kwargs)
+
+    monkeypatch.setattr(live_record, "live_mission_driver", driver)
     fixture = _write_fixture_root(tmp_path / "repo")
-    code, receipt = _run_record(
+    code, _ = _run_record(
         tmp_path, monkeypatch, fixture["suite_path"], fixture["suite"]["name"], "B2"
+    )
+    assert code == 0
+    assert seen.get("arm") == "B2", "the arm must reach the driver, not silently be B0"
+
+    # With no usable cap the same arm is refused, and the reason names what is
+    # missing. Point the config the cap is read from at a file that is not there.
+    from embodied.platform import mission_runtime as runtime_module
+
+    second = tmp_path / "second"
+    second.mkdir()
+    monkeypatch.setattr(
+        runtime_module,
+        "RUNTIME_MODEL_CONFIG_RELATIVE",
+        Path("configs/absent-runtime-model.yaml"),
+    )
+    code, receipt = _run_record(
+        second, monkeypatch, fixture["suite_path"], fixture["suite"]["name"], "B2"
     )
     assert code == 2
     assert receipt["status"] == "blocked"
-    assert "B2" in receipt["reasons"][0]
-    assert "P06" in receipt["reasons"][0]
+    assert "budget cap" in receipt["reasons"][0]
 
 
 def test_a_sensor_mode_the_suite_does_not_declare_is_blocked(tmp_path, monkeypatch):
