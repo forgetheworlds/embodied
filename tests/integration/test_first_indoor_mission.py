@@ -60,6 +60,10 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 REAL_PLATFORM_CONFIG = REPOSITORY / "configs" / "first_indoor.yaml"
 FIXTURE_SUITE_NAME = "first-indoor-fixture"
 HOST, CLOCK = "p05-integration-0", "monotonic"
+# The gate's real detection, captured before the fixtures below replace the
+# module attribute, so one test can still exercise it against a port this
+# process really holds rather than against a stub.
+_REAL_PORT_BLOCKERS = live_record.port_blockers
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +83,20 @@ def _healthy_host(monkeypatch):
         "host_state",
         lambda: {"load_1m": 1.0, "swap_free_mb": 4000.0},
     )
+
+
+@pytest.fixture(autouse=True)
+def _free_ports(monkeypatch):
+    """Keep the port gate out of these tests, without losing it.
+
+    The transport refuses a run while any declared port is held, which is right
+    in production and wrong in a test: another mission in this project can be
+    flying while the suite runs, and these tests then fail for a reason that has
+    nothing to do with what they prove. The gate keeps its own coverage in
+    ``test_a_held_port_is_seen_by_the_gate``, and its wiring into the run in
+    ``test_a_held_port_blocks_the_run``.
+    """
+    monkeypatch.setattr(live_record, "port_blockers", lambda ports=(): [])
 
 
 def _stamp(ns: int) -> ClockStamp:
@@ -201,6 +219,37 @@ def test_record_refuses_a_loaded_host(tmp_path, monkeypatch):
     assert any("freeze-blocked" in limitation for limitation in outcome.limitations)
     assert not (output / "episode").exists()
 
+
+
+def test_a_held_port_is_seen_by_the_gate():
+    """The port gate's own detection, on a port this test really holds.
+
+    The ephemeral port is bound for real, so the socket probe runs against the
+    kernel rather than against a stub, and the port is released before the
+    second assertion so the check is shown to answer both ways.
+    """
+    import socket
+
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    port = held.getsockname()[1]
+    try:
+        assert _REAL_PORT_BLOCKERS((port,)) == [f"port {port} is already in use"]
+    finally:
+        held.close()
+    assert _REAL_PORT_BLOCKERS((port,)) == []
+
+
+def test_a_held_port_blocks_the_run(tmp_path, monkeypatch):
+    """The gate stops a run, so it is wired in and not merely a function."""
+    monkeypatch.setattr(
+        live_record, "port_blockers", lambda ports=(): ["port 5760 is already in use"]
+    )
+    outcome, output = _record_scripted(tmp_path)
+    assert outcome.status.value == "blocked"
+    assert any("5760" in reason for reason in outcome.reasons)
+    assert not (output / "episode").exists()
 
 def test_registration_is_idempotent_and_a_foreign_claim_is_refused(tmp_path):
     fixture = _write_fixture_root(tmp_path / "repo")
@@ -415,6 +464,29 @@ def _scripted_driver(
     return result, report
 
 
+def _scripted_driver_for(*, target_present: bool):
+    """The scripted stand-in, reporting what a pilot on that scene reports.
+
+    On a present-target scene it claims the find and the inspection; on an
+    absent-target scene it claims the absence, which is that task's honest
+    answer. The transport hands a driver an instruction and the queried name
+    and nothing else, so this script is a property of the fixture: nothing here
+    reads the seed, and nothing about presence crosses into the runtime.
+    """
+
+    def driver(*, recorder, sensor_tap, episode_id, instruction, target_id, **kwargs):
+        return _scripted_driver(
+            recorder=recorder,
+            sensor_tap=sensor_tap,
+            episode_id=episode_id,
+            instruction=instruction,
+            target_id=target_id,
+            claims_found=target_present,
+        )
+
+    return driver
+
+
 def _sensor_ids():
     from embodied.contracts.records import SensorIds
 
@@ -434,8 +506,18 @@ class _ScriptedResult:
     guidance_events: list = []
 
 
-def _record_scripted(tmp_path, *, target_present: bool = True, adjudicate: bool = False):
-    fixture = _write_fixture_root(tmp_path / "repo", target_present=target_present)
+def _record_scripted(
+    tmp_path,
+    *,
+    target_present: bool = True,
+    target_identity: bool = True,
+    adjudicate: bool = False,
+):
+    fixture = _write_fixture_root(
+        tmp_path / "repo",
+        target_present=target_present,
+        target_identity=target_identity,
+    )
     output = tmp_path / "run"
     outcome = live_record.record(
         suite_name=fixture["suite"]["name"],
@@ -447,7 +529,7 @@ def _record_scripted(tmp_path, *, target_present: bool = True, adjudicate: bool 
         platform_config=REAL_PLATFORM_CONFIG,
         truth_seed=tmp_path / "repo" / "scenarios" / "first_indoor" / "truth.yaml",
         suite_config=fixture["suite_path"],
-        mission_driver=_scripted_driver,
+        mission_driver=_scripted_driver_for(target_present=target_present),
     )
     return outcome, output
 
@@ -491,17 +573,121 @@ def test_the_transport_closes_a_real_episode_and_the_grader_scores_it(tmp_path):
     assert (episode / SCORE_FILENAME).is_file()
 
 
-def test_a_seed_with_no_present_target_is_refused_rather_than_searched(tmp_path):
-    """A scenario with nothing to find is not this mission's suite.
+def test_an_absent_target_is_recorded_and_graded_against_the_truth(tmp_path):
+    """A scenario whose subject is not there is a task, not an exemption.
 
-    The transport needs the target's true position to measure the inspected
-    predicate, and a scenario with no present target would make that
-    measurement meaningless; refusing names the disagreement instead of
-    recording a run whose outcome cannot be read.
+    The instruction for such a scene is to report the absence. The transport
+    records it, the referee records the world as it actually is, and the grader
+    holds the report to that fact: an absence report is world-correct, and the
+    grader does not manufacture a miss for an object the world never had.
     """
-    outcome, _ = _record_scripted(tmp_path, target_present=False)
+    outcome, output = _record_scripted(
+        tmp_path, target_present=False, target_identity=False
+    )
+    assert outcome.status.value == "complete"
+    assert outcome.manifest["target_present"] is False
+    episode = output / "episode"
+    store = truth_store_path(episode)
+    truth_lines = [
+        json.loads(line)
+        for line in (store / "truth-events.jsonl").read_text().splitlines()
+    ]
+    # The world is recorded as it is, with no phantom target added to it.
+    assert truth_lines[0]["payload"]["targets"] == {"red_block": {"present": False}}
+    assert truth_lines[0]["payload"]["world_counts"] == {"red_block": 0}
+    # Nothing was there to inspect. The outcome says so, rather than reporting
+    # a failed look at an object that does not exist.
+    assert truth_lines[1]["payload"]["inspected"] == {"red_block": False}
+    summary = json.loads((output / "mission.json").read_text())
+    assert "declares no red_block" in summary["outcome"]["inspected_detail"]
+    # The absence report is world-correct on every predicate, and the grader
+    # misses nothing: the world never had this object to miss.
+    score = grade(episode)
+    assert score.missed_present_targets == ()
+    assert [verdict.world_correct for verdict in score.claims] == [True, True, True]
+    assert [verdict.observed for verdict in score.claims] == [
+        "not_found",
+        "not_inspected",
+        "returned",
+    ]
+
+
+def test_a_present_target_without_its_position_is_still_refused(tmp_path):
+    """The absent case is a different task, never an exemption from this one.
+
+    A seed that declares the object present must still give the referee its true
+    position, because the inspected predicate is measured against that position.
+    Without one the run cannot be read, and refusing is the honest answer: a
+    declared presence must not become a licence to record an unmeasured result.
+    """
+    outcome, _ = _record_scripted(tmp_path, target_present=True, target_identity=False)
     assert outcome.status.value == "blocked"
-    assert any("present targets" in reason for reason in outcome.reasons)
+    assert any("identity" in reason for reason in outcome.reasons)
+
+
+def test_every_declared_suite_resolves_by_its_own_name():
+    """Each declared suite is selectable by name, through the CLI's own path.
+
+    Demonstrated rather than asserted: this is the sequence ``bench record``
+    performs — resolve the name to its declaration, load it, register it, and
+    read the pointers it carries — for the shipped suite and all four held-out
+    ones.
+    """
+    for name in (
+        "first-indoor",
+        "holdout-e-wide",
+        "holdout-f-z",
+        "holdout-g-long",
+        "holdout-h-clutter",
+    ):
+        path = live_record.suite_config_path_for(name)
+        assert path.is_file(), f"{name} has no declaration at {path}"
+        document = live_record.load_suite_document(path)
+        assert document is not None
+        assert document["name"] == name
+        assert live_record.register_suite(document) == name
+        assert live_record.declared_path(document, "truth_seed").is_file()
+
+
+def test_a_suite_name_that_is_a_path_is_refused():
+    """A suite is selected by the name it declares, never by a path."""
+    for name in ("../../etc/passwd", "configs/suites/first-indoor", "a/b", ""):
+        with pytest.raises(live_record.SuiteConfigError):
+            live_record.suite_config_path_for(name)
+
+
+def test_the_cli_records_a_held_out_suite_against_its_own_truth(tmp_path, monkeypatch):
+    """The held-out suite is reachable from the CLI, and graded against itself.
+
+    The point is not that an episode appears. It is that the world state the
+    referee wrote names the held-out scene's own queried object (``red_can``)
+    rather than the default suite's (``red_block``): resolving a held-out suite
+    without carrying its truth across would fly one scene and grade another.
+    """
+    from embodied.bench import cli as bench_cli  # noqa: F401 - registers the command
+    from embodied.cli import main
+
+    monkeypatch.setattr(live_record, "live_mission_driver", _scripted_driver)
+    output = tmp_path / "run"
+    code = main(
+        [
+            "bench", "record",
+            "--suite", "holdout-e-wide",
+            "--sensor-mode", "sensor-derived",
+            "--arm", "B0",
+            "--output", str(output),
+        ]
+    )
+    assert code == 0
+    episode = output / "episode"
+    store = truth_store_path(episode)
+    truth_lines = [
+        json.loads(line)
+        for line in (store / "truth-events.jsonl").read_text().splitlines()
+    ]
+    assert truth_lines[0]["payload"]["targets"] == {"red_can": {"present": True}}
+    manifest = json.loads((episode / "manifest.json").read_text())
+    assert manifest["suite"] == "holdout-e-wide"
 
 
 def test_a_supported_annotation_turns_the_same_episode_into_a_pass(tmp_path):
