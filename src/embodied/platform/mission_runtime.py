@@ -1262,6 +1262,7 @@ class MissionRuntime:
                 # Closer to what it is looking at than the mission's own
                 # declared standoff: there is no approach left to make, and
                 # the "view" is the one already in hand.
+                self._count_gate("too_close")
                 continue
             approach = GE.approach_region(
                 target_point,
@@ -1269,10 +1270,56 @@ class MissionRuntime:
                 direction=FRONTIER_VIEW_DIRECTION,
             )
             if approach.contains(tuple(float(value) for value in here)):
+                self._count_gate("contains")
                 continue
             if any(cell in searchable for cell in approach.cells(self.store.config)):
+                self._count_gate("accepted")
                 return target_point
+            self._count_gate("not_searchable")
         return None
+
+    def _count_gate(self, name: str) -> None:
+        """Tally why a candidate vantage was or was not returned.
+
+        Diagnostics only, and tolerant of a runtime built without __init__
+        (the tests construct one that way): the counters exist to be logged,
+        never to change a decision.
+        """
+        counts = getattr(self, "_gate_counts", None)
+        if counts is None:
+            counts = {}
+            self._gate_counts = counts
+        counts[name] = counts.get(name, 0) + 1
+
+    def map_summary(self) -> dict[str, object]:
+        """What the map actually holds, in the terms planning depends on.
+
+        ``free_cells`` are cells the map publishes free; the searchable set is
+        those free with the whole declared envelope around them free too. A map
+        can hold many of the first and none of the second, and that difference
+        is the whole question of whether the aircraft has anywhere to go.
+        """
+        now = self._now_ns()
+        free = self.store.free_cells(now_ns=now)
+        here = self._position_odom()
+        searchable = self._searchable_cells(here) if here is not None else set()
+
+        def bbox(cells):
+            if not cells:
+                return None
+            centres = [self.store.config.cell_center(cell) for cell in cells]
+            return tuple(
+                (round(min(c[axis] for c in centres), 2), round(max(c[axis] for c in centres), 2))
+                for axis in range(3)
+            )
+
+        return {
+            "free_cells": len(free),
+            "searchable_cells": len(searchable),
+            "free_bbox": bbox(free),
+            "searchable_bbox": bbox(searchable),
+            "frontiers": len(self.frontier_regions()),
+        }
 
     def _searchable_cells(
         self, here: tuple[float, float, float]
@@ -1303,6 +1350,7 @@ class MissionRuntime:
         if here is None:
             return ()
         searchable = self._searchable_cells(here)
+        self._gate_counts = {}
         ranked: list[tuple[float, str]] = []
         for ref, region in self.frontier_regions().items():
             point = self._frontier_goal_point(
@@ -1313,6 +1361,12 @@ class MissionRuntime:
             distance = float(np.linalg.norm(np.asarray(point) - np.asarray(here)))
             ranked.append((-distance, ref))
         ranked.sort()
+        if not ranked:
+            self.result.log.append(
+                "no navigable frontier: gate counts {gates}; map {summary}".format(
+                    gates=dict(self._gate_counts), summary=self.map_summary()
+                )
+            )
         return tuple(ref for _, ref in ranked)
 
     def _frontier_vantage(
