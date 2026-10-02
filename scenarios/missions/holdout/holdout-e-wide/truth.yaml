@@ -1,0 +1,54 @@
+# EVALUATOR-ONLY — hidden task truth seed for the holdout-e-wide scene.
+#
+# This file is bench-side input to the referee and must never reach the
+# runtime side. The referee reads it at record time and writes the
+# `world_state` below into the bench-side store beside the episode —
+# `<episode>.truth/truth-events.jsonl`, created by
+# `embodied.bench.referee.Referee` and read only by
+# `embodied.bench.grader`. The agent surface of an episode is the projection
+# in `embodied.bench.recorder.PROJECTION` and structurally cannot reach
+# either this file or the store; the holdout group's probe re-proves that
+# against the live code.
+#
+# `world_state` below is verbatim the payload shape of a `world_state` truth
+# event (`embodied.bench.events._check_truth_payload`): targets map name ->
+# {present}, world_counts maps name -> non-negative integer.
+#
+# HELD OUT: this scene is never used to develop or tune the mission. Nothing
+# in this file, and nothing in the scene's other metadata, carries a route, a
+# doorway order or a waypoint — only what a grader needs to judge a claim.
+schema: holdout-e-wide-truth-1
+
+world_state:
+  targets:
+    red_can:
+      present: true
+  world_counts:
+    red_can: 1
+
+# Not seeded, on purpose. `physical_outcome` (inspected, return_verified,
+# violations, takeover) records what happened in one live episode; it is
+# measured by the referee/transport at record time, never declared here.
+physical_outcome: null
+
+# Evaluator-only geometric facts, for the per-run physical predicate (the
+# aircraft's truth pose sustained within a declared radius of the target's
+# true position). These keys are NOT the store payload: a `world_state`
+# target entry is exactly {"present": bool}
+# (`embodied.bench.events._check_truth_payload` refuses any other key), so a
+# referee must read position from here and write only `present` into the
+# event. Frames: the world file is ENU with x north, y west, z up and the
+# origin at floor level; NED here is the same origin converted with the
+# adapter's own single convention, `enu_to_ned` = (x, -y, -z).
+identity:
+  red_can:
+    node: target_can
+    position_enu_m: [13.5, 9.5, 1.55]
+    position_ned_from_world_origin_m: [13.5, -9.5, -1.55]
+    size_m:
+      radius: 0.12
+      height: 0.3
+    base_color: [0.85, 0.05, 0.05]
+    support: target_shelf, whose top face is at z = 1.4 m
+    note: the only object of this shade in the scene; the can's centre sits one
+      half-height above the shelf top, 1.4 + 0.15 = 1.55

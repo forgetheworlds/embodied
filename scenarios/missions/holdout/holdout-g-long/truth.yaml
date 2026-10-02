@@ -1,0 +1,44 @@
+# EVALUATOR-ONLY — hidden task truth seed for the holdout-g-long scene.
+#
+# This is the group's ABSENT-TARGET case. The scene's instruction is "Search
+# the room and the spur first; if no red can is present, report the absence
+# before returning to the start." The world file contains no red object at all
+# (verified against the geometry, not assumed), so the truthful hidden state is
+# that the queried object is not there, and the correct answer to this task is
+# a supported report of absence.
+#
+# Same contract as the group's other seeds: the referee reads this at record
+# time and writes `world_state` into the bench-side store beside the episode,
+# which only the grader reads. The agent surface cannot reach either.
+#
+# HELD OUT: this file is the grader's side of the task. It must never be
+# reachable by the pilot, and it deliberately contains no location, no route
+# and no hint beyond the single fact of absence — a scene that told the pilot
+# "there is nothing here" would not test anything.
+schema: holdout-g-long-truth-1
+
+world_state:
+  targets:
+    red_can:
+      present: false
+  world_counts:
+    red_can: 0
+
+# Measured per run, never declared here.
+physical_outcome: null
+
+# NO identity section, on purpose, and this is the load-bearing difference from
+# the group's other seeds. `identity` exists to give the referee the target's
+# true position so the `inspected` predicate can be measured. There is no such
+# object here, so there is no position to give, and
+# `embodied.bench.live_record.target_position_ned` raises `SuiteConfigError`
+# for this target rather than returning a guessed triple. That refusal is the
+# honest behaviour: a fabricated position would let the recorder measure an
+# inspection of nothing.
+#
+# Consequence for the grader, and the reason this seed is worth having: because
+# `present` is false, `red_can` is not a present target, so it cannot appear in
+# `missed_present_targets` — the grader does not manufacture a miss for a
+# target the world never had, and a report of absence is graded against the
+# truth rather than against a phantom obligation. The group's probe asserts
+# exactly that.

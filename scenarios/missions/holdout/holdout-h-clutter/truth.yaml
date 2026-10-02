@@ -1,0 +1,37 @@
+# EVALUATOR-ONLY — hidden task truth seed for the holdout-h-clutter scene.
+#
+# Same contract as the holdout group's other seeds: the referee reads this at
+# record time and writes `world_state` into the bench-side store beside the
+# episode (`<episode>.truth/truth-events.jsonl`), which only the grader reads.
+# The agent surface is the episode projection and cannot reach either.
+#
+# HELD OUT: nothing here or in the scene's other metadata carries a route, a
+# doorway order or a waypoint. The instruction's "clustered region" is a place
+# the pilot must find in the world file; this file only says what a grader
+# needs in order to judge whether a claim about the red can was true.
+schema: holdout-h-clutter-truth-1
+
+world_state:
+  targets:
+    red_can:
+      present: true
+  world_counts:
+    red_can: 1
+
+# Measured per run, never declared here.
+physical_outcome: null
+
+# Frames as in the sibling seeds: world file is ENU (x north, y west, z up,
+# origin at floor level); NED is `enu_to_ned` of the same triple = (x, -y, -z).
+identity:
+  red_can:
+    node: target_can
+    position_enu_m: [10.7, 4.5, 0.15]
+    position_ned_from_world_origin_m: [10.7, -4.5, -0.15]
+    size_m:
+      radius: 0.1
+      height: 0.3
+    base_color: [0.85, 0.05, 0.05]
+    support: R2 floor, inside the cluster
+    note: the only object of this shade in the scene; the cluster around it is
+      grey furniture, so nothing else can be mistaken for it by colour

@@ -1,0 +1,37 @@
+# EVALUATOR-ONLY — hidden task truth seed for the holdout-f-z scene.
+#
+# Same contract as the holdout group's other seeds: the referee reads this at
+# record time and writes `world_state` into the bench-side store beside the
+# episode (`<episode>.truth/truth-events.jsonl`), which only the grader reads.
+# The agent surface is the episode projection and cannot reach either.
+#
+# HELD OUT: nothing here or in the scene's other metadata carries a route, a
+# doorway order or a waypoint. "Behind the two corridor turns" is the pilot's
+# instruction, not a geometry hint: the corridor is in the world file, and the
+# truth below is only what a grader needs to judge a claim.
+schema: holdout-f-z-truth-1
+
+world_state:
+  targets:
+    red_bottle:
+      present: true
+  world_counts:
+    red_bottle: 1
+
+# Measured per run, never declared here.
+physical_outcome: null
+
+# Frames as in the sibling seeds: world file is ENU (x north, y west, z up,
+# origin at floor level); NED is `enu_to_ned` of the same triple = (x, -y, -z).
+identity:
+  red_bottle:
+    node: target_bottle
+    position_enu_m: [12.0, 5.0, 0.225]
+    position_ned_from_world_origin_m: [12.0, -5.0, -0.225]
+    size_m:
+      radius: 0.1
+      height: 0.45
+    base_color: [0.85, 0.05, 0.05]
+    support: R2 floor, standing directly on it
+    note: the only object of this shade in the scene; a tall thin cylinder whose
+      centre sits one half-height above the floor, 0 + 0.225

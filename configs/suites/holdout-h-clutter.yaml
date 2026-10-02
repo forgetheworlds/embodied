@@ -1,0 +1,21 @@
+# Suite registration data for the held-out scene `holdout-h-clutter`.
+#
+# Shape, contract and reachability note: see `configs/suites/holdout-e-wide.yaml`
+# (identical in structure). Keys map onto `SuiteSpec` plus the pointers the
+# transport reads; hidden truth lives only in `truth_seed`'s file.
+#
+# HELD OUT — no route, no doorway order, no waypoint, no target location
+# beyond the instruction itself. Which region is "the clustered region" is for
+# the pilot to find in the world file.
+name: holdout-h-clutter
+registered_by: P05
+localization_mode: sensor-derived
+
+provider_budget:
+  spend_ceiling_usd: 5.0
+
+scene_root: scenarios/missions/holdout/holdout-h-clutter
+world: scenarios/missions/holdout/holdout-h-clutter/world.wbt
+# Verbatim the scene's own instruction (mission.yaml `instructions[0]`).
+mission_instruction: "Inspect the clustered region first, then find the red can inside it, and only after that return to the start."
+truth_seed: scenarios/missions/holdout/holdout-h-clutter/truth.yaml

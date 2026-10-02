@@ -1,0 +1,43 @@
+# Suite registration data for the held-out scene `holdout-e-wide`.
+#
+# Same shape as `configs/suites/first-indoor.yaml`, which is the worked
+# example: the keys map one-to-one onto `embodied.bench.recorder.SuiteSpec`
+# (name, registered_by, localization_mode, provider_budget) plus the pointers
+# the transport reads (world, mission_instruction, truth_seed). The loader is
+# `embodied.bench.live_record.load_suite_document` / `register_suite`.
+#
+# Hidden task truth is NOT here. This file carries only the PATH of the
+# bench-side truth seed; the facts live in that file, and the per-episode store
+# the grader reads is written by the referee beside the episode.
+#
+# HELD OUT — the four scenes under `scenarios/missions/holdout/` exist so the
+# comparison can run on layouts the mission was never developed against.
+# Nothing in this declaration (or in the scene's other metadata) may carry a
+# route, a doorway order, a waypoint or the target's location: the instruction
+# below is everything the pilot is told.
+#
+# REACHABILITY, stated honestly: `bench record --suite <name>` reaches a suite
+# through `live_record.SUITE_CONFIG_RELATIVE`, which names exactly one file
+# (configs/suites/first-indoor.yaml). A held-out suite is therefore reachable
+# through the transport's own `record(...)` entry point — which takes the
+# document, the truth seed and the suite-config path as arguments, the way
+# `tests/integration/test_first_indoor_mission.py` drives its fixture — but not
+# yet through the bare CLI, which would need one line outside this stage's
+# fence. See the probe and the report.
+name: holdout-e-wide
+registered_by: P05
+localization_mode: sensor-derived
+
+# Positive numbers only (SuiteSpec refuses zero and negatives, so a budget key
+# cannot silently mean "absent"). This is a per-suite guard and deliberately
+# the same value as the sibling suite; the project-level ceiling is R7's.
+provider_budget:
+  spend_ceiling_usd: 5.0
+
+scene_root: scenarios/missions/holdout/holdout-e-wide
+world: scenarios/missions/holdout/holdout-e-wide/world.wbt
+# Verbatim the scene's own instruction (mission.yaml `instructions[0]`): the
+# held-out wording is part of what is being tested, so it is passed through
+# unchanged rather than restated in the flat "Find the X" form.
+mission_instruction: "Before returning to the start, inspect the red can in the far room and confirm its shape."
+truth_seed: scenarios/missions/holdout/holdout-e-wide/truth.yaml
