@@ -153,6 +153,17 @@ PLAN_CONFIG = PL.PlanConfig(
 # Frontier cells are clustered into one excursion target per 0.6 m block, so
 # the neighbouring boundary cells of one doorway are one frontier, not eight.
 FRONTIER_CLUSTER_CELLS = 6
+# How a frontier becomes a flyable goal. A frontier is a free cell touching
+# unknown space, so the standoff region the executor builds around it — one
+# metre back along the view direction, inflated by the envelope — can overlap
+# space the map has no evidence for, and the planner refuses that correctly: a
+# larger margin cannot turn unseen space into measured free space
+# (specification 7.1). The vantage is therefore walked back toward the aircraft,
+# which stands in known free space by construction, until that standoff region
+# is entirely supported. The direction matches the executor's own, so the region
+# this search clears is the region the planner will check.
+FRONTIER_VIEW_DIRECTION = (1.0, 0.0, 0.0)
+FRONTIER_VANTAGE_STEP_M = 0.2
 # The mission's own budget, in the simulator's seconds (the clock the bring-up
 # and route windows spend, owner ruling 2026-09-28).
 MISSION_BUDGET_SIM_S = 300.0
@@ -171,6 +182,15 @@ MISSION_YAW_HOLD_RAD = 0.0
 # the newest pair, at most this often (wall seconds). The estimator feed is on
 # its own thread and never waits behind this.
 MIN_PERCEPTION_INTERVAL_S = 0.3
+# The cold-start perception window: bounded, in simulator seconds, before the
+# mission's phases begin. It exists to break the bootstrap on the mission's
+# first flight — the map a frontier is resolved from can only be built from the
+# aircraft's own frames, so with an empty store no goal can resolve a target and
+# no step ever runs. Eight seconds is this stage's declared engineering
+# parameter (R2): long enough for the first frames to arrive, be depth-validated
+# and integrated, and short enough that an aircraft which sees nothing useful
+# says so well inside the mission budget.
+COLD_START_PERCEPTION_SIM_S = 8.0
 # Certificate renewal cadence: the planner is re-run against the newest map at
 # most this often (wall seconds). The cost is real (the P03 inflation pass runs
 # over the whole grid: ~70 ms at this scene's declared bounds), so renewal is
@@ -324,6 +344,11 @@ class MissionRuntime:
             ),
         )
         self._perception_queue: queue.Queue = queue.Queue(maxsize=4)
+        # Perception frames dropped because the perception queue was full. A
+        # count that stays at zero says the map saw every frame; anything else
+        # says the map was built from a subset, which a reader of the receipt
+        # needs to know before trusting a frontier.
+        self._perception_frames_dropped = 0
         self._state_ring: list[tuple[int, loc.EstimatorState]] = []
         self._latest_state: loc.EstimatorState | None = None
         self._latest_aligned: dict[str, object] | None = None
@@ -486,6 +511,7 @@ class MissionRuntime:
                 pending_pairs.put_nowait(record)
             except queue.Full:
                 self._stats.pair_records_dropped += 1
+            self._offer_to_perception(record)
 
         platform.record_sink = file_record
 
@@ -576,6 +602,17 @@ class MissionRuntime:
 
         def drain() -> None:
             nonlocal last_telemetry
+            # Deliberately NOT a perception pump. `drain` runs inside the
+            # ordered bring-up, whose RC-throttle override must be refreshed
+            # every 0.5 s inside the firmware's own 3.0 s override timeout.
+            # Running stereo depth here (SGBM, 128 disparities over 640x480)
+            # starved that refresh: on live-10 the vehicle's own RC report read
+            # 1000 us while the window sent 1899 us, so the excitation had no
+            # thrust path at all, the open-loop takeoff ramp then ran unbounded
+            # to 1.19 m, and the aircraft tipped over at roll -90 deg.
+            # Perception is pumped where it belongs instead: a bounded
+            # cold-start window before the phases, and inside each step's own
+            # loop, which is where the map is built from flown observation.
             if time.monotonic() - last_telemetry < 0.2:
                 return
             last_telemetry = time.monotonic()
@@ -723,6 +760,7 @@ class MissionRuntime:
                 "sim_clock_newest_s": self._stats.sim_clock.newest_s,
                 "first_record_kind": self._first_record_kind,
                 "feed_failures": list(feed_failures),
+                "perception_frames_dropped": self._perception_frames_dropped,
                 "publisher_published": getattr(publisher, "published", None),
                 "publisher_failures": list(getattr(publisher, "publish_failures", [])),
             }
@@ -742,11 +780,38 @@ class MissionRuntime:
         world = _LiveRunnerWorld(self)
         runner = RecipeRunner(self.broker, world, now=self._clock, sink=self._sink)
         termination = "mission_completed"
-        candidates_at_start = world.discovered_candidates()
+        # Look before leaping. A frontier is resolved out of the map, the map
+        # is built from the aircraft's own frames, and an empty store resolves
+        # nothing — so the first goal could never resolve a target, the step
+        # never ran, perception never ran, and the mission was blocked against
+        # its own empty map. Pump perception on its own cadence for a bounded
+        # window before the phases begin, so the first goal resolves against a
+        # real snapshot.
+        cold_start = _SimWindow(
+            self._stats.sim_clock,
+            COLD_START_PERCEPTION_SIM_S,
+            label="the cold-start perception window",
+            wall_ceiling_s=_sim_window_wall_ceiling_s(
+                COLD_START_PERCEPTION_SIM_S, self.settings.realtime_ratio_envelope[0]
+            ),
+        )
+        while not cold_start.expired():
+            if self._candidate_targets or self.frontier_regions():
+                break
+            drain()
+            self.perceive_if_due()
+            time.sleep(0.02)
+        self.result.log.append(
+            f"cold start: {len(self.frontier_regions())} frontier region(s), "
+            f"{len(self._candidate_targets)} grounded candidate(s), "
+            f"{self._observation_counter} observation(s) seen"
+        )
+        # The inspect phase's own step guard (candidate_present) decides whether
+        # there is anything to inspect, evaluated when that phase is reached. The
+        # skip that used to live here read a snapshot taken BEFORE exploration
+        # ran, so it could only ever skip the phase that exploration exists to
+        # feed.
         for phase, recipe in zip(("explore", "inspect", "return"), mission_module.build_b0_recipes()):
-            if phase == "inspect" and not candidates_at_start:
-                self.result.log.append("inspect phase skipped: no discovered candidate")
-                continue
             if mission_window.expired():
                 termination = "mission_budget_exhausted"
                 break
@@ -835,6 +900,33 @@ class MissionRuntime:
 
     # -- perception ----------------------------------------------------------
 
+    def _offer_to_perception(self, record: Any) -> None:
+        """Hand one stereo pair to the perception queue, newest frame wins.
+
+        A full queue drops its OLDEST frame rather than refusing the new one:
+        an old image snapshot is worth less than the current one
+        (specification 3.1, "drop replaceable old image snapshots rather than
+        allow backlog"), and blocking here would stall the thread the frames
+        arrive on. This method exists because the queue was once declared and
+        drained but never fed, and the omission was invisible: perception
+        simply never ran, so no observation, map, candidate or frontier was
+        ever produced, and the mission deadlocked against its own empty map.
+        """
+        try:
+            self._perception_queue.put_nowait(record)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._perception_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._perception_frames_dropped += 1
+        try:
+            self._perception_queue.put_nowait(record)
+        except queue.Full:
+            self._perception_frames_dropped += 1
+
     def perceive_if_due(self) -> None:
         """Depth, candidates and map integration on the newest queued pair.
 
@@ -856,9 +948,17 @@ class MissionRuntime:
         # its age on the host clock would make every cell read stale the moment
         # it was written.
         self._capture_clock_ns = max(self._capture_clock_ns or 0, int(pair.capture_host_ns))
-        pose = self._capture_pose(record)
+        # The alignment has to be sealed before a capture-time pose can be built:
+        # an unsealed one has no odom rotation, and its own accessor refuses
+        # rather than guessing the frame's unobservable yaw. So ask for the
+        # navigation state FIRST and record nothing until the estimator has
+        # defined the epoch. Perception now starts during the bring-up, on the
+        # way up, so "not sealed yet" is the ordinary case rather than an error.
         state = self._navigation_state()
-        if pose is None or state is None:
+        if state is None:
+            return
+        pose = self._capture_pose(record)
+        if pose is None:
             return
         try:
             left = np.frombuffer(pair.left_bytes, dtype=np.uint8).reshape(
@@ -966,7 +1066,18 @@ class MissionRuntime:
             ),
             receipt_stamp=record.received_stamp,
             sim_time_s=record.sim_time_s if record.sim_time_s >= 0.0 else None,
-            pair_id=f"{self.episode_id}-pair-{pair.pair_id:06d}",
+            # The pair id travels with the payloads or not at all: the observation
+            # record requires all three or none of them (records.py, "an
+            # observation carries the pair id and both payloads, or none of
+            # them"), and this runtime stores the frames only for an observation
+            # that grounded a candidate — the evidence a claim can cite. Setting
+            # the id unconditionally is a half-reference the recorder refuses,
+            # and it was invisible while perception never ran.
+            pair_id=(
+                f"{self.episode_id}-pair-{pair.pair_id:06d}"
+                if left_payload is not None
+                else None
+            ),
             left_payload=left_payload,
             right_payload=right_payload,
             encoding=pair.encoding,
@@ -1049,6 +1160,59 @@ class MissionRuntime:
             )
         return regions
 
+    def _frontier_vantage(
+        self, region: GE.BoxRegion
+    ) -> tuple[float, float, float]:
+        """The point to fly toward in order to observe this frontier.
+
+        A frontier is a boundary between observed free space and unknown space:
+        an observation opportunity, not a destination (specification 11). A goal
+        AT the boundary cannot be admitted, because the standoff region the
+        executor builds around it overlaps space the map has no evidence for —
+        which is exactly how live-12's two explore goals were refused. So the
+        vantage is searched back along the line to the aircraft, which stands in
+        known free space by construction, and the first point the planner could
+        admit is preferred.
+
+        When no such point exists the cluster's own centre is returned anyway:
+        resolution holds the target, and the support question belongs to
+        admission, which refuses with its own named reason rather than being
+        pre-empted here.
+        """
+        centre = tuple(float(value) for value in region.center())
+        here = self._position_odom()
+        if here is None:
+            return centre
+        direction = np.asarray(FRONTIER_VIEW_DIRECTION, dtype=np.float64)
+        ideal = np.asarray(centre, dtype=np.float64) - GE.STANDOFF_M * direction
+        toward = np.asarray(here, dtype=np.float64)
+        span = float(np.linalg.norm(toward - ideal))
+        steps = max(1, int(span / FRONTIER_VANTAGE_STEP_M))
+        # The planner admits a goal when at least one cell of its goal region is
+        # in the set it may search, so this asks exactly that and no weaker
+        # question: the same inflation, the same extra margin the planner adds,
+        # and the aircraft's own position excluded as an obstacle. A weaker test
+        # clears vantages the planner then refuses, which is how live-14's
+        # explore goals were still rejected after the first attempt at this.
+        searchable = GE.inflated_free_cells(
+            self.store,
+            ENVELOPE,
+            now_ns=self._now_ns(),
+            self_occupied_origin_odom_m=here,
+            extra_margin_m=self.store.config.voxel_m / 4.0,
+        )
+        for index in range(steps + 1):
+            vantage = ideal + (index / steps) * (toward - ideal)
+            target = vantage + GE.STANDOFF_M * direction
+            approach = GE.approach_region(
+                tuple(float(value) for value in target),
+                ENVELOPE,
+                direction=FRONTIER_VIEW_DIRECTION,
+            )
+            if any(cell in searchable for cell in approach.cells(self.store.config)):
+                return tuple(float(value) for value in target)
+        return centre
+
     def resolve_targets(self, proposal: R.SpatialGoal) -> tuple[R.GroundedTarget, ...]:
         """Resolve a proposal's target refs into grounded targets this runtime holds.
 
@@ -1091,7 +1255,9 @@ class MissionRuntime:
             else:
                 region = self.frontier_regions().get(ref)
                 if region is not None:
-                    point = region.center()
+                    # Not the region's own centre: a frontier cell sits beside
+                    # unknown space, and a goal AT it is refused as unsupported.
+                    point = self._frontier_vantage(region)
             if point is None:
                 continue
             resolved.append(
@@ -1156,6 +1322,11 @@ class _LiveAdmission:
             mission_revision=runtime.contract.revision,
             snapshot_id=runtime.store.snapshot_id,
             now_ns=runtime._now_ns(),
+            # The one declared pose-validity parameter, taken from the module
+            # that owns it rather than restated here (R2: a declared value has
+            # one home). It bounds how old a pose may be before a selection
+            # transformed with it is refused.
+            pose_validity_s=G.POSE_VALIDITY_S,
         )
         if result.accepted is None:
             for ref in proposal.target_refs:
@@ -1317,13 +1488,25 @@ class _LiveRunnerWorld:
     def completion(self, action: str, target_ref: str | None) -> tuple[str, tuple[str, ...]]:
         runtime = self._runtime
         active = runtime._active_goal
-        evidence = tuple(dict.fromkeys(self._step_observations))[:4]
+        observations = tuple(dict.fromkeys(self._step_observations))[:4]
         if active is None or active.certificate is None or active.terminal_region is None:
-            return "blocked", evidence
+            return "blocked", observations
         position = runtime._position_odom()
         if position is None:
-            return "blocked", evidence
+            return "blocked", observations
         nav_state = runtime._navigation_state()
+        # A completion is a claim, and a claim cites. What the step observed is
+        # the first choice of citation; when a step reaches its declared
+        # condition without grounding a candidate — an explore step arriving at
+        # a frontier, or the return to a start the aircraft already occupies —
+        # the citation is the navigation state whose position and speed the
+        # arrival was measured from. Handing the runner an empty tuple is what
+        # raised "a completion is a claim with evidence" on live-12; the
+        # mission's own claim evidence below stays observation-only, so the
+        # found/inspected/returned claims never cite a state string.
+        cited = observations or (
+            f"state:{nav_state.state_sequence if nav_state is not None else 0}",
+        )
         status = EX.completion_status(
             active.accepted,
             active.certificate,
@@ -1333,17 +1516,16 @@ class _LiveRunnerWorld:
             terminal_region=active.terminal_region,
             settle_position_tolerance_m=ENVELOPE.inflation_m,
             settle_speed_tolerance_mps=SETTLE_SPEED_MPS,
-            evidence=evidence
-            or (f"state:{nav_state.state_sequence if nav_state is not None else 0}",),
+            evidence=cited,
         )
         if status.disposition is not R.ExecutionDisposition.COMPLETED:
-            return "blocked", evidence
+            return "blocked", observations
         if action == "return":
             runtime._return_settled = True
-            runtime._return_evidence.extend(evidence)
+            runtime._return_evidence.extend(observations)
         if action == "inspect":
-            runtime._inspect_evidence.extend(evidence)
-        return "achieved", evidence
+            runtime._inspect_evidence.extend(observations)
+        return "achieved", cited
 
     # -- internals ---------------------------------------------------------------
 
@@ -1402,6 +1584,7 @@ class _LiveRunnerWorld:
             mission_revision=runtime.contract.revision,
             snapshot_id=runtime.store.snapshot_id,
             now_ns=runtime._now_ns(),
+            pose_validity_s=G.POSE_VALIDITY_S,
         )
         if result.accepted is not None and result.certificate is not None:
             active.certificate = result.certificate

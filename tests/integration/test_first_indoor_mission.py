@@ -134,10 +134,19 @@ def _write_fixture_root(
 
 
 def test_the_suite_registers_only_from_its_own_declaration(tmp_path):
-    """A build without the declaration registers nothing and refuses the suite."""
+    """A build without the declaration registers nothing and refuses the suite.
+
+    The registry is process-global, and the real record path legitimately fills
+    it: registering the shipped declaration is that path's act, not an import
+    side effect. So this asserts the invariant the test is named for — a missing
+    declaration loads nothing and a None document registers nothing, leaving the
+    registry exactly as it was — rather than the absence of a suite an earlier
+    test in the same process may have registered through the real path.
+    """
+    before = dict(live_record.recorder_module.SUITE_REGISTRY)
     assert live_record.load_suite_document(tmp_path / "missing.yaml") is None
     assert live_record.register_suite(None) is None
-    assert "first-indoor" not in live_record.recorder_module.SUITE_REGISTRY
+    assert dict(live_record.recorder_module.SUITE_REGISTRY) == before
 
 
 def test_a_loaded_host_is_blocked_before_anything_starts():
