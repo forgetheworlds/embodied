@@ -2141,6 +2141,7 @@ class TestOrderedBringUp:
             "TKOFF_THR_MAX",
             "PILOT_SPD_UP",
             "TKOFF_SLEW_TIME",
+            "DISARM_DELAY",
         }
         assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
         assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
@@ -2185,6 +2186,7 @@ class TestOrderedBringUp:
             "TKOFF_THR_MAX": 0.9,
             "PILOT_SPD_UP": 2.5,
             "TKOFF_SLEW_TIME": 2.0,
+            "DISARM_DELAY": 10.0,
         }
         # The thrust path is declared as a bounded LOCAL bring-up action, with the
         # frozen E-EXC climb target and the window's own airtime bound.
@@ -2798,6 +2800,7 @@ class TestTheTakeoffRampIsBoundedByTheAirframesOwnHover:
             "TKOFF_THR_MAX": 0.8999999761581421,  # the vehicle's float32(0.9)
             "PILOT_SPD_UP": 2.5,
             "TKOFF_SLEW_TIME": 2.0,
+            "DISARM_DELAY": 10.0,
         }
         assert check._bring_up_closure_blockers(restored, no_override) == []
         still_in_force = dict(restored)
