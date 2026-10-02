@@ -151,14 +151,68 @@ def test_a_plan_wider_than_the_declared_effort_is_refused():
     assert "declared effort" in str(refused.value)
 
 
-def test_a_plan_cannot_grant_itself_extra_iterations():
+def test_bounds_beyond_the_declared_step_cap_are_refused():
     inflated = {
         "steps": [{"action": "explore", "max_attempts": 1}],
         "bounds": {"max_steps": 9},
     }
     with pytest.raises(PlanRefused) as refused:
         plan_from_reply(type("Parsed", (), {"mission_recipe": inflated})())
-    assert "extra iterations" in str(refused.value)
+    assert "declared 1..6" in str(refused.value)
+
+
+def test_a_bounded_loop_inside_the_declared_cap_is_accepted():
+    """The measured live plan: three steps with max_steps 6 for the runner.
+
+    An earlier rule of mine refused this, but nothing declared it: the declared
+    bound is the conventional arm's own total effort, and a bounded loop is
+    allowed by the specification.
+    """
+    plan = {
+        "steps": [{"action": "explore", "max_attempts": 2} for _ in range(3)],
+        "bounds": {"max_steps": 6, "resource_ceiling": 6.0},
+    }
+    recipe = plan_from_reply(type("Parsed", (), {"mission_recipe": plan})())
+    assert recipe.max_steps == 6
+    assert len(recipe.steps) == 3
+
+
+def test_a_recipe_delivered_as_a_tool_call_is_validated():
+    """The shape that measured working on the pinned route."""
+    planner, transport, _ = make_planner()
+    tool_reply = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "propose_mission_recipe",
+                                "arguments": json.dumps(GOOD_RECIPE),
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    transport.schedule(ScriptedReply(document=tool_reply))
+    plan = run_plan(planner)
+    assert plan.usable is True
+    assert [step.action for step in plan.recipe.steps] == ["explore", "inspect", "return"]
+
+
+def test_the_recipe_tool_schema_carries_the_runner_vocabulary():
+    """The schema is the interface, so it cannot drift from the validator."""
+    from embodied.pilot.flight_plan import PLAN_STEPS_CAP, RECIPE_TOOL
+    from embodied.pilot.recipe_runner import GUARDS, INTENTS
+
+    props = RECIPE_TOOL["function"]["parameters"]["properties"]
+    step_props = props["steps"]["items"]["properties"]
+    assert step_props["action"]["enum"] == list(INTENTS)
+    assert step_props["guard_kind"]["enum"] == list(GUARDS)
+    assert step_props["target_kind"]["enum"] == ["candidate", "frontier", "place"]
+    assert props["bounds"]["properties"]["max_steps"]["maximum"] == PLAN_STEPS_CAP
 
 
 def test_a_plan_outside_the_runner_vocabulary_is_refused():
@@ -202,18 +256,13 @@ def test_no_plan_can_be_made_once_the_aircraft_is_airborne():
 
 
 
-def test_the_plan_question_carries_the_runners_own_vocabulary():
-    """The question cannot drift from what the validator accepts."""
-    from embodied.pilot.flight_plan import plan_question
-    from embodied.pilot.recipe_runner import GUARDS, INTENTS
+def test_the_plan_question_defers_the_vocabulary_to_the_tool_schema():
+    """The schema carries the vocabulary now, so the question only names the tool."""
+    from embodied.pilot.flight_plan import RECIPE_TOOL_NAME, plan_question
 
     question = plan_question("Find the red block, inspect it, and return to the start.")
-    for intent in INTENTS:
-        assert intent in question, f"the plan question never names the intent {intent}"
-    for guard in GUARDS:
-        assert guard in question, f"the plan question never names the guard {guard}"
-    assert "mission_recipe" in question
-    assert "Do not name a route" in question
+    assert RECIPE_TOOL_NAME in question
+    assert "reply with nothing else" in question
 
 
 def test_the_initial_prompt_names_the_plan_class_it_is_asking_for():
@@ -245,12 +294,10 @@ def test_a_fenced_json_reply_is_parsed_not_discarded():
     assert [step.action for step in plan.recipe.steps] == ["explore", "inspect", "return"]
 
 
-def test_the_question_shows_an_example_the_validator_accepts():
-    """The prompt cannot demonstrate a shape plan_from_reply would refuse."""
-    from embodied.pilot.flight_plan import _EXAMPLE_REPLY
+def test_the_question_asks_for_the_typed_tool_by_name():
+    """Prose schemas kept being reinvented; the question names the tool."""
+    from embodied.pilot.flight_plan import RECIPE_TOOL_NAME, plan_question
 
-    parsed = type(
-        "Parsed", (), {"mission_recipe": json.loads(_EXAMPLE_REPLY)["mission_recipe"]}
-    )()
-    recipe = plan_from_reply(parsed)
-    assert [step.action for step in recipe.steps] == ["explore", "inspect", "return"]
+    question = plan_question("Find the red block.")
+    assert RECIPE_TOOL_NAME in question
+    assert "do not name a route" in question

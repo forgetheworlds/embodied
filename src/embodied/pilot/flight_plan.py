@@ -58,40 +58,86 @@ PLAN_RESOURCE_CEILING_CAP = 6.0
 
 _TARGET_KINDS = ("candidate", "frontier", "place")
 
-# The worked example the plan question shows. Its values are illustrative and
-# its vocabulary is the runner's own, so a reply that copies this shape is
-# already in the language plan_from_reply validates. Built from a literal so
-# it is also what the drift test compares against.
-_EXAMPLE_REPLY = json.dumps(
-    {
-        "mission_recipe": {
-            "steps": [
-                {
-                    "action": "explore",
-                    "target_kind": "frontier",
-                    "target_ref": "next_unvisited",
-                    "guard_kind": "always",
-                    "max_attempts": 2,
+
+# The plan arrives as a typed tool call. Measured 2026-10-01 on the pinned
+# route: four prose attempts each invented a different schema (first its own
+# inner keys, then a top-level plan object with phases and abort conditions),
+# while the same model, asked through this schema, returned the runner's own
+# vocabulary in 6.99 s and 369 output tokens instead of 1,887. The schema is
+# the interface, so the vocabulary is the runner's, imported rather than
+# retyped.
+RECIPE_TOOL_NAME = "propose_mission_recipe"
+
+RECIPE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": RECIPE_TOOL_NAME,
+        "description": (
+            "Propose the bounded mission plan for the instruction as an ordered list of "
+            "steps plus its bounds. Call this exactly once with the whole plan."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": list(INTENTS)},
+                            "target_kind": {
+                                "type": "string",
+                                "enum": ["candidate", "frontier", "place"],
+                            },
+                            "target_ref": {"type": "string"},
+                            "guard_kind": {"type": "string", "enum": list(GUARDS)},
+                            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 2},
+                        },
+                        "required": ["action", "max_attempts"],
+                    },
                 },
-                {
-                    "action": "inspect",
-                    "target_kind": "candidate",
-                    "target_ref": "next_uninspected",
-                    "guard_kind": "candidate_present",
-                    "max_attempts": 2,
+                "bounds": {
+                    "type": "object",
+                    "properties": {
+                        "max_steps": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": PLAN_STEPS_CAP,
+                        },
+                        "resource_ceiling": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "maximum": PLAN_RESOURCE_CEILING_CAP,
+                        },
+                    },
+                    "required": ["max_steps", "resource_ceiling"],
                 },
-                {
-                    "action": "return",
-                    "target_kind": "place",
-                    "target_ref": "start",
-                    "guard_kind": "always",
-                    "max_attempts": 1,
-                },
-            ],
-            "bounds": {"max_steps": 3, "resource_ceiling": 3},
-        }
-    }
-)
+            },
+            "required": ["steps", "bounds"],
+        },
+    },
+}
+
+
+def recipe_document_from(parsed) -> dict[str, Any] | None:
+    """The recipe a reply proposed, from its content or from the typed tool call.
+
+    Both shapes are validated identically. The typed call is the one that
+    measured working: every prose answer invented a schema of its own.
+    """
+    if parsed.mission_recipe is not None:
+        return parsed.mission_recipe
+    for call in getattr(parsed, "tool_calls", ()) or ():
+        function = (call or {}).get("function") or {}
+        if function.get("name") != RECIPE_TOOL_NAME:
+            continue
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            return None
+        return arguments if isinstance(arguments, dict) else None
+    return None
+
 
 
 class PlanRefused(Exception):
@@ -146,18 +192,11 @@ def plan_question(instruction: str) -> str:
     example in the runner's own vocabulary, and it is the entire reply.
     """
     return (
-        "You are on the ground before takeoff and nothing has moved yet. Your entire reply "
-        "is ONE JSON object, with no prose and no markdown fence, whose exact shape is this "
-        f"example (values illustrative): {_EXAMPLE_REPLY} "
-        'mission_recipe has exactly the two keys "steps" and "bounds" and no others; the '
-        "reply has no other top-level keys. "
-        f"action must be one of: {', '.join(INTENTS)}. "
-        "target_kind must be one of: candidate, frontier, place. "
-        f"guard_kind must be one of: {', '.join(GUARDS)}. "
-        "Use at most 6 steps and at most 2 attempts per step, and set bounds.max_steps no "
-        "larger than the number of steps. A step says where to act relative to evidence the "
-        "local system will find later — a frontier, the next uninspected candidate, or the "
-        "start place. Do not name a route, a doorway order, a position or where any object is. "
+        "You are on the ground before takeoff and nothing has moved yet. Call "
+        f"{RECIPE_TOOL_NAME} exactly once with the whole plan for the instruction below, and "
+        "reply with nothing else. A step says where to act relative to evidence the local "
+        "system will find later — a frontier, the next uninspected candidate, or the start "
+        "place — so do not name a route, a doorway order, a position or where any object is. "
         f"Instruction: {instruction}"
     )
 
@@ -169,7 +208,7 @@ def plan_from_reply(parsed, *, source: str = "cloud-initial") -> MissionRecipe:
     the whole plan against the conventional arm's declared effort, so the
     model can propose but cannot widen its own envelope.
     """
-    document = parsed.mission_recipe
+    document = recipe_document_from(parsed)
     if document is None:
         raise PlanRefused("the reply proposed no mission_recipe document")
     raw_steps = document.get("steps")
@@ -210,10 +249,15 @@ def plan_from_reply(parsed, *, source: str = "cloud-initial") -> MissionRecipe:
         )
     bounds = document.get("bounds") or {}
     max_steps = int(bounds.get("max_steps", len(steps)))
-    if max_steps > len(steps):
+    # The declared bound is PLAN_STEPS_CAP, the conventional arm's own total
+    # effort. An earlier version of this rule required max_steps <= len(steps),
+    # which is stricter than anything declared: the measured 2026-10-01 probe
+    # showed the model proposing a sound 3-step plan with max_steps 6 — headroom
+    # for the runner to repeat a step, which is a bounded loop the spec allows.
+    # The declared cap is what binds, and it still does.
+    if not 1 <= max_steps <= PLAN_STEPS_CAP:
         raise PlanRefused(
-            f"bounds.max_steps {max_steps} exceeds the plan's own {len(steps)} steps; "
-            "the model cannot grant itself extra iterations"
+            f"bounds.max_steps {max_steps} is outside the declared 1..{PLAN_STEPS_CAP}"
         )
     ceiling = float(bounds.get("resource_ceiling", float(len(steps))) or float(len(steps)))
     if not 0.0 < ceiling <= PLAN_RESOURCE_CEILING_CAP:

@@ -33,7 +33,7 @@ import yaml
 from embodied.contracts.records import ClockStamp, MissionContract, Observation
 from embodied.pilot.broker import PilotBroker
 from embodied.pilot.decisions import DecisionEngine, PilotParameters, SceneStatus
-from embodied.pilot.flight_plan import FlightPlan, PreflightPlanner
+from embodied.pilot.flight_plan import RECIPE_TOOL, FlightPlan, PreflightPlanner
 from embodied.pilot.mission_packet import MissionPacketBuilder
 from embodied.pilot.provider import (
     CALL_CONTINUOUS,
@@ -85,8 +85,15 @@ class MissionPilot:
         self.provider = Provider(config, transport, TOOL_SCHEMAS)
         self.broker = PilotBroker(seam, parameters, self.provider, host_id=host_id, sink=sink)
         self.packet_builder = MissionPacketBuilder(config, contract.instruction)
+        # The pre-flight call gets its own provider so the recipe tool is
+        # declared for the plan and for nothing else: the in-flight surface
+        # stays exactly the five declared tools (specification section 11).
+        # Both providers share the transport, and the plan happens before any
+        # in-flight call exists, so they never interleave.
         self.planner = PreflightPlanner(
-            self.provider, self.packet_builder, retry_budget=int(parameters.retry_budget)
+            Provider(config, transport, (RECIPE_TOOL,)),
+            self.packet_builder,
+            retry_budget=int(parameters.retry_budget),
         )
         self.engine = DecisionEngine(parameters, config.identity)
         self.in_flight_plan: FlightPlan | None = None
