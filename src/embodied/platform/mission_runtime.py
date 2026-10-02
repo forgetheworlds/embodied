@@ -1175,58 +1175,130 @@ class MissionRuntime:
             )
         return regions
 
-    def _frontier_vantage(
-        self, region: GE.BoxRegion
-    ) -> tuple[float, float, float]:
-        """The point to fly toward in order to observe this frontier.
+    def _frontier_goal_point(
+        self,
+        region: GE.BoxRegion,
+        *,
+        here: tuple[float, float, float] | None = None,
+        searchable: set[tuple[int, int, int]] | None = None,
+    ) -> tuple[float, float, float] | None:
+        """The point an explore step would fly to for this frontier, or None.
 
-        A frontier is a boundary between observed free space and unknown space:
-        an observation opportunity, not a destination (specification 11). A goal
-        AT the boundary cannot be admitted, because the standoff region the
-        executor builds around it overlaps space the map has no evidence for —
-        which is exactly how live-12's two explore goals were refused. So the
-        vantage is searched back along the line to the aircraft, which stands in
-        known free space by construction, and the first point the planner could
-        admit is preferred.
+        A frontier is a boundary between observed free space and unknown
+        space: an observation opportunity, not a destination (specification
+        11). A goal AT the boundary cannot be admitted, because the standoff
+        region the executor builds around it overlaps space the map has no
+        evidence for — which is how live-12's two explore goals were refused.
+        So the vantage is searched back along the line to the aircraft, which
+        stands in known free space by construction, and the first point the
+        planner could admit is preferred.
 
-        When no such point exists the cluster's own centre is returned anyway:
-        resolution holds the target, and the support question belongs to
-        admission, which refuses with its own named reason rather than being
-        pre-empted here.
+        **A gate the aircraft is already standing in is not an excursion.**
+        The executor's approach region is centred ``STANDOFF_M`` behind the
+        target, so for a frontier that wraps the aircraft the only candidate
+        left admissible is ``here + STANDOFF_M * direction`` — and the
+        approach region of THAT point contains the aircraft itself. Such a
+        goal is satisfied the instant it is admitted: the certified prefix is
+        a hover, the step completes on arrival without moving, and the map
+        never grows. That is exactly what live-17 did for a whole flight while
+        every certificate said "explore" — 19 setpoints, every one commanding
+        the aircraft's own x and y with zero velocity. Candidates whose goal
+        region already contains the aircraft are therefore rejected, and when
+        no candidate survives, this frontier has no vantage and is not a place
+        to fly to. Returning ``None`` is the honest answer; the caller
+        declines the frontier rather than publishing a hover as progress.
         """
         centre = tuple(float(value) for value in region.center())
-        here = self._position_odom()
+        here = here if here is not None else self._position_odom()
         if here is None:
-            return centre
+            return None
         direction = np.asarray(FRONTIER_VIEW_DIRECTION, dtype=np.float64)
         ideal = np.asarray(centre, dtype=np.float64) - GE.STANDOFF_M * direction
         toward = np.asarray(here, dtype=np.float64)
         span = float(np.linalg.norm(toward - ideal))
         steps = max(1, int(span / FRONTIER_VANTAGE_STEP_M))
+        if searchable is None:
+            searchable = self._searchable_cells(here)
         # The planner admits a goal when at least one cell of its goal region is
         # in the set it may search, so this asks exactly that and no weaker
         # question: the same inflation, the same extra margin the planner adds,
         # and the aircraft's own position excluded as an obstacle. A weaker test
         # clears vantages the planner then refuses, which is how live-14's
         # explore goals were still rejected after the first attempt at this.
-        searchable = GE.inflated_free_cells(
+        for index in range(steps + 1):
+            vantage = ideal + (index / steps) * (toward - ideal)
+            target = vantage + GE.STANDOFF_M * direction
+            target_point = tuple(float(value) for value in target)
+            if float(np.linalg.norm(target - toward)) < GE.STANDOFF_M:
+                # Closer to what it is looking at than the mission's own
+                # declared standoff: there is no approach left to make, and
+                # the "view" is the one already in hand.
+                continue
+            approach = GE.approach_region(
+                target_point,
+                ENVELOPE,
+                direction=FRONTIER_VIEW_DIRECTION,
+            )
+            if approach.contains(tuple(float(value) for value in here)):
+                continue
+            if any(cell in searchable for cell in approach.cells(self.store.config)):
+                return target_point
+        return None
+
+    def _searchable_cells(
+        self, here: tuple[float, float, float]
+    ) -> set[tuple[int, int, int]]:
+        """The cells the planner may search: supported free space, minus the aircraft."""
+        return GE.inflated_free_cells(
             self.store,
             ENVELOPE,
             now_ns=self._now_ns(),
             self_occupied_origin_odom_m=here,
             extra_margin_m=self.store.config.voxel_m / 4.0,
         )
-        for index in range(steps + 1):
-            vantage = ideal + (index / steps) * (toward - ideal)
-            target = vantage + GE.STANDOFF_M * direction
-            approach = GE.approach_region(
-                tuple(float(value) for value in target),
-                ENVELOPE,
-                direction=FRONTIER_VIEW_DIRECTION,
+
+    def navigable_frontiers(self) -> tuple[str, ...]:
+        """The frontiers this mission may fly to, the most distant vantage first.
+
+        A frontier whose vantage the aircraft is already standing in is not an
+        excursion and is left out (see ``_frontier_goal_point``).
+
+        The order is the far vantage first. The known map is what the cameras
+        have already seen, so the least-observed space lies beyond its
+        boundary: the far frontier is the view that adds evidence, while the
+        near one is close to a view the aircraft already has. Voxel order
+        would offer the near ones first, and live-17 selected them for a whole
+        flight. Ties break on the ref so the choice is deterministic.
+        """
+        here = self._position_odom()
+        if here is None:
+            return ()
+        searchable = self._searchable_cells(here)
+        ranked: list[tuple[float, str]] = []
+        for ref, region in self.frontier_regions().items():
+            point = self._frontier_goal_point(
+                region, here=here, searchable=searchable
             )
-            if any(cell in searchable for cell in approach.cells(self.store.config)):
-                return tuple(float(value) for value in target)
-        return centre
+            if point is None:
+                continue
+            distance = float(np.linalg.norm(np.asarray(point) - np.asarray(here)))
+            ranked.append((-distance, ref))
+        ranked.sort()
+        return tuple(ref for _, ref in ranked)
+
+    def _frontier_vantage(
+        self, region: GE.BoxRegion
+    ) -> tuple[float, float, float]:
+        """The vantage for one frontier; the region's centre when it has none.
+
+        The centre is a fallback only, so that resolution still holds a target
+        for a frontier ``navigable_frontiers`` declined: admission then refuses
+        it with its own named reason rather than the goal vanishing silently.
+        """
+        point = self._frontier_goal_point(region)
+        if point is not None:
+            return point
+        return tuple(float(value) for value in region.center())
 
     def resolve_targets(self, proposal: R.SpatialGoal) -> tuple[R.GroundedTarget, ...]:
         """Resolve a proposal's target refs into grounded targets this runtime holds.
@@ -1273,6 +1345,17 @@ class MissionRuntime:
                     # Not the region's own centre: a frontier cell sits beside
                     # unknown space, and a goal AT it is refused as unsupported.
                     point = self._frontier_vantage(region)
+                    if point is not None:
+                        here = self._position_odom()
+                        if here is not None:
+                            excursion = float(
+                                np.linalg.norm(np.asarray(point) - np.asarray(here))
+                            )
+                            self.result.log.append(
+                                f"frontier {ref} resolved to a vantage "
+                                f"({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f}), "
+                                f"{excursion:.2f} m from the aircraft"
+                            )
             if point is None:
                 continue
             resolved.append(
@@ -1439,7 +1522,10 @@ class _LiveRunnerWorld:
         )
 
     def known_frontiers(self) -> tuple[str, ...]:
-        return tuple(self._runtime.frontier_regions())
+        # Not every frontier is a place to fly to: one whose vantage the
+        # aircraft already occupies yields a hover, and a hover explores
+        # nothing. Of them, farthest vantage first.
+        return self._runtime.navigable_frontiers()
 
     def start_place(self) -> str:
         return "start"
