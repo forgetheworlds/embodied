@@ -104,6 +104,15 @@ def _add_bench_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
+    """Record one live episode from a registered suite.
+
+    The suite's own declaration registers it (P05 owns first-indoor; P02 owns
+    none), and the transport that flies the mission lives in
+    :mod:`embodied.bench.live_record`. An unregistered suite is still refused
+    rather than substituted, and so is a sensor mode the suite does not
+    declare: the disagreement is the run's blocker, not something to paper
+    over by recording with a mode nobody declared.
+    """
     sensor_mode = SensorMode(args.sensor_mode)
     manifest = {
         "suite": args.suite,
@@ -114,6 +123,20 @@ def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
         "P02 owns offline record storage; a live episode is recorded by the stage "
         "that runs it, from a registered suite",
     )
+    from embodied.bench import live_record
+
+    try:
+        suite_document = live_record.load_suite_document()
+        registered_name = live_record.register_suite(suite_document)
+    except live_record.SuiteConfigError as error:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(f"the suite declaration cannot be used: {error}",),
+            limitations=limitations,
+            manifest=manifest,
+            sensor_mode=sensor_mode,
+        )
     try:
         suite = recorder.resolve_suite(args.suite)
     except recorder.SuiteError as error:
@@ -137,16 +160,24 @@ def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
             manifest=manifest,
             sensor_mode=sensor_mode,
         )
-    return CommandOutcome(
-        status=CommandStatus.BLOCKED,
-        gate_status=GateStatus.NOT_APPLICABLE,
-        reasons=(
-            f"suite {suite.name!r} is registered, but this build has no live recording "
-            "transport attached; refusing to substitute a synthetic episode",
-        ),
-        limitations=limitations,
-        manifest=manifest,
+    if registered_name != suite.name or suite_document is None:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(
+                f"suite {suite.name!r} is registered without a usable declaration in this "
+                "build; refusing to fly a suite whose own file cannot be read",
+            ),
+            limitations=limitations,
+            manifest=manifest,
+            sensor_mode=sensor_mode,
+        )
+    return live_record.record(
+        suite_name=args.suite,
+        suite_document=suite_document,
+        arm=args.arm,
         sensor_mode=sensor_mode,
+        output=output,
     )
 
 

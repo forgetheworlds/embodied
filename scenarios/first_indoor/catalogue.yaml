@@ -1,0 +1,33 @@
+# Load-validation catalogue for the first-indoor scene.
+#
+# Input to scenarios/missions/tools/validate_scenarios.py (the existing headless
+# validator, unchanged): one entry, the declared device set, the same pins as
+# the sibling catalogue at scenarios/missions/catalogue.yaml. The validator
+# checks what it always checks: the world loads headless and every declared
+# device resolves. This catalogue says nothing about the drone and nothing
+# about where the target is.
+schema_version: 1
+
+pins:
+  header: "#VRML_SIM R2025a utf8"
+  basic_time_step_ms: 2
+  optimal_thread_count: 1
+  random_seed_min: 0
+  remote_externproto_allowed: false
+
+groups:
+  first_indoor: 1
+
+scenarios:
+  - id: first-indoor
+    group: first_indoor
+    world: scenarios/first_indoor/world.wbt
+    mission:
+      type: search_inspect_return
+      instruction_family: first_indoor_single_clause
+      target: red block
+      target_class: box
+      target_present: true
+      search_region: room_pair
+    devices: ["camera left", "camera right", accelerometer, gyro, "inertial unit", gps,
+              m1_motor, m2_motor, m3_motor, m4_motor]
