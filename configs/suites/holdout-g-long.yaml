@@ -1,0 +1,31 @@
+# Suite registration data for the held-out scene `holdout-g-long`.
+#
+# Shape, contract and reachability note: see `configs/suites/holdout-e-wide.yaml`
+# (identical in structure). Keys map onto `SuiteSpec` plus the pointers the
+# transport reads; hidden truth lives only in `truth_seed`'s file.
+#
+# HELD OUT — no route, no doorway order, no waypoint. This is the group's
+# ABSENT-TARGET case: the instruction asks the pilot to search and, if the red
+# can is not there, report the absence. The world file contains no red object;
+# the truth seed declares present: false; and nothing here hints at the answer.
+#
+# THE TRANSPORT REFUSES THIS DECLARATION TODAY, and that is recorded rather
+# than worked around. `embodied.bench.live_record.record` requires the seed to
+# declare exactly one present target, because that check was written for the
+# first-indoor search, and this seed truthfully declares none. The check is
+# right for a search-for-a-present-object mission and wrong for an
+# absence-report mission; changing it is one line outside this stage's fence
+# (`live_record.py:530-545`). Until then this scene is truthful and declarable
+# but not recordable, and the group's probe proves both facts.
+name: holdout-g-long
+registered_by: P05
+localization_mode: sensor-derived
+
+provider_budget:
+  spend_ceiling_usd: 5.0
+
+scene_root: scenarios/missions/holdout/holdout-g-long
+world: scenarios/missions/holdout/holdout-g-long/world.wbt
+# Verbatim the scene's own instruction (mission.yaml `instructions[0]`).
+mission_instruction: "Search the room and the spur first; if no red can is present, report the absence before returning to the start."
+truth_seed: scenarios/missions/holdout/holdout-g-long/truth.yaml
