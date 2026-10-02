@@ -302,6 +302,16 @@ def _prompt_text(packet: RequestPacket, reply_format: str = "default") -> str:
     ]
     if reply_format == "strict":
         lines.extend(_STRICT_REPLY_LINES)
+    if packet.call_class == CALL_INITIAL:
+        # The initial class is the one planning call, made on the ground before
+        # takeoff. It answers with a mission_recipe document, and the question
+        # that carries its schema is built by the caller that owns the recipe
+        # vocabulary (pilot.flight_plan), so the vocabulary lives in one place.
+        lines.append(
+            "this call is the initial mission plan, made on the ground before takeoff: "
+            "answer it with the mission_recipe JSON object the explicit question specifies, "
+            "not with tool calls"
+        )
     lines.extend(
         [
             f"mission instruction: {packet.mission_instruction}",
@@ -493,6 +503,26 @@ class ParsedReply:
     malformed_reason: str | None = None
 
 
+def _unfence(content: str) -> str:
+    """Strip a markdown code fence from a reply's JSON block.
+
+    Measured 2026-10-01 on the pinned route: asked for one JSON object, the
+    model returned it inside a ```json fence, so ``json.loads`` saw no JSON at
+    all and a perfectly well-formed plan read as absent. The fence is a reply
+    formatting artifact, not content: removing it changes what is parsed,
+    never what is accepted — the parsed document still has to satisfy the
+    record's own validation.
+    """
+    text = content.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    lines = lines[1:] if lines else lines
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def parse_reply(document: dict[str, Any], request: DecisionRequest) -> ParsedReply:
     try:
         choice = document["choices"][0]["message"]
@@ -508,7 +538,7 @@ def parse_reply(document: dict[str, Any], request: DecisionRequest) -> ParsedRep
     recipe: dict[str, Any] | None = None
     malformed: list[str] = []
     try:
-        structured = json.loads(content) if isinstance(content, str) else content
+        structured = json.loads(_unfence(content)) if isinstance(content, str) else content
     except json.JSONDecodeError:
         # Free text is a valid answer: only a structured block that fails its
         # record's own validation is malformed.
