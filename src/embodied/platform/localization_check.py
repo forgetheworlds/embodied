@@ -956,6 +956,84 @@ PAIR_QUEUE_FRAMES = 16
 # empty instant is a 2 ms pause rather than a busy spin.
 FEED_STREAM_POLL_S = 0.002
 
+
+def pair_is_behind_imu(pair_sim_time_ns: int, newest_imu_ns: int) -> bool:
+    """True when the inertial samples past this frame's own instant have been fed.
+
+    The estimator's propagator integrates an image over `[last update, this image]`
+    using the inertial samples stamped inside that interval, and interpolates its
+    final segment using the first sample at or after the image's own instant
+    (open_vins-2.7, `ov_msckf/src/state/Propagator.cpp`, `select_imu_readings`).
+    An image handed over before that sample arrives leaves the interval empty, the
+    pin drops the update with "No IMU measurements to propagate with (0 of 2)", and
+    a run of those leaves the filter integrating nothing at all -- the frozen state
+    that later diverges. So a frame waits until an inertial sample strictly past it
+    has been sent; that ordering is what this predicate decides.
+    """
+    return newest_imu_ns > pair_sim_time_ns
+
+
+class OrderedPairFeed:
+    """Feeds queued stereo pairs without letting one overtake its inertial samples.
+
+    The sink files a pair the moment the reader's thread sees it, while the inertial
+    sample that follows that pair in the stream is handed over a moment later on the
+    metadata queue. Draining the pairs blindly therefore lets a camera frame overtake
+    the samples that must precede it: the pin's propagator finds an empty integration
+    window, drops the update with "No IMU measurements to propagate with (0 of 2)", and
+    a run of those leaves the filter with nothing to integrate at all -- the frozen
+    state that later diverges. A *late* image is absorbed by the pin's own
+    interpolation of its final segment (open_vins-2.7, Propagator.cpp, case 3.4); an
+    image with no interval behind it is not.
+
+    So the oldest pair that the inertial feed has not passed waits here, in this
+    object's own slot, and the queue is not touched while it waits: the queue keeps its
+    stream order, and the frame that waits is the frame that goes next. At most one
+    frame is held, so the extra memory is one stereo pair.
+
+    ``stats`` is duck-typed: ``pairs_held_for_imu`` counts the frames that waited and
+    ``max_pair_hold_s`` the longest wait, both measured from the frame's own receipt.
+    """
+
+    def __init__(
+        self,
+        pending_pairs: "queue.Queue[Any]",
+        *,
+        sim_time_ns_of: Callable[[Any], int],
+        feed_one: Callable[[Any], None],
+        stats: Any,
+    ) -> None:
+        self._pending = pending_pairs
+        self._sim_time_ns_of = sim_time_ns_of
+        self._feed_one = feed_one
+        self._stats = stats
+        self._waiting: Any = None
+        self._waiting_since_ns: int | None = None
+
+    def drain(self, newest_imu_ns: int) -> None:
+        """Feed every pair whose inertial samples have gone, in stream order."""
+        while True:
+            if self._waiting is None:
+                try:
+                    self._waiting = self._pending.get_nowait()
+                except queue.Empty:
+                    return
+            if not pair_is_behind_imu(
+                self._sim_time_ns_of(self._waiting), newest_imu_ns
+            ):
+                if self._waiting_since_ns is None:
+                    self._waiting_since_ns = self._waiting.received_stamp.monotonic_ns
+                    self._stats.pairs_held_for_imu += 1
+                self._stats.max_pair_hold_s = max(
+                    self._stats.max_pair_hold_s,
+                    (time.monotonic_ns() - self._waiting_since_ns) / 1e9,
+                )
+                return
+            record, self._waiting = self._waiting, None
+            self._waiting_since_ns = None
+            self._feed_one(record)
+
+
 # How long one parameter readback waits for the autopilot's own answer. A local SITL
 # answers in well under a second; this is generous enough that an answer would have to
 # be absent rather than slow, which is the distinction the gate depends on.
@@ -2694,6 +2772,14 @@ class _FeedStats:
         # between "the stream carried no pairs" and "the feed was too slow".
         self.pair_records_filed = 0
         self.pair_records_dropped = 0
+        # Pairs held back because the inertial samples that must precede them had
+        # not been fed yet, and the longest such hold. A stereo frame sent ahead of
+        # its own inertial samples leaves `select_imu_readings` with an empty
+        # interval, the update is dropped, and a run of them leaves the filter
+        # integrating nothing at all; a held frame is a delayed camera, which the
+        # estimator is built to absorb. Zero on a run whose feed never fell behind.
+        self.pairs_held_for_imu = 0
+        self.max_pair_hold_s = 0.0
 
 
 def _start_estimator(estimator: dict[str, Any], root: Path, writer: EvidenceWriter):
@@ -3106,6 +3192,12 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     feed_stop = threading.Event()
     feed_failures: list[str] = []
     feed_thread: threading.Thread | None = None
+    ordered_pairs = OrderedPairFeed(
+        pending_pairs,
+        sim_time_ns_of=lambda held: sim_time_ns(held.sim_time_s),
+        feed_one=feed_record,
+        stats=stats,
+    )
 
     def feed_cycle() -> None:
         """One pump of the feed: every queued record, then the pairs, then the state.
@@ -3121,14 +3213,14 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             if record is None:
                 break
             feed_record(record)
-        # The metadata stream is momentarily empty, so the inertial samples either
-        # side of a queued image have been fed: the sink's pairs can go now, which
-        # keeps every image behind the IMU that must precede it.
-        try:
-            while True:
-                feed_record(pending_pairs.get_nowait())
-        except queue.Empty:
-            pass
+        # The metadata stream is momentarily empty, so the inertial samples the reader
+        # has dispatched so far have been fed -- but a queued image may still be ahead
+        # of them: see OrderedPairFeed. The previously stated invariant, that flushing
+        # the pairs only when the metadata stream is empty keeps every image behind the
+        # inertial samples that precede it, holds for the reader's dispatch order and
+        # not for the two queues' delivery, which is the gap that let a camera frame
+        # overtake its interval on `live-14`/`live-15`.
+        ordered_pairs.drain(stats.newest_imu_ns)
         state = client.poll_state()
         if state is not None:
             publisher.offer(state, stats.newest_imu_ns)
@@ -3642,6 +3734,8 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                 "gps_aiding_blockers": gps_aiding["blockers"],
                 "pairs_filed": stats.pair_records_filed,
                 "pairs_fed": stats.pairs,
+                "pairs_held_for_imu": stats.pairs_held_for_imu,
+                "max_pair_hold_s": round(stats.max_pair_hold_s, 6),
                 "imu_samples_fed": stats.imu_samples,
                 "published": publisher.published,
                 "shutdown": {"exits": shutdown.exits},
@@ -5105,6 +5199,13 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
             )
         )
         stats.pairs += 1
+    ordered_pairs = OrderedPairFeed(
+        pending_pairs,
+        sim_time_ns_of=lambda held: sim_time_ns(held.sim_time_s),
+        feed_one=feed_pair,
+        stats=stats,
+    )
+
 
     def observe_state(state: loc.EstimatorState) -> None:
         observer["states_received"] += 1
@@ -5154,13 +5255,11 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
                 observer["feed_error"] = f"the sensor stream failed: {error}"
                 return
             if record is None:
+                # The diagnostic arm flies the same estimator seam as the check and shares
+                # its ordering hazard: a pair must not overtake the inertial samples that
+                # precede it (see OrderedPairFeed).
                 try:
-                    while True:
-                        pending = pending_pairs.get_nowait()
-                        if pending.kind is Kind.PAIR and pending.pair is not None:
-                            feed_pair(pending)
-                except queue.Empty:
-                    pass
+                    ordered_pairs.drain(stats.newest_imu_ns)
                 except loc.ProtocolError as error:
                     observer["feed_error"] = str(error)
                     return
