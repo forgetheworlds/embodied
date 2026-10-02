@@ -183,6 +183,18 @@ MISSION_YAW_HOLD_RAD = 0.0
 # the newest pair, at most this often (wall seconds). The estimator feed is on
 # its own thread and never waits behind this.
 MIN_PERCEPTION_INTERVAL_S = 0.3
+# How often the perception pump checks its clock while it is gathering. This is
+# a host-thread yield, not a rate: the rate perception actually runs at is
+# MIN_PERCEPTION_INTERVAL_S, and this only decides how promptly the pump
+# notices that a cycle is due.
+PERCEPTION_PUMP_SLEEP_S = 0.02
+# The most observation ids a step may cite. A bounded citation list keeps a
+# long mission's report readable without letting a claim grow without limit.
+MAX_CITED_OBSERVATIONS = 256
+# Distinct perception-refusal reasons written into a run's record. The summary
+# is bounded so a pathological scene cannot turn the log into a wall of text;
+# the counts still say how many of each there were.
+MAX_PERSISTED_REFUSAL_REASONS = 12
 # The cold-start perception window: bounded, in simulator seconds, before the
 # mission's phases begin. It exists to break the bootstrap on the mission's
 # first flight — the map a frontier is resolved from can only be built from the
@@ -350,6 +362,18 @@ class MissionRuntime:
         # says the map was built from a subset, which a reader of the receipt
         # needs to know before trusting a frontier.
         self._perception_frames_dropped = 0
+        # Perception cycles that actually took a frame, and every observation
+        # the mission recorded. The counter above says how many frames the
+        # producer could not hand over; these two say what the consumer did
+        # with the ones it took, which is what tells a healthy run from a
+        # starved one. A queue that drops frames is the design working
+        # (specification 3.1: drop replaceable old snapshots rather than allow
+        # backlog) whenever the frames arrive faster than the declared
+        # cadence; the fault is a cycle count that does not scale with the
+        # mission's duration.
+        self._perception_cycles = 0
+        self._observation_ids: list[str] = []
+        self._perception_refusal_counts: dict[str, int] = {}
         self._state_ring: list[tuple[int, loc.EstimatorState]] = []
         self._latest_state: loc.EstimatorState | None = None
         self._latest_aligned: dict[str, object] | None = None
@@ -776,6 +800,16 @@ class MissionRuntime:
                 "first_record_kind": self._first_record_kind,
                 "feed_failures": list(feed_failures),
                 "perception_frames_dropped": self._perception_frames_dropped,
+                # Cycles that took a frame, the observations they produced, the
+                # declared interval they were paced by, and how many distinct
+                # reasons perception refused. Frames dropped are the queue
+                # discarding an older snapshot for a newer one, which is the
+                # design; the fault this pair detects is a cycle count that does
+                # not scale with the run's own duration.
+                "perception_cycles": self._perception_cycles,
+                "perception_observations": self._observation_counter,
+                "perception_interval_s": MIN_PERCEPTION_INTERVAL_S,
+                "perception_refusal_reasons": len(self._perception_refusal_counts),
                 "publisher_published": getattr(publisher, "published", None),
                 "publisher_failures": list(getattr(publisher, "publish_failures", [])),
             }
@@ -799,36 +833,28 @@ class MissionRuntime:
         # is built from the aircraft's own frames, and an empty store resolves
         # nothing — so the first goal could never resolve a target, the step
         # never ran, perception never ran, and the mission was blocked against
-        # its own empty map. Pump perception on its own cadence for a bounded
+        # its own empty map. Gather on perception's own cadence for a bounded
         # window before the phases begin, so the first goal resolves against a
         # real snapshot.
-        cold_start = _SimWindow(
-            self._stats.sim_clock,
+        #
+        # The coupling that starved perception was never only a cold-start
+        # problem, which is why the same gathering also runs between phases
+        # below. live-motion-8 made 7 observations in 64 simulated seconds and
+        # dropped 593 frames: five of the seven came from this window, and once
+        # it closed no goal could be admitted, so the lease loop that pumped
+        # perception never turned, so the map could not grow, so no goal could
+        # be admitted. A mission with nothing to do has to keep looking.
+        self.pump_perception(
+            drain,
             COLD_START_PERCEPTION_SIM_S,
-            label="the cold-start perception window",
-            wall_ceiling_s=_sim_window_wall_ceiling_s(
-                COLD_START_PERCEPTION_SIM_S, self.settings.realtime_ratio_envelope[0]
-            ),
+            until=lambda: bool(self._candidate_targets) or bool(self.navigable_frontiers()),
         )
-        while not cold_start.expired():
-            # Keep gathering until the map offers SOMEWHERE TO GO, not merely
-            # until it offers a frontier. One depth frame is enough to make a
-            # frontier and nowhere near enough to plan in: live-motion-6
-            # measured the difference — 3126 free cells, exactly ONE of them
-            # searchable, 91 frontier regions and none navigable. The explore
-            # phase then had no goal to admit, so its lease loop never turned,
-            # so perception never ran again and the map could never grow. The
-            # aircraft was boxed in by the first frame it took.
-            if self._candidate_targets or self.navigable_frontiers():
-                break
-            drain()
-            self.perceive_if_due()
-            time.sleep(0.02)
         self.result.log.append(
             f"cold start: {len(self.frontier_regions())} frontier region(s), "
             f"{len(self.navigable_frontiers())} navigable, "
             f"{len(self._candidate_targets)} grounded candidate(s), "
-            f"{self._observation_counter} observation(s) seen; "
+            f"{self._observation_counter} observation(s) seen, "
+            f"{self._perception_cycles} perception cycle(s); "
             f"map {self.map_summary()}"
         )
         # The inspect phase's own step guard (candidate_present) decides whether
@@ -836,16 +862,40 @@ class MissionRuntime:
         # skip that used to live here read a snapshot taken BEFORE exploration
         # ran, so it could only ever skip the phase that exploration exists to
         # feed.
-        for phase, recipe in zip(("explore", "inspect", "return"), mission_module.build_b0_recipes()):
+        phases = tuple(
+            zip(("explore", "inspect", "return"), mission_module.build_b0_recipes())
+        )
+        index = 0
+        while index < len(phases):
             if mission_window.expired():
                 termination = "mission_budget_exhausted"
                 break
+            phase, recipe = phases[index]
             outcome = runner.run(recipe)
-            self.result.phases.append(PhaseOutcome(outcome.status, outcome.reason, outcome.steps))
+            self.result.phases.append(
+                PhaseOutcome(outcome.status, outcome.reason, outcome.steps)
+            )
             self.result.log.append(f"phase {phase}: {outcome.status} — {outcome.reason}")
             if outcome.status == "budget_exhausted":
                 termination = "mission_budget_exhausted"
                 break
+            if outcome.status == "blocked" and not mission_window.expired():
+                # Blocked means the mission had nothing to aim at, not that it
+                # aimed and failed: the runner resolves a target out of the map,
+                # and with nothing resolvable it spends its attempts without ever
+                # reaching the lease loop. Gather on the same declared window and
+                # run the phase again against a map that has grown, and stop
+                # retrying as soon as gathering stops producing frames — the
+                # mission may look for as long as looking helps, and no longer.
+                gathered = self.pump_perception(drain, COLD_START_PERCEPTION_SIM_S)
+                self.result.log.append(
+                    f"phase {phase} blocked: gathered {gathered} further frame(s) "
+                    f"before retrying ({self._observation_counter} observation(s) "
+                    f"so far, {len(self.navigable_frontiers())} navigable)"
+                )
+                if gathered > 0:
+                    continue
+            index += 1
         # Landing is a protective end, not a mission action: whatever the
         # recipes reached, the aircraft comes down and the report says which
         # obligations were met.
@@ -858,10 +908,18 @@ class MissionRuntime:
             bool(self._inspect_evidence),
             tuple(dict.fromkeys(self._inspect_evidence))[:4],
         )
+        # A physical return is checked from the mission's own state and
+        # controller feedback (specification 18.3), so a settled return is
+        # claimed as returned even when the step that made it had no observation
+        # to cite. Requiring an observation here is what made a verified return
+        # report "not_returned": the claim contradicted the referee, and an
+        # under-claim that contradicts measured truth is still a wrong claim.
+        # When the step did observe, those observations are cited as before.
         self.result.returned = mission_module.ClaimEvidence(
-            bool(self._return_settled and self._return_evidence),
+            bool(self._return_settled),
             tuple(dict.fromkeys(self._return_evidence))[:4],
         )
+        self._persist_perception_refusals()
         self.result.termination_reason = termination
 
     def _land(self, drain) -> None:
@@ -952,6 +1010,106 @@ class MissionRuntime:
         except queue.Full:
             self._perception_frames_dropped += 1
 
+    def _persist_perception_refusals(self) -> None:
+        """Write the perception refusals into the run's own record.
+
+        The runtime collected these from the first flight and wrote them
+        nowhere: five candidates were proposed, five groundings refused, and no
+        artifact said why. Deduplicated and bounded, so a reader of the receipt
+        learns the reason without the log growing with every frame.
+        """
+        if not self._perception_refusal_counts:
+            self.result.log.append("perception refusals: none")
+            return
+        total = sum(self._perception_refusal_counts.values())
+        self.result.log.append(
+            f"perception refusals: {total} over "
+            f"{len(self._perception_refusal_counts)} distinct reason(s)"
+        )
+        ranked = sorted(
+            self._perception_refusal_counts.items(), key=lambda item: (-item[1], item[0])
+        )
+        for reason, count in ranked[:MAX_PERSISTED_REFUSAL_REASONS]:
+            self.result.log.append(f"  x{count} {reason}")
+        if len(ranked) > MAX_PERSISTED_REFUSAL_REASONS:
+            self.result.log.append(
+                f"  ... and {len(ranked) - MAX_PERSISTED_REFUSAL_REASONS} more reason(s)"
+            )
+    def _note_perception_refusal(self, line: str) -> None:
+        """Record a perception refusal where the run's own record can see it.
+
+        These were collected and never written anywhere: five candidates were
+        proposed, five groundings refused, and the reason appeared in no
+        artifact. A refusal a reader cannot read is a defect that hides a
+        defect.
+        """
+        self._refusals_log.append(line)
+        self._perception_refusal_counts[line] = (
+            self._perception_refusal_counts.get(line, 0) + 1
+        )
+
+    def _append_observation_id(self, record_id: str) -> None:
+        """Remember every observation the mission made, not only grounded ones.
+
+        The step loop collected citations from grounded candidates alone, so a
+        step that observed the room but grounded nothing cited nothing — which
+        is how a settled return came out as "not_returned" against a referee
+        that had verified the return.
+        """
+        self._observation_ids.append(record_id)
+        if len(self._observation_ids) > MAX_CITED_OBSERVATIONS:
+            del self._observation_ids[0]
+
+    def pump_perception(self, drain, sim_seconds: float, until=None) -> int:
+        """Pump perception on its declared cadence for a bounded sim window.
+
+        Perception is the other half of the sensor path whose estimator feed
+        already runs on its own thread, and it must not be coupled to whether a
+        goal happens to be executing. live-motion-8 made 7 observations in 64
+        simulated seconds while dropping 593 frames: no goal could be admitted,
+        so the lease loop that pumped perception never turned, so the map could
+        not grow, so no goal could be admitted. The map grows from frames and a
+        mission that cannot see cannot decide, so gathering has to continue
+        while the mission has nothing to do.
+
+        ``until`` is an optional predicate: gathering stops as soon as it is
+        true, so a caller waiting for the map to offer somewhere to go does not
+        have to spend the whole window once it has somewhere.
+
+        Only for use once the ordered bring-up has finished: this runs stereo
+        depth, and the ``drain`` inside it is the path the bring-up's
+        RC-throttle override must never wait behind — live-10 starved that
+        override exactly this way and the aircraft tipped over at roll -90 deg.
+        Every call site below is after the bring-up, in the mission's phases.
+
+        Returns the number of cycles that took a frame.
+        """
+        window = _SimWindow(
+            self._stats.sim_clock,
+            sim_seconds,
+            label="a perception pump window",
+            wall_ceiling_s=_sim_window_wall_ceiling_s(
+                sim_seconds, self.settings.realtime_ratio_envelope[0]
+            ),
+        )
+        cycles = 0
+        next_cycle = 0.0
+        while not window.expired():
+            now = time.monotonic()
+            if now >= next_cycle:
+                next_cycle = now + MIN_PERCEPTION_INTERVAL_S
+                drain()
+                before = self._perception_cycles
+                self.perceive_if_due()
+                if self._perception_cycles > before:
+                    cycles += 1
+                # Asked once per cycle, never once per sleep: the predicate is
+                # the caller's and may be as expensive as a frontier search.
+                if until is not None and until():
+                    break
+            time.sleep(PERCEPTION_PUMP_SLEEP_S)
+        return cycles
+
     def perceive_if_due(self) -> None:
         """Depth, candidates and map integration on the newest queued pair.
 
@@ -966,6 +1124,10 @@ class MissionRuntime:
             pass
         if record is None or record.pair is None:
             return
+        # A cycle that took a frame. This, not the drop counter, is what says
+        # whether perception ran: dropped frames are the queue discarding an
+        # older snapshot in favour of a newer one, which the design intends.
+        self._perception_cycles += 1
         pair = record.pair
         # One clock for the map: its evidence stamps and its freshness clock are
         # both the controller's capture clock, which is the clock the poses are
@@ -1008,10 +1170,11 @@ class MissionRuntime:
                 ),
             )
         except Exception as error:  # a failed depth product clears nothing
-            self._refusals_log.append(f"depth_failed: {error}")
+            self._note_perception_refusal(f"depth_failed: {error}")
             return
         candidates = () if isinstance(outcome, DetectorUnavailable) else outcome
         observation = self._record_observation(record, store_payload=bool(candidates))
+        self._append_observation_id(observation.record_id)
         self.store.integrate(
             depth,
             pose,
@@ -1054,7 +1217,9 @@ class MissionRuntime:
                 selection, observation, depth, pose, state, self.calibration
             )
             if isinstance(target, G.Refusal):
-                self._refusals_log.append(f"{target.reason}: {target.detail}")
+                self._note_perception_refusal(
+                    f"grounding_refused {target.reason}: {target.detail}"
+                )
                 continue
             grounded.append(target)
         return grounded
@@ -1698,12 +1863,23 @@ class _LiveRunnerWorld:
             now = time.monotonic()
             if now >= next_perception:
                 next_perception = now + MIN_PERCEPTION_INTERVAL_S
-                before = len(runtime._candidate_observation_ids)
+                before_candidates = len(runtime._candidate_observation_ids)
+                before_counter = runtime._observation_counter
                 runtime.perceive_if_due()
-                if len(runtime._candidate_observation_ids) > before:
+                if len(runtime._candidate_observation_ids) > before_candidates:
                     self._step_observations.extend(
-                        runtime._candidate_observation_ids[before:]
+                        runtime._candidate_observation_ids[before_candidates:]
                     )
+                # Every observation the step made is citable, not only the ones
+                # that grounded a candidate. Counting from the monotone
+                # observation counter rather than from the citation list keeps
+                # this correct when the list has been trimmed at its bound. The
+                # alternative was a return that settled while the aircraft was
+                # observing and still claimed "not_returned", because a step
+                # with no grounded candidate cited nothing at all.
+                made = runtime._observation_counter - before_counter
+                if made > 0:
+                    self._step_observations.extend(runtime._observation_ids[-made:])
                 self._renew_certificate()
             if now >= next_publish:
                 next_publish = now + SETPOINT_PERIOD_S
