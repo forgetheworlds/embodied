@@ -811,15 +811,25 @@ class MissionRuntime:
             ),
         )
         while not cold_start.expired():
-            if self._candidate_targets or self.frontier_regions():
+            # Keep gathering until the map offers SOMEWHERE TO GO, not merely
+            # until it offers a frontier. One depth frame is enough to make a
+            # frontier and nowhere near enough to plan in: live-motion-6
+            # measured the difference — 3126 free cells, exactly ONE of them
+            # searchable, 91 frontier regions and none navigable. The explore
+            # phase then had no goal to admit, so its lease loop never turned,
+            # so perception never ran again and the map could never grow. The
+            # aircraft was boxed in by the first frame it took.
+            if self._candidate_targets or self.navigable_frontiers():
                 break
             drain()
             self.perceive_if_due()
             time.sleep(0.02)
         self.result.log.append(
             f"cold start: {len(self.frontier_regions())} frontier region(s), "
+            f"{len(self.navigable_frontiers())} navigable, "
             f"{len(self._candidate_targets)} grounded candidate(s), "
-            f"{self._observation_counter} observation(s) seen"
+            f"{self._observation_counter} observation(s) seen; "
+            f"map {self.map_summary()}"
         )
         # The inspect phase's own step guard (candidate_present) decides whether
         # there is anything to inspect, evaluated when that phase is reached. The
