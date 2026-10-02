@@ -113,7 +113,7 @@ from embodied.platform.webots_ardupilot import (
 )
 from embodied.pilot import mission as mission_module
 from embodied.pilot.broker import AdmissionContext, PilotBroker
-from embodied.pilot.decisions import PilotParameters
+from embodied.pilot.decisions import PilotParameters, SceneStatus
 from embodied.pilot.recipe_runner import RecipeRunner
 
 # ---------------------------------------------------------------------------
@@ -204,6 +204,13 @@ MAX_PHASE_REGATHERS = 3
 # altitude without turning the run record into a setpoint log.
 COMMANDED_SAMPLE_SIM_S = 1.0
 MAX_COMMANDED_SAMPLES = 512
+# The runtime model configuration, and the environment variable its pinned
+# route authenticates with. Both are named here rather than inlined so a
+# reader can see that the cloud arms read the same declared file, and the same
+# declared key, that the probe does: the platform configuration this runtime is
+# otherwise driven by carries no ``model`` section at all.
+RUNTIME_MODEL_CONFIG_RELATIVE = "configs/runtime-model.yaml"
+CLOUD_API_KEY_ENV = "COMMAND_CODE_API_KEY"
 # The cold-start perception window: bounded, in simulator seconds, before the
 # mission's phases begin. It exists to break the bootstrap on the mission's
 # first flight — the map a frontier is resolved from can only be built from the
@@ -266,6 +273,13 @@ class MissionResult:
     publications: int = 0
     publish_refusals: int = 0
     stream: dict[str, Any] = field(default_factory=dict)
+    # The one reasoned pre-flight call's own document: usable or refused, with
+    # its recipe source, attempts and round trip. Empty for B0, which makes no
+    # call at all, so a receipt can tell the arms apart by this field alone.
+    plan: dict[str, Any] = field(default_factory=dict)
+    # One entry per in-flight cloud exchange a cloud arm's broker produced, so a
+    # receipt carries the exchanges the mission actually had rather than a count.
+    cloud_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +303,7 @@ class MissionRuntime:
         self,
         *,
         settings: PlatformSettings,
+        arm: str = "B0",
         config_document: dict[str, Any],
         episode_dir: Path,
         evidence_dir: Path,
@@ -347,16 +362,9 @@ class MissionRuntime:
         # One clock domain for every event envelope in the agent stream.
         self._clock = lambda: settings.capture_stamp(time.monotonic_ns())
         self._sink = self._recorder_sink
-        self.broker = PilotBroker(
-            seam=_LiveAdmission(self),
-            parameters=PilotParameters.from_config(
-                _pilot_section(repository_root())
-            ),
-            provider=None,  # B0 makes no cloud call; the field's absence is the isolation
-            host_id=settings.host_id,
-            clock_id=settings.clock_id,
-            sink=self._sink,
-        )
+        # The arm this runtime flies. B0 builds no provider at all; B1 and B2
+        # build a pilot, which refuses any unknown arm rather than guessing one.
+        self.arm = arm
         self.contract = mission_module.mission_contract(
             mission_id=episode_id,
             instruction=instruction,
@@ -365,6 +373,35 @@ class MissionRuntime:
                 ("explore_steps", float(mission_module.EXPLORE_STEPS)),
             ),
         )
+        # One broker per mission. A cloud arm's broker is the one MissionPilot
+        # builds, because that object owns the provider and the cloud evidence;
+        # the conventional arm builds the provider-less one below, where the
+        # field's absence is the isolation rather than a placeholder.
+        self._pilot = self._build_mission_pilot(arm)
+        if self._pilot is not None:
+            self.broker = self._pilot.broker
+        else:
+            self.broker = PilotBroker(
+                seam=_LiveAdmission(self),
+                parameters=PilotParameters.from_config(
+                    _pilot_section(repository_root())
+                ),
+                provider=None,  # B0 makes no cloud call; the field's absence is the isolation
+                host_id=settings.host_id,
+                clock_id=settings.clock_id,
+                sink=self._sink,
+            )
+        # The one reasoned call belongs on the ground, so the runtime has to know
+        # whether it is still there: set once at liftoff and never cleared. The
+        # evidence that call is made from is the first frame captured while the
+        # aircraft is still down, kept as PPM because that is what the packet
+        # builder takes and it re-encodes to PNG itself.
+        self._airborne = False
+        self._preflight_observation: R.Observation | None = None
+        self._preflight_payloads: dict[str, bytes] = {}
+        # Candidate targets the cloud has already been shown, so an in-flight
+        # step reports a target as new once rather than on every tick.
+        self._told_targets: set[str] = set()
         self._perception_queue: queue.Queue = queue.Queue(maxsize=4)
         # Perception frames dropped because the perception queue was full. A
         # count that stays at zero says the map saw every frame; anything else
@@ -425,6 +462,116 @@ class MissionRuntime:
 
     def _recorder_sink(self, kind: str, payload: dict, stamp, sim_time_s=None) -> None:
         self.recorder.record(kind, payload, stamp, sim_time_s)
+
+    # -- the cloud arms ----------------------------------------------------
+
+    def _build_mission_pilot(self, arm: str):
+        """The cloud arm's pilot, or ``None`` for the arm that makes no call.
+
+        The runtime-model configuration is a different file from the platform
+        configuration this runtime is otherwise driven by — that one carries no
+        ``model`` section — so it is loaded here by name. Which arms may build a
+        pilot is not decided here: ``MissionPilot`` refuses B0 and any unknown
+        arm, and that refusal is the one place the rule lives.
+        """
+        if arm == "B0":
+            return None
+        from embodied.pilot.mission_executive import MissionPilot, load_runtime_config
+        from embodied.pilot.provider import LiveTransport, ModelConfig
+
+        document = load_runtime_config(repository_root() / RUNTIME_MODEL_CONFIG_RELATIVE)
+        return MissionPilot.for_arm(
+            arm=arm,
+            config_document=document,
+            contract=self.contract,
+            seam=_LiveAdmission(self),
+            transport=LiveTransport(
+                ModelConfig.from_config(document["model"]),
+                api_key_env=CLOUD_API_KEY_ENV,
+            ),
+            sink=self._sink,
+            host_id=self.settings.host_id,
+        )
+
+    def _plan_before_liftoff(self, drain) -> None:
+        """The one reasoned call, made while the aircraft is still on the ground.
+
+        The plan is made from the aircraft's own frame, so a bounded perception
+        window gathers one first — the same declared cold-start window the
+        mission already uses after liftoff, so this introduces no new number. If
+        no frame arrives, no call is made and the local recipes fly: an absent
+        plan is a recorded outcome, never a silent substitution.
+        """
+        self.pump_perception(
+            drain,
+            COLD_START_PERCEPTION_SIM_S,
+            until=lambda: self._preflight_observation is not None,
+        )
+        if self._preflight_observation is None:
+            self.result.plan = {
+                "usable": False,
+                "refusal_reason": (
+                    "no ground observation was captured, so no reasoned call was made"
+                ),
+                "model_identity": None,
+            }
+            self.result.log.append(
+                "pre-flight plan: no ground observation was captured, so the reasoned "
+                "call was not made and the local recipes fly"
+            )
+            return
+        plan = self._pilot.plan_preflight(
+            self._preflight_observation,
+            self._preflight_payloads,
+            self._clock(),
+            deadline_s=self.settings.step_timeout_s.startup,
+        )
+        document = plan.document()
+        document["model_identity"] = plan.model_identity
+        self.result.plan = document
+        self.result.log.append(
+            "pre-flight plan: "
+            f"usable={plan.usable} source={document.get('recipe_source')!r} "
+            f"steps={document.get('recipe_steps')} attempts={plan.attempts} "
+            f"round_trip_s={plan.round_trip_s}"
+            + (f" refusal={plan.refusal_reason!r}" if plan.refusal_reason else "")
+        )
+
+    def _tick_cloud(self, observation: R.Observation, payloads: dict[str, bytes]) -> None:
+        """One in-flight step for a cloud arm, after the latch has closed.
+
+        Two fields are real runtime state and one is a declared proxy, and the
+        difference is recorded rather than blurred:
+
+        * ``new_targets`` is the targets this runtime has grounded and not yet
+          put in front of the cloud — a genuine event, and the strongest reason
+          the runtime has to ask anything.
+        * ``signature`` is the number of cells the map currently holds free. This
+          runtime computes no scene-change score, so the signature is a proxy:
+          it moves while the map is still learning and stops moving once the map
+          settles, which is the behaviour a broad re-look wants. It is NOT a
+          measured scene delta, and no threshold was chosen against it.
+        * ``horizon_s`` is ``None``, because this runtime computes no execution
+          horizon. The reduced-horizon trigger therefore cannot fire here. That
+          is a limitation of this integration, not a decision.
+        """
+        signature = float(len(self.store.free_cells(now_ns=self._now_ns())))
+        new_targets = tuple(
+            target for target in self._candidate_targets if target not in self._told_targets
+        )
+        scene = SceneStatus(signature=signature, new_targets=new_targets, horizon_s=None)
+        outcomes = self._pilot.tick(scene, observation, payloads, self._clock())
+        self._told_targets.update(new_targets)
+        for outcome in outcomes:
+            self.result.cloud_calls.append(
+                {
+                    "kind": outcome.kind,
+                    "reason": outcome.reason,
+                    "request_id": outcome.request_id,
+                    "proposal_id": outcome.proposal_id,
+                }
+            )
+            self.result.log.append(f"cloud {self.arm}: {outcome.kind} — {outcome.reason}")
 
     def _now_ns(self) -> int:
         return self._capture_clock_ns if self._capture_clock_ns is not None else time.monotonic_ns()
@@ -791,6 +938,14 @@ class MissionRuntime:
                 )
                 self.result.termination_reason = "estimator_not_initialized"
                 return self.result
+            # The owner's ruling: the single reasoned call happens on the ground,
+            # using whatever the aircraft can gather while it is stationary. It
+            # is made here — after the estimator is initialized and before the
+            # guided takeoff — because past this point every cloud call is the
+            # fast continuous class and the reasoned one is structurally
+            # impossible.
+            if self._pilot is not None:
+                self._plan_before_liftoff(drain)
             control = platform.arm_and_guided(self.settings.step_timeout_s.flight, drain=drain)
             if control.refused:
                 self.result.blockers.append(
@@ -800,6 +955,12 @@ class MissionRuntime:
                 self.result.termination_reason = "arming_refused"
                 return self.result
             self.result.flew = True
+            if self._pilot is not None:
+                # Liftoff. The builder's latch closes here and never reopens, so
+                # no in-flight path can issue a reasoned call, however it is
+                # written later.
+                self._pilot.mark_airborne(self._clock(), reason="guided takeoff")
+                self._airborne = True
             self._machine.open_window(time.monotonic_ns())
             self._fly_the_mission(drain)
         finally:
@@ -842,6 +1003,14 @@ class MissionRuntime:
                 "commanded_setpoints": list(self._commanded),
                 "publisher_published": getattr(publisher, "published", None),
                 "publisher_failures": list(getattr(publisher, "publish_failures", [])),
+                # The arm, the one reasoned call's own document, and every
+                # in-flight cloud exchange. The transport already carries this
+                # dict into the run's record verbatim, so the receipt can tell
+                # a conventional run from a cloud one and show what the cloud
+                # was asked and what came back without a second integration.
+                "arm": self.arm,
+                "plan": self.result.plan,
+                "cloud_calls": list(self.result.cloud_calls),
             }
         return self.result
 
@@ -898,9 +1067,29 @@ class MissionRuntime:
         # skip that used to live here read a snapshot taken BEFORE exploration
         # ran, so it could only ever skip the phase that exploration exists to
         # feed.
-        phases = tuple(
-            zip(("explore", "inspect", "return"), mission_module.build_b0_recipes())
-        )
+        # A cloud arm flies the plan it made on the ground; the conventional arm
+        # flies its own three recipes. A refused plan is a complete outcome: the
+        # local recipes fly and the refusal is already recorded, never replaced
+        # silently. Either way the recipe goes through this one runner, so the
+        # arms differ in where the plan came from and in nothing else.
+        plan = self._pilot.in_flight_plan if self._pilot is not None else None
+        if plan is not None and plan.usable and plan.recipe is not None:
+            phases = ((f"cloud-plan({plan.recipe.source})", plan.recipe),)
+            self.result.log.append(
+                "cloud plan adopted: "
+                f"{[step.action for step in plan.recipe.steps]} "
+                f"(source {plan.recipe.source!r})"
+            )
+        else:
+            if plan is not None:
+                self.result.log.append(
+                    "cloud plan refused: "
+                    f"{plan.refusal_reason or 'no recipe was returned'}; the local "
+                    "recipes fly and the refusal stands as recorded"
+                )
+            phases = tuple(
+                zip(("explore", "inspect", "return"), mission_module.build_b0_recipes())
+            )
         index = 0
         regathers: dict[str, int] = {}
         while index < len(phases):
@@ -1265,6 +1454,21 @@ class MissionRuntime:
             self._frames_without_candidate += 1
         observation = self._record_observation(record, store_payload=bool(candidates))
         self._append_observation_id(observation.record_id)
+        # A cloud arm's call carries the observation's own frames, as PPM,
+        # because the packet builder re-encodes them to PNG itself. Built only
+        # for a cloud arm: the conventional arm sends nothing and would be
+        # paying for a copy it never uses.
+        frames: dict[str, bytes] = {}
+        if self._pilot is not None:
+            frames = {
+                "left": ppm_bytes(pair.left_bytes, pair.width, pair.height),
+                "right": ppm_bytes(pair.right_bytes, pair.width, pair.height),
+            }
+            if not self._airborne and self._preflight_observation is None:
+                # The first frame the aircraft takes while it is still on the
+                # ground is the evidence the one reasoned call is made from.
+                self._preflight_observation = observation
+                self._preflight_payloads = frames
         self.store.integrate(
             depth,
             pose,
@@ -1283,6 +1487,10 @@ class MissionRuntime:
             self.result.log.append(
                 f"candidate grounded: {target.target_id} from {observation.record_id}"
             )
+        if self._pilot is not None and self._airborne:
+            # In flight the builder's latch is closed, so this can only ever be
+            # the continuous class, and B1 makes no call at all.
+            self._tick_cloud(observation, frames)
 
     def _ground_candidates(self, candidates, observation, depth, pose, state):
         grounded: list[R.GroundedTarget] = []
