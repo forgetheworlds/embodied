@@ -195,6 +195,12 @@ MAX_CITED_OBSERVATIONS = 256
 # is bounded so a pathological scene cannot turn the log into a wall of text;
 # the counts still say how many of each there were.
 MAX_PERSISTED_REFUSAL_REASONS = 12
+# How many times one blocked phase may gather again before the mission moves on.
+# Retrying without a bound is what spent the whole 300 s mission budget inside
+# `explore` on live-vision-1 and starved `inspect` and `return`, so the mission
+# never returned and its own report said so. The mission may look again; it may
+# not look so long that the later phases lose their budget.
+MAX_PHASE_REGATHERS = 3
 # The cold-start perception window: bounded, in simulator seconds, before the
 # mission's phases begin. It exists to break the bootstrap on the mission's
 # first flight — the map a frontier is resolved from can only be built from the
@@ -374,6 +380,7 @@ class MissionRuntime:
         self._perception_cycles = 0
         self._observation_ids: list[str] = []
         self._perception_refusal_counts: dict[str, int] = {}
+        self._frames_without_candidate = 0
         self._state_ring: list[tuple[int, loc.EstimatorState]] = []
         self._latest_state: loc.EstimatorState | None = None
         self._latest_aligned: dict[str, object] | None = None
@@ -866,6 +873,7 @@ class MissionRuntime:
             zip(("explore", "inspect", "return"), mission_module.build_b0_recipes())
         )
         index = 0
+        regathers: dict[str, int] = {}
         while index < len(phases):
             if mission_window.expired():
                 termination = "mission_budget_exhausted"
@@ -879,19 +887,31 @@ class MissionRuntime:
             if outcome.status == "budget_exhausted":
                 termination = "mission_budget_exhausted"
                 break
-            if outcome.status == "blocked" and not mission_window.expired():
+            used = regathers.get(phase, 0)
+            if (
+                outcome.status == "blocked"
+                and not mission_window.expired()
+                and used < MAX_PHASE_REGATHERS
+            ):
                 # Blocked means the mission had nothing to aim at, not that it
                 # aimed and failed: the runner resolves a target out of the map,
                 # and with nothing resolvable it spends its attempts without ever
                 # reaching the lease loop. Gather on the same declared window and
-                # run the phase again against a map that has grown, and stop
-                # retrying as soon as gathering stops producing frames — the
-                # mission may look for as long as looking helps, and no longer.
+                # run the phase again against a map that has grown.
+                #
+                # Bounded, because unbounded retrying is what spent the whole
+                # mission budget inside `explore` on live-vision-1: `inspect` and
+                # `return` never ran, and a mission that never returns reports
+                # that it never returned. It also stops as soon as gathering
+                # stops producing frames, so a scene that is giving the mission
+                # nothing ends the retries early.
+                regathers[phase] = used + 1
                 gathered = self.pump_perception(drain, COLD_START_PERCEPTION_SIM_S)
                 self.result.log.append(
                     f"phase {phase} blocked: gathered {gathered} further frame(s) "
-                    f"before retrying ({self._observation_counter} observation(s) "
-                    f"so far, {len(self.navigable_frontiers())} navigable)"
+                    f"before retry {used + 1}/{MAX_PHASE_REGATHERS} "
+                    f"({self._observation_counter} observation(s) so far, "
+                    f"{len(self.navigable_frontiers())} navigable)"
                 )
                 if gathered > 0:
                     continue
@@ -1020,21 +1040,29 @@ class MissionRuntime:
         """
         if not self._perception_refusal_counts:
             self.result.log.append("perception refusals: none")
-            return
-        total = sum(self._perception_refusal_counts.values())
-        self.result.log.append(
-            f"perception refusals: {total} over "
-            f"{len(self._perception_refusal_counts)} distinct reason(s)"
-        )
-        ranked = sorted(
-            self._perception_refusal_counts.items(), key=lambda item: (-item[1], item[0])
-        )
-        for reason, count in ranked[:MAX_PERSISTED_REFUSAL_REASONS]:
-            self.result.log.append(f"  x{count} {reason}")
-        if len(ranked) > MAX_PERSISTED_REFUSAL_REASONS:
+        else:
+            total = sum(self._perception_refusal_counts.values())
             self.result.log.append(
-                f"  ... and {len(ranked) - MAX_PERSISTED_REFUSAL_REASONS} more reason(s)"
+                f"perception refusals: {total} over "
+                f"{len(self._perception_refusal_counts)} distinct reason(s)"
             )
+            ranked = sorted(
+                self._perception_refusal_counts.items(), key=lambda item: (-item[1], item[0])
+            )
+            for reason, count in ranked[:MAX_PERSISTED_REFUSAL_REASONS]:
+                self.result.log.append(f"  x{count} {reason}")
+            if len(ranked) > MAX_PERSISTED_REFUSAL_REASONS:
+                self.result.log.append(
+                    f"  ... and {len(ranked) - MAX_PERSISTED_REFUSAL_REASONS} more reason(s)"
+                )
+        # Always reported, refusals or none: it is the number that separates
+        # "the mission looked and found nothing to aim at" from "the mission
+        # never looked", and the two failures have nothing in common.
+        self.result.log.append(
+            f"perception candidates: {self._frames_without_candidate} frame(s) "
+            "proposed no candidate of the query"
+        )
+
     def _note_perception_refusal(self, line: str) -> None:
         """Record a perception refusal where the run's own record can see it.
 
@@ -1172,7 +1200,20 @@ class MissionRuntime:
         except Exception as error:  # a failed depth product clears nothing
             self._note_perception_refusal(f"depth_failed: {error}")
             return
+        if isinstance(outcome, DetectorUnavailable):
+            # A seam that refuses is a vision failure as much as a refused
+            # grounding is, and this one was discarded silently: the mission
+            # recorded nothing about why it proposed no candidate at all.
+            self._note_perception_refusal(
+                f"detector_unavailable {outcome.reason}: {outcome.detail}"
+            )
         candidates = () if isinstance(outcome, DetectorUnavailable) else outcome
+        if not candidates:
+            # A frame that yields no candidate of the query is the ordinary
+            # case for a colour proposer in a room the target is not visible
+            # from, and it is the number a reader needs to tell "the mission
+            # looked and saw nothing to aim at" from "the mission never looked".
+            self._frames_without_candidate += 1
         observation = self._record_observation(record, store_payload=bool(candidates))
         self._append_observation_id(observation.record_id)
         self.store.integrate(
