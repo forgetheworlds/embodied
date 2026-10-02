@@ -52,6 +52,19 @@ def band_edges(
     return edges
 
 
+def predicted_sigma_m(
+    z_m: float, focal_px: float, baseline_m: float, sigma_d_px: float
+) -> float:
+    """The declared quantization envelope at one range: sigma_z = z^2 sigma_d / (f B).
+
+    Reported beside the measured error so a reader can tell a quantization-limited
+    result from a correspondence failure: an error at or under this envelope is
+    what the declared disparity sigma predicts; an error several times above it is
+    not quantization and no envelope widening will explain it.
+    """
+    return (z_m * z_m) * sigma_d_px / (focal_px * baseline_m)
+
+
 def profile(config_path: Path) -> dict:
     """Measure depth error against declared depth, banded by range."""
     import yaml  # lazy: only a reader of the config needs it
@@ -170,6 +183,7 @@ def profile(config_path: Path) -> dict:
             "median_abs_error_m": float(np.median(magnitude)) if magnitude.size else None,
             "p95_abs_error_m": float(np.percentile(magnitude, 95)) if magnitude.size else None,
             "max_abs_error_m": float(np.max(magnitude)) if magnitude.size else None,
+            "median_signed_error_m": float(np.median(stacked)) if stacked.size else None,
         }
 
     return {
@@ -177,13 +191,31 @@ def profile(config_path: Path) -> dict:
         "tolerances": {"depth_abs_tol_m": abs_tol, "depth_rel_tol": rel_tol},
         "band_width_m": BAND_WIDTH_M,
         "pairs_measured": pairs_seen,
+        "calibration": {
+            "focal_px": float(calibration.left_intrinsics.focal_length_px[0]),
+            "baseline_m": float(calibration.baseline_m),
+            "disparity_quantization_sigma_px": float(
+                matcher.get("disparity_quantization_sigma_px", 1.0)
+            ),
+        },
+        "predicted_sigma_m_by_band": {
+            key: predicted_sigma_m(
+                (float(key.split("-")[0]) + float(key.split("-")[1])) / 2.0,
+                float(calibration.left_intrinsics.focal_length_px[0]),
+                float(calibration.baseline_m),
+                float(matcher.get("disparity_quantization_sigma_px", 1.0)),
+            )
+            for key in bands
+        },
         "by_range_band": {key: summarize(value) for key, value in bands.items()},
         "by_surface": {key: summarize(value) for key, value in by_surface.items()},
         "note": (
             "n_compared counts exactly the samples the check compares: a valid disparity, "
             "inside the border margin, inside the declared depth window, and with a finite "
             "declared depth. within_fraction is against max(depth_abs_tol_m, "
-            "depth_rel_tol * declared depth), the declared per-sample criterion."
+            "depth_rel_tol * declared depth), the declared per-sample criterion. "
+            "predicted_sigma_m is the declared quantization envelope at the band's "
+            "midpoint: an error far above it is not quantization."
         ),
     }
 
