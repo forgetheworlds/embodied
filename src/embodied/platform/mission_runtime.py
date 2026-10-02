@@ -1270,8 +1270,7 @@ class MissionRuntime:
             target_point = tuple(float(value) for value in target)
             if float(np.linalg.norm(target - toward)) < GE.STANDOFF_M:
                 # Closer to what it is looking at than the mission's own
-                # declared standoff: there is no approach left to make, and
-                # the "view" is the one already in hand.
+                # declared standoff: there is no approach left to make.
                 self._count_gate("too_close")
                 continue
             approach = GE.approach_region(
@@ -1279,8 +1278,16 @@ class MissionRuntime:
                 ENVELOPE,
                 direction=FRONTIER_VIEW_DIRECTION,
             )
-            if approach.contains(tuple(float(value) for value in here)):
-                self._count_gate("contains")
+            if _region_gap_m(approach, here) < GE.STANDOFF_M:
+                # A goal the aircraft already stands in -- or stands two
+                # centimetres outside of -- is not an excursion. The step
+                # completes on arrival without going anywhere, which is what
+                # live-motion-7 did: its admitted region's near face was
+                # 0.02 m from the aircraft, so "explore" advanced 2 cm. A view
+                # from where you already are is not a second view, and the
+                # declared standoff is this mission's own measure of a view
+                # taken from somewhere else.
+                self._count_gate("too_near")
                 continue
             if any(cell in searchable for cell in approach.cells(self.store.config)):
                 self._count_gate("accepted")
@@ -1599,6 +1606,24 @@ class _LiveAdmission:
 
     def invalidate_queued(self, goal_id: str) -> int:
         return 0
+
+
+def _region_gap_m(region: GE.BoxRegion, point: tuple[float, float, float]) -> float:
+    """The straight-line distance from a point to a box; 0.0 if it is inside.
+
+    This is how far the aircraft would have to travel to enter the region, which
+    is the only quantity an "excursion" can honestly be measured in: a region
+    whose near face is two centimetres away is a goal that is reached without
+    going anywhere.
+    """
+    squared = 0.0
+    for axis in range(3):
+        low, high = region.low[axis], region.high[axis]
+        if point[axis] < low:
+            squared += (low - point[axis]) ** 2
+        elif point[axis] > high:
+            squared += (point[axis] - high) ** 2
+    return float(np.sqrt(squared))
 
 
 def _terminal_region_for(targets: tuple[R.GroundedTarget, ...]) -> GE.BoxRegion | None:
