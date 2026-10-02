@@ -763,6 +763,7 @@ class MissionRuntime:
             )
             self.result.publications = self._publication_count
             self.result.publish_refusals = self._publish_refusal_count
+            self._surface_refusals()
             self.result.stream = {
                 "pairs": self._stats.pairs,
                 "pair_records_filed": self._stats.pair_records_filed,
@@ -898,6 +899,26 @@ class MissionRuntime:
         self.result.guidance_events = [
             event.document() for event in getattr(self._platform, "control_events", [])
         ]
+
+    def _surface_refusals(self) -> None:
+        """Copy the mission's refusal reasons into the record that is written out.
+
+        A refusal is a reason the aircraft did nothing: an admission the
+        supervisor would not accept, a target that could not be grounded, a
+        depth product that failed. They used to be accumulated in
+        ``_refusals_log`` and then dropped, so a run could report
+        "no_active_goal" and never state why the goal was refused. Live-19 is the
+        worked case: a frontier resolved to a vantage 5.63 m away, publication
+        then stopped, and the reason was on this list and invisible. Deduped,
+        order preserved, and the count survives a long list.
+        """
+        unique_refusals = list(dict.fromkeys(self._refusals_log))
+        for entry in unique_refusals[:40]:
+            self.result.log.append(f"refused: {entry}")
+        if len(unique_refusals) > 40:
+            self.result.log.append(
+                f"refused: ... and {len(unique_refusals) - 40} further distinct refusals"
+            )
 
     def _shutdown(self, platform, publisher, estimator_process, feed_stop, feed_thread, link) -> None:
         for action in (
