@@ -226,7 +226,38 @@ calibration:
     # Per-sample B3 bound, plan-fixed: |z_meas - z_declared| <= max of these.
     depth_abs_tol_m: 0.15
     depth_rel_tol: 0.10
-    depth_range_m: [0.5, 4.0]
+    # The depth operating range. ONE value by design: the runtime depth pipeline
+    # reads this same key (platform/mission_runtime.py:321), so the range the
+    # aircraft trusts and the range the P01-C gate was evaluated over are a
+    # single declaration rather than two that can drift apart.
+    #
+    # RAISED 4.0 -> 6.0 m on the owner's ruling of 2026-10-02, and the reason is
+    # measured rather than convenient. At 4 m the mission's own frames reject
+    # 44.0 % of pixels as REASON_DEPTH_RANGE -- the largest single rejection --
+    # and the resulting map holds zero cells that are free with the aircraft's
+    # 0.45 m envelope around them, so no goal at any real distance can be
+    # admitted and the aircraft never translates. The same five retained frames,
+    # the same matcher, map, envelope and thresholds, differing only in this
+    # range:
+    #   [0.5, 4.0]  valid 14.5 %  searchable 0     (12-step yaw sweep: still 0)
+    #   [0.5, 6.0]  valid 36.6 %  searchable 8     (sweep: 3)
+    #   [0.5, 8.0]  valid 56.3 %  searchable 3195  (sweep: 12514)
+    # Six metres is the smallest change that admits a first goal; once it moves,
+    # the aircraft gains viewpoints and the map grows without a further ruling.
+    # It is NOT the sensor's limit: num_disparities 128 puts the near limit at
+    # 0.44 m and disparity 1 near 55 m. More frames from one pose cannot help
+    # (809 -> 819 free cells), and a yaw sweep limited by the 5 s freshness
+    # window cannot either -- the sheets are ~0.38 m thick and 30 deg apart and
+    # never overlap into a solid volume.
+    #
+    # WHAT THIS DOES NOT BUY, recorded so it is not read as validated accuracy:
+    # P01-C's receipts record what was actually measured, which was 4 m. Depth
+    # uncertainty grows as sigma_z = z^2 * sigma_d / (f * B): about 0.29 m at
+    # 4 m against about 0.65 m at 6 m. The far half of this range is therefore
+    # trusted without that gate having checked it, and a ray whose far endpoint
+    # is badly placed clears space past a real surface -- a clearance guarantee,
+    # not a convenience. Re-running the P01-C depth check at 6 m is owed.
+    depth_range_m: [0.5, 6.0]
     # A per-surface pass/fail on a handful of matches is not a distribution:
     # a surface must contribute at least this many compared samples before its
     # accuracy fraction gates, and at least this fraction of them must sit
