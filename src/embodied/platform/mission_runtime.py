@@ -854,7 +854,13 @@ class MissionRuntime:
         self.pump_perception(
             drain,
             COLD_START_PERCEPTION_SIM_S,
-            until=lambda: bool(self._candidate_targets) or bool(self.navigable_frontiers()),
+            # Only a grounded candidate ends the cold start early. A navigable
+            # frontier does not: live-vision-1 and live-vision-2 both logged
+            # "0 navigable" at the close of a cold start that had already
+            # stopped after one observation, so a single frontier region is
+            # satisfiable by the cell the aircraft is standing in and says
+            # nothing about whether there is somewhere to go.
+            until=lambda: bool(self._candidate_targets),
         )
         self.result.log.append(
             f"cold start: {len(self.frontier_regions())} frontier region(s), "
@@ -1100,9 +1106,19 @@ class MissionRuntime:
         mission that cannot see cannot decide, so gathering has to continue
         while the mission has nothing to do.
 
+        The budget is spent as a COUNT of cycles — ``sim_seconds`` at one cycle
+        per ``MIN_PERCEPTION_INTERVAL_S`` of the aircraft's own time — and not
+        as a comparison against a running simulator clock. The distinction is
+        measured, not stylistic: ``_SimWindow`` expires when the simulator's own
+        clock has advanced the budget, and the simulator delivers its time in
+        bursts, so on live-vision-2 the cold start's 8 s window expired after a
+        SINGLE cycle, and a gathering that should have produced about 26
+        observations produced one. The wall ceiling is kept, so a stalled
+        simulator ends the wait instead of hanging the run.
+
         ``until`` is an optional predicate: gathering stops as soon as it is
-        true, so a caller waiting for the map to offer somewhere to go does not
-        have to spend the whole window once it has somewhere.
+        true, so a caller waiting for a real target need not spend the whole
+        budget once it has one.
 
         Only for use once the ordered bring-up has finished: this runs stereo
         depth, and the ``drain`` inside it is the path the bring-up's
@@ -1112,17 +1128,13 @@ class MissionRuntime:
 
         Returns the number of cycles that took a frame.
         """
-        window = _SimWindow(
-            self._stats.sim_clock,
-            sim_seconds,
-            label="a perception pump window",
-            wall_ceiling_s=_sim_window_wall_ceiling_s(
-                sim_seconds, self.settings.realtime_ratio_envelope[0]
-            ),
+        target_cycles = max(1, int(round(sim_seconds / MIN_PERCEPTION_INTERVAL_S)))
+        deadline_s = time.monotonic() + _sim_window_wall_ceiling_s(
+            sim_seconds, self.settings.realtime_ratio_envelope[0]
         )
         cycles = 0
         next_cycle = 0.0
-        while not window.expired():
+        while cycles < target_cycles and time.monotonic() < deadline_s:
             now = time.monotonic()
             if now >= next_cycle:
                 next_cycle = now + MIN_PERCEPTION_INTERVAL_S
@@ -1131,10 +1143,8 @@ class MissionRuntime:
                 self.perceive_if_due()
                 if self._perception_cycles > before:
                     cycles += 1
-                # Asked once per cycle, never once per sleep: the predicate is
-                # the caller's and may be as expensive as a frontier search.
-                if until is not None and until():
-                    break
+                    if until is not None and until():
+                        break
             time.sleep(PERCEPTION_PUMP_SLEEP_S)
         return cycles
 
