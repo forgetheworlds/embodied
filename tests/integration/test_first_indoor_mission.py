@@ -107,6 +107,7 @@ def _write_fixture_root(
     suite_name: str | None = None,
     localization_mode: str = "sensor-derived",
     target_present: bool = True,
+    target_identity: bool = True,
 ) -> dict:
     suite_name = suite_name or f"{FIXTURE_SUITE_NAME}-{abs(hash(str(root))) % 100000}"
     (root / "configs" / "suites").mkdir(parents=True, exist_ok=True)
@@ -127,21 +128,29 @@ def _write_fixture_root(
     }
     suite_path = root / "configs" / "suites" / "first-indoor.yaml"
     suite_path.write_text(yaml.safe_dump(suite, sort_keys=False), encoding="utf-8")
-    seed = {
-        "targets": {"red_block": {"present": target_present}},
-        "world_counts": {"red_block": 1 if target_present else 0},
-        "identity": {
+    # The absent case carries no geometry for the queried object, exactly as the
+    # held-out seed does: there is no such object, so there is no position to
+    # give, and a fabricated one would let an inspection of nothing be measured.
+    identity: dict = {
+        "decoy_box": {
+            "node": "decoy_box",
+            "position_ned_from_world_origin_m": [2.0, 1.0, -0.15],
+            "in_truth": False,
+        },
+    }
+    if target_identity:
+        identity = {
             "red_block": {
                 "node": "target_block",
                 "position_ned_from_world_origin_m": [4.0, 0.0, -0.9],
                 "position_enu_m": [4.0, 0.0, 0.9],
             },
-            "decoy_box": {
-                "node": "decoy_box",
-                "position_ned_from_world_origin_m": [2.0, 1.0, -0.15],
-                "in_truth": False,
-            },
-        },
+            **identity,
+        }
+    seed = {
+        "targets": {"red_block": {"present": target_present}},
+        "world_counts": {"red_block": 1 if target_present else 0},
+        "identity": identity,
     }
     (root / "scenarios" / "first_indoor" / "truth.yaml").write_text(
         yaml.safe_dump(seed, sort_keys=False), encoding="utf-8"
@@ -214,7 +223,14 @@ def _run_record(tmp_path, monkeypatch, suite_path: Path, suite_name: str, *extra
     from embodied.bench import cli as bench_cli  # registers the bench command
     from embodied.cli import main
 
-    monkeypatch.setattr(live_record, "SUITE_CONFIG_RELATIVE", suite_path)
+    # The CLI selects a suite by the name its own declaration carries, so a
+    # fixture suite is injected at that resolution. These tests are about the
+    # admission rules below it, not about where a suite lives on disk.
+    def _path_for(name: str, root: Path | None = None) -> Path:
+        assert name == suite_name, f"the CLI resolved {name!r}, expected {suite_name!r}"
+        return suite_path
+
+    monkeypatch.setattr(live_record, "suite_config_path_for", _path_for)
     output = tmp_path / "run"
     code = main(
         [
@@ -271,7 +287,16 @@ class _FakeTruthRecord:
         self.kind = "pose"
 
 
-def _scripted_driver(*, recorder, sensor_tap, episode_id, instruction, target_id, **kwargs):
+def _scripted_driver(
+    *,
+    recorder,
+    sensor_tap,
+    episode_id,
+    instruction,
+    target_id,
+    claims_found: bool = True,
+    **kwargs,
+):
     """A mission-shaped episode without a simulator.
 
     It writes the same surfaces a live run writes — a mission event,
@@ -352,9 +377,12 @@ def _scripted_driver(*, recorder, sensor_tap, episode_id, instruction, target_id
         ),
         _stamp(1_400_000_000),
     )
-    # The truth stream, bench-side only: a hold inside the declared radius of
-    # the target and a return to the start.
-    for index, (sim_s, xyz) in enumerate(
+    # The truth stream, bench-side only. On a present-target scene it holds
+    # inside the declared radius of the target and returns. On an absent-target
+    # scene there is no such position to hold near, so the stand-in only goes
+    # out and comes back: a hold is not simulated where the world has nothing
+    # to hold near.
+    track = (
         [
             (1.0, (0.0, 0.0, -0.1)),
             (2.0, (3.8, 0.1, -0.9)),
@@ -362,12 +390,21 @@ def _scripted_driver(*, recorder, sensor_tap, episode_id, instruction, target_id
             (4.0, (4.1, -0.1, -0.9)),
             (5.0, (0.2, 0.1, -0.1)),
         ]
-    ):
+        if claims_found
+        else [
+            (1.0, (0.0, 0.0, -0.1)),
+            (2.0, (1.6, 0.1, -0.9)),
+            (3.0, (2.4, 0.0, -0.9)),
+            (4.0, (1.6, -0.1, -0.9)),
+            (5.0, (0.2, 0.1, -0.1)),
+        ]
+    )
+    for sim_s, xyz in track:
         sensor_tap(_FakeTruthRecord(sim_s, xyz))
     result = _ScriptedResult()
     report = assemble_mission_claims(
-        found=ClaimEvidence(True, (observation.record_id,)),
-        inspected=ClaimEvidence(True, (observation.record_id,)),
+        found=ClaimEvidence(claims_found, (observation.record_id,)),
+        inspected=ClaimEvidence(claims_found, (observation.record_id,)),
         returned=ClaimEvidence(True, (observation.record_id,)),
         target_id=target_id,
         termination_reason="mission_completed",

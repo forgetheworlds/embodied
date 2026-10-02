@@ -67,6 +67,7 @@ from embodied.platform.localization_check import (
 
 SUITE_ID = "first-indoor"
 SUITE_CONFIG_RELATIVE = Path("configs/suites/first-indoor.yaml")
+SUITE_DIR_RELATIVE = Path("configs/suites")
 PLATFORM_CONFIG_RELATIVE = Path("configs/first_indoor.yaml")
 TRUTH_SEED_RELATIVE = Path("scenarios/first_indoor/truth.yaml")
 # The one arm this transport admits. B1/B2 are P06's comparison arms, gated on
@@ -101,6 +102,39 @@ class SuiteConfigError(Exception):
 
 def suite_config_path(root: Path | None = None, *, relative: Path | None = None) -> Path:
     return (root or repository_root()) / (relative or SUITE_CONFIG_RELATIVE)
+
+
+_SUITE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def suite_config_path_for(name: str, root: Path | None = None) -> Path:
+    """The declaration file a suite name resolves to, or a refusal.
+
+    A suite is selected by the name its own declaration carries, so the name is
+    a file component and never a path: anything that could step outside the
+    suites directory is refused here rather than resolved. A missing file is not
+    an error — ``load_suite_document`` answers None for it, which leaves the
+    unregistered-suite refusal in the caller's hands.
+    """
+    if not _SUITE_NAME_RE.fullmatch(name):
+        raise SuiteConfigError(
+            f"suite name {name!r} is not a plain name; a suite is selected by its own "
+            "declared name, never by a path"
+        )
+    return (root or repository_root()) / SUITE_DIR_RELATIVE / f"{name}.yaml"
+
+
+def declared_path(document: dict[str, Any], key: str, *, root: Path | None = None) -> Path:
+    """A repository-relative path a suite declaration names, or a refusal.
+
+    The declaration carries the pointers the transport reads — its scene and its
+    truth seed. Resolving them from the document is what keeps a suite graded
+    against its own truth rather than against the default suite's.
+    """
+    value = document.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SuiteConfigError(f"the suite declaration names no {key!r}")
+    return (root or repository_root()) / value
 
 
 def load_suite_document(path: Path | None = None) -> dict[str, Any] | None:
@@ -386,7 +420,7 @@ def world_state_payload(seed: dict[str, Any]) -> dict[str, Any]:
 def measure_physical_outcome(
     collector: "TruthCollector",
     *,
-    target_ned: tuple[float, float, float],
+    target_ned: tuple[float, float, float] | None,
     target_id: str,
     end_state: dict[str, Any],
     crash_statustexts: list[str],
@@ -398,9 +432,18 @@ def measure_physical_outcome(
     state — never from the mission's report. ``end_state`` is recorded beside
     the flags so a reader can see what the aircraft was doing at the end.
     """
-    inspected, inspected_detail = collector.inspected_within(
-        target_ned, radius_m=INSPECT_RADIUS_M, hold_s=INSPECT_HOLD_S
-    )
+    if target_ned is None:
+        # The world declares no such object, so there is no position to be near
+        # and no proximity to measure. The false is a fact about the world, not
+        # a failed look, and the detail says which it is.
+        inspected, inspected_detail = False, (
+            f"the world declares no {target_id}, so there is no position an inspection "
+            "could have been measured against"
+        )
+    else:
+        inspected, inspected_detail = collector.inspected_within(
+            target_ned, radius_m=INSPECT_RADIUS_M, hold_s=INSPECT_HOLD_S
+        )
     returned, returned_detail = collector.returned_near(radius_m=RETURN_RADIUS_M)
     violations: list[str] = []
     if crash_statustexts:
@@ -527,34 +570,43 @@ def record(
     document.setdefault("localization", {})["world"] = str(world_value)
     settings = _platform_settings(document, repository)
     truth_targets, _world_counts = truth_world_state(seed)
-    present_targets = sorted(
-        name for name, entry in truth_targets.items() if entry.get("present") is True
-    )
-    if len(present_targets) != 1:
+    declared_targets = sorted(truth_targets)
+    if len(declared_targets) != 1:
         return CommandOutcome(
             status=CommandStatus.BLOCKED,
             gate_status=GateStatus.NOT_APPLICABLE,
             reasons=(
-                f"the truth seed declares {len(present_targets)} present targets "
-                f"({', '.join(present_targets) or 'none'}); the first-indoor mission searches "
-                "for exactly one",
+                f"the truth seed declares {len(declared_targets)} targets "
+                f"({', '.join(declared_targets) or 'none'}); the mission searches for "
+                "exactly one",
             ),
             limitations=limitations,
             manifest=manifest_common,
             sensor_mode=sensor_mode,
         )
-    target_id = present_targets[0]
-    try:
-        target_ned = target_position_ned(seed, target_id)
-    except SuiteConfigError as error:
-        return CommandOutcome(
-            status=CommandStatus.BLOCKED,
-            gate_status=GateStatus.NOT_APPLICABLE,
-            reasons=(str(error),),
-            limitations=limitations,
-            manifest=manifest_common,
-            sensor_mode=sensor_mode,
-        )
+    target_id = declared_targets[0]
+    # Declaring which object the mission searches for and that object being
+    # there are two different facts. The first is the query; the second is the
+    # world's own state. A scenario whose subject is legitimately absent asks
+    # for a report of absence rather than an inspection, so it is a different
+    # task type and not an exemption from finding a present one. Only a present
+    # target has a position, and only a present target's inspection can be
+    # measured: a target declared present without geometry is still refused.
+    target_present = truth_targets[target_id].get("present") is True
+    if target_present:
+        try:
+            target_ned = target_position_ned(seed, target_id)
+        except SuiteConfigError as error:
+            return CommandOutcome(
+                status=CommandStatus.BLOCKED,
+                gate_status=GateStatus.NOT_APPLICABLE,
+                reasons=(str(error),),
+                limitations=limitations,
+                manifest=manifest_common,
+                sensor_mode=sensor_mode,
+            )
+    else:
+        target_ned = None
     instruction = str(
         suite_document.get("mission_instruction")
         or f"Find the {target_id.replace('_', ' ')}, inspect it, and return to the start."
@@ -695,6 +747,7 @@ def record(
             "episode_id": episode_id,
             "mission_instruction": instruction,
             "target_id": target_id,
+            "target_present": target_present,
             "truth_seed": str(seed_path),
             "platform_config": str(platform_path),
             "world": str(world_value),

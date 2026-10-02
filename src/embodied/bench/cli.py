@@ -108,10 +108,13 @@ def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
 
     The suite's own declaration registers it (P05 owns first-indoor; P02 owns
     none), and the transport that flies the mission lives in
-    :mod:`embodied.bench.live_record`. An unregistered suite is still refused
-    rather than substituted, and so is a sensor mode the suite does not
-    declare: the disagreement is the run's blocker, not something to paper
-    over by recording with a mode nobody declared.
+    :mod:`embodied.bench.live_record`. A suite is selected by the name its own
+    declaration carries, and the pointers in that declaration supply the scene
+    and the truth seed this run is graded against — the default suite's are
+    never substituted for them. An unregistered suite is still refused rather
+    than substituted, and so is a sensor mode the suite does not declare: the
+    disagreement is the run's blocker, not something to paper over by recording
+    with a mode nobody declared.
     """
     sensor_mode = SensorMode(args.sensor_mode)
     manifest = {
@@ -126,7 +129,18 @@ def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
     from embodied.bench import live_record
 
     try:
-        suite_document = live_record.load_suite_document()
+        suite_config = live_record.suite_config_path_for(args.suite)
+    except live_record.SuiteConfigError as error:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(f"the suite cannot be selected: {error}",),
+            limitations=limitations,
+            manifest=manifest,
+            sensor_mode=sensor_mode,
+        )
+    try:
+        suite_document = live_record.load_suite_document(suite_config)
         registered_name = live_record.register_suite(suite_document)
     except live_record.SuiteConfigError as error:
         return CommandOutcome(
@@ -172,12 +186,25 @@ def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
             manifest=manifest,
             sensor_mode=sensor_mode,
         )
+    try:
+        truth_seed = live_record.declared_path(suite_document, "truth_seed")
+    except live_record.SuiteConfigError as error:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(str(error),),
+            limitations=limitations,
+            manifest=manifest,
+            sensor_mode=sensor_mode,
+        )
     return live_record.record(
         suite_name=args.suite,
         suite_document=suite_document,
         arm=args.arm,
         sensor_mode=sensor_mode,
         output=output,
+        suite_config=suite_config,
+        truth_seed=truth_seed,
     )
 
 
