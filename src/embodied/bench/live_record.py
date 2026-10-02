@@ -45,7 +45,7 @@ from pathlib import Path
 import json
 import re
 import subprocess
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
 
@@ -422,8 +422,45 @@ GUIDED_MODE = "GUIDED"
 LANDING_MODE = "LAND"
 
 
+# The phrase ArduPilot uses when a failsafe takes the flight mode away from whoever
+# was controlling the vehicle ("EKF Failsafe: changed to Land Mode"). It is the
+# aircraft's own statement that the change was not asked for, which is the one signal
+# that separates a failsafe landing from the landing a mission is required to make.
+AUTOPILOT_MODE_CHANGE_MARKER = "changed to"
+
+
+def autopilot_mode_change_statustexts(mavlink_log: Path | str) -> list[str]:
+    """The autopilot's own reports that it changed the flight mode by itself.
+    Read from the run's recorded STATUSTEXT stream exactly as the crash-disarm scan
+    reads it, and kept as a separate signal because a failsafe can take the aircraft
+    to LAND without crashing it — and a landing is what the guidance accounting is
+    most tempted to excuse. ``live-14`` is the worked case: the mode changed to LAND
+    at message #11255 and the autopilot said why five messages later.
+    """
+    texts: list[str] = []
+    path = Path(mavlink_log)
+    if not path.is_file():
+        return texts
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(document, dict):
+                continue
+            if document.get("mavpackettype") != "STATUSTEXT":
+                continue
+            text = str(document.get("text", "")).strip()
+            if AUTOPILOT_MODE_CHANGE_MARKER in text.lower() and text not in texts:
+                texts.append(text)
+    return texts
+
+
 def _guidance_departures(
-    events: list[dict[str, Any]], end_state: dict[str, Any]
+    events: list[dict[str, Any]],
+    end_state: dict[str, Any],
+    autopilot_mode_changes: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split the platform's control events into control losses and ordinary changes.
 
@@ -446,11 +483,14 @@ def _guidance_departures(
     Of the departures, all but the terminal one are losses, because the aircraft
     came back: an autopilot that takes control away mid-flight and later returns it
     still took it away. The terminal departure is the end of the flight and is
-    excused only when the run ended in the mission's declared landing state (in
-    ``LAND``, disarmed) **and** the departure is into that landing or is the
-    shutdown while still in Guided. A terminal departure to anything else —
-    ``LOITER``, ``RTL`` — stays a loss, which is the case this detector exists to
-    catch.
+    excused only when all three of these hold: the run ended in the mission's
+    declared landing state (in ``LAND``, disarmed); the departure is into that
+    landing or is the shutdown while still in Guided; and **the autopilot did not
+    report taking the mode itself**. That last condition is what stops the rule
+    hiding the case it exists for — ``live-14`` flew under a failsafe that changed
+    the mode to LAND and then crashed, and a landing alone cannot be told from the
+    landing a mission is required to make. A terminal departure to ``LOITER`` or
+    ``RTL`` stays a loss without needing the autopilot's explanation.
     """
     ordered = sorted(events, key=lambda event: int(event.get("at_monotonic_ns") or 0))
     departures = [
@@ -463,6 +503,7 @@ def _guidance_departures(
     declared_landing = (
         str(end_state.get("mode") or "") == LANDING_MODE
         and end_state.get("armed") is False
+        and not autopilot_mode_changes
     )
     losses: list[dict[str, Any]] = []
     for index, event in enumerate(departures):
@@ -512,6 +553,7 @@ def measure_physical_outcome(
     end_state: dict[str, Any],
     crash_statustexts: list[str],
     guidance_events: list[dict[str, Any]],
+    autopilot_mode_changes: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The bench side's own per-run physical outcome.
 
@@ -536,7 +578,7 @@ def measure_physical_outcome(
     if crash_statustexts:
         violations.append("crash_disarm: " + "; ".join(crash_statustexts[:3]))
     guidance_losses, guidance_departures = _guidance_departures(
-        guidance_events, end_state
+        guidance_events, end_state, autopilot_mode_changes
     )
     if guidance_losses:
         violations.append(f"guidance_lost:{len(guidance_losses)}")
@@ -551,9 +593,12 @@ def measure_physical_outcome(
         "return_detail": returned_detail,
         "violations": violations,
         "end_state": end_state,
-        "guidance": _guidance_record(
-            guidance_losses, guidance_departures, len(guidance_events)
-        ),
+        "guidance": {
+            **_guidance_record(
+                guidance_losses, guidance_departures, len(guidance_events)
+            ),
+            "autopilot_mode_changes": list(autopilot_mode_changes),
+        },
     }
 
 
@@ -759,6 +804,12 @@ def record(
         end_state=getattr(result, "end_state", {}),
         crash_statustexts=list(getattr(result, "crash_statustexts", []) or []),
         guidance_events=list(getattr(result, "guidance_events", []) or []),
+        # Read from the run's own record rather than trusted to a summary: a
+        # failsafe that lands the aircraft looks exactly like the landing the
+        # mission owes, and only the aircraft's own words separate them.
+        autopilot_mode_changes=autopilot_mode_change_statustexts(
+            output / "platform" / "run-a" / "mavlink.jsonl"
+        ),
     )
     inspected = outcome["payload"]["inspected"][target_id]
     returned = outcome["payload"]["return_verified"]
@@ -828,11 +879,17 @@ def record(
         # reader can see how many control events the run had and how many of them
         # actually left armed Guided control, rather than being asked to trust a
         # number that a declared landing used to inflate.
+        autopilot_changes = guidance.get("autopilot_mode_changes") or []
         reasons = (
             *reasons,
             f"guidance: {guidance['events']} control event(s), "
             f"{guidance['departures_from_armed_guided']} departure(s) from armed Guided, "
-            f"{guidance['losses']} loss(es)",
+            f"{guidance['losses']} loss(es)"
+            + (
+                f"; the autopilot changed the mode itself: {'; '.join(autopilot_changes[:2])}"
+                if autopilot_changes
+                else ""
+            ),
         )
     return CommandOutcome(
         status=CommandStatus.COMPLETE,

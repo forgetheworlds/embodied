@@ -219,6 +219,53 @@ def test_the_outcome_still_reports_a_real_loss():
     assert outcome["guidance"]["lost"][0]["to_mode"] == "LOITER"
 
 
+def test_a_failsafe_landing_is_not_excused():
+    """The aircraft's own words override the end state.
+
+    ``live-14`` is the recorded case: an EKF failsafe changed the mode to LAND and
+    the aircraft then crashed. The run ends in the declared landing state, so the
+    end state alone would excuse the departure — and would hide the one mode change
+    on record that the autopilot made by itself.
+    """
+    events = the_recorded_mission()
+    excused, _ = live_record._guidance_departures(events, LANDED, ())
+    assert excused == []
+    losses, departures = live_record._guidance_departures(
+        events, LANDED, ("EKF Failsafe: changed to Land Mode",)
+    )
+    assert len(losses) == 1
+    assert losses[0]["to_mode"] == "LAND"
+    # The departure was there all along; only the excuse changed.
+    assert len(departures) == 1
+
+
+def test_the_autopilot_mode_change_scan_reads_the_runs_own_record(tmp_path):
+    """What the scan finds, and what it must not: the mission's own changes."""
+    log = tmp_path / "mavlink.jsonl"
+    log.write_text(
+        "\n".join(
+            [
+                '{"mavpackettype": "HEARTBEAT", "custom_mode": 4, "base_mode": 217}',
+                '{"mavpackettype": "STATUSTEXT", "text": "EKF Failsafe"}',
+                '{"mavpackettype": "STATUSTEXT", "text": "EKF Failsafe Cleared"}',
+                '{"mavpackettype": "STATUSTEXT", "text": "Arming motors"}',
+                '{"mavpackettype": "STATUSTEXT", "text": "EKF Failsafe: changed to Land Mode"}',
+                '{"mavpackettype": "STATUSTEXT", "text": "EKF Failsafe: changed to Land Mode"}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    found = live_record.autopilot_mode_change_statustexts(log)
+    # Named once, and a failsafe that did not take the mode is not a mode change.
+    assert found == ["EKF Failsafe: changed to Land Mode"]
+
+
+def test_the_scan_is_empty_when_there_is_no_record(tmp_path):
+    """A run with no log has no mode changes to report, and must not fail."""
+    assert live_record.autopilot_mode_change_statustexts(tmp_path / "absent.jsonl") == []
+
+
 def test_a_crash_disarm_is_still_reported_alongside_guidance():
     """The two violations are independent and neither suppresses the other."""
     outcome = live_record.measure_physical_outcome(
