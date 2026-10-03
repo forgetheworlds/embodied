@@ -169,14 +169,16 @@ def test_the_tracking_floor_is_the_declared_one(tmp_path):
 
 def test_the_transmission_path_refuses_a_collapsed_tracker(tmp_path):
     """A dead-reckoned pose under a live feed must not reach the controller."""
-    from embodied.platform import localization as loc
-
     runtime = _runtime(tmp_path, "tracks-publish")
     now_ns = 100_000_000_000
-    dead = loc.HealthMachine(runtime._machine.bounds)
-    dead.on_state(_state_with_tracks(n_tracks=1, time_ns=now_ns), now_ns)
-    assert dead.state_for_publish(now_ns / 1e9) is None
 
-    alive = loc.HealthMachine(runtime._machine.bounds)
-    alive.on_state(_state_with_tracks(n_tracks=40, time_ns=now_ns), now_ns)
-    assert alive.state_for_publish(now_ns / 1e9) is not None
+    # A live feed whose tracker has collapsed. The feed's clock advances, so no
+    # age bound fires; the tracker's count is the only thing that says so.
+    runtime._on_state(_state_with_tracks(n_tracks=1, time_ns=now_ns))
+    fault = runtime._visual_fault()
+    assert fault is not None, "a live feed with a collapsed tracker must be a fault"
+    assert "tracker" in fault, fault
+
+    # The same path with a healthy tracker is not a fault.
+    runtime._on_state(_state_with_tracks(n_tracks=40, time_ns=now_ns))
+    assert runtime._visual_fault() is None
