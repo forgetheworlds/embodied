@@ -17,6 +17,8 @@ evaluator whose hidden task truth the pilot never sees.
 | `catalogue.yaml` | Input to the existing headless load validator (`scenarios/missions/tools/validate_scenarios.py`, unchanged). |
 | `tools/verify_scene_geometry.py` | Reachability/visibility check from the `.wbt` geometry (verifier for "the red object is reachable and visible from somewhere the aircraft can legally be"). |
 | `tools/probe_truth_isolation.py` | Re-proves, against the live bench code, that the agent surface cannot reach this scene's truth or the per-episode store. |
+| `tools/capture_stereo_pairs.py` | Captures stereo pairs at declared poses with **no flight**: derives a capture world from `world.wbt` at run time, rewrites only the airframe's controller block, and refuses to run if any node name, any `Solid` or the text before that block differs. Poses: `tools/capture_poses.json`. |
+| `tools/measure_depth_on_pairs.py` | Per-pose and pooled depth-rejection breakdown over captured pairs, reading the matcher, border and window out of `configs/first_indoor.yaml` the way the runtime does. |
 
 ## The honesty contract of this scene
 
@@ -56,3 +58,30 @@ Geometry reachability and truth isolation, both pure Python:
 python3 scenarios/first_indoor/tools/verify_scene_geometry.py
 python3 scenarios/first_indoor/tools/probe_truth_isolation.py
 ```
+
+## Measuring the scene at fixed poses, without flying
+
+The depth pipeline's behaviour on this scene is measurable at **fixed** poses, which
+a flight cannot give: a flight moves the camera, so any before/after comparison
+across flights confounds the scene with whatever route each run happened to fly.
+
+```bash
+PYTHONPATH=src python3 scenarios/first_indoor/tools/capture_stereo_pairs.py \
+  --out-dir work/runs/p05/scenetexture/before
+PYTHONPATH=src python3 scenarios/first_indoor/tools/measure_depth_on_pairs.py \
+  --pairs work/runs/p05/scenetexture/before --label before \
+  --out work/runs/p05/scenetexture/before-depth.json
+```
+
+The controller poses the airframe kinematically — it re-asserts the robot's own
+translation and rotation on every step, so the pose at capture is the declared pose
+rather than whatever gravity did with it — and reads both cameras in a single step.
+It starts no autopilot, arms nothing, and needs no SITL and no ports, so it runs
+while siblings are flying.
+
+Two things worth knowing before changing it. Webots does **not** search the world's
+own directory for a controller: it searches `scenarios/controllers/` and
+`scenarios/compat/controllers/`, and its warning names every path it tried — which is
+why this controller lives in the former. And Webots relays a controller's stdout only
+when that process exits, so the launcher waits on the pairs appearing on disk rather
+than on the console marker.

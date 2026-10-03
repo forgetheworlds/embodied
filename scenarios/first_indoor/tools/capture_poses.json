@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Declared capture poses for scenarios/first_indoor/world.wbt.",
+    "",
+    "These exist so a scene change can be measured at FIXED poses: a flight moves",
+    "the camera, so a before/after comparison across flights would confound the",
+    "scene with whatever route each run happened to fly.",
+    "",
+    "Chosen to cover what the mission's own camera sees: interior altitude (1.5 m,",
+    "the declared hover), inside each room and the vestibule, at yaws that put a",
+    "wall in front, to the side and along the room -- so the ruled [0.5, 6.0] m",
+    "depth band is exercised from ~1 m to ~5.6 m rather than at one distance.",
+    "",
+    "Deliberately generic: no pose aims at the target or the decoy, so nothing in",
+    "this tool encodes where the scene's answer is."
+  ],
+  "world_zero": "floor level, ENU: x north, y west, z up",
+  "poses": [
+    {"id": "vest_spawn",   "translation": [-1.0, 0.0, 1.5], "yaw_deg": 0.0,
+     "note": "the declared spawn column, facing the shared wall at 1 m"},
+    {"id": "vest_door",    "translation": [-0.5, 0.0, 1.5], "yaw_deg": 0.0,
+     "note": "closer to the doorway wall, forward view"},
+    {"id": "r1_mid",       "translation": [ 2.5, 0.0, 1.5], "yaw_deg": 0.0,
+     "note": "room 1 centre, far wall at 2.55 m"},
+    {"id": "r1_north",     "translation": [ 2.5, 0.0, 1.5], "yaw_deg": 90.0,
+     "note": "room 1 centre, side wall at 2.55 m"},
+    {"id": "r1_south",     "translation": [ 2.5, 0.0, 1.5], "yaw_deg": -90.0,
+     "note": "room 1 centre, opposite side wall"},
+    {"id": "r1_wide",      "translation": [ 0.7, 0.0, 1.5], "yaw_deg": 0.0,
+     "note": "room 1 back, far wall at 4.35 m -- the mid band"},
+    {"id": "r2_mid",       "translation": [ 7.5, 0.0, 1.5], "yaw_deg": 0.0,
+     "note": "room 2 centre, far wall at 2.55 m"},
+    {"id": "r2_back",      "translation": [ 7.5, 0.0, 1.5], "yaw_deg": 180.0,
+     "note": "room 2 centre, looking back at the shared wall"},
+    {"id": "r2_wide",      "translation": [ 5.6, 0.0, 1.5], "yaw_deg": 0.0,
+     "note": "room 2 back, far wall at 4.45 m"},
+    {"id": "r2_long",      "translation": [ 5.6, 0.0, 1.5], "yaw_deg": 180.0,
+     "note": "room 2 back, looking the length of the scene at 5.6 m"}
+  ]
+}
