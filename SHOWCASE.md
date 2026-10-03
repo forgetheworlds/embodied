@@ -261,7 +261,9 @@ The decoy is deliberately the wrong shade of red and the wrong shape.
 
 ### What the pilot was given
 
-From `work/runs/p05/live-14/episode/agent-events.jsonl` (the `mission` record):
+From `work/runs/p05/live-14/episode/agent-events.jsonl` (the `mission` record: instruction,
+scope, budget, evidence obligation) and `work/runs/p05/live-14/manifest.json` (arm, sensor
+mode, world, suite):
 
 | field | value |
 |---|---|
