@@ -33,8 +33,16 @@ simulator's pose stream that decide them — never the report):
   inspection, hence the hold.
 * ``return_verified`` — the last truth sample after landing within
   ``RETURN_RADIUS_M`` horizontally of the first truth sample (the spawn).
-* ``violations`` — the aircraft's own reports of a crash-disarm, and any
-  observed loss of Guided flight while armed.
+* ``violations`` — the aircraft's own reports of a crash-disarm, any observed
+  loss of Guided flight while armed, and an end state that no landing produces.
+  The last of those exists because this record once affirmed that nothing went
+  wrong on a run that ended inverted on the ground for about a minute: a
+  landing and a crash recorded identically, and a mission then read a crashed
+  aircraft's resting pose as a healthy one's measurement error and built two
+  claims on it. It is measured from the vehicle's own reported attitude against
+  ``END_STATE_MAX_LANDING_TILT_DEG``, and it reports the end state rather than
+  diagnosing it: an estimate that says the vehicle came to rest inverted is
+  itself a run that did not land as the record previously implied.
 * ``takeover`` — an operator intervention, which this arm never records.
 """
 
@@ -43,6 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
+import math
 import re
 import subprocess
 from typing import Any, Sequence
@@ -83,6 +92,30 @@ CONVENTIONAL_ARM = "B0"
 INSPECT_RADIUS_M = 1.5
 INSPECT_HOLD_S = 1.0
 RETURN_RADIUS_M = 1.0
+
+# The end-state predicate: what attitude a landing can leave behind. A multirotor
+# that has landed rests on its base, so its own up-axis sits near vertical; a
+# vehicle that came to rest on its side or on its back did not land.
+#
+# The boundary is placed in the measured gap between the two populations rather
+# than at a geometric landmark, because a real run sits on the landmark. Reading
+# each run's own last telemetry sample across the 32 runs on disk: every run that
+# **landed** measured **0.971 deg or less**, and the six that did **not** measured
+# **89.980 to 179.660 deg** — each of those six *steady*, constant across its last
+# six samples, so they are resting poses rather than a tumble caught mid-flight.
+#
+# That gap is 89.0 deg wide, so any value inside it separates the two populations
+# and the verdict does not depend on which one is chosen. Forty-five sits closest
+# to the middle and so leaves the largest margin to the nearest real case: 44.0
+# deg one way, 45.0 the other. Ninety was the more attractive landmark — the
+# point where the up-axis reaches the horizon — and it is where `live-19`
+# measured, at 89.980 deg, two hundredths of a degree inside it, which would have
+# made a real run's verdict turn on rounding.
+#
+# Applied only to an end state that has finished flying (disarmed), because a run
+# that ends still armed is mid-flight and its attitude is a manoeuvre, not a
+# resting pose.
+END_STATE_MAX_LANDING_TILT_DEG = 45.0
 
 # The host gate (BASELINE-GUARD rows 16-18): a freeze-blocked run is not
 # evidence, so a loaded host blocks the run before the simulator is started.
@@ -550,6 +583,131 @@ def _guidance_record(
     }
 
 
+def end_state_tilt_deg(attitude_rpy: Sequence[float] | None) -> float | None:
+    """How far the vehicle's own up-axis is from vertical, in degrees.
+
+    With the aviation rotation order the body's up-axis in the world has a
+    vertical component of ``cos(roll)·cos(pitch)``, so this needs no yaw and no
+    matrix: the arc-cosine of that product is the tilt — 0 deg upright, 180 deg
+    resting on its back. ``None`` when the attitude is absent or unusable, which
+    is a different statement from "upright" and must not be read as one.
+    """
+    if attitude_rpy is None or len(attitude_rpy) != 3:
+        return None
+    try:
+        roll, pitch = float(attitude_rpy[0]), float(attitude_rpy[1])
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(roll) and math.isfinite(pitch)):
+        return None
+    vertical = math.cos(math.radians(roll)) * math.cos(math.radians(pitch))
+    return math.degrees(math.acos(max(-1.0, min(1.0, vertical))))
+
+
+def end_state_violation(end_state: dict[str, Any]) -> str | None:
+    """An end state no landing produces, or ``None`` when it could be one.
+
+    The whole rule in one place, so the live path and the re-derivation of an
+    older run cannot come to different answers about the same data.
+    """
+    if end_state.get("armed") is not False:
+        # Armed, or arming unknown. An end state that is still armed is
+        # mid-flight and its attitude is a manoeuvre, not a resting pose.
+        return None
+    tilt = end_state_tilt_deg(end_state.get("attitude_rpy"))
+    if tilt is None or tilt <= END_STATE_MAX_LANDING_TILT_DEG:
+        # Absent attitude is not evidence of a good landing — the field postdates
+        # the runs it would judge, which is what ``rederive_end_state_violation``
+        # exists for. It is only that this record cannot decide it.
+        return None
+    roll, pitch = (float(end_state["attitude_rpy"][0]), float(end_state["attitude_rpy"][1]))
+    return (
+        f"end_state_inverted: the vehicle came to rest {tilt:.1f} deg from vertical "
+        f"(roll {roll:.1f}, pitch {pitch:.1f}) while disarmed, past the "
+        f"{END_STATE_MAX_LANDING_TILT_DEG:.0f} deg a landing can leave it"
+    )
+
+
+def end_state_attitude_from_telemetry(run_dir: Path) -> tuple[float, float, float] | None:
+    """The attitude a run ended in, read from that run's own recorded telemetry.
+
+    ``attitude_rpy`` reaches an end state only for runs recorded after the field
+    existed. An older run still recorded the same quantity, because the platform
+    writes every ``ATTITUDE`` message it receives to its own log, and the last
+    one is the attitude that run ended in. Read-only: nothing is written back.
+    """
+    for log_path in sorted(Path(run_dir).glob("platform/*/mavlink.jsonl")):
+        last: dict[str, Any] | None = None
+        try:
+            with log_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if '"ATTITUDE"' not in line:
+                        continue
+                    try:
+                        document = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if document.get("mavpackettype") == "ATTITUDE":
+                        last = document
+        except OSError:
+            continue
+        if last is None:
+            continue
+        try:
+            return (
+                math.degrees(float(last["roll"])),
+                math.degrees(float(last["pitch"])),
+                math.degrees(float(last["yaw"])),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def rederive_end_state_violation(run_dir: Path) -> dict[str, Any]:
+    """What the end-state rule says about a run already on disk.
+
+    A run recorded before ``attitude_rpy`` existed cannot be re-scored by
+    re-running the transport, so this reads what that run itself recorded: its
+    end state from ``mission.json`` and, when that carries no attitude, the last
+    ``ATTITUDE`` message from its own platform log. It returns the finding; the
+    caller decides where it goes, and nothing here writes to the run.
+    """
+    run_dir = Path(run_dir)
+    summary_path = run_dir / "mission.json"
+    document: dict[str, Any] = {}
+    if summary_path.exists():
+        document = json.loads(summary_path.read_text(encoding="utf-8"))
+    outcome = document.get("outcome") or {}
+    recorded_end_state = dict(outcome.get("end_state") or {})
+    recorded = list(outcome.get("violations") or [])
+    end_state = dict(recorded_end_state)
+    source = "end_state"
+    if end_state_tilt_deg(end_state.get("attitude_rpy")) is None:
+        telemetry = end_state_attitude_from_telemetry(run_dir)
+        if telemetry is None:
+            source = "absent"
+        else:
+            end_state["attitude_rpy"] = list(telemetry)
+            source = "platform/*/mavlink.jsonl (the last ATTITUDE message)"
+    tilt = end_state_tilt_deg(end_state.get("attitude_rpy"))
+    violation = end_state_violation(end_state)
+    return {
+        "run": run_dir.name,
+        "recorded_violations": recorded,
+        "end_state_recorded": recorded_end_state,
+        "attitude_source": source,
+        "attitude_rpy_deg": (
+            [round(float(value), 3) for value in end_state["attitude_rpy"]]
+            if end_state.get("attitude_rpy")
+            else None
+        ),
+        "tilt_deg": None if tilt is None else round(tilt, 3),
+        "violation": violation,
+        "violations_rederived": [*recorded, violation] if violation else list(recorded),
+    }
+
+
 def measure_physical_outcome(
     collector: "TruthCollector",
     *,
@@ -587,6 +745,9 @@ def measure_physical_outcome(
     )
     if guidance_losses:
         violations.append(f"guidance_lost:{len(guidance_losses)}")
+    end_state_finding = end_state_violation(end_state)
+    if end_state_finding is not None:
+        violations.append(end_state_finding)
     return {
         "payload": {
             "inspected": {target_id: inspected},
