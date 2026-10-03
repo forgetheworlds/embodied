@@ -268,6 +268,30 @@ POSE_RING = 64
 # (stop before the unknown boundary; stand off the object).
 RETURN_STANDOFF_COMPENSATION_M = GE.STANDOFF_M
 
+# Section 12.2's conditional observation objective, and the declared parameters
+# that bound it (R2).
+#
+# The specification requires the assessment to offer "any supported observation
+# alternative", and the supervisor to be able to "admit a conditional
+# observation objective while leaving the requested traversal unadmitted", and to
+# "return both facts clearly". Until this existed the implementation returned one
+# fact — the refusal — and had nothing admissible left to do, so a mission whose
+# first traversal could not be admitted had `publications: 0` for its whole life.
+#
+# Why turning is the action. The aircraft is in a room whose near field its own
+# sensor cannot see: the space beside it is outside a forward-looking frustum,
+# and the space within the depth window's declared minimum range is invisible from
+# every heading. So the one thing it can do that gains evidence without moving
+# into space the map has not evidenced is to hold its position and turn.
+#
+# The rate turns a full circle in 2*pi / rate seconds, the window bounds one
+# observation in SIMULATOR seconds, and the per-target bound is what keeps the
+# refuse-observe-re-propose loop finite: a target may be looked at once, and then
+# re-proposed, but never looked at repeatedly.
+OBSERVATION_YAW_RATE_RAD_S = 0.6
+OBSERVATION_SWEEP_SIM_S = 10.0
+OBSERVATION_MAX_PER_TARGET = 1
+
 
 @dataclass
 class PhaseOutcome:
@@ -308,16 +332,32 @@ class MissionResult:
 
 @dataclass
 class _ActiveGoal:
-    """The one goal whose certified prefix may be published."""
+    """The one goal whose certified prefix may be published.
 
+    A goal with no certificate but a ``hold_position_odom`` is a station hold:
+    the aircraft stays where it is and the publisher sends its own position with
+    zero velocity. That is the shape section 12.2's conditional observation
+    objective takes — it does not translate, so it has no route to certify.
+    """
+
+    # Everything but the id is optional, because an observation objective is a
+    # goal with a station hold and NO trajectory: it never went through the
+    # acceptance path, so it has no proposal, no accepted goal and no certificate.
     goal_id: str
-    proposal: R.SpatialGoal
-    accepted: EX.AcceptedGoal
-    certificate: PL.TrajectoryCertificate | None
-    terminal_region: GE.BoxRegion | None
+    proposal: R.SpatialGoal | None = None
+    accepted: EX.AcceptedGoal | None = None
+    certificate: PL.TrajectoryCertificate | None = None
+    terminal_region: GE.BoxRegion | None = None
     execution: R.ExecutionDisposition = R.ExecutionDisposition.NOT_STARTED
     hold_position_odom: tuple[float, float, float] | None = None
     setpoints: tuple[R.MotionSetpoint, ...] = ()
+    # The yaw this goal commands. A non-zero rate sweeps it, which is what turns
+    # a station hold into an observation: the aircraft turns where it stands, so
+    # the camera sees parts of the room it has never seen, without translating
+    # into space the map has not evidenced.
+    hold_yaw_rad: float = MISSION_YAW_HOLD_RAD
+    hold_yaw_rate_rad_s: float = 0.0
+    hold_since_s: float = 0.0
 
 
 class MissionRuntime:
@@ -475,6 +515,11 @@ class MissionRuntime:
         self._blocked_refs: dict[str, str] = {}
         self._refusals_log: list[str] = []
         self._active_goal: _ActiveGoal | None = None
+        # Section 12.2's observation objective: how many have been taken, and
+        # which targets have already been looked at once. The per-target set is
+        # what bounds the refuse-observe-re-propose loop.
+        self._observe_count = 0
+        self._observed_targets: set[str] = set()
         self._return_settled = False
         self._return_evidence: list[str] = []
         self._inspect_evidence: list[str] = []
@@ -1660,6 +1705,74 @@ class MissionRuntime:
         self._last_observation_id = observation.record_id
         return observation
 
+    def observe_in_place(self, *, target_ref: str | None, refused_reason: str) -> tuple[bool, str]:
+        """Section 12.2's conditional observation objective, admitted and flown.
+
+        Called when a traversal could not be admitted. The aircraft holds its
+        position and turns once, so its camera covers headings no earlier frame
+        covered. Nothing translates, so there is no route to certify and no space
+        the map has not evidenced is entered — which is why this is admissible
+        when the traversal is not.
+
+        It returns BOTH facts, as the specification requires: the traversal stays
+        unadmitted and keeps its reason, and the observation is recorded with what
+        it cost and what it saw. It is bounded by OBSERVATION_MAX_PER_TARGET, so
+        the refuse-observe-re-propose loop cannot spin.
+        """
+        position = self._position_odom()
+        if position is None:
+            return False, "no position to observe from"
+        self._observe_count += 1
+        goal_id = f"observe-{self._observe_count}"
+        self._active_goal = _ActiveGoal(
+            goal_id=goal_id,
+            hold_position_odom=position,
+            hold_yaw_rad=MISSION_YAW_HOLD_RAD,
+            hold_yaw_rate_rad_s=OBSERVATION_YAW_RATE_RAD_S,
+            hold_since_s=time.monotonic(),
+        )
+        window = _SimWindow(
+            self._stats.sim_clock,
+            OBSERVATION_SWEEP_SIM_S,
+            label="the observation window",
+            wall_ceiling_s=_sim_window_wall_ceiling_s(
+                OBSERVATION_SWEEP_SIM_S, self.settings.realtime_ratio_envelope[0]
+            ),
+        )
+        before = self._observation_counter
+        published = 0
+        next_perception = 0.0
+        next_publish = 0.0
+        stopped = "the window closed"
+        while not window.expired():
+            if self._visual_fault_reason is not None:
+                stopped = f"the estimate stopped being a pose: {self._visual_fault_reason}"
+                break
+            now = time.monotonic()
+            if now >= next_perception:
+                next_perception = now + MIN_PERCEPTION_INTERVAL_S
+                self.perceive_if_due()
+            if now >= next_publish:
+                next_publish = now + SETPOINT_PERIOD_S
+                failure = self.publish_active()
+                if failure is not None:
+                    stopped = f"publication stopped: {failure}"
+                    break
+                published += 1
+            time.sleep(PERCEPTION_PUMP_SLEEP_S)
+        seen = self._observation_counter - before
+        # The observation goal is not the mission's active goal. Clearing it keeps
+        # `publish_active` honest: with no admitted traversal there is no goal to
+        # publish, and the next step must admit one rather than inherit a hold.
+        self._active_goal = None
+        self.result.log.append(
+            f"observation objective {goal_id}: traversal {target_ref!r} stays unadmitted "
+            f"({refused_reason}); held position and turned {OBSERVATION_YAW_RATE_RAD_S} rad/s "
+            f"for {OBSERVATION_SWEEP_SIM_S:.1f} sim s, {published} setpoint(s), "
+            f"{seen} further observation(s); ended: {stopped}"
+        )
+        return True, goal_id
+
     # -- publication: the single setpoint path --------------------------------
 
     def publish_active(self) -> str | None:
@@ -1684,11 +1797,20 @@ class MissionRuntime:
             certificate_ref = active.goal_id
         else:
             return "no_published_trajectory"
+        # The commanded yaw. A zero rate is the mission's declared hold yaw. A
+        # non-zero one is an observation: the aircraft turns where it stands, so
+        # the camera sees parts of the room no earlier frame covered, and the
+        # space it needs to certify stops being space nobody has looked at.
+        yaw_rad = active.hold_yaw_rad
+        if active.hold_yaw_rate_rad_s:
+            yaw_rad = active.hold_yaw_rad + (
+                time.monotonic() - active.hold_since_s
+            ) * active.hold_yaw_rate_rad_s
         sent = self._platform.send_local_ned(
             LocalNedTarget(
                 position_ned=position_ned,
                 velocity_ned=velocity_ned,
-                yaw_rad=MISSION_YAW_HOLD_RAD,
+                yaw_rad=yaw_rad,
                 deadline_s=SETPOINT_DEADLINE_S,
                 certificate_ref=certificate_ref,
             )
@@ -1700,6 +1822,7 @@ class MissionRuntime:
         self._record_commanded_setpoint(
             position_ned=position_ned,
             velocity_ned=velocity_ned,
+            yaw_rad=yaw_rad,
             certificate_ref=certificate_ref,
             goal_ref=active.goal_id,
         )
@@ -1712,6 +1835,7 @@ class MissionRuntime:
         *,
         position_ned,
         velocity_ned,
+        yaw_rad: float,
         certificate_ref: str,
         goal_ref: str,
     ) -> None:
@@ -1740,7 +1864,7 @@ class MissionRuntime:
                 "frame": "local_ned",
                 "position_m": [round(float(value), 4) for value in position_ned],
                 "velocity_mps": [round(float(value), 4) for value in velocity_ned],
-                "yaw_rad": MISSION_YAW_HOLD_RAD,
+                "yaw_rad": round(float(yaw_rad), 4),
                 "goal_ref": goal_ref,
                 "certificate_ref": certificate_ref,
             }
@@ -2376,6 +2500,26 @@ class _LiveRunnerWorld:
     def step(self, action: str, target_ref: str | None) -> tuple[R.Observation, ...]:
         runtime = self._runtime
         self._step_observations = []
+        # Section 12.2: a traversal that could not be admitted gets a conditional
+        # observation objective instead. The runner admits before it calls this, so
+        # a target present in the blocked map at this point means this step's
+        # traversal was refused and there is no trajectory to fly. The
+        # specification requires both facts to be returned clearly and the loop to
+        # stay bounded, so the observation happens ONCE per target and the target
+        # is then re-opened for a single re-proposal against the new evidence.
+        if target_ref is not None and runtime._active_goal is None:
+            refused_reason = runtime._blocked_refs.get(target_ref)
+            if refused_reason is not None and target_ref not in runtime._observed_targets:
+                runtime._observed_targets.add(target_ref)
+                before_observations = runtime._observation_counter
+                observed, detail = runtime.observe_in_place(
+                    target_ref=target_ref, refused_reason=refused_reason
+                )
+                made = runtime._observation_counter - before_observations
+                if made > 0:
+                    self._step_observations.extend(runtime._observation_ids[-made:])
+                if observed:
+                    runtime._blocked_refs.pop(target_ref, None)
         lease = _SimWindow(
             runtime._stats.sim_clock,
             ACTION_LEASE_SIM_S.get(action, 45.0),

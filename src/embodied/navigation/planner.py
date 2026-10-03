@@ -728,12 +728,6 @@ def _cells_of(segment: Segment, config: world_module.MapConfig) -> tuple[tuple[i
 
 SAMPLES_PER_SEGMENT_MIN = 8
 SAMPLE_INTERVAL_MAX_S = 0.05
-# The route is searched inside a slightly larger inflation than the certificate
-# requires, so the fitted curve - which can bow a few centimetres away from the
-# certified cell path between knots - still cannot leave supported free space.
-# Authored margin, not a measured one: two voxels is the deviation the fitting
-# observed on this stage's fixture.
-SEARCH_MARGIN_M = 0.10
 
 
 def _certify_segments(
