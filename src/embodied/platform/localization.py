@@ -991,6 +991,30 @@ class ExternalNavPublisher:
             > self._machine.bounds.state_lost_after_s
         ):
             return None
+        # The declared visual-update fail bound, which the same config says the
+        # transmission path owes: "visual_update_warn/fail_ms 300/500 ms:
+        # IMU-only propagation is a degraded estimate, not a position solution
+        # (F4)". ``visual_update_verdict`` computes exactly that and the mission
+        # runtime lands on it, but the transmission path never consulted it, so a
+        # pose with no visual support kept going to the flight controller as a
+        # current position.
+        #
+        # Measured, J37-move-2. The camera view went featureless -- tracks 0 for
+        # the whole run, left_sd falling from 16.09 to 5.26 -- and no visual
+        # update arrived again. The filter then propagated on inertial data alone
+        # for about 80 s: an integrated travel of 179.13 m inside a ~6 m room,
+        # p_IinG ending at (19.8, -145.5, -70.1), while gyro bias stayed at
+        # 0.0001 and the vehicle was in GUIDED having been commanded nothing.
+        # The pose it did publish carried a sigma of 0.96 m, inside the declared
+        # 1.0 m envelope, so the firmware had no reason to reject it.
+        #
+        # Not applied before the first visual update or before the estimator is
+        # initialized: an age measured against a clock that has never ticked is
+        # not a fault, which is the same condition the mission runtime's own
+        # guard uses. This is the declared bound being enforced, not a new one.
+        if self._latest.t_last_visual_ns and self._latest.initialized:
+            if self._machine.visual_update_verdict(self._latest) == "fail":
+                return None
         return self._latest
 
     def start(self, heartbeat_timeout_s: float = 15.0) -> None:

@@ -759,6 +759,71 @@ class TestHealthMachine:
         publisher.offer(_state(time_ns=3_000_000_000), 3_000_000_000)
         assert publisher.state_for_publish(now[0] + 0.001) is not None
 
+    def test_a_state_with_no_visual_support_stops_transmission(self):
+        """The declared visual-update fail bound gates transmission, not just the mission.
+
+        ``visual_update_warn/fail_ms 300/500`` is declared with its reason spelled
+        out: "IMU-only propagation is a degraded estimate, not a position solution
+        (F4)". The verdict that computes it existed, and the mission runtime lands
+        on it, but the transmission path never consulted it -- so a pose with no
+        visual support kept going to the flight controller as a current position.
+
+        Measured, J37-move-2: the view went featureless (tracks 0 for the whole
+        run, left_sd 16.09 -> 5.26) and no visual update arrived again. The filter
+        then propagated on inertial data alone for about 80 s, reaching an
+        integrated travel of 179.13 m inside a ~6 m room, and published a pose
+        carrying 0.96 m of sigma -- inside the declared 1.0 m envelope, so the
+        firmware had no reason to reject it.
+        """
+        machine = loc.HealthMachine(
+            _bounds(
+                state_lost_after_s=0.300,
+                visual_update_warn_s=0.300,
+                visual_update_fail_s=0.500,
+            )
+        )
+        now = [100.0]
+        publisher = loc.ExternalNavPublisher(
+            "tcp:127.0.0.1:5762",
+            loc.OdomAlignment((0.0, 0.0, 0.0)),
+            machine,
+            clock=lambda: now[0],
+        )
+        base = 10_000_000_000
+
+        # A live feed: the state's clock is the last visual update.
+        publisher.offer(_state(time_ns=base, t_last_visual_ns=base), base)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+        # Inertial-only propagation short of the declared fail bound still goes out.
+        publisher.offer(
+            _state(time_ns=base + 400_000_000, t_last_visual_ns=base), base + 400_000_000
+        )
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+        # Past it, the estimate is not a position solution and must not be sent.
+        publisher.offer(
+            _state(time_ns=base + 800_000_000, t_last_visual_ns=base), base + 800_000_000
+        )
+        assert publisher.state_for_publish(now[0] + 0.001) is None
+
+        # A visual update resumes, and transmission resumes with it.
+        publisher.offer(
+            _state(time_ns=base + 900_000_000, t_last_visual_ns=base + 900_000_000),
+            base + 900_000_000,
+        )
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
+        # Before the first visual update there is no age to measure against, and an
+        # uninitialized filter has no pose to judge: neither is a fault.
+        publisher.offer(_state(time_ns=base, t_last_visual_ns=0), base)
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+        publisher.offer(
+            _state(time_ns=base, initialized=False, t_last_visual_ns=base - 5_000_000_000),
+            base,
+        )
+        assert publisher.state_for_publish(now[0] + 0.001) is not None
+
     def test_a_parked_frozen_clock_does_not_stop_publication(self):
         """Before the flight is declared, a frozen clock does not stop transmission.
 
