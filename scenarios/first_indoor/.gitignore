@@ -1,0 +1,6 @@
+# Generated at capture time by tools/capture_stereo_pairs.py, derived from
+# world.wbt so it can never drift from the scene the mission actually flies.
+# Never committed: the only thing that should exist as a second world is one
+# nobody maintains by hand.
+world.capture.wbt
+.world.capture.wbproj
