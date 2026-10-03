@@ -1966,13 +1966,20 @@ class MissionRuntime:
         planner's half cleared roughly a fifth of the map that admission then
         refused, and ``_frontier_goal_point`` returned the first such false
         positive, so the frontier was marked blocked and never offered again.
+
+        Since R23 that constant is the certificate's own quarter voxel, used for
+        both routing and goal selection, so the number here is a quarter voxel
+        again — but for a different reason than when this method had a quarter of
+        its own. Then it agreed by coincidence and disagreed with the planner;
+        now it agrees because it is the same constant, and the certificate's
+        clearance is the value both questions inherit.
         """
         return GE.inflated_free_cells(
             self.store,
             ENVELOPE,
             now_ns=self._now_ns(),
             self_occupied_origin_odom_m=here,
-            extra_margin_m=self.store.config.voxel_m * PL.GOAL_SEARCH_MARGIN_VOXELS,
+            extra_margin_m=self.store.config.voxel_m * PL.CERTIFICATE_MARGIN_VOXELS,
         )
 
     def navigable_frontiers(self) -> tuple[str, ...]:

@@ -43,15 +43,36 @@ COMPUTATION_LIMIT = "computation_limit"
 UNSUPPORTED_SPACE = "unsupported_space"
 START_STATE_MISMATCH = "start_state_mismatch"
 
-# The margin a goal or a start cell must hold around it, in voxels, on top of the
-# declared envelope, before this planner will route to it. One home, because the
-# runtime's navigability test asks exactly the question "is there a point this
-# planner could admit", and it used a margin of its own (a quarter voxel) while
-# this file used a half. Two margins meant the runtime cleared vantages this
-# planner then refused — 38,016 versus 29,240 searchable cells on one map — and
-# the walk that looks for a vantage stopped at the first false positive, so the
-# frontier it belonged to was marked blocked and never offered again.
-GOAL_SEARCH_MARGIN_VOXELS = 0.5
+# The margin, in voxels, that a cell must hold beyond the declared envelope for
+# BOTH questions this module asks of a cell: the set a certificate walks in
+# (``traversable``) and the set a goal or start cell is chosen from
+# (``searchable``). One value, one home (R2), because two values are two answers
+# to one question — and here the extra one was stricter than the check it was
+# supposed to satisfy.
+#
+# The quarter voxel is the certificate's own. It walks the curve at a spacing
+# whose displacement bound is that quarter voxel, and ``_certify_segments``
+# passes the same slack, so a curve inside this set has its whole swept tube
+# inside free space. The goal search inherits exactly that margin.
+#
+# R23 (2026-10-02): the goal search used a HALF voxel, which had no stated
+# justification and was stricter than the clearance the certificate then
+# verifies — 0.500 m against 0.475 m on the declared 0.45 m envelope with a
+# 0.1 m voxel. That 2.5 cm cost the map every goal: at the half voxel a scene
+# held no evidence-based searchable cell at all, where the certificate's own
+# margin left 113, and because the vantage search returns the FIRST candidate
+# that passes, the first false positive became the goal, admission refused that
+# exact region, and the frontier was then marked blocked and never offered
+# again. The certificate keeps the final say: cells this search recovers that
+# ``traversable`` then refuses remain refused.
+#
+# The runtime's navigability test imports this rather than restating it, for the
+# reason it did when this was the goal-search margin alone: a test that answers
+# "is there a point this planner could admit" must ask with this planner's own
+# margin. Before both unifications it used a quarter voxel against this file's
+# half, clearing 38,016 cells against 29,240 on one map — and that difference
+# was never the clearance, only the disagreement.
+CERTIFICATE_MARGIN_VOXELS = 0.25
 
 POLYNOMIAL_ORDER = 6
 
@@ -351,6 +372,12 @@ def _straight_run_is_supported(
     end = np.asarray(grid.cell_center(second), dtype=np.float64)
     distance = float(np.linalg.norm(end - start))
     steps = max(int(math.ceil(distance / (grid.voxel_m / 4.0))), 1)
+    # Deliberately NOT CERTIFICATE_MARGIN_VOXELS, and not a clearance at all:
+    # this is the radius of the cell-offset ball used to test whether interpolated
+    # points along a run are members of `traversable`, not an inflation of the
+    # free-space test. R23 licenses unifying the goal search with the clearance
+    # the certificate verifies; it licenses nothing here, and lowering this
+    # would weaken a check that is not in question.
     radius = envelope.inflation_m + grid.voxel_m * 0.5
     offsets = geometry_module.ball_offsets(grid, radius)
     for step in range(steps + 1):
@@ -447,14 +474,17 @@ def plan(
         envelope,
         now_ns=now_ns,
         self_occupied_origin_odom_m=start,
-        extra_margin_m=grid.voxel_m / 4.0,
+        extra_margin_m=grid.voxel_m * CERTIFICATE_MARGIN_VOXELS,
     )
+    # The goal search is the same set with the same margin (R23). A half voxel
+    # here used to make this set strictly smaller than `traversable`, so the
+    # search refused points the certificate would have taken.
     searchable = geometry_module.inflated_free_cells(
         store,
         envelope,
         now_ns=now_ns,
         self_occupied_origin_odom_m=start,
-        extra_margin_m=grid.voxel_m * GOAL_SEARCH_MARGIN_VOXELS,
+        extra_margin_m=grid.voxel_m * CERTIFICATE_MARGIN_VOXELS,
     )
     start_cell = grid.cell_index(start)
     goal_cells = frozenset(cell for cell in goal_region.cells(grid) if cell in searchable)
