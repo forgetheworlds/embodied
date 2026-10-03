@@ -145,12 +145,29 @@ MAP_PARAMETERS = dict(
     min_clearing_rays=3,
     freshness_s=5.0,
 )
-# The error allowance is the live estimator's: the declared E1 bound is p95
-# 0.10 m and the H4 envelope reports in-flight sigma up to 0.05 m, so 0.15 m
-# admits a healthy 3-sigma pose under the validator's own rule while refusing
-# the H4 outage bound. A pose outside it refuses publication — the coupling is
-# the intended protective behaviour, not an accident.
-ENVELOPE = GE.Envelope(body_radius_m=0.3, error_allowance_m=0.15)
+# The error allowance is the live estimator's measured bound, and it is the
+# rig's floor rather than a conservative choice. The validator refuses any state
+# whose 3*sigma exceeds it, so the allowance IS the largest 3-sigma pose the
+# mission will act on — and no measured pose is better than it.
+#
+# Measured from the estimator's own feed, not assumed: across 4 087 in-flight
+# samples in work/runs/p01-localization/p01l-streak-4-20260930T031611Z/run-a the
+# smallest published sigma is 0.0500 m and the median 0.0512, and the best run
+# on disk (run-2026-09-28T02-43-27-442Z) is no better at p50 0.0512. The
+# declared E1 bound is p95 0.10 m, which is consistent with it.
+#
+# 3 * 0.05 = 0.15 m therefore admits every healthy pose this rig produces while
+# still refusing the H4 outage bound (sigma up to 1.0 m). It is written as the
+# product it is, so the value cannot drift away from its derivation (R2).
+#
+# This is the clearance inflation, a different quantity from R23's goal-search
+# margin in planner.py, and the two compose: a cell must hold a ball of
+# body + allowance + margin = 0.475 m to carry a certificate. R37 measured that
+# composition against the vestibule doorway and found the allowance is NOT its
+# binding term — see work/runs/p05/J37-allowance-REPORT.md.
+ESTIMATOR_HEALTHY_SIGMA_MAX_M = 0.05
+ERROR_ALLOWANCE_M = 3.0 * ESTIMATOR_HEALTHY_SIGMA_MAX_M
+ENVELOPE = GE.Envelope(body_radius_m=0.3, error_allowance_m=ERROR_ALLOWANCE_M)
 PLAN_CONFIG = PL.PlanConfig(
     limits=PL.PlanLimits(),
     inflation_m=0.4,
