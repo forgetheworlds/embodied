@@ -132,6 +132,215 @@ probe:
     flight: 120
   budget_wall_clock_s: 600
 
+# ---------------------------------------------------------------------------
+# R2 (2026-10-03). The values that decide whether a flight moves.
+#
+# These lived as module-level constants in the code with no declared home, so a
+# reader could not see them. Three separate blockers this project paid for were
+# one of these numbers: a goal-search margin nobody could see was stricter than
+# the clearance the planner itself verifies and held the aircraft still for a
+# session; STANDOFF_M put the approach region behind its own target and made an
+# explore goal resolve to a zero-length certificate; and the settle hold below
+# is why a report said `not_returned` while the referee said `return_verified`.
+#
+# R2 says every threshold is traceable to GOAL.md or is a declared engineering
+# parameter. Each value here is declared at the value in force today. NOT ONE OF
+# THEM IS CHANGED BY THIS SECTION. Where the source records no derivation, that
+# is said rather than invented, because a fabricated justification is worse than
+# a missing one: the next reader trusts it.
+#
+# The reader wiring is a separate change. Until it lands, the constants named in
+# work/runs/p05/J41-schema-REPORT.md remain in force, and every value below is
+# pinned to its constant by tests/contracts/test_config_declarations.py so the
+# declaration and the code cannot drift apart in the meantime.
+
+vehicle:
+  # The envelope is built from two quantities. A cell must hold a ball of body +
+  # allowance + the planner's certificate margin to carry a certificate, which on
+  # the declared voxel is 0.3 + 0.15 + 0.025 m.
+  #
+  # 0.3 m: the airframe's declared radius, as the envelope is constructed in
+  # platform/mission_runtime.py (ENVELOPE).
+  body_radius_m: 0.3
+  #
+  # 0.15 m: 3 x ESTIMATOR_HEALTHY_SIGMA_MAX_M (0.05). This is the rig's FLOOR,
+  # not a conservative choice. The validator refuses any state whose 3-sigma
+  # exceeds it, so this IS the largest 3-sigma pose the mission will act on.
+  # Measured from the estimator's own feed, not assumed: across 4 087 in-flight
+  # samples in work/runs/p01-localization/p01l-streak-4-20260930T031611Z/run-a
+  # the smallest published sigma is 0.0500 m (median 0.0512), so 3 x 0.05 admits
+  # every healthy pose this rig produces while still refusing the H4 outage bound
+  # (sigma up to 1.0 m). J37 measured this composition against the vestibule
+  # doorway and found the allowance is not its binding term.
+  error_allowance_m: 0.15
+
+planner:
+  # 0.25 voxels: the margin a cell must hold beyond the declared envelope for
+  # BOTH questions this planner asks of a cell, the set a certificate walks in
+  # (traversable) and the set a goal or start cell is chosen from (searchable).
+  #
+  # The quarter voxel is the certificate's own. It walks the curve at a spacing
+  # whose displacement bound is that quarter voxel (planner._sample_interval
+  # returns voxel / (4 * v_max)) and _certify_segments passes the same slack, so
+  # a curve inside this set has its whole swept tube inside free space.
+  #
+  # R23 (owner ruling, 2026-10-02) unified the goal search onto this value. It
+  # had used a HALF voxel, which had no stated justification and was stricter
+  # than the clearance the certificate then verifies, 0.500 m against 0.475 m.
+  # That 2.5 cm cost the map every goal: at the half voxel a scene held no
+  # evidence-based searchable cell at all, where the certificate's own margin
+  # left 113.
+  certificate_margin_voxels: 0.25
+  #
+  # 0.10 m: an AUTHORED margin, not a measured one. Two voxels, being the
+  # deviation the curve fitting observed on this stage's fixture. A route is
+  # searched inside this slightly larger inflation than the certificate requires,
+  # so a fitted curve that bows a few centimetres from the certified cell path
+  # between knots still cannot leave supported free space.
+  search_margin_m: 0.10
+  #
+  # The aperture geometry, along the opening's own normal. Negative is before the
+  # opening, positive beyond it. The approach region is where the vehicle comes
+  # to rest before crossing: it stands off an unknown boundary, or an object it
+  # inspects, rather than touching it.
+  #
+  # 1.0 m: the standoff. Provenance unknown. The value is not derived anywhere in
+  # the source; it is declared at its present value under R2, and it is the one
+  # whose absence cost the most. The return goal must compensate for it
+  # (RETURN_STANDOFF_COMPENSATION_M) or its terminal region lands a metre short
+  # of the start.
+  standoff_m: 1.0
+  #
+  # 0.3 m: the approach box's half-thickness, so the region spans 0.7 m to 1.3 m
+  # before the opening. Provenance unknown; declared at its present value.
+  approach_half_thickness_m: 0.3
+  #
+  # 0.4 m: the crossing box's half-depth about the opening's plane, so the box is
+  # 0.8 m deep. Provenance unknown; declared at its present value.
+  crossing_half_depth_m: 0.4
+  #
+  # 1.6 m: the far edge of the terminal (exit) region, which spans 0.8 m to 1.6 m
+  # past the opening. The 0.8 m near edge is a literal in the box construction
+  # with no separate derivation. Provenance unknown; declared at its present
+  # value.
+  exit_depth_m: 1.6
+
+mission:
+  # 300.0: the mission's own budget, in SIMULATOR seconds, the clock the bring-up
+  # and the route windows spend (owner ruling 2026-09-28). Wall seconds were the
+  # earlier unit and silently halved the windows on a busy host
+  # (LEARNED-FAILURES defect 16).
+  budget_sim_s: 300.0
+  #
+  # 8.0: the cold-start perception window, in simulator seconds, before the
+  # phases begin. It exists to break the bootstrap on the first flight: the map a
+  # frontier is resolved from can only be built from the aircraft's own frames,
+  # so with an empty store no goal resolves a target and no step ever runs. Eight
+  # seconds is this stage's declared engineering parameter under R2: long enough
+  # for the first frames to arrive, be depth-validated and integrated, and short
+  # enough that an aircraft which sees nothing useful says so well inside the
+  # mission budget.
+  cold_start_perception_sim_s: 8.0
+  #
+  # 0.3: the perception cadence. Stereo depth, candidate proposal and map
+  # integration on the newest pair, at most this often, in WALL seconds. The
+  # estimator feed is on its own thread and never waits behind this. Measured
+  # 2026-10-02: a real cycle ran at 3.5 to 4.3 s, dominated by map integration,
+  # which was then made 11x faster.
+  min_perception_interval_s: 0.3
+  #
+  # 6: frontier cells cluster into one excursion target per 0.6 m block at the
+  # declared 0.1 m voxel, so the neighbouring boundary cells of one doorway are
+  # one frontier rather than eight.
+  frontier_cluster_cells: 6
+  #
+  # 0.2: how far the vantage search steps back toward the aircraft, which stands
+  # in known free space by construction, until the standoff region it will occupy
+  # is entirely supported. A frontier is a free cell touching unknown space, so
+  # the region the executor builds around it can overlap space the map has no
+  # evidence for, and the planner refuses that correctly: a larger margin cannot
+  # turn unseen space into measured free space (specification 7.1).
+  #
+  # Provenance unknown. The source states no derivation, and that 0.2 is two
+  # voxels at the declared size is an observation about the number, not a
+  # recorded intent. Declared at its present value under R2, and listed with the
+  # owner questions in work/runs/p05/J41-schema-REPORT.md.
+  frontier_vantage_step_m: 0.2
+  #
+  # Arrival, in the real clock. Specification 13.3 requires "the declared
+  # position/velocity relationship over a settle interval selected during
+  # development" and names no number, so these are the executor's declared
+  # values.
+  #
+  # 0.15 m/s: the speed, inside the terminal region.
+  settle_speed_mps: 0.15
+  # 1.0 s: the hold. This is the value behind a report saying `not_returned`
+  # while the referee's return predicate was satisfied: two different predicates,
+  # and the report's requires this hold.
+  settle_hold_s: 1.0
+
+map:
+  # The occupancy representation. Every value here except bounds_odom_m is the
+  # P03 slice's declared value, recorded in
+  # tests/fixtures/navigation/doorway/truth/scene.json and duplicated into
+  # platform/mission_runtime.py's MAP_PARAMETERS so the live mission and the
+  # fixture agree. This section gives the live copy a declared home.
+  #
+  # 0.1: the voxel size, and the unit every margin in `planner` above is
+  # expressed in.
+  voxel_m: 0.1
+  #
+  # The scene's own extents in the aligned NED frame, per axis. These are the
+  # only values here the fixture does not carry: the fixture is a doorway at the
+  # origin, and the live scene's spawn sits in a vestibule, so the bounds are
+  # widened to the world's own extents (floor 12.4 x 5.4 m centred at (4, 0),
+  # vehicle spawning at (-1, 0, 0.09)) plus a voxel of margin.
+  #
+  # The z pair is written down rather than left implicit because THIS is the
+  # bound a climbing vehicle runs into. NED z points down, the scene's ceiling
+  # sits 2.55 m above its floor and the floor plane at -0.02 m, so -2.8 admits
+  # the ceiling with 0.25 m to spare and +0.4 admits the small negative
+  # excursions a landed vehicle's own estimate reports. A bound tighter than the
+  # ceiling would clip the map exactly where a vehicle flying into it needs
+  # evidence.
+  bounds_odom_m:
+    x: [-2.4, 10.6]
+    y: [-3.2, 3.2]
+    z: [-2.8, 0.4]
+  #
+  # 0.1 m: the band around an observed surface treated as occupied. It is the
+  # largest single disqualifier of a clearance ball, 65 per cent of them as
+  # measured on 2026-10-02, which makes it the most load-bearing value in this
+  # section.
+  #
+  # The value comes from the P03 fixture. No justification for it is recorded
+  # anywhere, in the fixture or in the source that copies it. Declared at its
+  # present value under R2 today, and it is an owner question rather than a
+  # settled parameter: it is the biggest single term in whether a clearance ball
+  # fits, and it is one of the three changes named as able to unblock the
+  # vestibule doorway.
+  surface_band_m: 0.1
+  # The log-odds update on a clearing ray, and on an occupied return.
+  log_odds_hit: 0.7
+  log_odds_pass: -0.4
+  # 4.0: the clamp on accumulated log-odds, so one cell cannot be driven to an
+  # unbounded belief either way.
+  clamp: 4.0
+  # 1.4 and 1.4: the thresholds a cell's accumulated log-odds must cross to be
+  # called free or occupied. Measured 2026-10-02: with the pass update above,
+  # reaching free_threshold needs about four clearing-ray passes, which is why a
+  # handful of frames from one viewpoint makes a film rather than a room.
+  free_threshold: 1.4
+  occupied_threshold: 1.4
+  # 3: how many clearing rays a cell needs before it is free, guarding against a
+  # single spurious return.
+  min_clearing_rays: 3
+  # 5.0 s: how long a mapped cell stays fresh. A cell older than this is not
+  # treated as free, which is what makes an aircraft that stops perceiving lose
+  # its own map: the perception pump ran only inside a goal lease, so one refused
+  # admission aged the map out permanently (fixed 2026-10-02).
+  freshness_s: 5.0
+
 output: work/runs/p00-compat
 
 # ---------------------------------------------------------------------------
