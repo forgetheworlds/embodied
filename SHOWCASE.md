@@ -53,10 +53,14 @@ Facts about the design, not claims about them:
   real causes, 13 attributions that were believed and then refuted by measurement, and 22
   transferable traps. Nothing was deleted when it turned out to be wrong.
 
-The first two are wired and unproven at mission level. The runtime calls the cloud in flight, and
-no mission has yet recorded a successful cloud decision: the one cloud-arm run on disk asked
-twice and got no reply inside its window (`work/runs/p05/J33-b1-1/mission.json`). The limits are
-listed in full at the end of this document.
+The first two are wired and **measured, not assumed**. **The cloud has flown**: in `J33-b1-2` B1
+made exactly one reasoned call while stationary on the ground and adopted the plan it returned
+(`approach → inspect → return`); in `J33-b2-3` B2 made that call and then thirteen more in flight,
+each carrying a quarter-scale frame. B0 built no provider, no packet and made no call, asserted from
+its own record rather than assumed. What is **not** shown is any effect on the outcome: the aircraft
+never translates, so all three arms report `not_found` and `not_inspected` and every score is
+`pending` (`work/runs/p05/J33-cloudfly-REPORT.md`). The limits are listed in full at the end of this
+document.
 
 ## How this was approached
 
@@ -442,11 +446,13 @@ textured surfaces: 100 % of compared samples inside the declared tolerance
   found the target.
 - **No held-out scoring has run.** Four held-out scenes exist with their own truth, and the transport
   can run them, but no comparison has been executed.
-- **The cloud has never completed a decision in a mission.** The first cloud-arm run is on disk
-  (`work/runs/p05/J33-b1-1`): it attempted the reasoned pre-flight call twice and recorded
-  `no reply arrived inside the pre-flight window`, then flew its local fallback recipes and crashed on
-  the ground. So the claim that the cloud stays involved while the aircraft moves has a wired
-  mechanism and no successful mission-level instance.
+- **The cloud has flown, and has not yet changed an outcome.** In `J33-b1-2` B1 made one reasoned
+  call on the ground and adopted the plan it returned; in `J33-b2-3` B2 added thirteen in-flight
+  continuous-class calls. All three arms report `not_found` and `not_inspected` and score `pending`,
+  because the aircraft never translates, so no executive had anything to act on. **The mechanism is
+  measured; its effect is not, and n is 1 per arm with a crash entangled.** An earlier cloud run
+  (`work/runs/p05/J33-b1-1`) recorded `no reply arrived inside the pre-flight window` before the
+  transport's failure reporting was fixed (`work/runs/p05/J33-cloudfly-REPORT.md`).
 - **The launch rate is bounded by seven samples.** 7 of 7 after the fix, against 6 failures in 21
   before. A later run refused to arm again.
 - **Grounding is vantage-dependent.** It refuses with `NO_RETURN` on a low-contrast red region from
