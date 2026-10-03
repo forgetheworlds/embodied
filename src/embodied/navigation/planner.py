@@ -43,6 +43,16 @@ COMPUTATION_LIMIT = "computation_limit"
 UNSUPPORTED_SPACE = "unsupported_space"
 START_STATE_MISMATCH = "start_state_mismatch"
 
+# The margin a goal or a start cell must hold around it, in voxels, on top of the
+# declared envelope, before this planner will route to it. One home, because the
+# runtime's navigability test asks exactly the question "is there a point this
+# planner could admit", and it used a margin of its own (a quarter voxel) while
+# this file used a half. Two margins meant the runtime cleared vantages this
+# planner then refused — 38,016 versus 29,240 searchable cells on one map — and
+# the walk that looks for a vantage stopped at the first false positive, so the
+# frontier it belonged to was marked blocked and never offered again.
+GOAL_SEARCH_MARGIN_VOXELS = 0.5
+
 POLYNOMIAL_ORDER = 6
 
 
@@ -444,7 +454,7 @@ def plan(
         envelope,
         now_ns=now_ns,
         self_occupied_origin_odom_m=start,
-        extra_margin_m=grid.voxel_m * 0.5,
+        extra_margin_m=grid.voxel_m * GOAL_SEARCH_MARGIN_VOXELS,
     )
     start_cell = grid.cell_index(start)
     goal_cells = frozenset(cell for cell in goal_region.cells(grid) if cell in searchable)

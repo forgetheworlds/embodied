@@ -1956,13 +1956,23 @@ class MissionRuntime:
     def _searchable_cells(
         self, here: tuple[float, float, float]
     ) -> set[tuple[int, int, int]]:
-        """The cells the planner may search: supported free space, minus the aircraft."""
+        """The cells the planner may search: supported free space, minus the aircraft.
+
+        Inflated by exactly the margin ``planner.plan`` demands of a goal or start
+        cell, imported from that module rather than restated here (R2: a declared
+        value has one home). This method exists to answer "is there a point the
+        planner could admit", so asking it with a margin of its own would be
+        answering a different question — which it did: a quarter voxel against the
+        planner's half cleared roughly a fifth of the map that admission then
+        refused, and ``_frontier_goal_point`` returned the first such false
+        positive, so the frontier was marked blocked and never offered again.
+        """
         return GE.inflated_free_cells(
             self.store,
             ENVELOPE,
             now_ns=self._now_ns(),
             self_occupied_origin_odom_m=here,
-            extra_margin_m=self.store.config.voxel_m / 4.0,
+            extra_margin_m=self.store.config.voxel_m * PL.GOAL_SEARCH_MARGIN_VOXELS,
         )
 
     def navigable_frontiers(self) -> tuple[str, ...]:
@@ -2002,18 +2012,42 @@ class MissionRuntime:
         return tuple(ref for _, ref in ranked)
 
     def _frontier_vantage(
-        self, region: GE.BoxRegion
+        self, region: GE.BoxRegion, ref: str = "?"
     ) -> tuple[float, float, float]:
         """The vantage for one frontier; the region's centre when it has none.
 
         The centre is a fallback only, so that resolution still holds a target
         for a frontier ``navigable_frontiers`` declined: admission then refuses
         it with its own named reason rather than the goal vanishing silently.
+
+        The fallback hides the question the record most needs answered — *was
+        there an admissible vantage at all?* — so it says so, with the walk's own
+        gate counts for that frontier and the size of the set it searched. The
+        counts are reset here so they belong to this frontier alone rather than
+        being the accumulation of every frontier the last listing walked.
         """
+        self._gate_counts = {}
         point = self._frontier_goal_point(region)
         if point is not None:
             return point
-        return tuple(float(value) for value in region.center())
+        here = self._position_odom()
+        searchable = self._searchable_cells(here) if here is not None else set()
+        free = self.store.free_cells(now_ns=self._now_ns())
+        centre = tuple(float(value) for value in region.center())
+        self.result.log.append(
+            "frontier {ref} has no admissible vantage: walk gates {gates}; "
+            "searched {searchable} searchable cell(s) of {free} free; "
+            "region centre ({cx:.2f}, {cy:.2f}, {cz:.2f}) is not evidence of one".format(
+                ref=ref,
+                gates=dict(self._gate_counts),
+                searchable=len(searchable),
+                free=len(free),
+                cx=centre[0],
+                cy=centre[1],
+                cz=centre[2],
+            )
+        )
+        return centre
 
     def resolve_targets(self, proposal: R.SpatialGoal) -> tuple[R.GroundedTarget, ...]:
         """Resolve a proposal's target refs into grounded targets this runtime holds.
@@ -2059,7 +2093,7 @@ class MissionRuntime:
                 if region is not None:
                     # Not the region's own centre: a frontier cell sits beside
                     # unknown space, and a goal AT it is refused as unsupported.
-                    point = self._frontier_vantage(region)
+                    point = self._frontier_vantage(region, ref)
                     if point is not None:
                         here = self._position_odom()
                         if here is not None:
