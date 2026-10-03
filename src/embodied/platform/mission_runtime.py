@@ -400,6 +400,9 @@ class MissionRuntime:
                 valid_fraction_min=bounds["valid_fraction_min"],
                 sigma_min_m=bounds["sigma_min_m"],
                 sigma_max_m=bounds["sigma_max_m"],
+                # Declared in the config (R2). A config that omits it keeps the
+                # module default, so nothing that declares nothing changes.
+                tracking_lost_min_tracks=int(bounds.get("tracking_lost_min_tracks", 5)),
             )
         )
         self.alignment = loc.OdomAlignment(
@@ -1422,6 +1425,19 @@ class MissionRuntime:
         state = self._latest_state
         if state is None or not state.t_last_visual_ns or not state.initialized:
             return None
+        # The tracker's floor first, because the age bounds are blind to it. A
+        # live feed with a collapsing tracker is the measured runaway: on
+        # J43-move-3 1300 stereo frames arrived and the feed's clock advanced
+        # throughout, so nothing here fired, while the tracker's count fell to 1
+        # and the filter integrated 772 m of travel inside a ~6 m room. The
+        # vehicle was then commanded along that estimate and crashed inverted.
+        if state.initialized and self._machine.tracking_verdict(state) == "fail":
+            return (
+                f"the tracker holds {state.n_tracks} feature(s), below the declared floor "
+                f"{self._machine.bounds.tracking_lost_min_tracks}: the estimate is propagating "
+                "without enough features to be a pose, and the visual-update age bound cannot "
+                "see this because the feed is still alive"
+            )
         if self._machine.visual_update_verdict(state) != "fail":
             return None
         age_s = (state.time_ns - state.t_last_visual_ns) / 1e9

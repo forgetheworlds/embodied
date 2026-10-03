@@ -963,6 +963,24 @@ localization:
     valid_fraction_min: 0.99
     sigma_min_m: 0.02
     sigma_max_m: 1.0
+    # The tracker's own floor, in features. Below it the estimator is propagating
+    # without enough features to be a pose, and the transmission path refuses to
+    # publish it — the same protective path ``visual_update_fail_ms`` drives.
+    #
+    # It is a separate bound because the age bounds cannot see this fault at all.
+    # Measured, J43-move-3: 1300 stereo frames arrived and the feed's clock
+    # advanced throughout, so no age bound fired, while the tracker's count fell
+    # to 1 and the filter integrated 772 m of travel inside a ~6 m room; the
+    # vehicle was then commanded along that estimate and the crash detector ended
+    # the run inverted. J37-move-2 is the same shape with the count at 0, and
+    # J43-move-3's own estimator log ends at tracks=1 with left_sd 13.55, a
+    # healthy-looking frame count beside a dead tracker.
+    #
+    # 5 is declared well below any healthy sample rather than near the boundary: a
+    # gate-passing P01-L flight tracks 44-59, and the runs that collapse read 0 or
+    # 1. A floor near the healthy range would refuse legitimate sparse views; this
+    # one cannot.
+    tracking_lost_min_tracks: 5
     disagreement_p95_m: 0.20
     disagreement_max_m: 0.40
     # E1, against evaluator truth in the odom-aligned frame (plan section 6,

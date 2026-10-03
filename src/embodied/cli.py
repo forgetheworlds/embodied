@@ -482,6 +482,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "valid_fraction_min": float,
                 "sigma_min_m": float,
                 "sigma_max_m": float,
+                "tracking_lost_min_tracks": int,
                 "disagreement_p95_m": float,
                 "disagreement_max_m": float,
                 "error_p95_horizontal_m": float,

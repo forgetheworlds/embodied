@@ -469,6 +469,14 @@ class HealthBounds:
     valid_fraction_min: float
     sigma_min_m: float
     sigma_max_m: float
+    # The tracker's own floor, in features. The visual-update age bound cannot
+    # catch an estimate that is wrong while the feed is alive, and that is the
+    # measured shape of the runaway: on J43-move-3 1300 stereo frames arrived and
+    # the feed's clock advanced throughout, so the age bound never fired, while
+    # the tracker's count fell to 1 and the filter integrated 772 m of travel
+    # inside a ~6 m room. Declared well below any healthy sample: a gate-passing
+    # P01-L flight tracks 44-59, and the runs that collapse read 0 or 1.
+    tracking_lost_min_tracks: int = 5
 
 
 @dataclass(frozen=True)
@@ -707,6 +715,17 @@ class HealthMachine:
             return "fail"
         if age_s >= self.bounds.visual_update_warn_s:
             return "warn"
+        return "ok"
+
+    def tracking_verdict(self, state: EstimatorState) -> str:
+        """The tracker's own verdict for one state: ok or fail.
+
+        A count below the declared floor means the estimator is propagating
+        without enough features to be a pose. The declared bound forbids acting on
+        that, and the age bound above cannot see it, because the feed is alive.
+        """
+        if state.n_tracks < self.bounds.tracking_lost_min_tracks:
+            return "fail"
         return "ok"
 
     def valid_fraction(self, now_wall_ns: int) -> float:
@@ -1015,6 +1034,12 @@ class ExternalNavPublisher:
         if self._latest.t_last_visual_ns and self._latest.initialized:
             if self._machine.visual_update_verdict(self._latest) == "fail":
                 return None
+        # The tracker's own bound, which the age bounds cannot substitute for. A
+        # live feed at 100 Hz with a collapsing tracker is exactly the runaway
+        # J43-move-3 measured: frames arriving, clock advancing, count at 1, and
+        # an estimate 772 m from a 6 m room on the wire as a current position.
+        if self._latest.initialized and self._machine.tracking_verdict(self._latest) == "fail":
+            return None
         return self._latest
 
     def start(self, heartbeat_timeout_s: float = 15.0) -> None:
