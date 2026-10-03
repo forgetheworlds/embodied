@@ -209,6 +209,7 @@ class PilotBroker:
         self._idempotency: dict[str, tuple[str, GoalStatus]] = {}
         self._cancel_keys: dict[str, GoalStatus] = {}
         self._goal_counter = 0
+        self._surfaced_failures = 0
 
     # -- mission and evidence ---------------------------------------------
 
@@ -285,6 +286,20 @@ class PilotBroker:
         outcomes = []
         for reply in self.provider.poll(now):
             outcomes.extend(self.on_reply(reply, now))
+        # A transport failure is appended to ``provider.failures`` and returned
+        # to nobody, so an in-flight cloud call that never arrived was invisible
+        # in the run's own record — the request simply expired and the record
+        # could not say why. Surfaced here as an outcome, because a record whose
+        # job is to say what happened must not hide the reason it did not. The
+        # state machine is deliberately untouched: the outstanding request still
+        # expires on its own deadline, which is the broker's declared policy and
+        # not this line's to change.
+        pending = self.provider.failures[self._surfaced_failures :]
+        self._surfaced_failures = len(self.provider.failures)
+        outcomes.extend(
+            BrokerOutcome(kind="transport_failure", reason=message, request_id=request_id)
+            for request_id, message in pending
+        )
         return tuple(outcomes)
 
     # -- replies -----------------------------------------------------------
