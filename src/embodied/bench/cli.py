@@ -34,10 +34,10 @@ from embodied.cli import (
     register_command,
 )
 from embodied.contracts.records import SensorMode
-from embodied.bench import grader, recorder
+from embodied.bench import adjudicate, grader, recorder
 from embodied.bench.events import EpisodeError, EventError
 
-_SUBCOMMANDS = ("record", "replay", "score")
+_SUBCOMMANDS = ("record", "replay", "score", "adjudicate")
 
 
 def _accept_output(parser: argparse.ArgumentParser) -> None:
@@ -56,7 +56,9 @@ def _accept_output(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_bench_arguments(parser: argparse.ArgumentParser) -> None:
-    subparsers = parser.add_subparsers(dest="bench_command", metavar="{record,replay,score}")
+    subparsers = parser.add_subparsers(
+        dest="bench_command", metavar="{" + ",".join(_SUBCOMMANDS) + "}"
+    )
 
     record = subparsers.add_parser(
         "record", help="record a live episode using a registered suite"
@@ -101,6 +103,26 @@ def _add_bench_arguments(parser: argparse.ArgumentParser) -> None:
     )
     _accept_output(score)
     score.set_defaults(_bench_handler=_score)
+
+    adjudicate_command = subparsers.add_parser(
+        "adjudicate",
+        help="have the independent adjudicator model write an episode's support annotation",
+    )
+    adjudicate_command.add_argument(
+        "--episode",
+        type=Path,
+        required=True,
+        help="episode directory whose claims the adjudicator reviews",
+    )
+    adjudicate_command.add_argument(
+        "--adjudication",
+        type=Path,
+        default=None,
+        help="path for the annotation; default is adjudication.json inside the "
+        "episode, which is where bench score looks for it",
+    )
+    _accept_output(adjudicate_command)
+    adjudicate_command.set_defaults(_bench_handler=_adjudicate)
 
 
 def _record(args: argparse.Namespace, output: Path) -> CommandOutcome:
@@ -309,6 +331,72 @@ def _score(args: argparse.Namespace, output: Path) -> CommandOutcome:
         **common,
     )
 
+def _adjudicate(args: argparse.Namespace, output: Path) -> CommandOutcome:
+    """Produce the per-claim support annotation the score consumes.
+
+    Until this exists the primary endpoint cannot pass: the grader holds every
+    claim at ``passed = None`` while support is pending, and nothing produced
+    the annotation. The adjudicator is a model from a different family than the
+    pilot's, reading the agent projection only and blinded to the arm.
+
+    A transport failure is reported **blocked** rather than written as a
+    verdict: an instrument that could not be reached must not look like an
+    adjudicator that found the claims unsupported.
+    """
+    episode = Path(args.episode)
+    target = (
+        Path(args.adjudication)
+        if args.adjudication
+        else episode / grader.ADJUDICATION_FILENAME
+    )
+    try:
+        run = adjudicate.adjudicate_episode(episode, output_path=target)
+    except adjudicate.AdjudicatorError as error:
+        return CommandOutcome(
+            status=CommandStatus.BLOCKED,
+            gate_status=GateStatus.NOT_APPLICABLE,
+            reasons=(f"the adjudicator could not review this episode: {error}",),
+            limitations=(
+                "an instrument failure is not a verdict; no annotation was written",
+            ),
+            manifest={"episode": str(episode)},
+            artifacts=(),
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    (output / grader.ADJUDICATION_FILENAME).write_bytes(target.read_bytes())
+    verdicts: dict[str, int] = {}
+    for entry in run.document["entries"]:
+        verdicts[entry["verdict"]] = verdicts.get(entry["verdict"], 0) + 1
+    manifest = recorder.AgentSurface.open(episode).manifest
+    return CommandOutcome(
+        status=CommandStatus.COMPLETE,
+        gate_status=GateStatus.NOT_APPLICABLE,
+        reasons=(
+            f"{len(run.document['entries'])} claim(s) reviewed by {run.reviewer}: "
+            + ", ".join(f"{name} {count}" for name, count in sorted(verdicts.items())),
+            f"annotation: {target}",
+        ),
+        limitations=(
+            "the adjudicator judges evidence support, not world correctness; the "
+            "two are reported separately and neither substitutes for the other",
+            "model review carries variance; the model identity and the rubric "
+            "revision are recorded in every annotation it writes",
+        ),
+        manifest={
+            "episode": str(episode),
+            "episode_id": manifest.episode_id,
+            "adjudicator": run.reviewer,
+            "calls": run.calls,
+            "prompt_tokens": run.prompt_tokens,
+            "completion_tokens": run.completion_tokens,
+            "prompt_sha256": run.prompt_sha256,
+            "resolved_model_identities": list(run.resolved_identities),
+        },
+        artifacts=(grader.ADJUDICATION_FILENAME,),
+        episode_id=manifest.episode_id,
+        sensor_mode=manifest.sensor_mode,
+    )
+
 
 def _bench(args: argparse.Namespace, output: Path) -> CommandOutcome:
     handler = getattr(args, "_bench_handler", None)
@@ -320,7 +408,7 @@ def _bench(args: argparse.Namespace, output: Path) -> CommandOutcome:
 register_command(
     "bench",
     _bench,
-    help_text="record, replay and score benchmark episodes",
+    help_text="record, replay, adjudicate and score benchmark episodes",
     stage_id="P02",
     run_prefix="p02-bench",
     add_arguments=_add_bench_arguments,
