@@ -43,17 +43,30 @@ COMPUTATION_LIMIT = "computation_limit"
 UNSUPPORTED_SPACE = "unsupported_space"
 START_STATE_MISMATCH = "start_state_mismatch"
 
-# The margin, in voxels, that a cell must hold beyond the declared envelope for
-# BOTH questions this module asks of a cell: the set a certificate walks in
-# (``traversable``) and the set a goal or start cell is chosen from
-# (``searchable``). One value, one home (R2), because two values are two answers
-# to one question — and here the extra one was stricter than the check it was
-# supposed to satisfy.
+
+class BudgetExhausted:
+    """The route search hit its own expansion budget.
+
+    Distinct from ``None``, which means the frontier emptied without reaching a
+    goal cell — a fact about the known map. Section 13.1 requires the two to be
+    reported differently: a computation limit is missing computation, not
+    evidence that no route exists. Until this existed they were the same
+    ``None``, and ``plan`` reported both as ``no_known_supported_route``.
+    """
+
+
+BUDGET_EXHAUSTED = BudgetExhausted()
+
+# The margin, in voxels, that a cell must hold beyond the declared envelope to
+# count as free space for this planner. One value, one home (R2). It answers
+# both questions this module asks of a cell — the set a certificate walks in,
+# and the set a goal or start cell is chosen from — and since R23 those are the
+# same set, carved once in ``plan``.
 #
 # The quarter voxel is the certificate's own. It walks the curve at a spacing
 # whose displacement bound is that quarter voxel, and ``_certify_segments``
 # passes the same slack, so a curve inside this set has its whole swept tube
-# inside free space. The goal search inherits exactly that margin.
+# inside free space.
 #
 # R23 (2026-10-02): the goal search used a HALF voxel, which had no stated
 # justification and was stricter than the clearance the certificate then
@@ -63,15 +76,14 @@ START_STATE_MISMATCH = "start_state_mismatch"
 # margin left 113, and because the vantage search returns the FIRST candidate
 # that passes, the first false positive became the goal, admission refused that
 # exact region, and the frontier was then marked blocked and never offered
-# again. The certificate keeps the final say: cells this search recovers that
-# ``traversable`` then refuses remain refused.
+# again. The certificate keeps the final say: cells this set contains that
+# ``_certify_segments`` then refuses remain refused.
 #
-# The runtime's navigability test imports this rather than restating it, for the
-# reason it did when this was the goal-search margin alone: a test that answers
-# "is there a point this planner could admit" must ask with this planner's own
-# margin. Before both unifications it used a quarter voxel against this file's
-# half, clearing 38,016 cells against 29,240 on one map — and that difference
-# was never the clearance, only the disagreement.
+# The runtime's navigability test imports this rather than restating it: a test
+# that answers "is there a point this planner could admit" must ask with this
+# planner's own margin. Before the unification it used a quarter voxel against
+# this file's half, clearing 38,016 cells against 29,240 on one map — and that
+# difference was never the clearance, only the disagreement.
 CERTIFICATE_MARGIN_VOXELS = 0.25
 
 POLYNOMIAL_ORDER = 6
@@ -305,8 +317,14 @@ def _astar(
     config: world_module.MapConfig,
     *,
     max_expansions: int,
-) -> list[tuple[int, int, int]] | None:
-    """A* over the inflated free-space grid, with no corner cutting."""
+) -> "list[tuple[int, int, int]] | BudgetExhausted | None":
+    """A* over the inflated free-space grid, with no corner cutting.
+
+    Three outcomes, and they are three different facts: the path; ``None`` when
+    the frontier emptied without reaching a goal cell, which is what the known
+    map holds; and ``BUDGET_EXHAUSTED`` when the search was cut off by its own
+    budget, which is not a statement about the map at all.
+    """
     import heapq
 
     if start_cell not in traversable:
@@ -338,7 +356,7 @@ def _astar(
             return list(reversed(path))
         expansions += 1
         if expansions > max_expansions:
-            return None
+            return BUDGET_EXHAUSTED
         for dx, dy, dz, step in offsets:
             neighbour = (current[0] + dx, current[1] + dy, current[2] + dz)
             if neighbour not in traversable:
@@ -466,20 +484,17 @@ def plan(
     """Plan one certified trajectory into a goal region, or refuse with a named reason."""
     start = start_position_odom_m or navigation_state.pose.position_m
     grid = store.config
-    # The set is inflated by the envelope plus a quarter voxel: a certificate walks
-    # the curve at a spacing whose displacement bound is that quarter voxel, so a
-    # curve that stays inside this set has its whole swept tube inside free space.
-    traversable = geometry_module.inflated_free_cells(
-        store,
-        envelope,
-        now_ns=now_ns,
-        self_occupied_origin_odom_m=start,
-        extra_margin_m=grid.voxel_m * CERTIFICATE_MARGIN_VOXELS,
-    )
-    # The goal search is the same set with the same margin (R23). A half voxel
-    # here used to make this set strictly smaller than `traversable`, so the
-    # search refused points the certificate would have taken.
-    searchable = geometry_module.inflated_free_cells(
+    # One set, one answer, one name. The margin is the certificate's own quarter
+    # voxel: a certificate walks the curve at a spacing whose displacement bound
+    # is that quarter voxel, so a curve inside this set has its whole swept tube
+    # inside free space.
+    #
+    # R23 (2026-10-02) removed the second, stricter margin the goal search used
+    # to carry, and with it the only reason to carve the map twice. The two calls
+    # were left behind as identical work under two names, which is the shape of
+    # the defect that cost this project a whole run's worth of goals: two answers
+    # to one question, disagreeing. There is now one call.
+    free_space = geometry_module.inflated_free_cells(
         store,
         envelope,
         now_ns=now_ns,
@@ -487,8 +502,8 @@ def plan(
         extra_margin_m=grid.voxel_m * CERTIFICATE_MARGIN_VOXELS,
     )
     start_cell = grid.cell_index(start)
-    goal_cells = frozenset(cell for cell in goal_region.cells(grid) if cell in searchable)
-    if start_cell not in searchable:
+    goal_cells = frozenset(cell for cell in goal_region.cells(grid) if cell in free_space)
+    if start_cell not in free_space:
         return PlanRefusal(
             NO_KNOWN_SUPPORTED_ROUTE,
             f"the start cell {start_cell} is not supported free space",
@@ -500,9 +515,16 @@ def plan(
             f"no cell of the {goal_region.label} region is supported free space",
             support="uncertain",
         )
-    path = _astar(searchable, start_cell, goal_cells, grid, max_expansions=config.max_expansions)
+    path = _astar(free_space, start_cell, goal_cells, grid, max_expansions=config.max_expansions)
+    if path is BUDGET_EXHAUSTED:
+        return PlanRefusal(
+            COMPUTATION_LIMIT,
+            f"the route search reached its declared {config.max_expansions}-expansion budget "
+            "before it could decide: a computation limit, not a statement that no route exists",
+            support="uncertain",
+        )
     if path is not None:
-        path = _merge_collinear(_shortcut(path, searchable, grid, envelope))
+        path = _merge_collinear(_shortcut(path, free_space, grid, envelope))
     if path is None:
         return PlanRefusal(
             NO_KNOWN_SUPPORTED_ROUTE,
@@ -541,7 +563,7 @@ def plan(
             return PlanRefusal(COMPUTATION_LIMIT, f"the quintic solve failed: {error}", support="uncertain")
         coefficients = np.stack(per_axis, axis=1)  # (segments, axis, power)
         candidate, violation = _certify_segments(
-            coefficients, durations, distances, traversable, grid, config, envelope, start
+            coefficients, durations, distances, free_space, grid, config, envelope, start
         )
         if violation is None:
             segments = candidate
@@ -557,7 +579,7 @@ def plan(
             # certify those instead. A curve that still cannot be certified is
             # refused: an uncertified curve is never published.
             fallback = _clamped_segments(
-                waypoints, durations, distances, traversable, grid, config, envelope, start, attempts
+                waypoints, durations, distances, free_space, grid, config, envelope, start, attempts
             )
             if isinstance(fallback, PlanRefusal):
                 return PlanRefusal(
@@ -573,7 +595,7 @@ def plan(
         return PlanRefusal(COMPUTATION_LIMIT, "the solver produced no segments", support="uncertain")
     t_start = now_ns / 1e9
     dependent = sorted({cell for segment in segments for cell in _cells_of(segment, grid)})
-    backup = _backup_segment(start, start_velocity_mps, config, traversable, grid)
+    backup = _backup_segment(start, start_velocity_mps, config, free_space, grid)
     if backup is None:
         return PlanRefusal(
             NO_KNOWN_SUPPORTED_ROUTE,
@@ -706,12 +728,6 @@ def _cells_of(segment: Segment, config: world_module.MapConfig) -> tuple[tuple[i
 
 SAMPLES_PER_SEGMENT_MIN = 8
 SAMPLE_INTERVAL_MAX_S = 0.05
-# The route is searched inside a slightly larger inflation than the certificate
-# requires, so the fitted curve - which can bow a few centimetres away from the
-# certified cell path between knots - still cannot leave supported free space.
-# Authored margin, not a measured one: two voxels is the deviation the fitting
-# observed on this stage's fixture.
-SEARCH_MARGIN_M = 0.10
 
 
 def _certify_segments(
