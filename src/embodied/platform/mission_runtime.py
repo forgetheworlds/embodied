@@ -1843,10 +1843,58 @@ class MissionRuntime:
         return {
             "free_cells": len(free),
             "searchable_cells": len(searchable),
+            # The decisive number: of the cells called searchable, how many the
+            # map itself publishes free. The rest come from the self-occupied
+            # exemption, which marks the aircraft's own envelope free by
+            # construction — so a count of one can mean the map holds none.
+            "searchable_from_evidence": sum(1 for cell in searchable if cell in free),
+            "here": None if here is None else tuple(round(value, 2) for value in here),
+            # Which rule withheld the observed cells, and what disqualifies the
+            # ball around a free cell. Both are diagnostics: they count, and no
+            # decision reads them.
+            "evidence": self.store.evidence_breakdown(now_ns=now),
+            "free_cell_fates": self._free_cell_fates(free, now=now),
             "free_bbox": bbox(free),
             "searchable_bbox": bbox(searchable),
             "frontiers": len(self.frontier_regions()),
         }
+
+    def _free_cell_fates(
+        self, free: frozenset, *, now: int, sample: int = 60
+    ) -> dict[str, int]:
+        """For a bounded sample of free cells, what disqualified the envelope ball.
+
+        A map can publish many free cells and no cell whose whole declared
+        envelope is free, and that difference is whether the aircraft has
+        anywhere to go. Walking every free cell against every offset in the ball
+        costs as much as the integration that built the map, so a sample is
+        taken: this answers a proportion, which needs a sample, and it is logged
+        from the same path as the counts it explains.
+        """
+        cells = sorted(free)
+        if not cells:
+            return {}
+        stride = max(1, len(cells) // sample)
+        picked = cells[::stride][:sample]
+        radius = ENVELOPE.inflation_m + self.store.config.voxel_m / 4.0
+        offsets = GE.ball_offsets(self.store.config, radius)
+        fates: dict[str, int] = {}
+        for cell in picked:
+            for dx, dy, dz in offsets:
+                neighbour = (cell[0] + dx, cell[1] + dy, cell[2] + dz)
+                if not self.store.config.inside(neighbour):
+                    reason = "outside_map"
+                elif neighbour in free:
+                    continue
+                else:
+                    state = self.store.classify(neighbour, now_ns=now)
+                    reason = (
+                        "occupied"
+                        if state == world_module.OCCUPIED
+                        else self.store.unknown_reason(neighbour, now_ns=now)
+                    )
+                fates[reason] = fates.get(reason, 0) + 1
+        return fates
 
     def _searchable_cells(
         self, here: tuple[float, float, float]

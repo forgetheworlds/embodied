@@ -230,25 +230,38 @@ class MapStore:
         next_center = (camera_cell_along_axis + 1.5) * resolution
         starts = (next_center - camera_dominant) / axis_lengths
         max_steps = int(np.ceil(float((depths / steps).max()))) + 2
-        clearing: list[tuple[int, int, int]] = []
+        # One frame's ray march visits the same cell many times over — a 0.1 m
+        # voxel a couple of metres out is crossed by dozens of rays — so the
+        # visits are packed and collapsed before any cell is written. Walking
+        # them one at a time measured 2.27 s per frame against 0.22 s
+        # aggregated, which put a perception cycle at 4.86 s against the map's
+        # own 5.0 s freshness: cells were refreshed only just ahead of expiring,
+        # and the free set decayed in steps. The arithmetic is unchanged — n
+        # applications of `max(clamp, score + pass)` are exactly
+        # `max(clamp, score + n*pass)` because the clamp is monotone — and the
+        # band is idempotent, so deduplicating the hits marks the same cells.
+        clearing_batches: list[np.ndarray] = []
         for index in range(max_steps):
             t = starts + index * steps
             alive = t < depths - band / 2.0
             if not bool(alive.any()):
                 break
             points = camera_center[None, :] + t[alive, None] * directions_odom[alive]
-            clearing.extend(self._cell_batch(points))
-        hit_cells = self._cell_batch(hits)
+            clearing_batches.append(self._cell_keys(points))
 
-        for cell in clearing:
+        for cell, count in self._cell_counts(clearing_batches):
             evidence = self._cells.setdefault(cell, _CellEvidence())
             evidence.frames.add(observation_id)
-            evidence.clearing_rays += 1
-            evidence.score = max(-self.config.clamp, evidence.score + self.config.log_odds_pass)
+            evidence.clearing_rays += count
+            evidence.score = max(
+                -self.config.clamp, evidence.score + count * self.config.log_odds_pass
+            )
             evidence.last_pass_ns = stamp_ns
-        for cell in hit_cells:
+        for cell, count in self._cell_counts([self._cell_keys(hits)]):
             evidence = self._cells.setdefault(cell, _CellEvidence())
-            evidence.score = min(self.config.clamp, evidence.score + self.config.log_odds_hit)
+            evidence.score = min(
+                self.config.clamp, evidence.score + count * self.config.log_odds_hit
+            )
             evidence.last_hit_ns = stamp_ns
             for offset in _NEIGHBOUR_OFFSETS:
                 neighbour = (cell[0] + offset[0], cell[1] + offset[1], cell[2] + offset[2])
@@ -259,16 +272,51 @@ class MapStore:
         self._drop_expired_dynamic(now_ns if now_ns is not None else stamp_ns)
         return self._revision
 
-    def _cell_batch(self, points: np.ndarray) -> list[tuple[int, int, int]]:
+    def _cell_keys(self, points: np.ndarray) -> np.ndarray:
+        """Packed keys for the in-bounds points, as integers rather than tuples.
+
+        Ray marching only becomes affordable if cell identity stays integer:
+        one Python tuple per visit is what made this the dominant cost of a
+        perception cycle.
+        """
         if points.size == 0:
-            return []
+            return np.empty(0, dtype=np.int64)
         offsets = np.array(
             [self.config.bounds_odom_m[axis][0] for axis in ("x", "y", "z")], dtype=np.float64
         )
         indices = np.floor((points - offsets) / self.config.voxel_m).astype(np.int64)
         extents = np.array(self.config.shape())
         keep = np.all((indices >= 0) & (indices < extents), axis=1)
-        return [tuple(int(value) for value in cell) for cell in indices[keep]]
+        if not bool(keep.any()):
+            return np.empty(0, dtype=np.int64)
+        idx = indices[keep]
+        width = int(extents[2])
+        plane = int(extents[1]) * width
+        return (idx[:, 0] * plane + idx[:, 1] * width + idx[:, 2]).astype(np.int64, copy=False)
+
+    def _cell_counts(
+        self, batches: list[np.ndarray]
+    ) -> list[tuple[tuple[int, int, int], int]]:
+        """Distinct cells across every batch, with the number of visits to each.
+
+        A frame's march is millions of visits over tens of thousands of distinct
+        cells, so the visits are counted before the map is written: the update
+        loop then runs once per cell rather than once per visit.
+        """
+        live = [batch for batch in batches if batch.size]
+        if not live:
+            return []
+        uniq, counts = np.unique(np.concatenate(live), return_counts=True)
+        extents = self.config.shape()
+        width = int(extents[2])
+        plane = int(extents[1]) * width
+        return [
+            (
+                (int(key) // plane, (int(key) % plane) // width, int(key) % width),
+                int(count),
+            )
+            for key, count in zip(uniq.tolist(), counts.tolist())
+        ]
 
     def update_dynamic(self, track: DynamicTrack) -> None:
         """Publish or refresh one moving track in the dynamic layer."""
@@ -457,6 +505,51 @@ class MapStore:
         counts = {FREE: 0, OCCUPIED: 0, UNKNOWN: 0}
         for cell in self._cells:
             counts[self.classify(cell, now_ns=clock)] += 1
+        return counts
+
+    def evidence_breakdown(self, *, now_ns: int) -> dict[str, int]:
+        """How the cells holding evidence divide among the rules. Diagnostic only.
+
+        ``map_summary`` reports free cells and search cells, and a map can hold
+        many of the first and none of the second. This says which rule withheld
+        the rest — the surface band, staleness, a score that never reached the
+        free threshold, too few clearing rays — using the same order as
+        :meth:`classify` so the tally and the classification cannot disagree.
+
+        It counts and returns; no decision reads it.
+        """
+        counts = {
+            "observed": 0,
+            FREE: 0,
+            OCCUPIED: 0,
+            STALE: 0,
+            SURFACE_BAND: 0,
+            "score_below_threshold": 0,
+            "clearing_rays_short": 0,
+            "unstamped": 0,
+        }
+        for evidence in self._cells.values():
+            counts["observed"] += 1
+            age = self._age_s(evidence, now_ns)
+            if age is None:
+                counts["unstamped"] += 1
+                continue
+            if evidence.score >= self.config.occupied_threshold:
+                counts[OCCUPIED] += 1
+                continue
+            if evidence.band:
+                counts[SURFACE_BAND] += 1
+                continue
+            if age > self.config.freshness_s:
+                counts[STALE] += 1
+                continue
+            if evidence.score > -self.config.free_threshold:
+                counts["score_below_threshold"] += 1
+                continue
+            if evidence.clearing_rays < self.config.min_clearing_rays:
+                counts["clearing_rays_short"] += 1
+                continue
+            counts[FREE] += 1
         return counts
 
 
