@@ -66,7 +66,6 @@ def test_every_declared_value_matches_the_constant_in_force(declared: dict) -> N
         ("vehicle", "body_radius_m", runtime.ENVELOPE.body_radius_m),
         ("vehicle", "error_allowance_m", runtime.ERROR_ALLOWANCE_M),
         ("planner", "certificate_margin_voxels", planner_module.CERTIFICATE_MARGIN_VOXELS),
-        ("planner", "search_margin_m", planner_module.SEARCH_MARGIN_M),
         ("planner", "standoff_m", geometry_module.STANDOFF_M),
         ("planner", "approach_half_thickness_m", geometry_module.APPROACH_HALF_THICKNESS_M),
         ("planner", "crossing_half_depth_m", geometry_module.CROSSING_HALF_DEPTH_M),
@@ -121,7 +120,6 @@ def test_no_declared_key_is_unpinned(declared: dict) -> None:
         "vehicle": {"body_radius_m", "error_allowance_m"},
         "planner": {
             "certificate_margin_voxels",
-            "search_margin_m",
             "standoff_m",
             "approach_half_thickness_m",
             "crossing_half_depth_m",

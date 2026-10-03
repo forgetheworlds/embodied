@@ -335,10 +335,6 @@ CONFIG_SCHEMA: dict[str, Any] = {
             # certificate walks in and the set a goal or start cell is
             # chosen from.
             "certificate_margin_voxels": float,
-            # The slightly larger inflation a route is searched inside, so a
-            # fitted curve that bows between knots cannot leave supported
-            # free space.
-            "search_margin_m": float,
             # The aperture geometry: where the approach region sits before the
             # opening, how thick it is, how deep the crossing box is, and how
             # far past the opening the terminal region ends.

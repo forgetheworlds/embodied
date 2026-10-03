@@ -192,13 +192,6 @@ planner:
   # left 113.
   certificate_margin_voxels: 0.25
   #
-  # 0.10 m: an AUTHORED margin, not a measured one. Two voxels, being the
-  # deviation the curve fitting observed on this stage's fixture. A route is
-  # searched inside this slightly larger inflation than the certificate requires,
-  # so a fitted curve that bows a few centimetres from the certified cell path
-  # between knots still cannot leave supported free space.
-  search_margin_m: 0.10
-  #
   # The aperture geometry, along the opening's own normal. Negative is before the
   # opening, positive beyond it. The approach region is where the vehicle comes
   # to rest before crossing: it stands off an unknown boundary, or an object it
