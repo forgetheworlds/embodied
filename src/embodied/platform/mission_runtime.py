@@ -1193,13 +1193,7 @@ class MissionRuntime:
             time.sleep(0.01)
         try:
             sample = self._platform.telemetry()
-            self.result.end_state = {
-                "armed": sample.armed,
-                "mode": sample.mode_name,
-                "local_position_ned": list(sample.local_position_ned)
-                if sample.local_position_ned is not None
-                else None,
-            }
+            self.result.end_state = _end_state_record(sample)
         except Exception:
             self.result.end_state = {}
         try:
@@ -2097,6 +2091,27 @@ class MissionRuntime:
                 )
             )
         return tuple(resolved)
+
+
+def _end_state_record(sample: Any) -> dict[str, Any]:
+    """The state a run ended in, from the last telemetry sample it saw.
+
+    Carries the attitude as well as the position. Without it a run that came to
+    rest inverted reads exactly like one that landed upright — same mode, same
+    armed flag, a plausible position — which is how a vertical-error measurement
+    was once taken on a crashed, inverted aircraft and read as an estimator
+    property.
+    """
+    return {
+        "armed": sample.armed,
+        "mode": sample.mode_name,
+        "local_position_ned": list(sample.local_position_ned)
+        if sample.local_position_ned is not None
+        else None,
+        "attitude_rpy": list(sample.attitude_rpy)
+        if sample.attitude_rpy is not None
+        else None,
+    }
 
 
 def _quality_of(pair, settings):
