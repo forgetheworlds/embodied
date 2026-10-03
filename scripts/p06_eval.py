@@ -351,6 +351,27 @@ def score_episode(cell: Cell, output: Path) -> tuple[int, str]:
     return code, ""
 
 
+def adjudicate_episode(cell: Cell, output: Path) -> tuple[int, str]:
+    """Have the independent adjudicator write this episode's support annotation.
+
+    Through the CLI's own path, so the thing the runner exercises is the thing
+    an operator runs. Exit 2 is a refused adjudication — an instrument failure,
+    which is recorded as one rather than being read as a verdict.
+    """
+    adjudicate_dir = output / "adjudication"
+    code = _run_cli(
+        [
+            "bench",
+            "adjudicate",
+            "--episode",
+            str(output / "episode"),
+            "--output",
+            str(adjudicate_dir),
+        ]
+    )
+    return code, ""
+
+
 def cmd_execute(args: argparse.Namespace) -> int:
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     out = Path(args.out)
@@ -402,6 +423,15 @@ def cmd_execute(args: argparse.Namespace) -> int:
             else:
                 code, receipt = record_live(cell, run_dir)
 
+            # The annotation is produced before the score, because the score
+            # reads it: with no annotation every claim is pending and the
+            # primary endpoint cannot be reached, which is the defect this
+            # step exists to close. A scored run always adjudicates; a dry run
+            # does so only when asked, because it is a paid model call.
+            adjudicate_code = None
+            if args.adjudicate or args.mode == "live":
+                adjudicate_code, _ = adjudicate_episode(cell, run_dir)
+
             score_code = None
             if code == 0:
                 score_code, _ = score_episode(cell, run_dir)
@@ -414,15 +444,20 @@ def cmd_execute(args: argparse.Namespace) -> int:
                 "episode_index": cell.episode_index,
                 "mode": manifest["mode"],
                 "record_exit_code": code,
+                "adjudicate_exit_code": adjudicate_code,
                 "score_exit_code": score_code,
                 "run_dir": str(run_dir),
                 "receipt": receipt,
                 "score": _read_json(run_dir / "episode" / "score.json"),
+                "adjudication": _read_json(run_dir / "adjudication" / "adjudication.json"),
                 "mission": _read_json(run_dir / "mission.json"),
             }
             sink.write(json.dumps(record, sort_keys=True, default=str) + "\n")
             written += 1
-            print(f"  {cell.label}: record={code} score={score_code}")
+            print(
+                f"  {cell.label}: record={code} adjudicate={adjudicate_code} "
+                f"score={score_code}"
+            )
     print(f"records: {written} written to {records_path}")
     return 0
 
@@ -520,10 +555,25 @@ def summarise(record: dict) -> dict:
         # Zero claims does not yield perfect precision, so both the count and
         # the denominator travel together and never a bare ratio.
         "evidence_support_supported": support.get("supported"),
+        "evidence_support_unsupported": support.get("unsupported"),
+        "evidence_support_unadjudicable": support.get("unadjudicable"),
         "evidence_support_adjudicable": support.get("adjudicable"),
         "evidence_support_pending": support.get("pending"),
-        "report_asserted_confirmations": (score.get("report_correctness") or {}).get(
-            "asserted_confirmations"
+        # World correctness, which is the axis that separates a report the world
+        # agrees with from one it does not. Without these the table cannot tell
+        # a truthful stand-in from an over-claiming one: both produce the same
+        # safe-task-completion count, and the difference lives only in the
+        # records underneath. Payloads on disk do not help a reader who has the
+        # report.
+        "world_correct_claims": (score.get("report_correctness") or {}).get("world_correct"),
+        "world_incorrect_claims": (score.get("report_correctness") or {}).get(
+            "world_incorrect"
+        ),
+        "world_unverifiable_claims": (score.get("report_correctness") or {}).get(
+            "world_unverifiable"
+        ),
+        "false_asserted_confirmations": (score.get("report_correctness") or {}).get(
+            "false_asserted_confirmations"
         ),
         "cloud_call_records": len(cloud_calls),
         "termination_reason": mission.get("termination_reason"),
@@ -562,6 +612,30 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
                 "episodes": len(rows),
                 "outcomes": len(valid),
                 "invalid": len(invalid),
+                "evidence_supported": sum(
+                    (r["evidence_support_supported"] or 0) for r in valid
+                ),
+                "evidence_adjudicable": sum(
+                    (r["evidence_support_adjudicable"] or 0) for r in valid
+                ),
+                "evidence_unsupported": sum(
+                    (r["evidence_support_unsupported"] or 0) for r in valid
+                ),
+                "evidence_unadjudicable": sum(
+                    (r["evidence_support_unadjudicable"] or 0) for r in valid
+                ),
+                "world_correct_claims": sum(
+                    (r["world_correct_claims"] or 0) for r in valid
+                ),
+                "world_incorrect_claims": sum(
+                    (r["world_incorrect_claims"] or 0) for r in valid
+                ),
+                "world_unverifiable_claims": sum(
+                    (r["world_unverifiable_claims"] or 0) for r in valid
+                ),
+                "false_asserted_confirmations": sum(
+                    (r["false_asserted_confirmations"] or 0) for r in valid
+                ),
                 "unclassified": len(unclassified),
                 "safe_task_completions": sum(
                     1 for r in valid if r["safe_task_completion"] is True
@@ -573,9 +647,6 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
                 ),
                 "evidence_pending": sum(
                     1 for r in valid if (r["evidence_support_pending"] or 0) > 0
-                ),
-                "evidence_adjudicable": sum(
-                    (r["evidence_support_adjudicable"] or 0) for r in valid
                 ),
                 "cloud_calls_recorded": sum(r["cloud_call_records"] for r in rows),
                 # Cost and latency are not recorded per call by the runtime yet
@@ -636,14 +707,26 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
             "because guessing a classification is worse than an unclassified row."
         ),
     }
-    (Path(args.out) / "aggregate.json").write_text(
+    # --out is a directory, and it is created if it is absent. Passing a file
+    # path used to fail as `aggregate.json/aggregate.json` with a bare
+    # FileNotFoundError, which tells a caller nothing about what went wrong.
+    out_dir = Path(args.out)
+    if out_dir.exists() and not out_dir.is_dir():
+        print(
+            f"refused: --out takes a directory and writes aggregate.json and "
+            f"REPORT.md inside it, but {out_dir} is a file",
+            file=sys.stderr,
+        )
+        return 2
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "aggregate.json").write_text(
         json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
     report = render_report(aggregate)
-    (Path(args.out) / "REPORT.md").write_text(report, encoding="utf-8")
+    (out_dir / "REPORT.md").write_text(report, encoding="utf-8")
     print(f"cells aggregated: {len(per_cell)}")
-    print(f"report: {Path(args.out) / 'REPORT.md'}")
+    print(f"report: {out_dir / 'REPORT.md'}")
     return 0
 
 
@@ -696,17 +779,31 @@ def render_report(aggregate: dict) -> str:
         "A cell below is empty rather than zero when it has no episodes: section 20.4",
         "requires denominators, because a percentage without one cannot be read.",
 
-        "| arm | scene | episodes | outcomes | invalid | safe | task | takeover | missed target | support pending | cloud calls | cost |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "Two axes, published side by side because they answer different questions.",
+        "**World correctness** asks whether what a claim asserts was actually true.",
+        "**Evidence support** asks whether the cited evidence justified it. A claim can",
+        "be true but unsupported (a guess), or supported but false (an honest error),",
+        "and a reader must be able to tell those from the records alone — a truthful",
+        "report and an over-claiming one produce the same safe-completion count, so",
+        "the counts of world-correct and world-incorrect claims are what separate",
+        "them. `false` counts claims the world contradicts.",
+        "",
+        "| arm | scene | episodes | outcomes | invalid | safe | task | takeover | missed target | world_correct | world_false | world_unverifiable | support supported | unsupported | pending | evidence unadjudicable | false confirmations | cloud calls | cost |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for cell in aggregate["per_cell"]:
         lines.append(
             "| {arm} | {suite} | {episodes} | {outcomes} | {invalid} | {safe_task_completions} | "
-            "{task_completions} | {takeovers} | {missed_required_targets} | {evidence_pending} | "
+            "{task_completions} | {takeovers} | {missed_required_targets} | "
+            "{world_correct_claims} | {world_incorrect_claims} | {world_unverifiable_claims} | "
+            "{evidence_supported} | {evidence_unsupported} | {evidence_pending} | "
+            "{evidence_unadjudicable} | {false_asserted_confirmations} | "
             "{cloud_calls_recorded} | {model_calls_cost} |".format(**cell)
         )
     if not aggregate["per_cell"]:
-        lines.append("| — | — | 0 | 0 | 0 | — | — | — | — | — | — | — |")
+        lines.append(
+            "| — | — | 0 | 0 | 0 | — | — | — | — | — | — | — | — | — | — | — | — | — | — |"
+        )
     lines += [
         "",
         "Columns are counts, with the denominator in `episodes`: section 20.4 requires",
@@ -971,6 +1068,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="dry run only: the stand-in claims a find it never made, to exercise "
         "the grader's negative path. Refused in live mode.",
+    )
+    execute.add_argument(
+        "--adjudicate",
+        action="store_true",
+        help="run the independent adjudicator on each episode. It is a paid model "
+        "call, so a dry run does not do it unless this is passed; a scored run "
+        "does it always, because without an annotation every claim is pending "
+        "and the primary endpoint cannot be reached.",
     )
     execute.set_defaults(func=cmd_execute)
 
