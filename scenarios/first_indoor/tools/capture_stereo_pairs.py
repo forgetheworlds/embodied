@@ -164,10 +164,18 @@ def main(argv=None) -> int:
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
 
+    # Webots forwards a controller's own stdout only when the controller process
+    # exits, so the marker can arrive late. Watch the output directory for the
+    # expected pairs as well: the capture is finished when its product is on
+    # disk, whatever the console has or has not relayed yet.
+    expected_pairs = len(json.loads(poses_path.read_text(encoding="utf-8"))["poses"])
     deadline = time.monotonic() + args.timeout_s
     failure = None
     while time.monotonic() < deadline:
         if any(DONE_MARKER in line for line in lines):
+            break
+        if len(list(out_dir.glob("*-left.ppm"))) >= expected_pairs:
+            print(f"all {expected_pairs} pair(s) on disk", flush=True)
             break
         # A controller Webots could not find falls back to its own <generic>
         # controller, which never captures. Fail on that rather than sitting out
