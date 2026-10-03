@@ -206,7 +206,7 @@ class MissionPilot:
                 self.broker.outstanding_request,
             )
             if decision.send and decision.request is not None:
-                packet, _trace = self.packet_builder.build(
+                packet, trace = self.packet_builder.build(
                     request=decision.request,
                     observation=observation,
                     payloads=payloads,
@@ -219,6 +219,13 @@ class MissionPilot:
                     target_refs=decision.cited_observation_ids,
                     explicit_question=scene.explicit_question,
                 )
+                # The trace is the only record of what this call actually
+                # carried — its declared class and the image scale applied — and
+                # it used to be discarded here, so a run could show twenty
+                # in-flight requests and not one fact about any of them. Written
+                # to the run's own sink, the one the broker's request records go
+                # to, so the two sit side by side in the episode.
+                self.broker.sink("packet", trace.document(), now, observation.sim_time_s)
                 self.broker.submit(
                     decision.request,
                     packet,

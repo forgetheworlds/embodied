@@ -201,9 +201,10 @@ def test_b2_in_flight_calls_are_continuous_class_at_the_declared_scale():
     )
     pilot.mark_airborne(stamp(1.0))
     # An explicit question is a trigger the shared engine always sends on.
+    observation = make_observation("obs-1", 1)
     pilot.tick(
         SceneStatus(signature=None, explicit_question="which candidate is the target?"),
-        make_observation("obs-1", 1),
+        observation,
         {"left.ppm": make_png()},
         stamp(2.0),
     )
@@ -218,6 +219,18 @@ def test_b2_in_flight_calls_are_continuous_class_at_the_declared_scale():
 
     with Image.open(io.BytesIO(base64.b64decode(data_uri.split(",", 1)[1]))) as image:
         assert image.size == (2, 2)  # quarter of 8x6
+
+    # And the run's own record carries what the call *was*, not only that one was
+    # made. The packet trace was discarded at this seam, so a live B2 episode
+    # held twenty `request` events and not one fact about any of them: no class,
+    # no scale. The behaviour above was already tested; the recording was not.
+    packets = [entry for entry in pilot.broker.sink.entries if entry[0] == "packet"]
+    assert len(packets) == 1, [entry[0] for entry in pilot.broker.sink.entries]
+    trace = packets[0][1]
+    assert trace["call_class"] == "continuous"
+    assert trace["image_scale"] == 0.25
+    assert trace["observation_id"] == observation.record_id
+    assert trace["model_identity"]
 
 
 def test_no_plan_can_be_made_after_liftoff():
