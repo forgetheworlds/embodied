@@ -315,6 +315,9 @@ class PreflightPlanner:
         """
         question = explicit_question or plan_question(self.builder.instruction)
         attempt = 0
+        # Every transport failure this call produces is new; the count is what
+        # says which ones are ours.
+        failures_before = len(self.provider.failures)
         last_failure: str | None = None
         while attempt <= self.retry_budget:
             request_id = f"preflight-{sequence}-{attempt}"
@@ -365,6 +368,22 @@ class PreflightPlanner:
                     round_trip_s=reply.arrival.round_trip_ns / 1_000_000_000,
                 )
             last_failure = "no reply arrived inside the pre-flight window"
+        # The transport's own diagnosis, if there was one. ``Provider.poll``
+        # appends a transport failure to ``provider.failures`` and returns it to
+        # nobody, so an HTTP status and its response body — the actual reason a
+        # live pre-flight call failed — surfaced here as "no reply arrived
+        # inside the pre-flight window": true, and useless. The message is
+        # carried verbatim; the transport bounds its own read at 1000 chars and
+        # it never contains the API key.
+        #
+        # Read by count, not by request id: the planner sends every retry on the
+        # caller's own stamp and the provider attributes an arrival to a record
+        # by that stamp, so two attempts share one id — measured, not assumed
+        # (``provider.failures`` read ``[('preflight-0-0', ...), ('preflight-0-0',
+        # ...)]`` for a two-attempt call). A count is immune to that.
+        new_failures = self.provider.failures[failures_before:]
+        if new_failures:
+            last_failure = f"{last_failure}: {new_failures[-1][1]}"
         return FlightPlan(
             usable=False,
             recipe=None,

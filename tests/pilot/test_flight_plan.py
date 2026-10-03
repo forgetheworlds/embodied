@@ -234,16 +234,26 @@ def test_a_transport_failure_is_retried_once_on_the_ground():
     assert len(transport.sent_documents) == 2
 
 
-def test_exhausted_retries_end_in_a_recorded_refusal():
+def test_exhausted_retries_carry_the_transport_own_reason():
+    """A recorded refusal names the failure, not only that there was one.
+
+    Measured cause of this assertion existing: a live pre-flight call recorded
+    "no reply arrived inside the pre-flight window" while the transport held the
+    real diagnosis — an HTTP status and its body — in ``provider.failures``,
+    returned to nobody. The refusal was true and useless, and the previous
+    version of this test asserted only that the string was non-empty, so it
+    passed while the reason was being thrown away.
+    """
     planner, transport, _ = make_planner(retry_budget=1)
     transport.schedule(
-        ScriptedReply(error=TransportError("timeout")),
-        ScriptedReply(error=TransportError("timeout")),
+        ScriptedReply(error=TransportError("HTTP 400: invalid tool schema")),
+        ScriptedReply(error=TransportError("HTTP 400: invalid tool schema")),
     )
     plan = run_plan(planner)
     assert plan.usable is False
     assert plan.attempts == 2
-    assert plan.refusal_reason
+    assert "no reply arrived" in plan.refusal_reason
+    assert "HTTP 400: invalid tool schema" in plan.refusal_reason
 
 
 def test_no_plan_can_be_made_once_the_aircraft_is_airborne():

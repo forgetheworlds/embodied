@@ -206,7 +206,7 @@ class MissionPilot:
                 self.broker.outstanding_request,
             )
             if decision.send and decision.request is not None:
-                packet, _trace = self.packet_builder.build(
+                packet, trace = self.packet_builder.build(
                     request=decision.request,
                     observation=observation,
                     payloads=payloads,
@@ -219,11 +219,21 @@ class MissionPilot:
                     target_refs=decision.cited_observation_ids,
                     explicit_question=scene.explicit_question,
                 )
+                # The trace is the only record of what this call actually
+                # carried — the class it was built as and the image scale
+                # applied — and it used to be discarded here, so a run could show
+                # twenty in-flight requests and not one fact about any of them.
+                # It goes to the broker, which names it in the reply outcome the
+                # runtime writes into the run's own log. The episode's event
+                # vocabulary is closed and exact-key, so a new event kind is
+                # refused by the transport — measured, not assumed — and the
+                # class cannot ride on the `request` event either.
                 self.broker.submit(
                     decision.request,
                     packet,
                     now,
                     supersede_outstanding=decision.supersede_outstanding,
+                    trace=trace,
                 )
         outcomes = self.broker.poll(now)
         outcomes += self.broker.tick(now)

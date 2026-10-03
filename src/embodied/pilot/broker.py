@@ -129,6 +129,14 @@ class RequestRecord:
     send_stamp: ClockStamp
     state: str = RequestState.OUTSTANDING
     delay_not_zeroed_s: float | None = None
+    # What the packet for this request actually was. The episode's own event
+    # vocabulary is closed and its payloads are exact-key, so the call's class
+    # and the image scale actually applied cannot ride on the `request` event —
+    # measured, not assumed: doing that raised "'packet' is not an agent-stream
+    # event kind". They are carried here and named in the reply outcome, which
+    # the runtime writes into the run's own log.
+    call_class: str | None = None
+    image_scale: float | None = None
 
 
 @dataclass
@@ -209,6 +217,7 @@ class PilotBroker:
         self._idempotency: dict[str, tuple[str, GoalStatus]] = {}
         self._cancel_keys: dict[str, GoalStatus] = {}
         self._goal_counter = 0
+        self._surfaced_failures = 0
 
     # -- mission and evidence ---------------------------------------------
 
@@ -254,6 +263,7 @@ class PilotBroker:
         now: ClockStamp,
         *,
         supersede_outstanding: bool = False,
+        trace=None,
     ) -> None:
         if self.provider is None:
             raise RuntimeError("no provider is configured; a local-only arm submits no requests")
@@ -269,6 +279,10 @@ class PilotBroker:
         self.requests[request.request_id] = RequestRecord(
             request=request,
             send_stamp=now,
+            call_class=(
+                trace.call_class if trace is not None else getattr(packet, "call_class", None)
+            ),
+            image_scale=trace.image_scale if trace is not None else None,
         )
         self._emit("request", request, now)
         self.provider.submit(request, packet, now)
@@ -285,6 +299,20 @@ class PilotBroker:
         outcomes = []
         for reply in self.provider.poll(now):
             outcomes.extend(self.on_reply(reply, now))
+        # A transport failure is appended to ``provider.failures`` and returned
+        # to nobody, so an in-flight cloud call that never arrived was invisible
+        # in the run's own record — the request simply expired and the record
+        # could not say why. Surfaced here as an outcome, because a record whose
+        # job is to say what happened must not hide the reason it did not. The
+        # state machine is deliberately untouched: the outstanding request still
+        # expires on its own deadline, which is the broker's declared policy and
+        # not this line's to change.
+        pending = self.provider.failures[self._surfaced_failures :]
+        self._surfaced_failures = len(self.provider.failures)
+        outcomes.extend(
+            BrokerOutcome(kind="transport_failure", reason=message, request_id=request_id)
+            for request_id, message in pending
+        )
         return tuple(outcomes)
 
     # -- replies -----------------------------------------------------------
@@ -378,7 +406,27 @@ class PilotBroker:
         outcomes.append(
             BrokerOutcome(
                 kind="reply",
-                reason=f"reply processed for {record.request.request_id}",
+                # The call's own shape travels with its outcome. The class it was
+                # built as and the image scale actually applied are facts of the
+                # packet, and the episode's event vocabulary is closed and
+                # exact-key so they cannot ride on the `request` event. The
+                # runtime writes this reason into the run's own log, so a reader
+                # can see what each in-flight call was and not only that one
+                # happened.
+                reason=(
+                    f"reply processed for {record.request.request_id}"
+                    + (
+                        f" [{record.call_class} class"
+                        + (
+                            f", image scale {record.image_scale}"
+                            if record.image_scale is not None
+                            else ""
+                        )
+                        + "]"
+                        if record.call_class is not None
+                        else ""
+                    )
+                ),
                 request_id=record.request.request_id,
                 recipe=parsed.mission_recipe,
                 parsed=parsed,
