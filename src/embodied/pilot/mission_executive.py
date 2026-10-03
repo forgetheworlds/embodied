@@ -220,17 +220,20 @@ class MissionPilot:
                     explicit_question=scene.explicit_question,
                 )
                 # The trace is the only record of what this call actually
-                # carried — its declared class and the image scale applied — and
-                # it used to be discarded here, so a run could show twenty
-                # in-flight requests and not one fact about any of them. Written
-                # to the run's own sink, the one the broker's request records go
-                # to, so the two sit side by side in the episode.
-                self.broker.sink("packet", trace.document(), now, observation.sim_time_s)
+                # carried — the class it was built as and the image scale
+                # applied — and it used to be discarded here, so a run could show
+                # twenty in-flight requests and not one fact about any of them.
+                # It goes to the broker, which names it in the reply outcome the
+                # runtime writes into the run's own log. The episode's event
+                # vocabulary is closed and exact-key, so a new event kind is
+                # refused by the transport — measured, not assumed — and the
+                # class cannot ride on the `request` event either.
                 self.broker.submit(
                     decision.request,
                     packet,
                     now,
                     supersede_outstanding=decision.supersede_outstanding,
+                    trace=trace,
                 )
         outcomes = self.broker.poll(now)
         outcomes += self.broker.tick(now)

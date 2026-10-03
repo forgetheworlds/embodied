@@ -194,7 +194,15 @@ def test_b1_plans_once_on_the_ground_and_never_calls_again():
 
 
 def test_b2_in_flight_calls_are_continuous_class_at_the_declared_scale():
-    pilot, transport = make_pilot("B2", replies=[ScriptedReply(document=GOOD_RECIPE_REPLY)])
+    # Two scripted replies: the first is consumed by the pre-flight call, the
+    # second answers the in-flight one whose shape this test is about.
+    pilot, transport = make_pilot(
+        "B2",
+        replies=[
+            ScriptedReply(document=GOOD_RECIPE_REPLY),
+            ScriptedReply(document=GOOD_RECIPE_REPLY),
+        ],
+    )
     pilot.set_mission(stamp(0.0))
     pilot.plan_preflight(
         make_observation("obs-0", 0), {"left.ppm": make_png()}, stamp(0.0), deadline_s=90.0
@@ -202,12 +210,15 @@ def test_b2_in_flight_calls_are_continuous_class_at_the_declared_scale():
     pilot.mark_airborne(stamp(1.0))
     # An explicit question is a trigger the shared engine always sends on.
     observation = make_observation("obs-1", 1)
-    pilot.tick(
+    outcomes = pilot.tick(
         SceneStatus(signature=None, explicit_question="which candidate is the target?"),
         observation,
         {"left.ppm": make_png()},
         stamp(2.0),
     )
+    # The scripted reply arrives on a later poll than the send, as a real one
+    # does; the outcome that names the call's shape comes with it.
+    outcomes = outcomes + pilot.broker.poll(stamp(2.1))
     assert len(transport.sent_documents) == 2
     inflight = transport.sent_documents[1]
     assert inflight["reasoning_effort"] == "off"
@@ -221,16 +232,16 @@ def test_b2_in_flight_calls_are_continuous_class_at_the_declared_scale():
         assert image.size == (2, 2)  # quarter of 8x6
 
     # And the run's own record carries what the call *was*, not only that one was
-    # made. The packet trace was discarded at this seam, so a live B2 episode
-    # held twenty `request` events and not one fact about any of them: no class,
-    # no scale. The behaviour above was already tested; the recording was not.
-    packets = [entry for entry in pilot.broker.sink.entries if entry[0] == "packet"]
-    assert len(packets) == 1, [entry[0] for entry in pilot.broker.sink.entries]
-    trace = packets[0][1]
-    assert trace["call_class"] == "continuous"
-    assert trace["image_scale"] == 0.25
-    assert trace["observation_id"] == observation.record_id
-    assert trace["model_identity"]
+    # made. The trace was discarded at this seam, so a live B2 episode held
+    # twenty `request` events and not one fact about any of them: no class, no
+    # scale. The behaviour above was already tested; the recording was not.
+    # It rides on the reply outcome because the episode's event vocabulary is
+    # closed and exact-key — a new event kind is refused by the transport, which
+    # is measured: it raised "'packet' is not an agent-stream event kind".
+    replies = [outcome for outcome in outcomes if outcome.kind == "reply"]
+    assert replies, [outcome.kind for outcome in outcomes]
+    assert "continuous class" in replies[0].reason
+    assert "image scale 0.25" in replies[0].reason
 
 
 def test_no_plan_can_be_made_after_liftoff():
