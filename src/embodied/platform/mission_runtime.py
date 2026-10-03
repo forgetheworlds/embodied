@@ -126,6 +126,13 @@ from embodied.pilot.recipe_runner import RecipeRunner
 # The bounds are the scene's own extents in the aligned NED frame (the world's
 # floor is 12.4 x 5.4 m centred at (4, 0) with the vehicle spawning at
 # (-1, 0, 0.09) and NED z pointing down), plus a voxel of margin.
+# The z pair is the room's height and the margin past it, written down rather
+# than left implicit because this is the bound a climbing vehicle runs into:
+# NED z points down, the scene's ceiling sits at 2.55 m above its floor and the
+# floor plane at -0.02 m (scenarios/first_indoor/world.wbt), so -2.8 admits the
+# ceiling with 0.25 m to spare and +0.4 admits the small negative excursions a
+# landed vehicle's own estimate reports. A bound tighter than the ceiling would
+# clip the map exactly where a vehicle flying into it needs evidence.
 MAP_PARAMETERS = dict(
     voxel_m=0.1,
     bounds_odom_m={"x": (-2.4, 10.6), "y": (-3.2, 3.2), "z": (-2.8, 0.4)},
