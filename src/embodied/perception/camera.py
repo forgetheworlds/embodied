@@ -364,6 +364,13 @@ class DepthProduct:
     valid: np.ndarray
     reasons: np.ndarray
     uncertainty_m: np.ndarray
+    # Whether the declared ``texture_threshold`` was actually applied by the
+    # backend that produced this field. OpenCV's ``StereoSGBM_create`` dropped
+    # the parameter in recent 4.x releases, so on the pinned backend it is NOT
+    # in force — and until this travelled on the product, nothing in any
+    # artifact said so. Defaulted, because the fixture builders outside this
+    # module predate the field; False is the conservative claim.
+    texture_threshold_applied: bool = False
 
     def __post_init__(self) -> None:
         def text(value: object, name: str) -> None:
@@ -572,7 +579,9 @@ def _make_sgbm(cv2, settings: dict):
     ``StereoSGBM_create`` dropped the parameter in recent 4.x releases (its
     low-texture handling moved inside the cost aggregation). The backend
     capability is detected, never assumed: the returned flag says whether the
-    declared value was applied, and the derivation records it.
+    declared value was applied. That flag travels on the product it built, so a
+    depth product states whether every declared filter was in force rather than
+    leaving a reader to assume it was.
     """
     block = int(settings["block_size"])
     kwargs = dict(
@@ -692,7 +701,53 @@ def compute_validated_depth(
         valid=valid,
         reasons=reasons,
         uncertainty_m=uncertainty,
+        texture_threshold_applied=_texture_threshold_applied,
     )
+
+
+def rejection_breakdown(product: DepthProduct, settings: dict) -> dict[str, int]:
+    """Why a depth field's samples were rejected, split finer than the reason codes.
+
+    ``REASON_NAMES`` is the per-pixel contract and does not change here. But three
+    of its buckets merge causes that call for different action, and a reader of
+    the counts cannot tell them apart:
+
+    * ``depth_range`` merges samples NEARER than ``z_min`` — the floor under a
+      forward-looking camera, and anything the aircraft is about to overfly —
+      with samples beyond ``z_max``. Measured over real frames, one source was
+      entirely too-far (125,284 against 0) and another mostly too-near (217,008
+      against 60,048), so a single "depth_range" number describes two different
+      scenes.
+    * ``no_return`` merges SGBM's own invalid marker with samples the matcher
+      resolved to a zero disparity. A zero disparity is not a return either, but
+      it is a different event: it appears in the flattest parts of a frame (mean
+      local gradient 3.7 against 8.2 at valid samples) and vanishes entirely on a
+      well-textured one, which is a flat cost surface whose argmin landed at zero
+      rather than a measurement at infinite range. Calling both "no return" hides
+      which of the two a scene is suffering from.
+    * ``lr_mismatch`` merges a genuine two-view disagreement with a sample whose
+      reverse pass produced no match at all. Over 18 frames, 92.0 % of that
+      bucket was the second and 8.0 % the first.
+
+    This is a reading of one product: it changes no reason, no validity test and
+    no declared value.
+    """
+    reasons = product.reasons
+    disparity = product.disparity_px
+    depth = product.depth_m
+    z_min, z_max = (float(v) for v in settings["depth_range_m"])
+    no_return = reasons == REASON_NO_RETURN
+    in_range = reasons == REASON_DEPTH_RANGE
+    return {
+        "valid": int((reasons == REASON_VALID).sum()),
+        "border": int((reasons == REASON_BORDER).sum()),
+        "depth_range_near": int((in_range & (depth < z_min)).sum()),
+        "depth_range_far": int((in_range & (depth > z_max)).sum()),
+        "no_return_zero_disparity": int((no_return & (disparity == 0.0)).sum()),
+        "no_return_unmatched": int((no_return & (disparity < 0.0)).sum()),
+        "lr_mismatch": int((reasons == REASON_LR_MISMATCH).sum()),
+        "samples": int(reasons.size),
+    }
 
 
 # ---------------------------------------------------------------------------
