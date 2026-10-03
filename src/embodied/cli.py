@@ -297,6 +297,79 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "step_timeout_s": {"startup": float, "ready": float, "flight": float},
         "budget_wall_clock_s": float,
     },
+    # -------------------------------------------------------------------
+    # R2 (2026-10-03): the values that decide whether a flight moves.
+    #
+    # These were module-level constants in the code with no declared home, so
+    # a reader could not see them — and three separate blockers this project
+    # paid for were one of these numbers: a goal-search margin stricter than
+    # the clearance the planner verifies, a standoff that put the approach
+    # region behind its own target, and a settle predicate that disagreed
+    # with the referee. R2 says every threshold is traceable to GOAL.md or is
+    # a declared engineering parameter. These are the second kind, now
+    # declared where the discipline says declared values live.
+    #
+    # Every section is _Optional so a configuration which predates it — the
+    # compatibility gate's own file, the platform fixtures — still loads
+    # unchanged. Keys INSIDE each are required, so a typo inside one is
+    # caught exactly as before. Unknown-key rejection is unchanged: a
+    # silently ignored section is still a substituted experiment.
+    #
+    # IMPORTANT until the reader handoff lands: these declarations do not yet
+    # drive the code. The constants named in
+    # work/runs/p05/J41-schema-REPORT.md remain the values in force, and
+    # tests/contracts/test_config_declarations.py pins each declared value to
+    # its constant so the two cannot drift apart before the wiring lands.
+    # -------------------------------------------------------------------
+    "vehicle": _Optional(
+        {
+            # The aircraft's own radius, and the pose error the mission acts on.
+            "body_radius_m": float,
+            "error_allowance_m": float,
+        }
+    ),
+    "planner": _Optional(
+        {
+            # The margin, in voxels, a cell must hold beyond the declared
+            # envelope for BOTH questions the planner asks of it: the set a
+            # certificate walks in and the set a goal or start cell is
+            # chosen from.
+            "certificate_margin_voxels": float,
+            # The aperture geometry: where the approach region sits before the
+            # opening, how thick it is, how deep the crossing box is, and how
+            # far past the opening the terminal region ends.
+            "standoff_m": float,
+            "approach_half_thickness_m": float,
+            "crossing_half_depth_m": float,
+            "exit_depth_m": float,
+        }
+    ),
+    "mission": _Optional(
+        {
+            "budget_sim_s": float,
+            "cold_start_perception_sim_s": float,
+            "min_perception_interval_s": float,
+            "frontier_cluster_cells": int,
+            "frontier_vantage_step_m": float,
+            "settle_speed_mps": float,
+            "settle_hold_s": float,
+        }
+    ),
+    "map": _Optional(
+        {
+            "voxel_m": float,
+            # The scene's own extents in the aligned NED frame, per axis.
+            "bounds_odom_m": {"x": [float], "y": [float], "z": [float]},
+            "surface_band_m": float,
+            "log_odds_hit": float,
+            "log_odds_pass": float,
+            "clamp": float,
+            "free_threshold": float,
+            "occupied_threshold": float,
+            "min_clearing_rays": int,
+            "freshness_s": float,
+        }
+    ),
     # Added by P01-C (calibration) and P01-L (localization). Both are optional so
     # that a configuration predating them still loads; inside each, every key is
     # required. Without these the real first_indoor.yaml was refused outright
