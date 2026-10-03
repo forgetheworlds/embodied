@@ -126,6 +126,13 @@ from embodied.pilot.recipe_runner import RecipeRunner
 # The bounds are the scene's own extents in the aligned NED frame (the world's
 # floor is 12.4 x 5.4 m centred at (4, 0) with the vehicle spawning at
 # (-1, 0, 0.09) and NED z pointing down), plus a voxel of margin.
+# The z pair is the room's height and the margin past it, written down rather
+# than left implicit because this is the bound a climbing vehicle runs into:
+# NED z points down, the scene's ceiling sits at 2.55 m above its floor and the
+# floor plane at -0.02 m (scenarios/first_indoor/world.wbt), so -2.8 admits the
+# ceiling with 0.25 m to spare and +0.4 admits the small negative excursions a
+# landed vehicle's own estimate reports. A bound tighter than the ceiling would
+# clip the map exactly where a vehicle flying into it needs evidence.
 MAP_PARAMETERS = dict(
     voxel_m=0.1,
     bounds_odom_m={"x": (-2.4, 10.6), "y": (-3.2, 3.2), "z": (-2.8, 0.4)},
@@ -441,6 +448,9 @@ class MissionRuntime:
         self._last_observation_id: str | None = None
         self._payload_count = 0
         self._publication_count = 0
+        # Set when the declared visual-update bound is passed. It ends normal
+        # operation rather than being recorded and flown past.
+        self._visual_fault_reason: str | None = None
         self._publish_refusal_count = 0
         self._grounded: dict[str, R.GroundedTarget] = {}
         self._candidate_targets: list[str] = []
@@ -1093,6 +1103,13 @@ class MissionRuntime:
         index = 0
         regathers: dict[str, int] = {}
         while index < len(phases):
+            if self._visual_fault_reason is not None:
+                # The estimate is no longer a pose. Landing is the declared
+                # protective end, and the reason names the bound that was
+                # passed rather than blaming the phase that happened to be
+                # running.
+                termination = "visual_localization_lost"
+                break
             if mission_window.expired():
                 termination = "mission_budget_exhausted"
                 break
@@ -1317,6 +1334,47 @@ class MissionRuntime:
         if len(self._observation_ids) > MAX_CITED_OBSERVATIONS:
             del self._observation_ids[0]
 
+    def _visual_fault(self) -> str | None:
+        """The declared visual-update bound, evaluated (F4).
+
+        ``visual_update_fail_ms`` has been declared, measured and logged since
+        P01-L, and this runtime built a ``HealthMachine`` carrying it and then
+        never asked that machine a single question. The consequence is
+        measured: on three retained runs the aircraft climbed into the room's
+        ceiling and crashed while its visual updates had already stopped, and
+        nothing in the mission noticed.
+
+        The mechanism those runs show is worth stating, because it is not
+        obvious. ``EK3_SRC1_POSZ`` is ExternalNav, so the altitude channel is
+        the estimator's own z. When the view degenerates the estimator's z
+        drifts low: on the run whose dataflash is ``00000238.BIN`` the
+        published altitude read 1.76 m while the simulator's own state said
+        2.44 m, an error that grew to 1.12 m. GUIDED then holds the *estimated*
+        position, so a drifting estimate is chased by real motion — the
+        aircraft climbed about a metre to keep a falling number where it was,
+        struck the 2.5 m ceiling, and the crash detector did the rest.
+
+        So the bound is not a statistic about the log. Past it the estimate is
+        no longer a pose, and the only honest options are the declared
+        protective behaviours. This returns the reason past the bound, and the
+        caller lands.
+
+        Not evaluated before the first visual update (``t_last_visual_ns``
+        zero) or before the estimator is initialized, because an age measured
+        against a clock that has never ticked is not a fault.
+        """
+        state = self._latest_state
+        if state is None or not state.t_last_visual_ns or not state.initialized:
+            return None
+        if self._machine.visual_update_verdict(state) != "fail":
+            return None
+        age_s = (state.time_ns - state.t_last_visual_ns) / 1e9
+        return (
+            f"visual updates stopped: the newest estimate's last visual update "
+            f"is {age_s:.2f} s old, past the declared fail bound "
+            f"{self._machine.bounds.visual_update_fail_s:.2f} s (F4)"
+        )
+
     def pump_perception(self, drain, sim_seconds: float, until=None) -> int:
         """Pump perception on its declared cadence for a bounded sim window.
 
@@ -1358,6 +1416,11 @@ class MissionRuntime:
         cycles = 0
         next_cycle = 0.0
         while cycles < target_cycles and time.monotonic() < deadline_s:
+            fault = self._visual_fault()
+            if fault is not None:
+                self._visual_fault_reason = fault
+                self.result.log.append(f"visual update fault: {fault}")
+                break
             now = time.monotonic()
             if now >= next_cycle:
                 next_cycle = now + MIN_PERCEPTION_INTERVAL_S
@@ -2253,6 +2316,11 @@ class _LiveRunnerWorld:
         next_perception = 0.0
         settle_since: float | None = None
         while not lease.expired():
+            if runtime._visual_fault_reason is not None:
+                # A step also ends when the estimate stops being a pose, so a
+                # fault during a flown step stops the step rather than being
+                # noticed only after the phase returns.
+                break
             now = time.monotonic()
             if now >= next_perception:
                 next_perception = now + MIN_PERCEPTION_INTERVAL_S
