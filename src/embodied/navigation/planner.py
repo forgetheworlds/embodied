@@ -59,14 +59,21 @@ BUDGET_EXHAUSTED = BudgetExhausted()
 
 # The margin, in voxels, that a cell must hold beyond the declared envelope to
 # count as free space for this planner. One value, one home (R2). It answers
-# both questions this module asks of a cell — the set a certificate walks in,
-# and the set a goal or start cell is chosen from — and since R23 those are the
-# same set, carved once in ``plan``.
+# both questions this module asks of a cell — the radius of the occupancy set
+# a route walks and every knot is chosen from (a knot is a place the vehicle
+# may stop and hold), and the slack inside the clearance ball the certificate
+# sweeps against the map's published free cells.
 #
 # The quarter voxel is the certificate's own. It walks the curve at a spacing
-# whose displacement bound is that quarter voxel, and ``_certify_segments``
-# passes the same slack, so a curve inside this set has its whole swept tube
-# inside free space.
+# whose displacement bound is that quarter voxel, and the sweep demands every
+# cell inside a ball of the declared envelope plus that slack to be published
+# free. The sweep's membership is the published free set, not the occupancy
+# set: the ball already carries the envelope once, and membership in the
+# occupancy set would inflate a second time — 0.95 m of raw free space against
+# the declared 0.475 m clearance on this map. That second width had no
+# derivation, and it measured refusing all eight offered frontiers at the
+# certification axis on the doorway map while the same occupancy set admitted
+# their routes (2026-10-03, night/motion).
 #
 # R23 (2026-10-02): the goal search used a HALF voxel, which had no stated
 # justification and was stricter than the clearance the certificate then
@@ -144,7 +151,8 @@ class Segment:
     def value(self, t_s: float) -> tuple[float, ...]:
         """Position at a time inside the segment."""
         return tuple(
-            float(np.polyval(list(reversed(axis)), t_s - self.t_start_s)) for axis in self.coefficients
+            float(np.polyval(list(reversed(axis)), t_s - self.t_start_s))
+            for axis in self.coefficients
         )
 
     def derivative(self, t_s: float, order: int) -> tuple[float, ...]:
@@ -192,21 +200,42 @@ class TrajectoryCertificate:
     constraints: tuple[str, ...]
     backup: Segment | None
 
-    def sample(self, t_s: float) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
-        """Position, velocity and acceleration at an absolute time inside the plan."""
+    def sample(
+        self, t_s: float
+    ) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+        """Position, velocity and acceleration at an absolute time inside the plan.
+
+        The segments carry plan-relative times, but the certificate's own window
+        is absolute — ``t_start_s`` is the epoch second the plan was certified at
+        — and every caller samples in that domain: the executor builds the
+        published prefix from ``now_ns``, the validator walks ``t_start_s`` to
+        ``t_end_s``, and the runtime samples at ``time.monotonic()`` against a
+        plan taken from ``monotonic_ns``. The conversion therefore happens here,
+        once. Before it did, an absolute ``t_s`` matched no segment and the
+        sample clamped to the curve's end: the first published setpoint would
+        have been the goal point itself rather than the certified prefix.
+        """
+        relative = min(max(t_s - self.t_start_s, 0.0), self.horizon_s)
         for segment in self.segments:
-            if segment.t_start_s <= t_s <= segment.t_end_s + 1e-12:
+            if segment.t_start_s <= relative <= segment.t_end_s + 1e-12:
                 return (
-                    segment.value(t_s),
-                    segment.derivative(t_s, 1),
-                    segment.derivative(t_s, 2),
+                    segment.value(relative),
+                    segment.derivative(relative, 1),
+                    segment.derivative(relative, 2),
                 )
         last = self.segments[-1]
-        return (last.value(last.t_end_s), last.derivative(last.t_end_s, 1), last.derivative(last.t_end_s, 2))
+        return (
+            last.value(last.t_end_s),
+            last.derivative(last.t_end_s, 1),
+            last.derivative(last.t_end_s, 2),
+        )
 
 
 def _quintic_coefficients(
-    waypoints: np.ndarray, durations: np.ndarray, start_velocity: float, start_acceleration: float
+    waypoints: np.ndarray,
+    durations: np.ndarray,
+    start_velocity: float,
+    start_acceleration: float,
 ) -> np.ndarray:
     """Solve the fixed-duration minimum-jerk system for one axis.
 
@@ -231,7 +260,9 @@ def _quintic_coefficients(
             factor = 1.0
             for step in range(order):
                 factor *= power - step
-            coefficients[coefficient_index(segment, power)] = factor * offset ** (power - order)
+            coefficients[coefficient_index(segment, power)] = factor * offset ** (
+                power - order
+            )
         return coefficients
 
     for segment in range(segments):
@@ -244,7 +275,9 @@ def _quintic_coefficients(
         row += 1
     for segment in range(segments - 1):
         for order in (1, 2, 3, 4):
-            matrix[row] = derivative_row(segment, order, True) - derivative_row(segment + 1, order, False)
+            matrix[row] = derivative_row(segment, order, True) - derivative_row(
+                segment + 1, order, False
+            )
             rhs[row] = 0.0
             row += 1
     matrix[row] = derivative_row(0, 1, False)
@@ -260,7 +293,9 @@ def _quintic_coefficients(
     rhs[row] = 0.0
     row += 1
     if row != unknowns:
-        raise R.RecordError(f"minimum-jerk system is {row} by {unknowns}: it is not square")
+        raise R.RecordError(
+            f"minimum-jerk system is {row} by {unknowns}: it is not square"
+        )
     try:
         solution = np.linalg.solve(matrix, rhs)
     except np.linalg.LinAlgError as error:
@@ -291,9 +326,7 @@ def _norm_max(axis_coefficients: np.ndarray, duration_s: float, order: int) -> f
             if abs(root.imag) < 1e-9 and 0.0 < root.real < duration_s:
                 candidates.append(float(root.real))
     return max(
-        float(
-            sum(float(derivative(time)) ** 2 for derivative in derivatives) ** 0.5
-        )
+        float(sum(float(derivative(time)) ** 2 for derivative in derivatives) ** 0.5)
         for time in candidates
     )
 
@@ -308,7 +341,6 @@ def _initial_durations(distances: np.ndarray, limits: PlanLimits) -> np.ndarray:
     solve is then certified exactly, and a violating segment lengthens and re-solves.
     """
     return np.maximum(distances / (0.8 * limits.v_max_mps), 0.2)
-
 
 
 # The adjacency a path may use, written down once. `_neighbours`, `reachable_from`
@@ -376,6 +408,7 @@ def reachable_from(
                 stack.append(neighbour)
     return frozenset(seen)
 
+
 def _astar(
     traversable: frozenset[tuple[int, int, int]],
     start_cell: tuple[int, int, int],
@@ -395,12 +428,20 @@ def _astar(
 
     if start_cell not in traversable:
         return None
-    goal_low = np.array([min(cell[axis] for cell in goal_cells) - 0.5 for axis in range(3)])
-    goal_high = np.array([max(cell[axis] for cell in goal_cells) + 0.5 for axis in range(3)])
+    goal_low = np.array(
+        [min(cell[axis] for cell in goal_cells) - 0.5 for axis in range(3)]
+    )
+    goal_high = np.array(
+        [max(cell[axis] for cell in goal_cells) + 0.5 for axis in range(3)]
+    )
 
     def heuristic(cell: tuple[int, int, int]) -> float:
         position = np.asarray(cell, dtype=np.float64)
-        return float(np.linalg.norm(np.maximum(np.maximum(goal_low - position, position - goal_high), 0.0)))
+        return float(
+            np.linalg.norm(
+                np.maximum(np.maximum(goal_low - position, position - goal_high), 0.0)
+            )
+        )
 
     frontier = [(heuristic(start_cell), 0.0, start_cell)]
     came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
@@ -422,7 +463,9 @@ def _astar(
             if candidate < cost.get(neighbour, float("inf")):
                 cost[neighbour] = candidate
                 came_from[neighbour] = current
-                heapq.heappush(frontier, (candidate + heuristic(neighbour), candidate, neighbour))
+                heapq.heappush(
+                    frontier, (candidate + heuristic(neighbour), candidate, neighbour)
+                )
     return None
 
 
@@ -441,12 +484,13 @@ def _straight_run_is_supported(
     end = np.asarray(grid.cell_center(second), dtype=np.float64)
     distance = float(np.linalg.norm(end - start))
     steps = max(int(math.ceil(distance / (grid.voxel_m / 4.0))), 1)
-    # Deliberately NOT CERTIFICATE_MARGIN_VOXELS, and not a clearance at all:
-    # this is the radius of the cell-offset ball used to test whether interpolated
-    # points along a run are members of `traversable`, not an inflation of the
-    # free-space test. R23 licenses unifying the goal search with the clearance
-    # the certificate verifies; it licenses nothing here, and lowering this
-    # would weaken a check that is not in question.
+    # The membership set is the map's published free cells, so this ball IS a
+    # clearance test — and its radius stays inflation + half a voxel, above the
+    # certificate's own ball (inflation + quarter voxel): a run the shortcut
+    # keeps is certificate-clean at every sampled point. The radius itself is
+    # declared and not in question; R23 licenses unifying the goal search with
+    # the clearance the certificate verifies, and this run check now answers the
+    # certificate's question, neither more nor less.
     radius = envelope.inflation_m + grid.voxel_m * 0.5
     offsets = geometry_module.ball_offsets(grid, radius)
     for step in range(steps + 1):
@@ -503,7 +547,11 @@ def _merge_collinear(
     direction = None
     run = 0
     for previous, current in zip(path, path[1:]):
-        step = (current[0] - previous[0], current[1] - previous[1], current[2] - previous[2])
+        step = (
+            current[0] - previous[0],
+            current[1] - previous[1],
+            current[2] - previous[2],
+        )
         if direction is not None and (step != direction or run >= max_cells):
             merged.append(previous)
             run = 0
@@ -535,16 +583,19 @@ def plan(
     """Plan one certified trajectory into a goal region, or refuse with a named reason."""
     start = start_position_odom_m or navigation_state.pose.position_m
     grid = store.config
-    # One set, one answer, one name. The margin is the certificate's own quarter
-    # voxel: a certificate walks the curve at a spacing whose displacement bound
-    # is that quarter voxel, so a curve inside this set has its whole swept tube
-    # inside free space.
-    #
-    # R23 (2026-10-02) removed the second, stricter margin the goal search used
-    # to carry, and with it the only reason to carve the map twice. The two calls
-    # were left behind as identical work under two names, which is the shape of
-    # the defect that cost this project a whole run's worth of goals: two answers
-    # to one question, disagreeing. There is now one call.
+    # Two sets, each answering one question, both carved from the same evidence
+    # (R23: never two answers to one question). ``free_space`` is the occupancy
+    # set — cells whose own declared envelope lies in published free space — and
+    # it is what the route search walks and every knot is chosen from, because a
+    # knot is a place the curve may stop and the vehicle may hold. The sweep test
+    # is a different question: the curve's clearance ball already carries the
+    # declared envelope plus its quarter-voxel slack, so membership there is
+    # tested against ``published_free`` directly. Testing it against
+    # ``free_space`` instead would inflate a second time — a 0.95 m corridor of
+    # raw free space against the declared 0.475 m clearance on this map — and
+    # that second width has no derivation anywhere; it was measured refusing all
+    # eight offered frontiers at the certification axis on the doorway map while
+    # the same search set admitted their routes (2026-10-03, night/motion).
     free_space = geometry_module.inflated_free_cells(
         store,
         envelope,
@@ -552,8 +603,11 @@ def plan(
         self_occupied_origin_odom_m=start,
         extra_margin_m=grid.voxel_m * CERTIFICATE_MARGIN_VOXELS,
     )
+    published_free = store.free_cells(now_ns=now_ns)
     start_cell = grid.cell_index(start)
-    goal_cells = frozenset(cell for cell in goal_region.cells(grid) if cell in free_space)
+    goal_cells = frozenset(
+        cell for cell in goal_region.cells(grid) if cell in free_space
+    )
     if start_cell not in free_space:
         return PlanRefusal(
             NO_KNOWN_SUPPORTED_ROUTE,
@@ -566,7 +620,9 @@ def plan(
             f"no cell of the {goal_region.label} region is supported free space",
             support="uncertain",
         )
-    path = _astar(free_space, start_cell, goal_cells, grid, max_expansions=config.max_expansions)
+    path = _astar(
+        free_space, start_cell, goal_cells, grid, max_expansions=config.max_expansions
+    )
     if path is BUDGET_EXHAUSTED:
         return PlanRefusal(
             COMPUTATION_LIMIT,
@@ -575,7 +631,7 @@ def plan(
             support="uncertain",
         )
     if path is not None:
-        path = _merge_collinear(_shortcut(path, free_space, grid, envelope))
+        path = _merge_collinear(_shortcut(path, published_free, grid, envelope))
     if path is None:
         return PlanRefusal(
             NO_KNOWN_SUPPORTED_ROUTE,
@@ -584,7 +640,9 @@ def plan(
             support="uncertain",
         )
     waypoint_cells = _merge_collinear(path)
-    waypoints = np.asarray([grid.cell_center(cell) for cell in waypoint_cells], dtype=np.float64)
+    waypoints = np.asarray(
+        [grid.cell_center(cell) for cell in waypoint_cells], dtype=np.float64
+    )
     waypoints[0] = np.asarray(start, dtype=np.float64)
     distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
     durations = _initial_durations(distances, config.limits)
@@ -611,10 +669,21 @@ def plan(
                     )
                 )
         except R.RecordError as error:
-            return PlanRefusal(COMPUTATION_LIMIT, f"the quintic solve failed: {error}", support="uncertain")
+            return PlanRefusal(
+                COMPUTATION_LIMIT,
+                f"the quintic solve failed: {error}",
+                support="uncertain",
+            )
         coefficients = np.stack(per_axis, axis=1)  # (segments, axis, power)
         candidate, violation = _certify_segments(
-            coefficients, durations, distances, free_space, grid, config, envelope, start
+            coefficients,
+            durations,
+            distances,
+            published_free,
+            grid,
+            config,
+            envelope,
+            start,
         )
         if violation is None:
             segments = candidate
@@ -630,7 +699,15 @@ def plan(
             # certify those instead. A curve that still cannot be certified is
             # refused: an uncertified curve is never published.
             fallback = _clamped_segments(
-                waypoints, durations, distances, free_space, grid, config, envelope, start, attempts
+                waypoints,
+                durations,
+                distances,
+                published_free,
+                grid,
+                config,
+                envelope,
+                start,
+                attempts,
             )
             if isinstance(fallback, PlanRefusal):
                 return PlanRefusal(
@@ -640,12 +717,21 @@ def plan(
                 )
             segments = fallback
             coefficients = None
+            # The certificate's horizon must be the fallback's own time axis: the
+            # loop's ``durations`` belong to the minimum-jerk form the fallback
+            # replaced, and building t_end_s from them publishes a window longer
+            # than the curve it certifies.
+            durations = np.asarray([segment.duration_s for segment in fallback])
             break
         durations = lengthened
     if segments is None:
-        return PlanRefusal(COMPUTATION_LIMIT, "the solver produced no segments", support="uncertain")
+        return PlanRefusal(
+            COMPUTATION_LIMIT, "the solver produced no segments", support="uncertain"
+        )
     t_start = now_ns / 1e9
-    dependent = sorted({cell for segment in segments for cell in _cells_of(segment, grid)})
+    dependent = sorted(
+        {cell for segment in segments for cell in _cells_of(segment, grid)}
+    )
     backup = _backup_segment(start, start_velocity_mps, config, free_space, grid)
     if backup is None:
         return PlanRefusal(
@@ -677,7 +763,11 @@ def plan(
         limiting_reasons=(
             "certified under the inflated free-space map and the declared motion limits",
             "curve_form: "
-            + ("minimum_jerk_C4" if coefficients is not None else "clamped_quintic_fallback"),
+            + (
+                "minimum_jerk_C4"
+                if coefficients is not None
+                else "clamped_quintic_fallback"
+            ),
         ),
         certified=True,
         constraints=("inflated_free_space", "complete_segment_certification"),
@@ -753,7 +843,14 @@ def _clamped_segments(
                 6.0 * delta[axis] / duration**5,
             )
     segments, violation = _certify_segments(
-        coefficients, segment_durations, distances, traversable, grid, config, envelope, start
+        coefficients,
+        segment_durations,
+        distances,
+        traversable,
+        grid,
+        config,
+        envelope,
+        start,
     )
     if violation is not None:
         # A curve whose sweep leaves supported free space is not a computation limit:
@@ -772,8 +869,12 @@ def _sample_interval(grid: world_module.MapConfig, config: PlanConfig) -> float:
     return min(SAMPLE_INTERVAL_MAX_S, grid.voxel_m / (4.0 * config.limits.v_max_mps))
 
 
-def _cells_of(segment: Segment, config: world_module.MapConfig) -> tuple[tuple[int, int, int], ...]:
-    region = geometry_module.BoxRegion(low=segment.low, high=segment.high, label="segment")
+def _cells_of(
+    segment: Segment, config: world_module.MapConfig
+) -> tuple[tuple[int, int, int], ...]:
+    region = geometry_module.BoxRegion(
+        low=segment.low, high=segment.high, label="segment"
+    )
     return region.cells(config)
 
 
@@ -796,12 +897,19 @@ def _certify_segments(
     The limit check reads the extremes of the segment's own derivatives, so it can
     never miss a violation between samples. The clearance check walks the segment
     at a spacing whose displacement bound is a quarter voxel (``v_max * dt <=
-    voxel/4``) and requires each sampled cell's envelope — inflated with that same
-    quarter voxel of slack — to be free. The curve between two samples stays within
-    ``v_max * dt / 2`` of them, so the whole swept tube is covered rather than
-    merely sampled.
+    voxel/4``) and requires every cell inside a ball of the declared envelope plus
+    that same quarter voxel of slack to be published free — ``traversable`` here is
+    the map's published free cells, not the occupancy set: the ball already carries
+    the envelope once, and membership in the occupancy set would inflate a second
+    time. The curve between two samples stays within ``v_max * dt / 2`` of them,
+    so the whole swept tube is covered rather than merely sampled.
     """
     segments = []
+    # The only writer of this clock is the knot bookkeeping below. The sweep
+    # loop samples at its own local time: reusing this name there once silently
+    # shifted every following segment's start by (samples-1)/samples of the
+    # previous duration, gapping the certificate's time axis and clamping every
+    # mid-plan sample to the curve's end (2026-10-03, night/motion).
     time = 0.0
     for index in range(durations.size):
         bounds = []
@@ -818,8 +926,13 @@ def _certify_segments(
         for order in (1, 2, 3):
             values = []
             for axis in range(3):
-                derivative = np.poly1d(list(reversed(coefficients[index, axis]))).deriv(order)
-                axis_values = [float(derivative(0.0)), float(derivative(durations[index]))]
+                derivative = np.poly1d(list(reversed(coefficients[index, axis]))).deriv(
+                    order
+                )
+                axis_values = [
+                    float(derivative(0.0)),
+                    float(derivative(durations[index])),
+                ]
                 if derivative.order >= 1:
                     for root in np.atleast_1d(derivative.roots):
                         if abs(root.imag) < 1e-9 and 0.0 < root.real < durations[index]:
@@ -839,7 +952,10 @@ def _certify_segments(
             index=index,
             t_start_s=time,
             duration_s=float(durations[index]),
-            coefficients=tuple(tuple(float(value) for value in coefficients[index, axis]) for axis in range(3)),
+            coefficients=tuple(
+                tuple(float(value) for value in coefficients[index, axis])
+                for axis in range(3)
+            ),
             low=low,
             high=high,
             max_speed_mps=max_speed,
@@ -848,25 +964,40 @@ def _certify_segments(
             distance_m=float(distances[index]),
         )
         if max_speed > config.limits.v_max_mps + 1e-9:
-            return None, f"segment-{index} reaches {max_speed:.3f} m/s over the declared v_max"
+            return (
+                None,
+                f"segment-{index} reaches {max_speed:.3f} m/s over the declared v_max",
+            )
         if max_acceleration > config.limits.a_max_mps2 + 1e-9:
-            return None, f"segment-{index} reaches {max_acceleration:.3f} m/s^2 over the declared a_max"
+            return (
+                None,
+                f"segment-{index} reaches {max_acceleration:.3f} m/s^2 over the declared a_max",
+            )
         if max_jerk > config.limits.jerk_max_mps3 + 1e-9:
-            return None, f"segment-{index} reaches {max_jerk:.3f} m/s^3 over the declared jerk limit"
+            return (
+                None,
+                f"segment-{index} reaches {max_jerk:.3f} m/s^3 over the declared jerk limit",
+            )
         slack = grid.voxel_m / 4.0
-        samples = max(
-            int(math.ceil(segment.duration_s / _sample_interval(grid, config))),
-            SAMPLES_PER_SEGMENT_MIN,
-        ) + 1
+        samples = (
+            max(
+                int(math.ceil(segment.duration_s / _sample_interval(grid, config))),
+                SAMPLES_PER_SEGMENT_MIN,
+            )
+            + 1
+        )
         unsupported = None
         self_occupied_radius = envelope.inflation_m + slack
         for step in range(samples):
-            time = segment.t_start_s + segment.duration_s * step / samples
-            centre = segment.value(time)
+            sample_time_s = segment.t_start_s + segment.duration_s * step / samples
+            centre = segment.value(sample_time_s)
             # The part of the curve still inside the envelope the aircraft already
             # occupies at its start is not a claim about new space: the aircraft is
             # there. Everything beyond that ball must be supported free space.
-            if float(np.linalg.norm(np.asarray(centre) - np.asarray(start))) <= self_occupied_radius:
+            if (
+                float(np.linalg.norm(np.asarray(centre) - np.asarray(start)))
+                <= self_occupied_radius
+            ):
                 continue
             here = grid.cell_index(tuple(float(value) for value in centre))
             for offset in geometry_module.ball_offsets(grid, self_occupied_radius):
@@ -878,7 +1009,7 @@ def _certify_segments(
                 break
         if unsupported is not None:
             return None, (
-                f"segment-{index} sweeps cell {unsupported}, whose envelope is not supported "
+                f"segment-{index} sweeps cell {unsupported}, which is not published "
                 "free space"
             )
         segments.append(segment)
@@ -906,7 +1037,9 @@ def _backup_segment(
             index=-1,
             t_start_s=0.0,
             duration_s=config.settle_s,
-            coefficients=tuple((float(value), 0.0, 0.0, 0.0, 0.0, 0.0) for value in start),
+            coefficients=tuple(
+                (float(value), 0.0, 0.0, 0.0, 0.0, 0.0) for value in start
+            ),
             low=start,
             high=start,
             max_speed_mps=0.0,
@@ -916,7 +1049,9 @@ def _backup_segment(
         )
         missing = [cell for cell in _cells_of(segment, grid) if cell not in traversable]
         return None if missing else segment
-    distance = speed * config.limits.reaction_s + speed * speed / (2.0 * config.limits.deceleration_mps2)
+    distance = speed * config.limits.reaction_s + speed * speed / (
+        2.0 * config.limits.deceleration_mps2
+    )
     direction = np.asarray(velocity_mps, dtype=np.float64) / speed
     end = np.asarray(start, dtype=np.float64) + direction * distance
     duration = max(distance / max(speed, 1e-6), 0.1)
