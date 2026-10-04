@@ -2217,13 +2217,28 @@ class MissionRuntime:
         now it agrees because it is the same constant, and the certificate's
         clearance is the value both questions inherit.
         """
-        return GE.inflated_free_cells(
+        free = GE.inflated_free_cells(
             self.store,
             ENVELOPE,
             now_ns=self._now_ns(),
             self_occupied_origin_odom_m=here,
             extra_margin_m=self.store.config.voxel_m * PL.CERTIFICATE_MARGIN_VOXELS,
         )
+        # Membership is not the question admission asks. `planner.plan` runs A*
+        # from the aircraft's own cell and refuses with `no_known_supported_route`
+        # when no path connects it to the goal region — so a region holding free
+        # cells that no route reaches is a goal the planner will refuse.
+        # Measured on J48-fly-1: this method's caller accepted a vantage on
+        # membership alone, admission refused it, and the frontier was then marked
+        # blocked and never offered again.
+        #
+        # So the set returned here is the component reachable from where the
+        # aircraft stands, by the planner's own adjacency and its own margin. One
+        # home for both questions, which is what R23 began and this finishes.
+        if not free:
+            return set()
+        start_cell = self.store.config.cell_index(here)
+        return set(PL.reachable_from(frozenset(free), start_cell))
 
     def navigable_frontiers(self) -> tuple[str, ...]:
         """The frontiers this mission may fly to, the most distant vantage first.
