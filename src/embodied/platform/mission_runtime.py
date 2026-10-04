@@ -167,7 +167,26 @@ MAP_PARAMETERS = dict(
 # binding term — see work/runs/p05/J37-allowance-REPORT.md.
 ESTIMATOR_HEALTHY_SIGMA_MAX_M = 0.05
 ERROR_ALLOWANCE_M = 3.0 * ESTIMATOR_HEALTHY_SIGMA_MAX_M
-ENVELOPE = GE.Envelope(body_radius_m=0.3, error_allowance_m=ERROR_ALLOWANCE_M)
+# The sensor's near blind field. The matcher cannot report depth inside it, so no
+# free-space evidence can exist there in any direction, and a clearance ball around
+# any cell within about half a metre of the camera reaches space the sensor provably
+# cannot see. The self-occupied exemption is derived from this rather than from the
+# envelope (GE.Envelope.self_occupied_radius_m), because the exemption exists for
+# what the vehicle's own presence blinds, and the envelope is not that quantity.
+#
+# It mirrors the declared depth window's near bound —
+# configs/first_indoor.yaml calibration.bounds.depth_range_m[0]. The mirror is pinned
+# by tests/platform/test_near_field_clearance.py so the two cannot drift apart.
+#
+# Measured, J44-fly-1: with the exemption at the envelope radius, 0 of 26 neighbours
+# were searchable and every one of the mission's 36 setpoints was a station hold.
+# 83 % of the ball disqualifiers sat within this distance of the camera.
+SENSOR_NEAR_LIMIT_M = 0.5
+ENVELOPE = GE.Envelope(
+    body_radius_m=0.3,
+    error_allowance_m=ERROR_ALLOWANCE_M,
+    sensor_near_limit_m=SENSOR_NEAR_LIMIT_M,
+)
 PLAN_CONFIG = PL.PlanConfig(
     limits=PL.PlanLimits(),
     inflation_m=0.4,
@@ -357,7 +376,11 @@ class _ActiveGoal:
     # into space the map has not evidenced.
     hold_yaw_rad: float = MISSION_YAW_HOLD_RAD
     hold_yaw_rate_rad_s: float = 0.0
-    hold_since_s: float = 0.0
+    # SIMULATOR seconds, not wall seconds. The sweep's duration is a declared sim
+    # window, so the angle swept has to be measured against the same clock, or it
+    # depends on how fast the host happened to run — defect 16's shape, measured on
+    # J44-fly-1 as 3.08 rad swept against a declared 6.0.
+    hold_since_sim_s: float = 0.0
 
 
 class MissionRuntime:
@@ -1721,6 +1744,10 @@ class MissionRuntime:
         self._last_observation_id = observation.record_id
         return observation
 
+    def _sim_now_s(self) -> float:
+        """The simulator's own clock, in seconds — the one the declared windows use."""
+        return self._stats.sim_clock.newest_s or 0.0
+
     def observe_in_place(self, *, target_ref: str | None, refused_reason: str) -> tuple[bool, str]:
         """Section 12.2's conditional observation objective, admitted and flown.
 
@@ -1745,7 +1772,7 @@ class MissionRuntime:
             hold_position_odom=position,
             hold_yaw_rad=MISSION_YAW_HOLD_RAD,
             hold_yaw_rate_rad_s=OBSERVATION_YAW_RATE_RAD_S,
-            hold_since_s=time.monotonic(),
+            hold_since_sim_s=self._sim_now_s(),
         )
         window = _SimWindow(
             self._stats.sim_clock,
@@ -1819,9 +1846,15 @@ class MissionRuntime:
         # space it needs to certify stops being space nobody has looked at.
         yaw_rad = active.hold_yaw_rad
         if active.hold_yaw_rate_rad_s:
-            yaw_rad = active.hold_yaw_rad + (
-                time.monotonic() - active.hold_since_s
-            ) * active.hold_yaw_rate_rad_s
+            # Measured on the SAME clock the sweep's declared window is spent on.
+            # On the wall clock the swept angle depended on the host's own speed:
+            # J44-fly-1 swept 3.08 rad against a declared 6.0. Clamped to the
+            # declared window, so a clock that jumps cannot command an angle the
+            # sweep never declared.
+            elapsed_sim_s = min(
+                self._sim_now_s() - active.hold_since_sim_s, OBSERVATION_SWEEP_SIM_S
+            )
+            yaw_rad = active.hold_yaw_rad + elapsed_sim_s * active.hold_yaw_rate_rad_s
         sent = self._platform.send_local_ned(
             LocalNedTarget(
                 position_ned=position_ned,

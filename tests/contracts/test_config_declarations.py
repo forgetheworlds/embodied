@@ -65,6 +65,7 @@ def test_every_declared_value_matches_the_constant_in_force(declared: dict) -> N
     rows: list[tuple[str, str, object]] = [
         ("vehicle", "body_radius_m", runtime.ENVELOPE.body_radius_m),
         ("vehicle", "error_allowance_m", runtime.ERROR_ALLOWANCE_M),
+        ("vehicle", "sensor_near_limit_m", runtime.SENSOR_NEAR_LIMIT_M),
         ("planner", "certificate_margin_voxels", planner_module.CERTIFICATE_MARGIN_VOXELS),
         ("planner", "standoff_m", geometry_module.STANDOFF_M),
         ("planner", "approach_half_thickness_m", geometry_module.APPROACH_HALF_THICKNESS_M),
@@ -117,7 +118,7 @@ def test_no_declared_key_is_unpinned(declared: dict) -> None:
     never checked.
     """
     pinned = {
-        "vehicle": {"body_radius_m", "error_allowance_m"},
+        "vehicle": {"body_radius_m", "error_allowance_m", "sensor_near_limit_m"},
         "planner": {
             "certificate_margin_voxels",
             "standoff_m",

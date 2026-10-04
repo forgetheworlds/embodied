@@ -173,6 +173,31 @@ vehicle:
   # (sigma up to 1.0 m). J37 measured this composition against the vestibule
   # doorway and found the allowance is not its binding term.
   error_allowance_m: 0.15
+  #
+  # 0.5 m: the sensor's near blind field, and it mirrors
+  # calibration.bounds.depth_range_m[0] below. The matcher cannot report depth
+  # inside it, so no free-space evidence can exist there in ANY direction — which
+  # is why a clearance ball around any cell within about half a metre of the
+  # camera reaches space the sensor provably cannot see. Measured, J44-fly-1:
+  # 83 % of every ball disqualifier sat within this distance of the camera and
+  # they were spread over all eight octants, not sitting behind the aircraft.
+  #
+  # The self-occupied exemption is derived from this value rather than from the
+  # envelope, because the exemption exists for what the vehicle's own presence
+  # blinds, and the envelope is not that quantity. The derived exempt radius is
+  # near_limit + sqrt(3) x voxel = 0.5 + 0.173 = 0.673 m (one body-diagonal step,
+  # so every cell the aircraft could step to is startable), which selects the same
+  # discrete ball as the 0.675 m an independent mission measured as sufficient.
+  #
+  # Before this, the exemption was the envelope radius, 0.475 m, and NO neighbour
+  # was searchable: 0 of 26. The mission published 36 setpoints, every one a
+  # station hold at the same position, and travelled nowhere.
+  #
+  # It does not widen the free space ahead. The exemption marks cells free for the
+  # START of a plan only; every cell beyond it is still refused unless the map
+  # carries evidence that it is free. tests/platform/test_near_field_clearance.py
+  # pins this value to the depth window's own near bound.
+  sensor_near_limit_m: 0.5
 
 planner:
   # 0.25 voxels: the margin a cell must hold beyond the declared envelope for
