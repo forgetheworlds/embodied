@@ -1534,6 +1534,11 @@ class TelemetrySample:
     # Parameters the autopilot has reported about itself, by name. This is the only
     # statement of the configuration that is actually running.
     parameters: dict[str, float]
+    # The primary barometer's own reading, exactly as SCALED_PRESSURE carries it:
+    # absolute pressure in hPa and its temperature in centi-degrees C. The R24 z
+    # guard's reference; None until a message carrying it has been seen.
+    press_abs_hpa: float | None = None
+    press_temp_cdegc: int | None = None
 
     @property
     def in_guided_mode(self) -> bool:
@@ -1601,6 +1606,8 @@ def decode_telemetry(
         "home_position": None,
         "autopilot_version": None,
         "parameters": {},
+        "press_abs_hpa": None,
+        "press_temp_cdegc": None,
         "messages_seen": 0,
     }
     if previous is not None:
@@ -1623,6 +1630,8 @@ def decode_telemetry(
                 "home_position": previous.home_position,
                 "autopilot_version": previous.autopilot_version,
                 "parameters": dict(previous.parameters),
+                "press_abs_hpa": previous.press_abs_hpa,
+                "press_temp_cdegc": previous.press_temp_cdegc,
             }
         )
 
@@ -1654,6 +1663,13 @@ def decode_telemetry(
         elif kind == "LOCAL_POSITION_NED":
             latest["local_position_ned"] = _triple(message, "x", "y", "z")
             latest["velocity_ned"] = _triple(message, "vx", "vy", "vz")
+        elif kind == "SCALED_PRESSURE":
+            # The barometer itself. A frame without the pressure field carries
+            # nothing and is not invented into one.
+            if message.get("press_abs") is not None:
+                latest["press_abs_hpa"] = float(message["press_abs"])
+            if message.get("temperature") is not None:
+                latest["press_temp_cdegc"] = int(message["temperature"])
         elif kind == "SERVO_OUTPUT_RAW":
             latest["servo_outputs"] = tuple(
                 UNKNOWN_SERVO_RAW if message.get(f"servo{index}_raw") is None
@@ -1710,6 +1726,38 @@ def decode_telemetry(
         home_position=latest["home_position"],
         autopilot_version=latest["autopilot_version"],
         parameters=dict(latest["parameters"]),
+        press_abs_hpa=latest["press_abs_hpa"],
+        press_temp_cdegc=latest["press_temp_cdegc"],
+    )
+
+
+# ArduPilot's own simple pressure-to-altitude model, get_altitude_difference_simple
+# (AP_Baro_atmosphere.cpp:54-67 at the pinned commit): the altitude difference is
+# 153.8462 * T * (1 - (p/p0)^0.190259) with the temperature in kelvin. The runtime
+# converts the barometer's pressure with the run's FIRST reading as the datum
+# (p0, T0), so what reaches the z guard is the vehicle's own altitude convention
+# up to one fixed datum — the thing the guard's fixed-offset window exists to
+# absorb. No second atmospheric model is invented here.
+BARO_ALTITUDE_KELVIN_SCALE = 153.8462
+BARO_ALTITUDE_LOG_COEFFICIENT = 0.190259
+
+
+def baro_relative_altitude_m(
+    press_abs_hpa: float,
+    temp_cdegc: int,
+    ref_press_abs_hpa: float,
+    ref_temp_cdegc: int,
+) -> float:
+    """Metres above the reference sample's pressure datum, by ArduPilot's model.
+
+    Up-positive, like the altitude the barometer measures; the vision z it is
+    compared against is down-positive, and the z guard's fixed offset absorbs
+    the sign and the datum between the two frames.
+    """
+    temp_k = (ref_temp_cdegc / 100.0) + 273.15
+    scaling = press_abs_hpa / ref_press_abs_hpa
+    return BARO_ALTITUDE_KELVIN_SCALE * temp_k * (
+        1.0 - math.exp(BARO_ALTITUDE_LOG_COEFFICIENT * math.log(scaling))
     )
 
 
@@ -1970,9 +2018,24 @@ MAV_FRAME_BODY_NED = 8
 # the message rate is that join's resolution. Attitude is what the join samples.
 ATTITUDE_STREAM_HZ = 50.0
 
+# The R24 z guard's barometric reference stream. Matched to the position stream's
+# 10 Hz: the divergence the guard polices grew >= 1 m within 4 s of onset
+# (work/runs/night/Z-CLIMB.md), so a ~0.1 s reference staleness is two orders of
+# magnitude under the bound's decision scale.
+BARO_STREAM_HZ = 10.0
+
 # Message identifiers this adapter asks the autopilot for.
 MSG_ID_ATTITUDE = 30
 MSG_ID_LOCAL_POSITION_NED = 32
+# The primary barometer's own report — the R24 z guard's reference. Deliberately
+# NOT GLOBAL_POSITION_INT: at the pinned commit that message's altitudes are the
+# EKF's position expressed in the origin datum (send_global_position_int reads
+# ahrs.get_location; AP_NavEKF3_Outputs.cpp:316 builds loc.alt from posD, the
+# fused down position) and with EK3_SRC1_POSZ 6 the fused z IS the vision feed —
+# the guard would compare vision with vision exactly when vision is wrong.
+# SCALED_PRESSURE is AP_Baro itself, untouched by the estimator
+# (send_scaled_pressure_instance: barometer.get_pressure(instance), GCS_Common.cpp:2404).
+MSG_ID_SCALED_PRESSURE = 29
 MSG_ID_SERVO_OUTPUT_RAW = 36
 MSG_ID_AUTOPILOT_VERSION = 148
 MSG_ID_EKF_STATUS_REPORT = 193
@@ -3269,6 +3332,11 @@ class WebotsArduPilot:
         for message_id, hz in (
             (MSG_ID_ATTITUDE, ATTITUDE_STREAM_HZ),
             (MSG_ID_LOCAL_POSITION_NED, 10.0),
+            # The z guard's reference, read beside the position stream it is
+            # compared against. A widening of the read set only: the request is
+            # a COMMAND_LONG (MAV_CMD_SET_MESSAGE_INTERVAL), already in
+            # ALLOWED_OUTBOUND_TYPES, and nothing outbound changes.
+            (MSG_ID_SCALED_PRESSURE, BARO_STREAM_HZ),
             (MSG_ID_SERVO_OUTPUT_RAW, 5.0),
             (MSG_ID_EKF_STATUS_REPORT, 2.0),
         ):

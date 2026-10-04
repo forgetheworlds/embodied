@@ -19,15 +19,17 @@ from embodied.platform.mission_runtime import MissionResult, MissionRuntime
 
 
 class _LogHolder:
-    """The two attributes ``_surface_refusals`` actually uses.
+    """The attributes ``_surface_refusals`` actually uses.
 
     The method is called unbound against this stub so the rule can be tested
     without constructing a runtime, whose construction reads the whole platform
-    configuration and would start nothing anyway.
+    configuration and would start nothing anyway. ``_publisher`` is None, which
+    is the no-trip case of the R24 z-guard line the method also surfaces.
     """
 
     def __init__(self, refusals: list[str]) -> None:
         self._refusals_log = refusals
+        self._publisher = None
         self.result = MissionResult(flew=False, termination_reason="mission_completed")
 
 

@@ -493,6 +493,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 # Optional: the runtime defaults it, so a config that predates
                 # the tracker floor keeps loading and keeps the default.
                 "tracking_lost_min_tracks": _Optional(int),
+                # R24's z guard, the same optional-declaration pattern: the
+                # runtime defaults each key, and configs/first_indoor.yaml
+                # declares all three with their derivation.
+                "z_guard_max_residual_m": _Optional(float),
+                "z_guard_offset_window_ms": _Optional(int),
+                "z_guard_baro_stale_after_ms": _Optional(int),
                 "disagreement_p95_m": float,
                 "disagreement_max_m": float,
                 "error_p95_horizontal_m": float,

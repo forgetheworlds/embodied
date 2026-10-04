@@ -1139,6 +1139,12 @@ LOCALIZATION_SECTION: dict[str, Any] = {
         "sigma_min_m": float,
         "sigma_max_m": float,
         "tracking_lost_min_tracks": _Optional(int),
+        # R24's z guard, the shared cli.py schema's same three optional keys:
+        # the runtime defaults each, and configs/first_indoor.yaml declares all
+        # three with their derivation.
+        "z_guard_max_residual_m": _Optional(float),
+        "z_guard_offset_window_ms": _Optional(int),
+        "z_guard_baro_stale_after_ms": _Optional(int),
         "disagreement_p95_m": float,
         "disagreement_max_m": float,
         # E1, against evaluator truth: plan-fixed values, the upper edge of the

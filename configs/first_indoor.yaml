@@ -1067,6 +1067,69 @@ localization:
     # 1. A floor near the healthy range would refuse legitimate sparse views; this
     # one cannot.
     tracking_lost_min_tracks: 5
+    # ---------------------------------------------------------------------------
+    # R24 — the vision-publication z guard (owner ruling 2026-10-04; the crash
+    # mechanism is work/runs/night/Z-CLIMB.md). The FC's altitude channel IS the
+    # estimator's z (EK3_SRC1_POSZ 6), so J53-vantage-2's wandering estimate was
+    # indistinguishable from real motion: Guided held a fixed target against it
+    # with saturated motors until the crash detector disarmed a flipped aircraft.
+    # On breach of the residual bound below, the ExternalNavPublisher STOPS
+    # publishing vision and the firmware's own external-navigation-loss machinery
+    # (FS_EKF_ACTION 1) lands protectively. The bound refuses to publish; it never
+    # edits the estimator's output, the FC's fusion, or any existing declared
+    # verdict, and the divergence that trips it is named in the run's receipt.
+    #
+    # The reference is the vehicle's own barometer, read as SCALED_PRESSURE — the
+    # primary barometer itself. GLOBAL_POSITION_INT would not do: at the pinned
+    # commit its altitudes are the EKF's position in the origin datum
+    # (AP_NavEKF3_Outputs.cpp:316), which with EK3_SRC1_POSZ 6 is the vision feed,
+    # so the guard would compare vision with vision exactly when vision is wrong.
+    #
+    # z_guard_max_residual_m -- 0.6 m, the midpoint of the owner's 0.5-0.75 m
+    # band, which separates the measured regimes with margin on both sides:
+    #   - healthy runs disagree with the barometer by <= 0.2 m in z across the
+    #     whole healthy envelope, so the bound is 3x the worst healthy
+    #     disagreement and per-tick noise cannot trip it;
+    #   - J53's divergence crossed 1 m within 4 s of onset (and 0.48 m in the
+    #     first resumption step alone), so 0.6 m trips at the measured onset
+    #     rate ~2.5 s after onset -- well before the 1 m crossing that preceded
+    #     saturation, and with >= 1.7x margin against the divergence magnitude
+    #     that produced the crash.
+    # The populations separate cleanly (3x below, 1.7x above), so the bound
+    # needs no debounce: a single inside-band spike (J53's first 0.48 m step)
+    # publishes; sustained divergence crosses.
+    #
+    # Frames. Vision z is local NED (down-positive, odom-origin datum); the
+    # barometer reads pressure, converted by ArduPilot's own simple model with
+    # the run's first reading as datum (up-positive). The guard estimates ONE
+    # fixed offset between (-vision z) and that altitude over the window below
+    # and binds only the RESIDUAL, so neither frame's datum enters the bound.
+    # A fixed offset is safe at this scale because the healthy population
+    # already spans the mission envelope: <= 0.2 m covers everything a healthy
+    # flight does to the pair (including barometric drift over the declared
+    # mission length), and the divergence being caught grows >= 1 m in 4 s -- a
+    # rate no barometric drift produces. If a future mission flies long enough
+    # for barometric drift to approach this band, the assumption is unsafe and
+    # the honest alternative is a drifting (windowed) offset re-estimated on
+    # evidence, not a wider bound.
+    #
+    # z_guard_offset_window_ms -- 10 s of PUBLISHED states from the first state
+    # the wire carried. Assumptions, declared: the window covers estimator
+    # bring-up and the parked/takeoff phase (init latches inside it on healthy
+    # runs) and closes before the first observation sweep -- the measured
+    # degradation source (0.6 rad/s yaw; J53's first sweep began at sim 39.8 s
+    # against takeoff at 31.5 s). Before it closes the guard measures and never
+    # gates. Offset = median of the window's samples, robust to a single outlier.
+    #
+    # z_guard_baro_stale_after_ms -- 500 ms. The runtime hands the guard a fresh
+    # reading at ~5 Hz (the telemetry drain's 0.2 s turn) off the 10 Hz stream,
+    # so a live reference is at most ~0.3 s old; 500 ms admits that with margin.
+    # Past it the guard gates nothing: it is a comparison, not a source, and a
+    # frozen barometer must not false-trip every healthy climb and descent. The
+    # FC's own machinery remains the declared failsafe for a silent vehicle.
+    z_guard_max_residual_m: 0.6
+    z_guard_offset_window_ms: 10000
+    z_guard_baro_stale_after_ms: 500
     disagreement_p95_m: 0.20
     disagreement_max_m: 0.40
     # E1, against evaluator truth in the odom-aligned frame (plan section 6,
