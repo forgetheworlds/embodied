@@ -177,3 +177,41 @@ def test_the_candidate_the_old_rule_accepted_lands_the_goal_on_the_aircraft():
     """
     target = (HERE[0] + GE.STANDOFF_M, HERE[1], HERE[2])
     assert _goal_region(target).contains(HERE)
+
+
+def test_the_excursion_standoff_is_derived_from_the_searchable_shell():
+    """The standoff cannot exceed the space the exemption can make searchable.
+
+    The gap this closes, measured on J47-nearfield-1: the live map carried ONE
+    evidence-supported searchable cell, so every other searchable cell was the
+    self-occupied exemption bubble. A cell is searchable only if its whole
+    clearance ball is free, so the deepest searchable cell inside that bubble is
+    ``self_occupied_radius - (inflation + certificate margin)``, and a goal region
+    of half-extent ``inflation + 0.1`` must contain one of them while sitting at
+    least ``EXCURSION_STANDOFF_M`` from the aircraft. The 1.0 m it used to carry
+    could not be satisfied at all.
+
+    Pins the derived value *and* the walk's step against the shell, so neither can
+    drift out of range, and asserts the approach standoff did not move with them.
+    """
+    from embodied.navigation import planner as planner_module
+    from embodied.platform import mission_runtime as MR
+
+    voxel = float(MR.MAP_PARAMETERS["voxel_m"])
+    envelope = MR.ENVELOPE
+    shell = envelope.self_occupied_radius_m(voxel) - (
+        envelope.inflation_m + voxel * planner_module.CERTIFICATE_MARGIN_VOXELS
+    )
+
+    assert MR.EXCURSION_STANDOFF_M <= shell, (
+        f"standoff {MR.EXCURSION_STANDOFF_M} exceeds the {shell:.3f} m searchable shell"
+    )
+    band = shell - MR.EXCURSION_STANDOFF_M
+    assert MR.FRONTIER_VANTAGE_STEP_M <= band, (
+        f"a {MR.FRONTIER_VANTAGE_STEP_M} m step cannot land in a {band:.3f} m band; "
+        "the walk steps clean over the only candidates that can be accepted"
+    )
+    # The approach standoff is a different quantity — how far the aircraft comes to
+    # rest before a doorway or the object it inspects — and must not have moved.
+    assert GE.STANDOFF_M == 1.0
+    assert MR.EXCURSION_STANDOFF_M < GE.STANDOFF_M

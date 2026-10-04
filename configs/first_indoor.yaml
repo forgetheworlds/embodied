@@ -222,11 +222,19 @@ planner:
   # to rest before crossing: it stands off an unknown boundary, or an object it
   # inspects, rather than touching it.
   #
-  # 1.0 m: the standoff. Provenance unknown. The value is not derived anywhere in
-  # the source; it is declared at its present value under R2, and it is the one
-  # whose absence cost the most. The return goal must compensate for it
-  # (RETURN_STANDOFF_COMPENSATION_M) or its terminal region lands a metre short
-  # of the start.
+  # 1.0 m: the APPROACH standoff — how far the vehicle comes to rest before a
+  # doorway, or before the object it inspects. Provenance unknown; the value is not
+  # derived anywhere in the source, it is declared at its present value under R2,
+  # and it is the one whose absence cost the most. The return goal must compensate
+  # for it (RETURN_STANDOFF_COMPENSATION_M) or its terminal region lands a metre
+  # short of the start.
+  #
+  # It is NOT the excursion standoff, and the two were one value until 2026-10-03.
+  # The owner ruled that the *excursion* standoff be lowered to the searchable
+  # bubble; lowering this one instead would fly the aircraft to within 10 cm of the
+  # object it is inspecting, which is a different change and was not ruled on. The
+  # excursion measure now lives in the mission section as `excursion_standoff_m`,
+  # derived, and only the frontier vantage search reads it.
   standoff_m: 1.0
   #
   # 0.3 m: the approach box's half-thickness, so the region spans 0.7 m to 1.3 m
@@ -272,18 +280,41 @@ mission:
   # one frontier rather than eight.
   frontier_cluster_cells: 6
   #
-  # 0.2: how far the vantage search steps back toward the aircraft, which stands
-  # in known free space by construction, until the standoff region it will occupy
-  # is entirely supported. A frontier is a free cell touching unknown space, so
-  # the region the executor builds around it can overlap space the map has no
-  # evidence for, and the planner refuses that correctly: a larger margin cannot
-  # turn unseen space into measured free space (specification 7.1).
+  # 0.10: THE EXCURSION STANDOFF — split on 2026-10-03 from the approach standoff
+  # in the planner section, which is a different quantity. This one answers only:
+  # how far must a goal's region be from the aircraft to count as a view taken from
+  # somewhere else rather than a hover?
   #
-  # Provenance unknown. The source states no derivation, and that 0.2 is two
-  # voxels at the declared size is an observation about the number, not a
-  # recorded intent. Declared at its present value under R2, and listed with the
-  # owner questions in work/runs/p05/J41-schema-REPORT.md.
-  frontier_vantage_step_m: 0.2
+  # Derived, because the value it replaces (1.0 m, provenance unknown) could not be
+  # satisfied. The space the planner may search is set by the self-occupied
+  # exemption, and a cell is searchable only if its whole clearance ball is free:
+  #
+  #     self-occupied radius - (inflation + certificate margin)
+  #       = (0.5 + sqrt(3) * 0.1) - (0.45 + 0.1 * 0.25)
+  #       = 0.673 - 0.475 = 0.198 m
+  #
+  # So 0.198 m is the deepest searchable cell the exemption can provide, and a goal
+  # region of half-extent 0.55 m must reach one of them while sitting at least this
+  # far away — so the standoff can be at most 0.198 m. Half of that leaves the
+  # search a band to land in. Measured on J47-nearfield-1: the live map carried ONE
+  # evidence-supported searchable cell, every other searchable cell was the
+  # exemption bubble, and no candidate's region reached any of them.
+  excursion_standoff_m: 0.10
+  #
+  # 0.05: how far the vantage search steps back toward the aircraft, which stands in
+  # free space by construction, until the region it will occupy is supported. A
+  # frontier is a free cell touching unknown space, so the region the executor
+  # builds around it can overlap space the map has no evidence for, and the planner
+  # refuses that correctly: a larger margin cannot turn unseen space into measured
+  # free space (specification 7.1).
+  #
+  # Derived as a quarter of the same 0.198 m shell, because the walk must be fine
+  # enough to land inside the band it is looking for, which is 0.198 - 0.10 =
+  # 0.098 m wide. At the 0.2 m it carried before — two voxels, "an observation about
+  # the number, not a recorded intent" — the walk stepped clean over that band at
+  # every standoff, which is why lowering the standoff alone would not have moved
+  # the aircraft. A finer walk is a stricter search, never a weaker one.
+  frontier_vantage_step_m: 0.05
   #
   # Arrival, in the real clock. Specification 13.3 requires "the declared
   # position/velocity relationship over a settle interval selected during
