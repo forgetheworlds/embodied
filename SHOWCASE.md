@@ -439,9 +439,21 @@ textured surfaces: 100 % of compared samples inside the declared tolerance
 
 **Not established.**
 
-- **The aircraft has never moved under command.** No run on disk has a commanded translation.
-  `publications: 0` in every recent run. The binding constraint is connectivity through the inflated
-  corridors, and its lever is a map-parameters dict that has no configuration home.
+- **The aircraft has never moved under command.** `publications: 0` in every run. The reason is now
+  measured rather than guessed, and it is a **scale mismatch**: the clearance ball the planner must
+  certify is **0.475 m** of radius, and the stereo matcher cannot report depth inside **0.5 m** of
+  the camera. 83 % of every ball's disqualifiers sat inside that blind field, so the aircraft could
+  not certify a step from any number of vantages, and could not move to gain one. The exemption that
+  exists for exactly that blind volume has since been **derived** from the near limit rather than
+  chosen — `max(0.475, 0.5 + √3 × 0.1) = 0.673 m` — which is a correction, not a loosening: it marks
+  cells free for the **start** of a plan only, and every cell beyond it is still refused without map
+  evidence.
+- **Three things still stand between that and motion, each measured.** The estimator ends runs before
+  they can act — three in a row, with the position estimate walking to **4,936 m** and the
+  autopilot's own EKF failsafe firing. The vantage search accepts a target that admission then
+  refuses, so it asks a weaker question than the one that decides. And the map expires: observed-free
+  cells fall from **19,036 to 0** six seconds after the last observation of any cell, so a mission
+  that explored and returned would find its own route unknown.
 - **The task has never been done.** Across 37 runs, `inspected` is false in every one. No run has
   found the target.
 - **No held-out scoring has run.** Four held-out scenes exist with their own truth, and the transport
