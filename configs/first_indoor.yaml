@@ -201,13 +201,18 @@ vehicle:
 
 planner:
   # 0.25 voxels: the margin a cell must hold beyond the declared envelope for
-  # BOTH questions this planner asks of a cell, the set a certificate walks in
-  # (traversable) and the set a goal or start cell is chosen from (searchable).
+  # both questions this planner asks of a cell — the radius of the occupancy
+  # set the route walks and every knot is chosen from (a knot is a place the
+  # vehicle may stop and hold), and the slack inside the clearance ball the
+  # certificate sweeps against the map's published free cells.
   #
   # The quarter voxel is the certificate's own. It walks the curve at a spacing
   # whose displacement bound is that quarter voxel (planner._sample_interval
-  # returns voxel / (4 * v_max)) and _certify_segments passes the same slack, so
-  # a curve inside this set has its whole swept tube inside free space.
+  # returns voxel / (4 * v_max)) and sweeps a ball of the declared envelope plus
+  # that slack: every cell inside the ball must be published free. Membership in
+  # the occupancy set there would inflate a second time — 0.95 m of raw free
+  # space against the declared 0.475 m clearance on this map — and that second
+  # width refused every first setpoint on the doorway map (2026-10-03).
   #
   # R23 (owner ruling, 2026-10-02) unified the goal search onto this value. It
   # had used a HALF voxel, which had no stated justification and was stricter

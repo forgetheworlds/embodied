@@ -28,7 +28,9 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "navigation" / "doo
 
 @pytest.fixture(scope="module")
 def fixture():
-    spec = importlib.util.spec_from_file_location("p03_doorway_generate_nav", FIXTURE / "generate.py")
+    spec = importlib.util.spec_from_file_location(
+        "p03_doorway_generate_nav", FIXTURE / "generate.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -41,7 +43,9 @@ def scene() -> dict:
 
 @pytest.fixture(scope="module")
 def truth() -> dict:
-    return json.loads((FIXTURE / "truth" / "expected-answer.json").read_text(encoding="utf-8"))
+    return json.loads(
+        (FIXTURE / "truth" / "expected-answer.json").read_text(encoding="utf-8")
+    )
 
 
 _STORES: dict[str, world_module.MapStore] = {}
@@ -70,7 +74,9 @@ def build_store(fixture, variant: str = "nominal") -> world_module.MapStore:
 
 
 def envelope(scene: dict) -> GE.Envelope:
-    return GE.Envelope(scene["vehicle"]["body_radius_m"], scene["vehicle"]["error_allowance_m"])
+    return GE.Envelope(
+        scene["vehicle"]["body_radius_m"], scene["vehicle"]["error_allowance_m"]
+    )
 
 
 def plan_config(scene: dict) -> PL.PlanConfig:
@@ -91,7 +97,9 @@ def plan_config(scene: dict) -> PL.PlanConfig:
 
 
 def ground_target(fixture, variant: str = "nominal") -> R.GroundedTarget:
-    selections = {selection.selection_id: selection for selection in fixture.selection_records()}
+    selections = {
+        selection.selection_id: selection for selection in fixture.selection_records()
+    }
     surfaces = fixture.variant_surfaces(variant)
     return G.ground(
         selections[fixture.SELECTION_APERTURE],
@@ -181,7 +189,9 @@ def test_a_route_through_the_inflated_opening_exists(fixture, scene, truth):
         extra_margin_m=store.config.voxel_m / 4.0,
     )
     start = store.config.cell_index(fixture.navigation_state().pose.position_m)
-    crossing = [cell for cell in regions.crossing.cells(store.config) if cell in traversable]
+    crossing = [
+        cell for cell in regions.crossing.cells(store.config) if cell in traversable
+    ]
     assert truth["traverse"]["route_exists"] is True
     assert crossing, "the crossing region contains supported free cells"
     assert regions.corridor_width_m == pytest.approx(
@@ -196,7 +206,9 @@ def test_the_certified_plan_publishes_a_valid_setpoint_prefix(fixture, scene, tr
     assert certificate.nav_epoch == scene["nav_epoch"]
     assert certificate.map_revision == store.revision
     assert certificate.dependent_cells
-    assert certificate.backup is not None, "a certificate without a checked backup is not published"
+    assert certificate.backup is not None, (
+        "a certificate without a checked backup is not published"
+    )
     limits = scene["limits"]
     for segment in certificate.segments:
         assert segment.max_speed_mps <= limits["v_max_mps"] + 1e-9
@@ -206,7 +218,9 @@ def test_the_certified_plan_publishes_a_valid_setpoint_prefix(fixture, scene, tr
     for previous, following in zip(certificate.segments, certificate.segments[1:]):
         for order in (1, 2):
             for axis in range(3):
-                assert previous.derivative(previous.t_end_s, order)[axis] == pytest.approx(
+                assert previous.derivative(previous.t_end_s, order)[
+                    axis
+                ] == pytest.approx(
                     following.derivative(following.t_start_s, order)[axis], abs=1e-6
                 )
     setpoints = EX.publish_prefix(
@@ -219,7 +233,9 @@ def test_the_certified_plan_publishes_a_valid_setpoint_prefix(fixture, scene, tr
     )
     expected = truth["setpoint_prefix"]
     assert len(setpoints) == expected["samples"]
-    assert all(setpoint.certificate_ref == certificate.certificate_id for setpoint in setpoints)
+    assert all(
+        setpoint.certificate_ref == certificate.certificate_id for setpoint in setpoints
+    )
     assert all(setpoint.nav_epoch == scene["nav_epoch"] for setpoint in setpoints)
     assert all(setpoint.frame is R.Frame.ODOM for setpoint in setpoints)
     assert all(setpoint.source is R.SetpointSource.NORMAL for setpoint in setpoints)
@@ -271,16 +287,22 @@ def test_a_blocked_passage_is_reported_not_worked_around(fixture, scene, truth):
     assert result.assessment.planner_witness is None
 
 
-def test_a_partial_block_leaves_a_route_through_the_remaining_opening(fixture, scene, truth):
+def test_a_partial_block_leaves_a_route_through_the_remaining_opening(
+    fixture, scene, truth
+):
     """The same planner replans through the part of the opening still observed free."""
     expected = truth["traverse"]["partial_block_variant"]
     surfaces = fixture.variant_surfaces("partial_block")
     partial = fixture.aperture_evidence(0, fixture.APERTURE_BOX_PX, surfaces)
-    assert partial["opening_width_m"] == pytest.approx(expected["opening_width_m"], abs=1e-6)
+    assert partial["opening_width_m"] == pytest.approx(
+        expected["opening_width_m"], abs=1e-6
+    )
     assert partial["corridor_width_m"] == pytest.approx(
         expected["corridor_width_m_after_inflation"], abs=1e-6
     )
-    assert partial["opening_width_m"] < truth["grounding"]["aperture"]["opening_width_m"]
+    assert (
+        partial["opening_width_m"] < truth["grounding"]["aperture"]["opening_width_m"]
+    )
     target = ground_target(fixture, "partial_block")
     assert isinstance(target, R.GroundedTarget)
     aperture = G.parse_aperture(target.geometry)
@@ -316,21 +338,35 @@ def test_a_partial_block_leaves_a_route_through_the_remaining_opening(fixture, s
 
 
 def test_the_planner_refuses_an_uncertifiable_crossing(fixture, scene, truth):
-    """The free space is a cone through the aperture: the crossing is not certifiable.
+    """Unknown space beyond the door prevents a traverse; the approach stays certified.
 
     Section 10.2's own answer for this case: unknown space beyond the door prevents
     traversal certification while still permitting an approach for another view.
-    The refusal is named, and no setpoint is published from it.
+    The refusal is named at admission, and no setpoint is published from it.
+
+    The admission-level assertions carry that answer, and they are unchanged by the
+    2026-10-03 sweep-membership fix: the traverse's terminal region beyond the wall
+    still holds no supported cell, so ``admit`` refuses before planning. Before that
+    fix this test also pinned a ``PlanRefusal`` from a direct ``plan`` call into the
+    crossing region — but the curve that refusal blocked never crossed anything: it
+    ended at the region's near face, short of the wall, and the doubled corridor the
+    old certification demanded (the envelope applied twice, ~0.85 m of raw free
+    space against the declared 0.425 m clearance on this scene) is what refused it.
+    The direct call now certifies that approach, so the pin here is what the
+    geometry actually claims: a certified curve whose centre never crosses the
+    aperture plane.
     """
     store, result = admission(fixture, scene)
-    assert result.certificate is None, "the traverse beyond the approach is not certifiable"
+    assert result.certificate is None, (
+        "the traverse beyond the approach is not certifiable"
+    )
     assert result.status.disposition is R.GoalDisposition.REJECTED
     assert result.assessment.verdict == EX.UNCERTAIN
     assert any(PL.UNSUPPORTED_SPACE in reason for reason in result.assessment.reasons)
     crossing_region = GE.BoxRegion(
         low=(2.65, 0.15, 0.55), high=(3.35, 0.45, 1.55), label="crossing"
     )
-    refusal = PL.plan(
+    outcome = PL.plan(
         store,
         envelope(scene),
         plan_config(scene),
@@ -346,11 +382,21 @@ def test_the_planner_refuses_an_uncertifiable_crossing(fixture, scene, truth):
         snapshot_id=store.snapshot_id,
         now_ns=fixture.EVALUATION_NS,
     )
-    assert isinstance(refusal, PL.PlanRefusal)
-    assert refusal.reason == PL.UNSUPPORTED_SPACE
-    assert "not supported free space" in refusal.detail
+    assert isinstance(outcome, PL.TrajectoryCertificate)
+    assert outcome.certified is True
+    # The wall face stands at x = 3.0 m (fixture truth: crossing band x in
+    # [2.6, 3.4]); the certified curve may approach the aperture mouth but its
+    # centre never crosses the aperture plane.
+    wall_face_x_m = 3.0
+    t = outcome.t_start_s
+    while t <= outcome.t_end_s + 1e-12:
+        position, _, _ = outcome.sample(t)
+        assert position[0] < wall_face_x_m, (
+            f"the certified curve crossed the aperture plane at x={position[0]:.3f}"
+        )
+        t += 0.01
     assert truth["traverse"]["crossing_certified"] is False
-    assert truth["traverse"]["crossing_refusal_reason"] == refusal.reason
+    assert truth["traverse"]["crossing_refusal_reason"] == PL.UNSUPPORTED_SPACE
     # The certified region the stage publishes is the approach.
     store_approach, certificate = approach_certificate(fixture, scene)
     assert certificate.certified is True
@@ -418,7 +464,10 @@ def test_validator_refuses_a_corrupted_certificate(fixture, scene):
     )
     corrupted = PL.TrajectoryCertificate(
         **{
-            **{field: getattr(certificate, field) for field in certificate.__dataclass_fields__},
+            **{
+                field: getattr(certificate, field)
+                for field in certificate.__dataclass_fields__
+            },
             "segments": (corrupted_segment,) + certificate.segments[1:],
             "dependent_cells": tuple(
                 set(certificate.dependent_cells)
@@ -454,7 +503,10 @@ def test_validator_refuses_a_limit_violating_certificate(fixture, scene):
     )
     violating = PL.TrajectoryCertificate(
         **{
-            **{field: getattr(certificate, field) for field in certificate.__dataclass_fields__},
+            **{
+                field: getattr(certificate, field)
+                for field in certificate.__dataclass_fields__
+            },
             "segments": (violating_segment,) + certificate.segments[1:],
         }
     )
@@ -467,7 +519,10 @@ def test_validator_refuses_an_uncertified_certificate(fixture, scene):
     store, certificate = approach_certificate(fixture, scene)
     uncertified = PL.TrajectoryCertificate(
         **{
-            **{field: getattr(certificate, field) for field in certificate.__dataclass_fields__},
+            **{
+                field: getattr(certificate, field)
+                for field in certificate.__dataclass_fields__
+            },
             "certified": False,
         }
     )
@@ -486,7 +541,9 @@ def test_validator_refuses_unknown_in_the_braking_region(fixture, scene):
     import dataclasses
 
     moved_pose = dataclasses.replace(state.pose, position_m=position)
-    moved_state = dataclasses.replace(state, pose=moved_pose, velocity_mps=(0.5, 0.0, 0.0))
+    moved_state = dataclasses.replace(
+        state, pose=moved_pose, velocity_mps=(0.5, 0.0, 0.0)
+    )
     verdict = _validated(fixture, scene, certificate, store, state=moved_state)
     assert not verdict.permitted()
     assert any(VA.UNSUPPORTED_SPACE in reason for reason in verdict.reasons)
@@ -546,7 +603,10 @@ def test_injected_pose_degradation_is_refused_by_the_validator(fixture, scene, t
     assert any(VA.POSE_ERROR_EXCEEDS_ALLOWANCE in reason for reason in verdict.reasons)
 
     # (c) a nav_epoch reset invalidates every prior control reference
-    reset_epoch = truth["grounding"]["aperture"] and fixture.POSE_DEGRADATION["epoch"]["nav_epoch"]
+    reset_epoch = (
+        truth["grounding"]["aperture"]
+        and fixture.POSE_DEGRADATION["epoch"]["nav_epoch"]
+    )
     reset = fixture.navigation_state(
         pose=fixture.degraded_pose("epoch"),
         nav_epoch=reset_epoch,
@@ -562,10 +622,15 @@ def test_injected_pose_degradation_is_refused_by_the_validator(fixture, scene, t
     refusal = PL.replan_is_current(certificate, jumped_pose.position_m)
     assert refusal is not None
     assert refusal.reason == PL.START_STATE_MISMATCH
-    assert jumped_pose.position_m[0] - certificate.start_position_odom_m[0] > certificate.start_tolerance_m
+    assert (
+        jumped_pose.position_m[0] - certificate.start_position_odom_m[0]
+        > certificate.start_tolerance_m
+    )
 
 
-def test_the_horizon_reports_its_limiting_reason_and_progress_separately(fixture, scene):
+def test_the_horizon_reports_its_limiting_reason_and_progress_separately(
+    fixture, scene
+):
     """Holding is containment, not progress: the two are reported separately."""
     store, certificate = approach_certificate(fixture, scene)
     # A short lease must bound the horizon when it is the smallest term, and the
