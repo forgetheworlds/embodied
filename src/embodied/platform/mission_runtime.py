@@ -53,6 +53,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import ctypes
 import faulthandler
+import math
 import os
 import queue
 import threading
@@ -509,6 +510,30 @@ OBSERVATION_YAW_RATE_RAD_S = 0.6
 OBSERVATION_SWEEP_SIM_S = 10.0
 OBSERVATION_MAX_PER_TARGET = 1
 
+# The vantage policy's declared count (R2): the consecutive ``unknown_geometry``
+# groundings of the query's selection that convert "selected but unmeasurable"
+# into a change of view — the section-12.2 observation sweep toward the
+# selection's bearing, then explore — instead of another selection from the same
+# pose. Declared in configs/first_indoor.yaml (mission.vantage_refusal_sweep_cycles).
+#
+# 2, derived from J52-discrim-1 (measured, GROUNDING-INVALID-DEPTH.md): the
+# mission re-selected the same unmeasurable decoy sliver 19 times — in runs of
+# 12 and 6 consecutive candidate-bearing observations (obs 3-14, obs 21-26; 207
+# further frames proposed no candidate) — and never once changed view, every
+# refusal the same `none of the 1 selected samples carries valid depth`. One
+# refusing cycle is not evidence of a vantage defect: a single frame can drop
+# out of the stereo matcher on an otherwise measurable view, and grounding
+# refuses honestly per pixel. The SECOND consecutive refusal of the same query
+# from the same standing view is the smallest count that separates the measured
+# pathology (invalid depth persisting over the selection) from a one-frame
+# transient: at 2 the measured run's first series sweeps on its 2nd selection
+# instead of re-selecting 19 times (12 wasted selections in that series alone).
+# The sweep itself runs at most once per standing view — the flag re-arms only
+# when a goal is admitted and flies, which is a new vantage — so the pair
+# (count 2, one sweep per view) cannot loop, and a sweep that still refuses ends
+# the episode honestly ("not measurable from here") rather than re-selecting.
+VANTAGE_REFUSAL_SWEEP_CYCLES = 2
+
 
 @dataclass
 class PhaseOutcome:
@@ -744,6 +769,14 @@ class MissionRuntime:
         # what bounds the refuse-observe-re-propose loop.
         self._observe_count = 0
         self._observed_targets: set[str] = set()
+        # The vantage policy's own state (GROUNDING-INVALID-DEPTH.md): how many
+        # consecutive cycles the query's selection has refused unknown_geometry,
+        # the bearing that selection was last seen at, and whether the standing
+        # view has already spent its one sweep. Re-armed by a new admitted
+        # vantage (_note_new_vantage), never by the refusals themselves.
+        self._unmeasurable_streak = 0
+        self._unmeasurable_bearing_rad = MISSION_YAW_HOLD_RAD
+        self._vantage_sweep_spent = False
         self._return_settled = False
         self._return_evidence: list[str] = []
         self._inspect_evidence: list[str] = []
@@ -1872,6 +1905,12 @@ class MissionRuntime:
                 self._perception_depth_s += t_end - t_frame_start
                 if self._perception_cycles > before:
                     cycles += 1
+                    # The pump is exactly the mission-had-nothing-to-do state the
+                    # vantage policy answers: perception ran, the selection (if
+                    # any) refused, and nothing else was flying. The consume is
+                    # bounded by the sweep's own once-per-view flag, so it cannot
+                    # turn into a second sweep inside this window.
+                    self._consume_vantage_sweep()
                     if until is not None and until():
                         break
             time.sleep(PERCEPTION_PUMP_SLEEP_S)
@@ -2020,9 +2059,144 @@ class MissionRuntime:
                 self._note_perception_refusal(
                     f"grounding_refused {target.reason}: {target.detail}"
                 )
+                # The refusal is honest and stays the refusal (no bound moves).
+                # What was missing is the policy that reads it: a selection that
+                # keeps refusing unknown_geometry is the vantage's verdict, and
+                # the streak below is what converts it into a change of view
+                # instead of a 20th selection of the same sliver.
+                if target.reason == G.REFUSAL_UNKNOWN_GEOMETRY:
+                    self._note_unmeasurable_selection(selection)
+                else:
+                    self._reset_unmeasurable_streak()
                 continue
             grounded.append(target)
+        if grounded:
+            # A grounding is a measurable view: the streak was about a selection
+            # that could not be measured, and that question is answered.
+            self._reset_unmeasurable_streak()
         return grounded
+
+    def _selection_bearing(self, selection: R.VisualSelection) -> float:
+        """The selection's horizontal bearing in the commanded-yaw frame.
+
+        The selection is image geometry and nothing else — the whole point of
+        the refusal is that no depth exists to place it in the world. Its
+        horizontal angle off the camera axis is ``atan2(u - u0, f)`` on the
+        declared pinhole model (the calibration's own focal length and
+        principal point), and the camera's heading is the mission's declared
+        hold yaw on every published goal (``publish_active`` commands
+        ``hold_yaw_rad`` for certificates and holds alike). So the bearing the
+        vantage sweep must start from is the hold yaw plus that offset, in the
+        same frame the yaw commands live in: a selection left of the image
+        centre carries a negative offset, matching the frame's yaw sign.
+        """
+        u, _v = (float(value) for value in selection.geometry)
+        intrinsics = self.calibration.left_intrinsics
+        return MISSION_YAW_HOLD_RAD + math.atan2(
+            u - float(intrinsics.principal_point_px[0]),
+            float(intrinsics.focal_length_px[0]),
+        )
+
+    def _note_unmeasurable_selection(self, selection: R.VisualSelection) -> None:
+        """Count one more consecutive unknown_geometry refusal of the query.
+
+        GROUNDING-INVALID-DEPTH.md: J52 refused the same selection 19 times and
+        the count went nowhere. The streak is what the vantage response reads
+        (``_consume_vantage_sweep``); the bearing is remembered so the sweep it
+        triggers starts at the selection rather than at the hold heading.
+        """
+        self._unmeasurable_streak += 1
+        self._unmeasurable_bearing_rad = self._selection_bearing(selection)
+
+    def _reset_unmeasurable_streak(self) -> None:
+        """The view was measured (or refused for a different reason): start over."""
+        self._unmeasurable_streak = 0
+
+    def _note_new_vantage(self) -> None:
+        """A new goal was admitted and will fly: the standing view is a new one.
+
+        This is the sweep's only re-arm. Bounded by it, a refuse-sweep episode
+        cannot loop: the refusals themselves never re-arm the sweep, so a
+        selection that stays unmeasurable is answered once per view — with the
+        sweep and then with explore, not with another selection.
+        """
+        self._unmeasurable_streak = 0
+        self._vantage_sweep_spent = False
+
+    def _consume_vantage_sweep(self) -> None:
+        """Convert a persistent unknown_geometry refusal into a change of view.
+
+        The response uses the machinery the runtime already owns: the
+        section-12.2 observation objective, started at the selection's bearing,
+        turning the aircraft where it stands. Nothing translates, so there is
+        no route to certify and no unevidenced space is entered. The sweep's
+        honest terminal is "not measurable from here": a refusal after a real
+        look is a valid outcome and is recorded as one — explore, not another
+        selection, is what follows.
+        """
+        if self._vantage_sweep_spent:
+            return
+        if self._unmeasurable_streak < VANTAGE_REFUSAL_SWEEP_CYCLES:
+            return
+        self._vantage_sweep_spent = True
+        bearing = self._unmeasurable_bearing_rad
+        before = len(self._candidate_targets)
+        observed, goal_id = self.observe_in_place(
+            target_ref=None,
+            refused_reason=(
+                f"{G.REFUSAL_UNKNOWN_GEOMETRY} on {self._unmeasurable_streak} "
+                "consecutive selections of the query"
+            ),
+            bearing_rad=bearing,
+        )
+        grounded_during = len(self._candidate_targets) - before
+        if grounded_during > 0:
+            self.result.log.append(
+                f"vantage sweep {goal_id}: the look grounded {grounded_during} "
+                "candidate(s) of the query"
+            )
+        elif observed:
+            self.result.log.append(
+                f"vantage sweep {goal_id}: not measurable from here — the honest "
+                "outcome of a full look at the selection's bearing is a refusal; "
+                "explore continues, not another selection"
+            )
+
+    def _renewal_hold_position(
+        self, current: tuple[float, float, float] | None
+    ) -> tuple[float, float, float] | None:
+        """The station hold's position after a refused certificate renewal.
+
+        The hold is the supported station keep of specification 14.2: it holds
+        the aircraft FLYING while the map re-evidences. It must hold it at the
+        declared hover altitude, not at whatever altitude the blocked excursion
+        had descended to. J52-discrim-1 measured the difference: the explore
+        vantage walk descended the aircraft to ~0.2 m, the renewal was refused
+        (`unsupported_space`), and the hold then pinned it there — the
+        autopilot's landing detector fired and its AUTO_DISARMING_DELAY (the
+        pin's declared 10 s, restored after bring-up) disarmed the parked
+        aircraft, so every later step ran grounded: 16 publications refused
+        "not in armed Guided flight", mode GUIDED, armed False (RETURN-
+        UNSUPPORTED.md; the run's refused-publications.jsonl).
+
+        The lateral position is unchanged — a hold does not translate. The
+        vertical target is the declared cruise altitude
+        (`probe.hover_altitude_m`), the same altitude the return target is
+        built at and the bring-up climbs to; the higher of the aircraft's
+        current altitude and it is kept, so the hold climbs out of a
+        landed-looking altitude but never commands a descent. In the aligned
+        NED frame down is positive, so "higher" is the smaller z.
+        """
+        if current is None:
+            return None
+        if not self.alignment.sealed:
+            # No frame yet: the declared altitude cannot be expressed. Hold at
+            # the current position, as before — the unsealed case is bring-up,
+            # where the aircraft is parked by design.
+            return current
+        origin = self.alignment.aligned_position_ned((0.0, 0.0, 0.0))
+        hover_z = origin[2] - self.settings.hover_altitude_m
+        return (current[0], current[1], min(current[2], hover_z))
 
     def _record_observation(self, record: Any, *, store_payload: bool) -> R.Observation:
         self._observation_counter += 1
@@ -2092,14 +2266,29 @@ class MissionRuntime:
         """The simulator's own clock, in seconds — the one the declared windows use."""
         return self._stats.sim_clock.newest_s or 0.0
 
-    def observe_in_place(self, *, target_ref: str | None, refused_reason: str) -> tuple[bool, str]:
+    def observe_in_place(
+        self,
+        *,
+        target_ref: str | None,
+        refused_reason: str,
+        bearing_rad: float | None = None,
+    ) -> tuple[bool, str]:
         """Section 12.2's conditional observation objective, admitted and flown.
 
-        Called when a traversal could not be admitted. The aircraft holds its
-        position and turns once, so its camera covers headings no earlier frame
-        covered. Nothing translates, so there is no route to certify and no space
-        the map has not evidenced is entered — which is why this is admissible
-        when the traversal is not.
+        Called when a traversal could not be admitted, or when the query's
+        selection has refused unknown_geometry for the declared consecutive
+        count (the vantage policy). The aircraft holds its position and turns
+        once, so its camera covers headings no earlier frame covered. Nothing
+        translates, so there is no route to certify and no space the map has
+        not evidenced is entered — which is why this is admissible when the
+        traversal is not.
+
+        ``bearing_rad`` starts the turn at a heading of interest (a refusing
+        selection's bearing) instead of the mission's hold yaw. The sweep still
+        runs for the whole declared window at the declared rate, so it covers
+        every heading either way; starting at the bearing puts the object that
+        could not be measured near-axis first, which is the geometry the
+        diagnosis measured grounding from (large, near-axis, unclipped).
 
         It returns BOTH facts, as the specification requires: the traversal stays
         unadmitted and keeps its reason, and the observation is recorded with what
@@ -2114,7 +2303,7 @@ class MissionRuntime:
         self._active_goal = _ActiveGoal(
             goal_id=goal_id,
             hold_position_odom=position,
-            hold_yaw_rad=MISSION_YAW_HOLD_RAD,
+            hold_yaw_rad=MISSION_YAW_HOLD_RAD if bearing_rad is None else bearing_rad,
             hold_yaw_rate_rad_s=OBSERVATION_YAW_RATE_RAD_S,
             hold_since_sim_s=self._sim_now_s(),
         )
@@ -2153,10 +2342,16 @@ class MissionRuntime:
         # `publish_active` honest: with no admitted traversal there is no goal to
         # publish, and the next step must admit one rather than inherit a hold.
         self._active_goal = None
+        subject = (
+            f"traversal {target_ref!r}" if target_ref is not None
+            else "the query's unmeasurable selection"
+        )
         self.result.log.append(
-            f"observation objective {goal_id}: traversal {target_ref!r} stays unadmitted "
+            f"observation objective {goal_id}: {subject} stays unadmitted "
             f"({refused_reason}); held position and turned {OBSERVATION_YAW_RATE_RAD_S} rad/s "
-            f"for {OBSERVATION_SWEEP_SIM_S:.1f} sim s, {published} setpoint(s), "
+            f"for {OBSERVATION_SWEEP_SIM_S:.1f} sim s from "
+            f"{(MISSION_YAW_HOLD_RAD if bearing_rad is None else bearing_rad):.3f} rad, "
+            f"{published} setpoint(s), "
             f"{seen} further observation(s); ended: {stopped}"
         )
         return True, goal_id
@@ -2821,6 +3016,11 @@ class _LiveAdmission:
             terminal_region=_terminal_region_for(targets),
             execution=R.ExecutionDisposition.RUNNING,
         )
+        # A new admitted traversal flies the aircraft somewhere new: that is a
+        # new vantage, so the vantage policy may spend its sweep again from the
+        # view this goal reaches (GROUNDING-INVALID-DEPTH.md). Refusals never
+        # re-arm it — only a change of where the aircraft stands does.
+        runtime._note_new_vantage()
         return result.status
 
     def cancel(self, goal_id: str, expected_revision: int, idempotency_key: str) -> R.GoalStatus:
@@ -3002,6 +3202,14 @@ class _LiveRunnerWorld:
     def step(self, action: str, target_ref: str | None) -> tuple[R.Observation, ...]:
         runtime = self._runtime
         self._step_observations = []
+        # A goal still installed here belongs to a finished step: this step's own
+        # goal, if it has one, is admitted immediately below by the runner and
+        # not before. Leaving a foreign goal installed is what silenced the
+        # return's recovery in J52-discrim-1 — its leftover explore goal kept
+        # `_active_goal` non-None through every return step, so the observation
+        # machinery below never fired, and the renewal machinery even flew the
+        # explore goal during the return leases (RETURN-UNSUPPORTED.md).
+        self._demote_foreign_active_goal(action, target_ref)
         # Section 12.2: a traversal that could not be admitted gets a conditional
         # observation objective instead. The runner admits before it calls this, so
         # a target present in the blocked map at this point means this step's
@@ -3009,6 +3217,10 @@ class _LiveRunnerWorld:
         # specification requires both facts to be returned clearly and the loop to
         # stay bounded, so the observation happens ONCE per target and the target
         # is then re-opened for a single re-proposal against the new evidence.
+        # The `_active_goal is None` condition is what keeps a legitimately
+        # executing goal untouched: an admitted goal for this very target is
+        # never demoted, and while it flies there is no refused traversal to
+        # observe for.
         if target_ref is not None and runtime._active_goal is None:
             refused_reason = runtime._blocked_refs.get(target_ref)
             if refused_reason is not None and target_ref not in runtime._observed_targets:
@@ -3062,6 +3274,13 @@ class _LiveRunnerWorld:
                 if made > 0:
                     self._step_observations.extend(runtime._observation_ids[-made:])
                 self._renew_certificate()
+                # The vantage policy's answer to a persistently unmeasurable
+                # selection, consumed in the same state the section-12.2
+                # objective answers a refused traversal: no goal of this step's
+                # is flying (otherwise the sweep would replace a legitimately
+                # executing goal). Bounded by the sweep's once-per-view flag.
+                if runtime._active_goal is None:
+                    runtime._consume_vantage_sweep()
             if now >= next_publish:
                 next_publish = now + SETPOINT_PERIOD_S
                 stopped = runtime.publish_active()
@@ -3144,6 +3363,49 @@ class _LiveRunnerWorld:
         if action == "inspect" and target_ref:
             self._inspected.add(target_ref)
 
+    def _demote_foreign_active_goal(self, action: str, target_ref: str | None) -> None:
+        """Clear an installed goal that does not belong to the step about to run.
+
+        A step's goal is admitted immediately before its lease loop, so a goal
+        still installed when ``step`` begins was installed by an EARLIER step —
+        one that has already finished, blocked or otherwise. J52-discrim-1
+        measured what keeping it costs: the explore goal
+        (cert-explore-frontier:8:7:2) stayed installed through every return
+        step, kept `_active_goal` non-None, silenced the section-12.2
+        observation that would have re-evidenced the start, and was even
+        RENEWED and published by the return steps' own leases — the mission
+        flew the wrong goal while believing it was flying the return.
+
+        A previous attempt of THIS step is not foreign: its goal aims at this
+        step's own target, may still be that target's best trajectory, and
+        cancelling it would discard a legitimately executing goal. Everything
+        else is demoted: the step has no trajectory of its own until one is
+        admitted, so it publishes nothing, reports blocked, and the observation
+        machinery in ``step`` runs against the refused target.
+        """
+        runtime = self._runtime
+        active = runtime._active_goal
+        if active is None:
+            return
+        proposal = active.proposal
+        if (
+            proposal is not None
+            and proposal.intent == action
+            and tuple(proposal.target_refs) == (target_ref,)
+        ):
+            return
+        runtime._active_goal = None
+        owned = (
+            f"{proposal.intent} {list(proposal.target_refs)}"
+            if proposal is not None
+            else "no proposal (an observation objective)"
+        )
+        runtime.result.log.append(
+            f"step {action} {target_ref}: demoted installed goal {active.goal_id} "
+            f"({owned}), which belongs to a finished step; this step has no "
+            "trajectory of its own until one is admitted"
+        )
+
     def _renew_certificate(self) -> None:
         """Renew the active goal's certificate when the map has advanced.
 
@@ -3187,11 +3449,13 @@ class _LiveRunnerWorld:
             active.accepted = result.accepted
             active.terminal_region = _terminal_region_for(targets)
             return
-        active.hold_position_odom = runtime._position_odom()
+        active.hold_position_odom = runtime._renewal_hold_position(
+            runtime._position_odom()
+        )
         active.certificate = None
         runtime.result.log.append(
             f"certificate renewal refused for {active.proposal.intent}: "
-            f"{result.status.reason}; holding at the current position"
+            f"{result.status.reason}; holding at the declared hover altitude"
         )
 
 

@@ -358,6 +358,9 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "frontier_vantage_step_m": float,
             "settle_speed_mps": float,
             "settle_hold_s": float,
+            # The vantage policy's declared count (R2): consecutive
+            # unknown_geometry groundings that trigger the observation sweep.
+            "vantage_refusal_sweep_cycles": int,
         }
     ),
     "map": _Optional(
