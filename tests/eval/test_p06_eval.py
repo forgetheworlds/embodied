@@ -17,6 +17,7 @@ What these cover, and why each matters to a comparison rather than to the code:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -151,7 +152,9 @@ def test_the_scored_plan_refuses_while_the_freeze_is_incomplete(tmp_path):
     """The refusal is the enforcement. Without it, a protocol with a null
     sample count would quietly run at whatever count a caller passed."""
     protocol = _minimal_protocol(tmp_path, episodes=None, stop_rule=None)
-    completed = _run("plan", "--protocol", str(protocol), "--out", str(tmp_path / "out"))
+    completed = _run(
+        "plan", "--protocol", str(protocol), "--out", str(tmp_path / "out")
+    )
     assert completed.returncode == 2, completed.stdout + completed.stderr
     assert "freeze is not complete" in completed.stderr
     assert not (tmp_path / "out" / "manifest.json").exists()
@@ -162,10 +165,17 @@ def test_a_dry_run_manifest_can_never_be_executed_as_scored(tmp_path):
     is one must not be run in live mode even if a caller asks."""
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
-        json.dumps({"mode": "dry-run", "open_questions": [], "cells": []}), encoding="utf-8"
+        json.dumps({"mode": "dry-run", "open_questions": [], "cells": []}),
+        encoding="utf-8",
     )
     completed = _run(
-        "execute", "--manifest", str(manifest), "--out", str(tmp_path / "out"), "--mode", "live"
+        "execute",
+        "--manifest",
+        str(manifest),
+        "--out",
+        str(tmp_path / "out"),
+        "--mode",
+        "live",
     )
     assert completed.returncode == 2
     assert "dry run" in completed.stderr
@@ -174,11 +184,23 @@ def test_a_dry_run_manifest_can_never_be_executed_as_scored(tmp_path):
 def test_a_scored_manifest_with_open_questions_cannot_spend(tmp_path):
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
-        json.dumps({"mode": "scored", "open_questions": ["matrix.episodes_per_cell"], "cells": []}),
+        json.dumps(
+            {
+                "mode": "scored",
+                "open_questions": ["matrix.episodes_per_cell"],
+                "cells": [],
+            }
+        ),
         encoding="utf-8",
     )
     completed = _run(
-        "execute", "--manifest", str(manifest), "--out", str(tmp_path / "out"), "--mode", "live"
+        "execute",
+        "--manifest",
+        str(manifest),
+        "--out",
+        str(tmp_path / "out"),
+        "--mode",
+        "live",
     )
     assert completed.returncode == 2
     assert "freeze is incomplete" in completed.stderr
@@ -207,6 +229,7 @@ def test_every_cell_has_a_unique_episode_id_and_a_shared_trial_group(runner):
     """Section 20.2: a unique episode_id per run, a shared trial_group_id for
     matched conditions. A collided trial group would pair two runs that were
     never matched; a collided episode id would overwrite one."""
+
     def scene(name: str) -> dict:
         return {
             "suite": name,
@@ -242,13 +265,20 @@ def test_the_aggregation_separates_invalid_from_outcome(runner, tmp_path):
     outcome carrying it."""
     records = [
         {
-            "episode_id": "e1", "trial_group": "g1", "arm": "B0", "suite": "s",
+            "episode_id": "e1",
+            "trial_group": "g1",
+            "arm": "B0",
+            "suite": "s",
             "episode_index": 1,
             "receipt": _receipt("blocked", ("port 9002 is already in use",)),
-            "score": None, "mission": None,
+            "score": None,
+            "mission": None,
         },
         {
-            "episode_id": "e2", "trial_group": "g2", "arm": "B0", "suite": "s",
+            "episode_id": "e2",
+            "trial_group": "g2",
+            "arm": "B0",
+            "suite": "s",
             "episode_index": 2,
             "receipt": _receipt("complete"),
             "score": {
@@ -260,7 +290,10 @@ def test_the_aggregation_separates_invalid_from_outcome(runner, tmp_path):
             "mission": {"cloud_calls": []},
         },
         {
-            "episode_id": "e3", "trial_group": "g3", "arm": "B0", "suite": "s",
+            "episode_id": "e3",
+            "trial_group": "g3",
+            "arm": "B0",
+            "suite": "s",
             "episode_index": 3,
             "receipt": _receipt("complete"),
             "score": {
@@ -278,8 +311,9 @@ def test_the_aggregation_separates_invalid_from_outcome(runner, tmp_path):
     ]
     path = tmp_path / "records.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
-    assert runner.main(["aggregate", "--records", str(path), "--out", str(tmp_path)]) == 0
-
+    assert (
+        runner.main(["aggregate", "--records", str(path), "--out", str(tmp_path)]) == 0
+    )
     aggregate = json.loads((tmp_path / "aggregate.json").read_text(encoding="utf-8"))
     cell = aggregate["per_cell"][0]
     assert cell["episodes"] == 3
@@ -291,6 +325,103 @@ def test_the_aggregation_separates_invalid_from_outcome(runner, tmp_path):
     # Cost and latency are not recorded per call by the runtime yet: unmeasured,
     # never zero, because zero would read as free.
     assert cell["model_calls_cost"] == "unmeasured"
+
+
+# ---------------------------------------------------------------------------
+# resume idempotence — a re-run must not re-record finished cells or duplicate
+# records.jsonl lines
+
+
+def _cell_dict(index: int) -> dict:
+    return {
+        "label": f"cell-{index}",
+        "arm": "arm-a",
+        "suite": "suite-a",
+        "scene_root": "scenarios/missions/holdout/suite-a",
+        "truth_seed": "scenarios/missions/holdout/suite-a/truth",
+        "target": "red_block",
+        "target_present": True,
+        "episode_index": index,
+        "trial_group": f"suite-a-{index}",
+        "episode_id": f"suite-a-arm-a-{index}",
+    }
+
+
+def _write_finished_cell(out: Path, index: int, *, status: str, scored: bool) -> Path:
+    run_dir = out / "runs" / "arm-a" / "suite-a" / str(index)
+    (run_dir / "episode").mkdir(parents=True, exist_ok=True)
+    (run_dir / "receipt.json").write_text(
+        json.dumps({"status": status, "gate_status": "pass", "reasons": ["recorded"]}),
+        encoding="utf-8",
+    )
+    if scored:
+        (run_dir / "episode" / "score.json").write_text("{}", encoding="utf-8")
+    return run_dir
+
+
+def _execute(runner, monkeypatch, tmp_path, manifest: dict):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    calls = []
+
+    def _record_spy(cell, output, *, overclaim=False):
+        calls.append(cell.episode_index)
+        return 0, {"status": "complete", "gate_status": "pass", "reasons": []}
+
+    monkeypatch.setattr(runner, "record_scripted", _record_spy)
+    args = argparse.Namespace(
+        manifest=str(manifest_path),
+        out=str(tmp_path / "out"),
+        mode="scripted",
+        overclaim=False,
+        adjudicate=False,
+    )
+    code = runner.cmd_execute(args)
+    return code, calls
+
+
+def test_a_resumed_execute_skips_a_finished_cell_without_re_recording(
+    runner, tmp_path, monkeypatch
+):
+    """The runner writes receipt.json, so that is the file a resume must test;
+    testing the never-written record.json re-records every finished cell and
+    appends a duplicate records.jsonl line per cell — silent double counting in
+    a host-gated campaign."""
+    out = tmp_path / "out"
+    _write_finished_cell(out, 0, status="complete", scored=True)
+    records = out / "records.jsonl"
+    records.write_text("existing line\n", encoding="utf-8")
+
+    code, calls = _execute(
+        runner, monkeypatch, tmp_path, {"mode": "scored", "cells": [_cell_dict(0)]}
+    )
+
+    assert code == 0
+    assert calls == []  # nothing re-recorded
+    assert records.read_text(encoding="utf-8") == "existing line\n"  # no duplicate
+
+
+def test_a_blocked_or_unscored_cell_is_not_treated_as_complete(
+    runner, tmp_path, monkeypatch
+):
+    """A receipt alone is not completion: a blocked record or a failed scoring
+    step is re-run on resume rather than silently kept as evidence."""
+    out = tmp_path / "out"
+    _write_finished_cell(out, 1, status="blocked", scored=False)
+    _write_finished_cell(out, 2, status="complete", scored=False)
+
+    code, calls = _execute(
+        runner,
+        monkeypatch,
+        tmp_path,
+        {"mode": "scored", "cells": [_cell_dict(1), _cell_dict(2)]},
+    )
+
+    assert code == 0
+    assert sorted(calls) == [1, 2]
+    records = out / "records.jsonl"
+    assert len(records.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_the_report_names_every_cell_before_it_has_any(runner):

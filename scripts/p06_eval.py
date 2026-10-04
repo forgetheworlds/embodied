@@ -151,7 +151,9 @@ def build_cells(protocol: dict, episodes: int) -> list[Cell]:
     return cells
 
 
-def require_scene_prerequisites(protocol: dict, repository: Path = REPOSITORY) -> list[str]:
+def require_scene_prerequisites(
+    protocol: dict, repository: Path = REPOSITORY
+) -> list[str]:
     """Refuse loudly when a scene the protocol names is not actually there.
 
     Every pointer is checked on disk, because a protocol that names a scene
@@ -161,11 +163,15 @@ def require_scene_prerequisites(protocol: dict, repository: Path = REPOSITORY) -
     for scene in protocol["scenes"]:
         suite_path = repository / "configs" / "suites" / f"{scene['suite']}.yaml"
         if not suite_path.exists():
-            problems.append(f"scene {scene['suite']}: no suite declaration at {suite_path}")
+            problems.append(
+                f"scene {scene['suite']}: no suite declaration at {suite_path}"
+            )
         for key in ("scene_root", "truth_seed"):
             path = repository / scene[key]
             if not path.exists():
-                problems.append(f"scene {scene['suite']}: {key} {scene[key]} does not exist")
+                problems.append(
+                    f"scene {scene['suite']}: {key} {scene[key]} does not exist"
+                )
     return problems
 
 
@@ -183,7 +189,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     problems = require_scene_prerequisites(protocol)
 
     if problems:
-        print("refused: the protocol names scenes that are not on disk", file=sys.stderr)
+        print(
+            "refused: the protocol names scenes that are not on disk", file=sys.stderr
+        )
         for problem in problems:
             print(f"  - {problem}", file=sys.stderr)
         return 2
@@ -241,10 +249,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
     }
     manifest_path = out / "manifest.json"
     manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
+        json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
     )
     print(f"mode: {mode}")
-    print(f"cells: {len(cells)} ({len(protocol['arms'])} arms x {len(protocol['scenes'])} scenes x {episodes})")
+    print(
+        f"cells: {len(cells)} ({len(protocol['arms'])} arms x {len(protocol['scenes'])} scenes x {episodes})"
+    )
     print(f"manifest: {manifest_path}")
     if outstanding:
         print(f"open questions carried in the manifest: {', '.join(outstanding)}")
@@ -271,11 +282,16 @@ def record_live(cell: Cell, output: Path) -> tuple[int, str]:
     """One live episode through the CLI, which is what a scored run uses."""
     code = _run_cli(
         [
-            "bench", "record",
-            "--suite", cell.suite,
-            "--sensor-mode", "sensor-derived",
-            "--arm", cell.arm,
-            "--output", str(output),
+            "bench",
+            "record",
+            "--suite",
+            cell.suite,
+            "--sensor-mode",
+            "sensor-derived",
+            "--arm",
+            cell.arm,
+            "--output",
+            str(output),
         ]
     )
     return code, _read_json(output / "receipt.json")
@@ -317,7 +333,9 @@ def record_scripted(
         suite_config=suite_path,
         mission_driver=scripted_driver_for(
             target_present=cell.target_present,
-            target_ned=_target_position_from_seed(REPOSITORY / cell.truth_seed, cell.target),
+            target_ned=_target_position_from_seed(
+                REPOSITORY / cell.truth_seed, cell.target
+            ),
             overclaim=overclaim,
         ),
     )
@@ -346,7 +364,14 @@ def record_scripted(
 def score_episode(cell: Cell, output: Path) -> tuple[int, str]:
     """Score through the CLI's own score path. Exit 3 is pending, not failure."""
     code = _run_cli(
-        ["bench", "score", "--episode", str(output / "episode"), "--output", str(output / "score")]
+        [
+            "bench",
+            "score",
+            "--episode",
+            str(output / "episode"),
+            "--output",
+            str(output / "score"),
+        ]
     )
     return code, ""
 
@@ -370,6 +395,31 @@ def adjudicate_episode(cell: Cell, output: Path) -> tuple[int, str]:
         ]
     )
     return code, ""
+
+
+def _cell_is_complete(run_dir: Path) -> bool:
+    """A cell is complete only when its record step succeeded AND its score
+    step produced a file.
+
+    The runner writes receipt.json (:340) — never record.json — so that is the
+    file a resumed execute must test. But a receipt alone is not enough: the
+    receipt is written for every recorded outcome, including ``blocked`` and
+    ``invalid`` ones, and the score step only runs when the record exited 0 and
+    writes episode/score.json on success. Requiring both means a resumed run
+    skips only cells that genuinely finished, and re-records a cell whose
+    receipt says blocked or whose scoring failed, rather than quietly treating
+    a half-run cell as evidence.
+    """
+    receipt_path = run_dir / "receipt.json"
+    if not receipt_path.is_file():
+        return False
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    if receipt.get("status") != "complete":
+        return False
+    return (run_dir / "episode" / "score.json").is_file()
 
 
 def cmd_execute(args: argparse.Namespace) -> int:
@@ -414,7 +464,7 @@ def cmd_execute(args: argparse.Namespace) -> int:
             # episode id doubles that prefix in every recorded episode — which is
             # what the first dry run produced.
             run_dir = out / "runs" / cell.arm / cell.suite / str(cell.episode_index)
-            if (run_dir / "record.json").exists():
+            if _cell_is_complete(run_dir):
                 continue  # already executed; a re-run is a deliberate act
             run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -449,7 +499,9 @@ def cmd_execute(args: argparse.Namespace) -> int:
                 "run_dir": str(run_dir),
                 "receipt": receipt,
                 "score": _read_json(run_dir / "episode" / "score.json"),
-                "adjudication": _read_json(run_dir / "adjudication" / "adjudication.json"),
+                "adjudication": _read_json(
+                    run_dir / "adjudication" / "adjudication.json"
+                ),
                 "mission": _read_json(run_dir / "mission.json"),
             }
             sink.write(json.dumps(record, sort_keys=True, default=str) + "\n")
@@ -499,6 +551,7 @@ def _target_position_from_seed(seed_path: Path, target: str) -> tuple | None:
         return (float(position[0]), float(position[1]), float(position[2]))
     except (TypeError, ValueError, IndexError):
         return None
+
 
 # ---------------------------------------------------------------------------
 # classify — the distinction section 20.5 turns on
@@ -565,7 +618,9 @@ def summarise(record: dict) -> dict:
         # safe-task-completion count, and the difference lives only in the
         # records underneath. Payloads on disk do not help a reader who has the
         # report.
-        "world_correct_claims": (score.get("report_correctness") or {}).get("world_correct"),
+        "world_correct_claims": (score.get("report_correctness") or {}).get(
+            "world_correct"
+        ),
         "world_incorrect_claims": (score.get("report_correctness") or {}).get(
             "world_incorrect"
         ),
@@ -640,7 +695,9 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
                 "safe_task_completions": sum(
                     1 for r in valid if r["safe_task_completion"] is True
                 ),
-                "task_completions": sum(1 for r in valid if r["task_completion"] is True),
+                "task_completions": sum(
+                    1 for r in valid if r["task_completion"] is True
+                ),
                 "takeovers": sum(1 for r in valid if r["takeover"] is True),
                 "missed_required_targets": sum(
                     1 for r in valid if r["missed_present_targets"]
@@ -669,7 +726,9 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
     # to work out which. grader.py:472-478 requires `all(v.passed is True for v in
     # verdicts)`, and a verdict's `passed` is None while its support is pending —
     # so pending support makes the endpoint FALSE rather than unknown.
-    outcomes = [r for rows in grouped.values() for r in rows if r["classification"] == "outcome"]
+    outcomes = [
+        r for rows in grouped.values() for r in rows if r["classification"] == "outcome"
+    ]
     pending = sum(1 for r in outcomes if (r["evidence_support_pending"] or 0) > 0)
     adjudicated = len(outcomes) - pending
     aggregate = {
@@ -768,7 +827,9 @@ def render_report(aggregate: dict) -> str:
         "# P06 — held-out comparison",
         "",
         "Answer first: **the primary endpoint is not readable from these records.**"
-        if not (aggregate.get("primary_endpoint") or {}).get("reachable_from_these_records", False)
+        if not (aggregate.get("primary_endpoint") or {}).get(
+            "reachable_from_these_records", False
+        )
         else "Answer first: **see the primary endpoint rows below.**",
         "",
         "Primary endpoint: **safe mission completion** — all required task, report and",
@@ -778,7 +839,6 @@ def render_report(aggregate: dict) -> str:
         "",
         "A cell below is empty rather than zero when it has no episodes: section 20.4",
         "requires denominators, because a percentage without one cannot be read.",
-
         "Two axes, published side by side because they answer different questions.",
         "**World correctness** asks whether what a claim asserts was actually true.",
         "**Evidence support** asks whether the cited evidence justified it. A claim can",
@@ -922,8 +982,15 @@ def scripted_driver(
 ):
     sys.path.insert(0, str(REPOSITORY / "src"))
     from embodied.contracts.records import (
-        ClockStamp, ExecutionDisposition, ExecutionStatus, MissionContract, Observation,
-        SelectionGeometry, VisualSelection, SensorIds, to_dict,
+        ClockStamp,
+        ExecutionDisposition,
+        ExecutionStatus,
+        MissionContract,
+        Observation,
+        SelectionGeometry,
+        VisualSelection,
+        SensorIds,
+        to_dict,
     )
     from embodied.perception import camera as camera_module
     from embodied.pilot.mission import ClaimEvidence, assemble_mission_claims
@@ -953,7 +1020,9 @@ def scripted_driver(
     observation = Observation(
         episode_id=episode_id,
         record_id=f"{episode_id}-obs-00001",
-        sensor_ids=SensorIds(left="camera left", right="camera right", imu="inertial unit"),
+        sensor_ids=SensorIds(
+            left="camera left", right="camera right", imu="inertial unit"
+        ),
         sequence=1,
         capture_stamp=stamp(1_050_000_000),
         receipt_stamp=stamp(1_060_000_000),
@@ -1049,17 +1118,25 @@ def scripted_driver(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     plan = sub.add_parser("plan", help="expand the protocol into a manifest")
     plan.add_argument("--protocol", required=True)
     plan.add_argument("--out", required=True)
-    plan.add_argument("--dry-run", action="store_true", help="label the manifest a dry run")
-    plan.add_argument("--episodes", type=int, default=None, help="episodes per cell, dry run only")
+    plan.add_argument(
+        "--dry-run", action="store_true", help="label the manifest a dry run"
+    )
+    plan.add_argument(
+        "--episodes", type=int, default=None, help="episodes per cell, dry run only"
+    )
     plan.set_defaults(func=cmd_plan)
 
-    execute = sub.add_parser("execute", help="record and score every cell in a manifest")
+    execute = sub.add_parser(
+        "execute", help="record and score every cell in a manifest"
+    )
     execute.add_argument("--manifest", required=True)
     execute.add_argument("--out", required=True)
     execute.add_argument("--mode", choices=("scripted", "live"), default="scripted")
