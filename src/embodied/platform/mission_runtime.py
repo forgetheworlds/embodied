@@ -58,7 +58,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -2322,6 +2322,7 @@ class MissionRuntime:
         *,
         here: tuple[float, float, float] | None = None,
         searchable: set[tuple[int, int, int]] | None = None,
+        searchable_bounds: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None,
     ) -> tuple[float, float, float] | None:
         """The point an explore step would fly to for this frontier, or None.
 
@@ -2365,6 +2366,8 @@ class MissionRuntime:
         steps = max(1, int(span / FRONTIER_VANTAGE_STEP_M))
         if searchable is None:
             searchable = self._searchable_cells(here)
+        if searchable_bounds is None:
+            searchable_bounds = _index_bounds(searchable)
         # The planner admits a goal when at least one cell of its goal region is
         # in the set it may search, so this asks exactly that and no weaker
         # question: the same inflation, the same extra margin the planner adds,
@@ -2399,7 +2402,9 @@ class MissionRuntime:
                 # exemption provides. See its definition above.
                 self._count_gate("too_near")
                 continue
-            if any(cell in searchable for cell in approach.cells(self.store.config)):
+            if _region_holds_searchable(
+                approach, searchable, searchable_bounds, self.store.config
+            ):
                 self._count_gate("accepted")
                 return target_point
             self._count_gate("not_searchable")
@@ -2546,6 +2551,10 @@ class MissionRuntime:
         A frontier whose vantage the aircraft is already standing in is not an
         excursion and is left out (see ``_frontier_goal_point``).
 
+        When the reachable set is provably empty -- the aircraft's own cell is
+        not traversable, so it could not take one step -- the answer is ``()``
+        by construction and is returned without walking a single region.
+
         The order is the far vantage first. The known map is what the cameras
         have already seen, so the least-observed space lies beyond its
         boundary: the far frontier is the view that adds evidence, while the
@@ -2557,16 +2566,31 @@ class MissionRuntime:
         if here is None:
             return ()
         searchable = self._searchable_cells(here)
+        searchable_bounds = _index_bounds(searchable)
         self._gate_counts = {}
         ranked: list[tuple[float, str]] = []
-        for ref, region in self.frontier_regions().items():
-            point = self._frontier_goal_point(
-                region, here=here, searchable=searchable
-            )
-            if point is None:
-                continue
-            distance = float(np.linalg.norm(np.asarray(point) - np.asarray(here)))
-            ranked.append((-distance, ref))
+        if not searchable:
+            # The reachable set is provably empty: reachable_from refused the
+            # aircraft's own cell (J51-move-2 flew off the map and every
+            # traversable cell was in-grid), so no region can hold a cell the
+            # planner may search and no walk can change the answer. The empty
+            # listing is returned in O(1) -- no region is walked at all.
+            # Without this early answer the walk still ran, tested every
+            # region's every vantage to exhaustion, and stalled the mission
+            # loop past its 90 s beat bound.
+            self._count_gate("no_searchable_cells")
+        else:
+            for ref, region in self.frontier_regions().items():
+                point = self._frontier_goal_point(
+                    region,
+                    here=here,
+                    searchable=searchable,
+                    searchable_bounds=searchable_bounds,
+                )
+                if point is None:
+                    continue
+                distance = float(np.linalg.norm(np.asarray(point) - np.asarray(here)))
+                ranked.append((-distance, ref))
         ranked.sort()
         if not ranked:
             self.result.log.append(
@@ -2859,6 +2883,67 @@ def _region_gap_m(region: GE.BoxRegion, point: tuple[float, float, float]) -> fl
         elif point[axis] > high:
             squared += (point[axis] - high) ** 2
     return float(np.sqrt(squared))
+
+
+def _index_bounds(
+    cells: Iterable[tuple[int, int, int]],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    """The inclusive index box of ``cells``, or None when there are none.
+
+    One pass, so a caller that tests many regions against one reachable set
+    pays for the box once.
+    """
+    low: list[int] | None = None
+    high: list[int] | None = None
+    for cell in cells:
+        if low is None:
+            low = [cell[0], cell[1], cell[2]]
+            high = [cell[0], cell[1], cell[2]]
+            continue
+        for axis in range(3):
+            value = cell[axis]
+            if value < low[axis]:
+                low[axis] = value
+            elif value > high[axis]:
+                high[axis] = value
+    if low is None or high is None:
+        return None
+    return (low[0], low[1], low[2]), (high[0], high[1], high[2])
+
+
+def _region_holds_searchable(
+    region: GE.BoxRegion,
+    searchable: set[tuple[int, int, int]],
+    bounds: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+    config: world_module.MapConfig,
+) -> bool:
+    """Whether any cell of ``region`` is in ``searchable``, without materializing.
+
+    This answers exactly the question ``any(cell in searchable for cell in
+    region.cells(config))`` asks; only its cost changed. The region's index box
+    against the reachable set's own index box settles the disjoint case without
+    touching a cell: the index rule is floor, hence monotone, so a centre inside
+    the region always indexes inside the region's index box -- the pre-test can
+    only skip regions the exact test would refuse. Where the boxes overlap, the
+    cheaper of the two walks runs: the region's cells one at a time (the walk
+    short-circuits on the first hit instead of building the whole tuple), or the
+    reachable set against ``BoxRegion.holds_cell``.
+    """
+    if bounds is None or not searchable:
+        return False
+    index_low = config.cell_index(region.low)
+    index_high = config.cell_index(region.high)
+    if any(
+        index_low[axis] > bounds[1][axis] or bounds[0][axis] > index_high[axis]
+        for axis in range(3)
+    ):
+        return False
+    estimate = 1
+    for axis in range(3):
+        estimate *= index_high[axis] - index_low[axis] + 1
+    if estimate <= len(searchable):
+        return any(cell in searchable for cell in region.iter_cells(config))
+    return any(region.holds_cell(cell, config) for cell in searchable)
 
 
 def _terminal_region_for(targets: tuple[R.GroundedTarget, ...]) -> GE.BoxRegion | None:

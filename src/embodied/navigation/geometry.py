@@ -20,6 +20,7 @@ properties matter more than any one function:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 import math
 
@@ -110,18 +111,39 @@ class BoxRegion:
     def extent(self) -> tuple[float, float, float]:
         return tuple(high - low for low, high in zip(self.low, self.high))
 
-    def cells(self, config: world_module.MapConfig) -> tuple[tuple[int, int, int], ...]:
-        """Every cell whose center lies inside the region."""
+    def iter_cells(
+        self, config: world_module.MapConfig
+    ) -> Iterator[tuple[int, int, int]]:
+        """Yield every cell whose center lies inside the region, one at a time.
+
+        Yields exactly what ``cells`` returns, in the same order; ``cells`` is
+        this walk materialized, so a membership question that short-circuits
+        never has to pay for a large region's whole cell tuple.
+        """
         index_low = config.cell_index(self.low)
         index_high = config.cell_index(self.high)
-        cells = []
         for x in range(index_low[0], index_high[0] + 1):
             for y in range(index_low[1], index_high[1] + 1):
                 for z in range(index_low[2], index_high[2] + 1):
                     cell = (x, y, z)
                     if config.inside(cell) and self.contains(config.cell_center(cell)):
-                        cells.append(cell)
-        return tuple(cells)
+                        yield cell
+
+    def holds_cell(
+        self, cell: tuple[int, int, int], config: world_module.MapConfig
+    ) -> bool:
+        """Whether ``cell`` is one of ``self.cells(config)``, without building them.
+
+        The same predicate ``cells`` filters by: the cell inside the grid, its
+        centre inside the region. A centre inside the region always indexes
+        inside the region's index box (the declared index rule is floor, hence
+        monotone), so this agrees with membership in the materialized tuple.
+        """
+        return config.inside(cell) and self.contains(config.cell_center(cell))
+
+    def cells(self, config: world_module.MapConfig) -> tuple[tuple[int, int, int], ...]:
+        """Every cell whose center lies inside the region."""
+        return tuple(self.iter_cells(config))
 
 
 @dataclass(frozen=True)
