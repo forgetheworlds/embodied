@@ -161,6 +161,10 @@ class FlightPlan:
     trace: dict[str, Any] | None
     attempts: int
     round_trip_s: float | None
+    # What the provider reported the call consumed, when it reported anything:
+    # measured tokens, not a price (no rate table is declared for the route, so
+    # spend is never computed from these numbers here).
+    usage: dict[str, Any] | None = None
 
     def document(self) -> dict[str, Any]:
         return {
@@ -171,6 +175,7 @@ class FlightPlan:
             "trace": self.trace,
             "attempts": self.attempts,
             "round_trip_s": self.round_trip_s,
+            "usage": self.usage,
             "recipe_source": self.recipe.source if self.recipe else None,
             "recipe_steps": [step.action for step in self.recipe.steps] if self.recipe else [],
         }
@@ -366,6 +371,7 @@ class PreflightPlanner:
                     trace=trace.document(),
                     attempts=attempt,
                     round_trip_s=reply.arrival.round_trip_ns / 1_000_000_000,
+                    usage=reply.parsed.usage,
                 )
             last_failure = "no reply arrived inside the pre-flight window"
         # The transport's own diagnosis, if there was one. ``Provider.poll``
@@ -405,4 +411,5 @@ class PreflightPlanner:
             trace=trace.document(),
             attempts=attempts,
             round_trip_s=reply.arrival.round_trip_ns / 1_000_000_000,
+            usage=reply.parsed.usage,
         )
