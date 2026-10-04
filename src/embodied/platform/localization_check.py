@@ -1138,7 +1138,7 @@ LOCALIZATION_SECTION: dict[str, Any] = {
         "valid_fraction_min": float,
         "sigma_min_m": float,
         "sigma_max_m": float,
-        "tracking_lost_min_tracks": int,
+        "tracking_lost_min_tracks": _Optional(int),
         "disagreement_p95_m": float,
         "disagreement_max_m": float,
         # E1, against evaluator truth: plan-fixed values, the upper edge of the
