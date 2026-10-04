@@ -354,6 +354,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "cold_start_perception_sim_s": float,
             "min_perception_interval_s": float,
             "frontier_cluster_cells": int,
+            "excursion_standoff_m": float,
             "frontier_vantage_step_m": float,
             "settle_speed_mps": float,
             "settle_hold_s": float,

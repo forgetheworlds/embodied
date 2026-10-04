@@ -198,16 +198,45 @@ PLAN_CONFIG = PL.PlanConfig(
 # the neighbouring boundary cells of one doorway are one frontier, not eight.
 FRONTIER_CLUSTER_CELLS = 6
 # How a frontier becomes a flyable goal. A frontier is a free cell touching
-# unknown space, so the standoff region the executor builds around it — one
-# metre back along the view direction, inflated by the envelope — can overlap
-# space the map has no evidence for, and the planner refuses that correctly: a
-# larger margin cannot turn unseen space into measured free space
-# (specification 7.1). The vantage is therefore walked back toward the aircraft,
-# which stands in known free space by construction, until that standoff region
-# is entirely supported. The direction matches the executor's own, so the region
-# this search clears is the region the planner will check.
+# unknown space, so the approach region built around it can overlap space the map
+# has no evidence for, and the planner refuses that correctly: a larger margin
+# cannot turn unseen space into measured free space (specification 7.1). The
+# vantage is therefore walked back toward the aircraft, which stands in free space
+# by construction, until that region is supported. The direction matches the
+# executor's own, so the region this search clears is the region the planner
+# checks.
 FRONTIER_VIEW_DIRECTION = (1.0, 0.0, 0.0)
-FRONTIER_VANTAGE_STEP_M = 0.2
+#
+# THE EXCURSION STANDOFF — which is NOT the approach standoff. ``GE.STANDOFF_M``
+# (1.0 m) is how far the executor comes to rest before a doorway or the object it
+# inspects, and lowering *that* would fly the aircraft to within 10 cm of the
+# thing it is looking at. That is a different change and was not ruled on. This
+# constant answers only the excursion question: how far a goal's region must be
+# from the aircraft to be a view taken from somewhere else rather than a hover.
+#
+# It is derived, because the value it replaces (1.0 m, whose own config comment
+# says "provenance unknown") could not be satisfied. The space the planner may
+# search is set by the self-occupied exemption, and a cell is searchable only if
+# its whole clearance ball is free. Measured on J47-nearfield-1: the live map's
+# *evidence*-supported clear space is nil — the run reported one such cell — so
+# every searchable cell is an exemption cell, and the deepest of them sits
+#
+#     self_occupied_radius_m - (inflation_m + voxel * CERTIFICATE_MARGIN_VOXELS)
+#       = (0.5 + sqrt(3) * 0.1) - (0.45 + 0.1 * 0.25)
+#       = 0.673 - 0.475
+#       = 0.198 m
+#
+# from the aircraft. A goal region of half-extent 0.55 m must contain one of those
+# cells while sitting at least `standoff` away, so the standoff can be at most
+# 0.198 m. Half of that leaves the search a band to land in.
+EXCURSION_STANDOFF_M = 0.10
+#
+# And the walk must be fine enough to land in that band, which is
+# `0.198 - 0.10 = 0.098 m` wide. At the old 0.2 m step the walk stepped clean over
+# it at every standoff — which is why lowering the standoff alone would not have
+# moved the aircraft. A quarter of the shell is finer than the band, and a finer
+# walk is a stricter search, never a weaker one.
+FRONTIER_VANTAGE_STEP_M = 0.05
 # The mission's own budget, in the simulator's seconds (the clock the bring-up
 # and route windows spend, owner ruling 2026-09-28).
 MISSION_BUDGET_SIM_S = 300.0
@@ -2003,6 +2032,11 @@ class MissionRuntime:
         no candidate survives, this frontier has no vantage and is not a place
         to fly to. Returning ``None`` is the honest answer; the caller
         declines the frontier rather than publishing a hover as progress.
+        How close a candidate may be is ``EXCURSION_STANDOFF_M``, derived from the
+        searchable shell the exemption provides rather than borrowed from the
+        approach standoff: with the map carrying no evidence-supported clear space,
+        a goal region can only reach into the exemption bubble, and that bubble is
+        0.198 m deep once a cell's clearance ball is fitted inside it.
         """
         centre = tuple(float(value) for value in region.center())
         here = here if here is not None else self._position_odom()
@@ -2035,15 +2069,18 @@ class MissionRuntime:
                 ENVELOPE,
                 direction=FRONTIER_VIEW_DIRECTION,
             )
-            if _region_gap_m(approach, here) < GE.STANDOFF_M:
+            if _region_gap_m(approach, here) < EXCURSION_STANDOFF_M:
                 # A goal the aircraft already stands in -- or stands two
                 # centimetres outside of -- is not an excursion. The step
                 # completes on arrival without going anywhere, which is what
                 # live-motion-7 did: its admitted region's near face was
                 # 0.02 m from the aircraft, so "explore" advanced 2 cm. A view
-                # from where you already are is not a second view, and the
-                # declared standoff is this mission's own measure of a view
-                # taken from somewhere else.
+                # from where you already are is not a second view.
+                #
+                # The measure is EXCURSION_STANDOFF_M, not the approach standoff:
+                # this asks only how far the goal's region must be from the
+                # aircraft, and the value is derived from the searchable shell the
+                # exemption provides. See its definition above.
                 self._count_gate("too_near")
                 continue
             if any(cell in searchable for cell in approach.cells(self.store.config)):
