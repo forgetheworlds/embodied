@@ -26,6 +26,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -334,11 +335,16 @@ def _prompt_text(packet: RequestPacket, reply_format: str = "default") -> str:
 class LiveTransport:
     """stdlib transport; no new dependency.
 
-    ``send`` performs the one blocking HTTP round trip and stores the result;
-    ``poll`` yields it to the caller at the caller's clock. A browser
-    User-Agent header is required by the provider edge (measured finding,
-    APPROVAL-RECORD). The API key is read from the environment at call time
-    and is never logged, returned or stored.
+    ``send`` performs the one blocking HTTP round trip and records the moment
+    it returned; ``poll`` yields that result with its own completion stamp, so
+    ``Arrival.round_trip_ns`` is the measured send-to-reply duration and never
+    the caller's poll clock. Stamping the arrival at the caller's ``now``
+    instead made a successful pre-flight call report exactly the declared
+    window it was polled at (J33-b1-2: ``round_trip_s`` 90.0 for a class the
+    probe measured at 23.85 s), which is why the completion read lives here.
+    A browser User-Agent header is required by the provider edge (measured
+    finding, APPROVAL-RECORD). The API key is read from the environment at
+    call time and is never logged, returned or stored.
     """
 
     def __init__(
@@ -353,7 +359,8 @@ class LiveTransport:
         self._api_key_env = api_key_env
         self._timeout_s = timeout_s
         self._opener = opener
-        self._completed: list[tuple[ClockStamp, dict[str, Any] | TransportError]] = []
+        # (send stamp, completion stamp, payload); the class docstring says why.
+        self._completed: list[tuple[ClockStamp, ClockStamp, dict[str, Any] | TransportError]] = []
 
     def send(self, document: dict[str, Any], sent_at: ClockStamp) -> None:
         request = urllib.request.Request(
@@ -366,13 +373,13 @@ class LiveTransport:
             },
             method="POST",
         )
+        outcome: dict[str, Any] | TransportError
         try:
             if self._opener is not None:
-                response = self._opener(request)
+                outcome = self._opener(request)
             else:
                 with urllib.request.urlopen(request, timeout=self._timeout_s) as handle:
-                    response = json.loads(handle.read().decode("utf-8"))
-            self._completed.append((sent_at, response))
+                    outcome = json.loads(handle.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             # The body is the diagnosis: a 400 from this edge carries the
             # reason ("invalid_request_error: unsupported image media type")
@@ -381,18 +388,24 @@ class LiveTransport:
                 body = error.read(2048).decode("utf-8", "replace")
             except Exception:  # pragma: no cover - best-effort body recovery
                 body = ""
-            self._completed.append(
-                (sent_at, TransportError(f"HTTP {error.code}: {body[:1000] or error.reason}"))
-            )
+            outcome = TransportError(f"HTTP {error.code}: {body[:1000] or error.reason}")
         except (urllib.error.URLError, OSError, ValueError) as error:
-            self._completed.append((sent_at, TransportError(f"transport failed: {error}")))
+            outcome = TransportError(f"transport failed: {error}")
+        # The one clock read this module owns, taken the moment the blocking
+        # call returned: the transport is the only party that knows when that
+        # happened, while every deadline stays decided by the stamps callers
+        # hand in.
+        completed_at = ClockStamp(sent_at.host_id, sent_at.clock_id, time.monotonic_ns())
+        self._completed.append((sent_at, completed_at, outcome))
 
     def poll(self, now: ClockStamp) -> tuple["Arrival", ...]:
+        # ``now`` is the caller's clock and never moves an arrival's own
+        # stamp: a completed send is due whenever it is asked for.
         arrivals = tuple(
-            Arrival(send_stamp=send, arrived_at=now, document=payload)
+            Arrival(send_stamp=send, arrived_at=completed, document=payload)
             if isinstance(payload, dict)
-            else Arrival(send_stamp=send, arrived_at=now, error=payload)
-            for send, payload in self._completed
+            else Arrival(send_stamp=send, arrived_at=completed, error=payload)
+            for send, completed, payload in self._completed
         )
         self._completed.clear()
         return arrivals

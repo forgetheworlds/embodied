@@ -164,6 +164,13 @@ class BrokerOutcome:
     recipe: dict[str, Any] | None = None
     parsed: Any = None
     malformed_reason: str | None = None
+    # Measured facts of the call itself, carried on the ``reply`` outcome so a
+    # run's own record can state what its cloud exchanges cost and took:
+    # provider-reported token usage and the transport's send-to-reply duration.
+    # Cost in currency is deliberately absent — no rate table is declared for
+    # the route, and an invented price would be a fabricated measurement.
+    usage: dict[str, Any] | None = None
+    round_trip_s: float | None = None
 
 
 def _status(
@@ -430,6 +437,8 @@ class PilotBroker:
                 request_id=record.request.request_id,
                 recipe=parsed.mission_recipe,
                 parsed=parsed,
+                usage=parsed.usage,
+                round_trip_s=reply.arrival.round_trip_ns / 1_000_000_000,
             )
         )
         self.outcomes.extend(outcomes)
