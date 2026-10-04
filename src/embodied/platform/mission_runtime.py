@@ -51,6 +51,9 @@ is also the clock the controller stamps its frames on.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ctypes
+import faulthandler
+import os
 import queue
 import threading
 import time
@@ -315,6 +318,172 @@ POSE_RING = 64
 # short of it; the frontier and inspect goals use the standoff as intended
 # (stop before the unknown boundary; stand off the object).
 RETURN_STANDOFF_COMPENSATION_M = GE.STANDOFF_M
+# ---------------------------------------------------------------------------
+# The mission-loop watchdog: supervision from outside the loop
+# ---------------------------------------------------------------------------
+#
+# Tonight's failure mode (J50-move-1, 2026-10-04): the mission loop's main
+# thread entered the pre-admission explore machinery after the cold start and
+# never came back. Every declared bound — the mission window, the action
+# leases, the regather caps, the budget checks in the recipe runner — is
+# consulted BETWEEN computations, never inside them, so a computation that
+# does not return holds the whole run: the last agent event stood at sim
+# 50.2 s while the simulator, the controller, SITL and the estimator all kept
+# running for 23 more minutes, and nothing ended the run until a human killed
+# it. The runner blocked with no reason on disk at all: no receipt, no
+# mission.json, no shutdown record.
+#
+# The watchdog is deliberately NOT a check the mission loop runs. It is a
+# thread that watches the loop's own heartbeat — a beat wherever a healthy
+# loop turns (the bring-up's drain, every perception cycle, every lease-loop
+# and phase-loop iteration) — and when no beat arrives inside the declared
+# window it (1) writes the stall, with every thread's stack, into the run's
+# own artifacts, (2) names the termination, and (3) breaks the loop with an
+# asynchronous exception so the run's normal shutdown and receipt still
+# happen. It therefore answers the two failure modes of that night in one
+# mechanism: silence now has a detector, and a hang now has a name.
+#
+# The bound is wall seconds because a stalled loop stops spending every other
+# clock: the simulator's own clock kept advancing for the whole 23 minutes of
+# tonight's hang, so no sim-clock budget could see it. Its derivation:
+#   * the beats are dense in a healthy run — drain turns at >= 5 Hz, the
+#     lease loop at 200 Hz, perception cycles measured ~0.5 s apart on
+#     J50-move-1 itself (25 observations in ~13 s of wall);
+#   * the largest measured LEGITIMATE single silent call is map integration
+#     at 4.31 s (J24, pre-fix; 0.218 s since) and the cloud transport's
+#     declared 30 s read timeout on the one blocking HTTP round trip a
+#     B1/B2 ground call makes;
+#   * 90 s clears the worst legitimate silence by 3x and cuts tonight's
+#     1380 s hang at 1/15th of its cost.
+MISSION_LOOP_STALL_S = 90.0
+# How often the watchdog inspects the heartbeat. A poll, not a deadline: the
+# bound above decides, this only decides how promptly.
+MISSION_WATCHDOG_POLL_S = 1.0
+# The exit code of the last resort, recorded here so a reader of a shell
+# transcript can trace an abrupt exit back to this module's artifact.
+MISSION_STALL_EXIT_CODE = 73
+
+
+class MissionLoopStalled(BaseException):
+    """Raised into the mission loop's own thread by the watchdog.
+
+    Deliberately NOT an ``Exception``: the loop's legitimate handlers catch
+    ``Exception`` (a failed depth product, a refused grounding, a feed error),
+    and a stall must not be absorbed by a handler that then continues the
+    loop it was supposed to stop.
+    """
+
+
+class _MissionLoopWatchdog:
+    """Watches the mission loop's heartbeat and ends the run when it stops.
+
+    The clock and sleep are injectable (a watchdog test must not measure the
+    real machine — LEARNED-FAILURES T18). ``fire`` runs on the watchdog
+    thread when the bound is passed once: it writes the run's own record of
+    the stall and raises ``MissionLoopStalled`` into ``thread_id``. If the
+    process is still alive one FULL bound later the beat never resumed, the
+    asynchronous exception was not delivered (or did not unwind), and
+    ``escalate`` ends the process from outside: the artifact is already on
+    disk, so an abrupt exit still leaves a named cause — which a plain
+    wall-clock kill never did. A delivery that lands in a loop already
+    unwinding is absorbed by run()'s own handlers after it names the stall.
+    """
+
+    def __init__(
+        self,
+        *,
+        thread_id: int,
+        fire: Callable[[float], None],
+        escalate: Callable[[float], None],
+        stall_s: float = MISSION_LOOP_STALL_S,
+        poll_s: float = MISSION_WATCHDOG_POLL_S,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._thread_id = thread_id
+        self._fire = fire
+        self._escalate = escalate
+        self._stall_s = stall_s
+        self._poll_s = poll_s
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._stop = threading.Event()
+        self._last_beat_s = self._monotonic()
+        self._fired = False
+        self._fired_age_s: float | None = None
+        self._thread: threading.Thread | None = None
+
+    def beat(self) -> None:
+        """One turn of the mission loop. Called by the loop itself, on its own thread."""
+        self._last_beat_s = self._monotonic()
+
+    def stall_age_s(self) -> float:
+        return max(0.0, self._monotonic() - self._last_beat_s)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name="mission-watchdog", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def join(self, timeout_s: float) -> None:
+        """Wait for the watchdog thread to finish; a no-op if never started."""
+        if self._thread is not None:
+            self._thread.join(timeout_s)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._sleep(self._poll_s)
+            if self._stop.is_set():
+                # The run ended (normally, or unwinding from a named stall)
+                # while this poll was pending: its own shutdown owns the
+                # process now, and escalation must never race a receipt.
+                return
+            age = self.stall_age_s()
+            if age <= self._stall_s:
+                continue
+            if not self._fired:
+                self._fired = True
+                self._fired_age_s = age
+                try:
+                    self._fire(age)
+                except Exception:  # the watchdog never dies before the run does
+                    # Firing is what names the stall; if even that fails, the
+                    # escalation below is the only honest ending left.
+                    self._escalate(age)
+                continue
+            # A second FULL window with no beat: the exception never unwound
+            # the loop (a C call that does not return delays delivery past any
+            # bytecode boundary). Nothing inside the process can end this run
+            # cleanly any more, so it is ended from outside, cause already on
+            # disk. The full window, not the next poll, is what keeps a
+            # run that IS unwinding safe to finish its own receipt.
+            if age - self._fired_age_s < self._stall_s:
+                continue
+            try:
+                self._escalate(age)
+            except Exception:
+                # Even the last resort must not leak an exception out of this
+                # thread; the artifact is already on disk.
+                os._exit(MISSION_STALL_EXIT_CODE)
+            return
+
+
+def _raise_in_thread(thread_id: int, exception: type[BaseException]) -> int:
+    """Raise ``exception`` in ``thread_id`` at its next bytecode boundary.
+
+    Returns the number of threads the request reached (1 = delivered). While
+    the target thread runs a C call that does not return — a blocking socket
+    read, an extension call — delivery is delayed until it does; the
+    watchdog's escalation covers exactly that case.
+    """
+    setter = ctypes.pythonapi.PyThreadState_SetAsyncExc
+    setter.argtypes = (ctypes.c_ulong, ctypes.py_object)
+    setter.restype = ctypes.c_int
+    return setter(ctypes.c_ulong(thread_id), ctypes.py_object(exception))
 
 # Section 12.2's conditional observation objective, and the declared parameters
 # that bound it (R2).
@@ -584,6 +753,18 @@ class MissionRuntime:
         self._session: PymavlinkSession | None = None
         self._publisher: loc.ExternalNavPublisher | None = None
         self.result = MissionResult(flew=False, termination_reason="not_started")
+        # The mission-loop watchdog, once run() starts it. A field on the
+        # runtime (and not a local of run()) because the beats come from
+        # methods the runtime owns, on the mission loop's own thread.
+        self._watchdog: _MissionLoopWatchdog | None = None
+        # The watchdog's own clock and cadence. Production values are the
+        # declared constants above; they sit on the instance so a test can
+        # drive this exact machinery on an injected clock (T18) without
+        # touching the declared bounds.
+        self._watchdog_stall_s = MISSION_LOOP_STALL_S
+        self._watchdog_poll_s = MISSION_WATCHDOG_POLL_S
+        self._watchdog_monotonic = time.monotonic
+        self._watchdog_sleep = time.sleep
 
     # -- records ----------------------------------------------------------
 
@@ -779,6 +960,100 @@ class MissionRuntime:
 
     # -- the whole mission -------------------------------------------------
 
+    def _watchdog_start(self) -> None:
+        """Start the mission-loop watchdog on the calling thread.
+
+        Called by run() on the mission loop's own thread; kept as its own
+        method so a test can start the run's real fire/escalate machinery on
+        an injected clock instead of measuring the machine (T18).
+        """
+        thread_id = threading.get_ident()
+
+        def fire(age_s: float) -> None:
+            # The run's own record of the stall, beside its other evidence:
+            # every thread's stack, so the hung computation is named by its
+            # frames rather than guessed from a shell transcript. Written
+            # directly, not through the recorder, which the watchdog thread
+            # must not touch mid-write.
+            dump_path = self.evidence.path("mission-loop-stall.txt")
+            with open(dump_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    f"mission loop stalled: no beat for {age_s:.1f} s "
+                    f"(bound {self._watchdog_stall_s:.1f} s); mission thread "
+                    f"{thread_id}\n"
+                )
+                handle.write(
+                    "result at stall: flew="
+                    f"{self.result.flew} termination_reason="
+                    f"{self.result.termination_reason!r}\n\n"
+                )
+                handle.flush()
+                faulthandler.dump_traceback(file=handle, all_threads=True)
+            self.result.termination_reason = "mission_loop_stalled"
+            self.result.blockers.append(
+                f"the mission loop stopped beating for {age_s:.1f} s "
+                f"(bound {self._watchdog_stall_s:.1f} s); the stall and every "
+                "thread's stack are in mission-loop-stall.txt"
+            )
+            self.result.log.append(
+                f"mission loop stalled: no beat for {age_s:.1f} s; breaking the loop"
+            )
+            if _raise_in_thread(thread_id, MissionLoopStalled) != 1:
+                self.result.log.append(
+                    "the stall exception could not be delivered to the mission "
+                    "thread; the watchdog will escalate"
+                )
+
+        def escalate(age_s: float) -> None:
+            # One full bound after fire the loop still has not unwound: the
+            # thread is wedged where the asynchronous exception cannot reach.
+            # The artifact is on disk; keep its timeline and end the process,
+            # because this run will never write its own receipt.
+            marker = self.evidence.path("mission-loop-stall.txt")
+            try:
+                with marker.open(
+                    "a" if marker.exists() else "w", encoding="utf-8"
+                ) as handle:
+                    handle.write(
+                        f"escalated after {age_s:.1f} s without a beat; exiting "
+                        f"{MISSION_STALL_EXIT_CODE}\n"
+                    )
+            except Exception:
+                pass
+            os._exit(MISSION_STALL_EXIT_CODE)
+
+        self._watchdog = _MissionLoopWatchdog(
+            thread_id=thread_id,
+            fire=fire,
+            escalate=escalate,
+            stall_s=self._watchdog_stall_s,
+            poll_s=self._watchdog_poll_s,
+            monotonic=self._watchdog_monotonic,
+            sleep=self._watchdog_sleep,
+        )
+        self._watchdog.start()
+
+    def _watchdog_stop(self) -> None:
+        """Stop the watchdog and wait for it. Every run() exit path calls this
+        before the shutdown, so a healthy run never carries a live watchdog —
+        and a stalled run's escalation can never race the receipt."""
+        watchdog = self._watchdog
+        if watchdog is None:
+            return
+        self._watchdog = None
+        watchdog.stop()
+        watchdog.join(timeout_s=3.0 * self._watchdog_poll_s)
+
+    def _beat_watchdog(self) -> None:
+        """One turn of the mission loop, on the loop's own thread.
+
+        A no-op before run() starts the watchdog, so nothing outside a run
+        pays for it.
+        """
+        watchdog = self._watchdog
+        if watchdog is not None:
+            watchdog.beat()
+
     def run(self) -> MissionResult:
         log = self.result.log
         estimator = self._localization["estimator"]
@@ -933,6 +1208,9 @@ class MissionRuntime:
 
         def drain() -> None:
             nonlocal last_telemetry
+            # One turn of the mission loop: everything the ordered bring-up
+            # waits inside of turns here.
+            self._beat_watchdog()
             # Deliberately NOT a perception pump. `drain` runs inside the
             # ordered bring-up, whose RC-throttle override must be refreshed
             # every 0.5 s inside the firmware's own 3.0 s override timeout.
@@ -955,6 +1233,9 @@ class MissionRuntime:
         bring_up_link: BringUpLink | None = None
         feed_thread: threading.Thread | None = None
         try:
+            # The supervisor starts with the run and stops in the finally
+            # below, before the shutdown, on every exit path.
+            self._watchdog_start()
             self.broker.set_mission(self.contract, self._clock())
             platform.start()
             readiness = platform.wait_ready(self.settings.step_timeout_s.startup)
@@ -1090,55 +1371,71 @@ class MissionRuntime:
                 self._airborne = True
             self._machine.open_window(time.monotonic_ns())
             self._fly_the_mission(drain)
-        finally:
-            self._shutdown(
-                platform, publisher, estimator_process, feed_stop, feed_thread, bring_up_link
+        except MissionLoopStalled:
+            # The watchdog already wrote the stall artifact and named the
+            # termination. Unwinding HERE, rather than out of run(), is what
+            # lets the run's normal shutdown and receipt still happen — the
+            # one thing J50-move-1 never got.
+            log.append(
+                "mission loop stalled: the loop unwound; the run's receipt follows"
             )
-            self.result.publications = self._publication_count
-            self.result.publish_refusals = self._publish_refusal_count
-            self._surface_refusals()
-            self.result.stream = {
-                "pairs": self._stats.pairs,
-                "pair_records_filed": self._stats.pair_records_filed,
-                "pair_records_dropped": self._stats.pair_records_dropped,
-                "pairs_held_for_imu": self._stats.pairs_held_for_imu,
-                "max_pair_hold_s": round(self._stats.max_pair_hold_s, 6),
-                "imu_samples": self._stats.imu_samples,
-                "truth_samples": len(self._stats.truth_samples),
-                "sim_clock_frames": self._stats.sim_clock.frames,
-                "sim_clock_newest_s": self._stats.sim_clock.newest_s,
-                "first_record_kind": self._first_record_kind,
-                "feed_failures": list(feed_failures),
-                "perception_frames_dropped": self._perception_frames_dropped,
-                # Cycles that took a frame, the observations they produced, the
-                # declared interval they were paced by, and how many distinct
-                # reasons perception refused. Frames dropped are the queue
-                # discarding an older snapshot for a newer one, which is the
-                # design; the fault this pair detects is a cycle count that does
-                # not scale with the run's own duration.
-                "perception_cycles": self._perception_cycles,
-                "perception_observations": self._observation_counter,
-                "perception_interval_s": MIN_PERCEPTION_INTERVAL_S,
-                "perception_refusal_reasons": len(self._perception_refusal_counts),
-                # Where a perception cycle's wall time went, and what was
-                # actually commanded. Both exist because a run that says only
-                # "85 cycles" and "0 publications" cannot be read: the first
-                # hides whether the cadence was honoured and why not, the second
-                # hides whether the aircraft was ever told to go anywhere.
-                "perception_drain_s": round(self._perception_drain_s, 3),
-                "perception_depth_s": round(self._perception_depth_s, 3),
-                "commanded_setpoints": list(self._commanded),
-                "publisher_published": getattr(publisher, "published", None),
-                "publisher_failures": list(getattr(publisher, "publish_failures", [])),
-                # The arm, the one reasoned call's own document, and every
-                # in-flight cloud exchange. The transport already carries this
-                # dict into the run's record verbatim, so the receipt can tell
-                # a conventional run from a cloud one and show what the cloud
-                # was asked and what came back without a second integration.
-                "arm": self.arm,
-                "plan": self.result.plan,
-                "cloud_calls": list(self.result.cloud_calls),
-            }
+            self.result.termination_reason = "mission_loop_stalled"
+        finally:
+            try:
+                self._watchdog_stop()
+                self._shutdown(
+                    platform, publisher, estimator_process, feed_stop, feed_thread, bring_up_link
+                )
+                self.result.publications = self._publication_count
+                self.result.publish_refusals = self._publish_refusal_count
+                self._surface_refusals()
+                self.result.stream = {
+                    "pairs": self._stats.pairs,
+                    "pair_records_filed": self._stats.pair_records_filed,
+                    "pair_records_dropped": self._stats.pair_records_dropped,
+                    "pairs_held_for_imu": self._stats.pairs_held_for_imu,
+                    "max_pair_hold_s": round(self._stats.max_pair_hold_s, 6),
+                    "imu_samples": self._stats.imu_samples,
+                    "truth_samples": len(self._stats.truth_samples),
+                    "sim_clock_frames": self._stats.sim_clock.frames,
+                    "sim_clock_newest_s": self._stats.sim_clock.newest_s,
+                    "first_record_kind": self._first_record_kind,
+                    "feed_failures": list(feed_failures),
+                    "perception_frames_dropped": self._perception_frames_dropped,
+                    # Cycles that took a frame, the observations they produced, the
+                    # declared interval they were paced by, and how many distinct
+                    # reasons perception refused. Frames dropped are the queue
+                    # discarding an older snapshot for a newer one, which is the
+                    # design; the fault this pair detects is a cycle count that does
+                    # not scale with the run's own duration.
+                    "perception_cycles": self._perception_cycles,
+                    "perception_observations": self._observation_counter,
+                    "perception_interval_s": MIN_PERCEPTION_INTERVAL_S,
+                    "perception_refusal_reasons": len(self._perception_refusal_counts),
+                    # Where a perception cycle's wall time went, and what was
+                    # actually commanded. Both exist because a run that says only
+                    # "85 cycles" and "0 publications" cannot be read: the first
+                    # hides whether the cadence was honoured and why not, the second
+                    # hides whether the aircraft was ever told to go anywhere.
+                    "perception_drain_s": round(self._perception_drain_s, 3),
+                    "perception_depth_s": round(self._perception_depth_s, 3),
+                    "commanded_setpoints": list(self._commanded),
+                    "publisher_published": getattr(publisher, "published", None),
+                    "publisher_failures": list(getattr(publisher, "publish_failures", [])),
+                    # The arm, the one reasoned call's own document, and every
+                    # in-flight cloud exchange. The transport already carries this
+                    # dict into the run's record verbatim, so the receipt can tell
+                    # a conventional run from a cloud one and show what the cloud
+                    # was asked and what came back without a second integration.
+                    "arm": self.arm,
+                    "plan": self.result.plan,
+                    "cloud_calls": list(self.result.cloud_calls),
+                }
+            except MissionLoopStalled:
+                # A delivery that lands in a run already shutting down: the
+                # stall is named and its artifact is on disk, and the receipt
+                # must survive even this.
+                self.result.termination_reason = "mission_loop_stalled"
         return self.result
 
     # -- the mission phases -------------------------------------------------
@@ -1220,6 +1517,7 @@ class MissionRuntime:
         index = 0
         regathers: dict[str, int] = {}
         while index < len(phases):
+            self._beat_watchdog()
             if self._visual_fault_reason is not None:
                 # The estimate is no longer a pose. Landing is the declared
                 # protective end, and the reason names the bound that was
@@ -1585,6 +1883,7 @@ class MissionRuntime:
         One observation event per cycle, with the pair's payloads stored only
         when the frame grounded a candidate — the evidence a claim can cite.
         """
+        self._beat_watchdog()
         record = None
         try:
             while True:
@@ -1833,6 +2132,7 @@ class MissionRuntime:
         next_publish = 0.0
         stopped = "the window closed"
         while not window.expired():
+            self._beat_watchdog()
             if self._visual_fault_reason is not None:
                 stopped = f"the estimate stopped being a pose: {self._visual_fault_reason}"
                 break
@@ -2650,6 +2950,7 @@ class _LiveRunnerWorld:
         next_perception = 0.0
         settle_since: float | None = None
         while not lease.expired():
+            runtime._beat_watchdog()
             if runtime._visual_fault_reason is not None:
                 # A step also ends when the estimate stops being a pose, so a
                 # fault during a flown step stops the step rather than being
