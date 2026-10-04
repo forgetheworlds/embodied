@@ -79,6 +79,7 @@ def test_every_declared_value_matches_the_constant_in_force(declared: dict) -> N
         ("mission", "excursion_standoff_m", runtime.EXCURSION_STANDOFF_M),
         ("mission", "settle_speed_mps", runtime.SETTLE_SPEED_MPS),
         ("mission", "settle_hold_s", runtime.SETTLE_HOLD_S),
+        ("mission", "vantage_refusal_sweep_cycles", runtime.VANTAGE_REFUSAL_SWEEP_CYCLES),
         ("map", "voxel_m", runtime.MAP_PARAMETERS["voxel_m"]),
         ("map", "surface_band_m", runtime.MAP_PARAMETERS["surface_band_m"]),
         ("map", "log_odds_hit", runtime.MAP_PARAMETERS["log_odds_hit"]),
@@ -136,6 +137,7 @@ def test_no_declared_key_is_unpinned(declared: dict) -> None:
             "excursion_standoff_m",
             "settle_speed_mps",
             "settle_hold_s",
+            "vantage_refusal_sweep_cycles",
         },
         "map": {
             "voxel_m",

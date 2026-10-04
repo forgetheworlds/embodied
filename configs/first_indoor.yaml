@@ -332,6 +332,31 @@ mission:
   # while the referee's return predicate was satisfied: two different predicates,
   # and the report's requires this hold.
   settle_hold_s: 1.0
+  #
+  # 2: the consecutive `unknown_geometry` groundings of the query's selection
+  # that convert "selected but unmeasurable" into a change of view — the
+  # section-12.2 observation sweep toward the selection's bearing, then explore —
+  # instead of another selection from the same pose. One home in code:
+  # VANTAGE_REFUSAL_SWEEP_CYCLES.
+  #
+  # 2, derived from J52-discrim-1 (measured; work/runs/night/GROUNDING-INVALID-
+  # DEPTH.md): the mission re-selected the same unmeasurable decoy sliver 19
+  # times — in runs of 12 and 6 consecutive candidate-bearing observations
+  # (obs 3-14, obs 21-26; 207 further frames proposed no candidate) — and never
+  # once changed view, every refusal the same "none of the 1 selected samples
+  # carries valid depth". One refusing cycle is not evidence of a vantage
+  # defect: a single frame can drop out of the stereo matcher on an otherwise
+  # measurable view, and grounding refuses honestly per pixel. The second
+  # consecutive refusal from the same standing view is the smallest count that
+  # separates the measured pathology (invalid depth persisting over the
+  # selection) from a one-frame transient: at 2, the measured run's first series
+  # sweeps on its 2nd selection instead of re-selecting 19 times (12 wasted
+  # selections in that series alone, 17 over the run). The sweep runs at most
+  # once per standing view — it re-arms only when a goal is admitted and flies,
+  # which is a new vantage — so the pair (count 2, one sweep per view) cannot
+  # loop, and a sweep that still refuses ends the episode honestly ("not
+  # measurable from here") rather than re-selecting.
+  vantage_refusal_sweep_cycles: 2
 
 map:
   # The occupancy representation. Every value here except bounds_odom_m is the
