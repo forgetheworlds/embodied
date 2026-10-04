@@ -924,8 +924,52 @@ class MissionRuntime:
             host_id=controller_host, clock_id=controller_clock, monotonic_ns=self._now_ns()
         )
 
+    def _publishable_state(self, state: loc.EstimatorState | None) -> loc.EstimatorState | None:
+        """One raw estimator state, only while the publisher's verdicts would publish it.
+
+        ESTIMATOR-DIVERGENCE.md measured where divergence reached this mission:
+        the feed thread hands every raw STATE to ``_on_state`` before
+        ``publisher.offer`` sees it, and the pose accessors consumed that state
+        with none of the gates the publish path applies -- so J51 flew on, and
+        recorded, ``here`` = (-0.22, -6.76, -1.42), a 6.9 m pose inside a 6 m
+        room, while the autopilot wire stayed clean (VPE max |y| <= 0.09 m in
+        every diverged run). The publisher's ``state_for_publish`` is the
+        system's declaration of what is fit to act on, and this runtime shares
+        its ``HealthMachine``; the mission reads the estimator through the same
+        declaration, state for state, so a state the wire would refuse is never
+        the mission's pose either:
+
+        - the declared visual-update fail verdict (F4), under the same condition
+          the publisher applies it -- an initialized state whose visual clock
+          has ticked; an age measured against a clock that has never ticked is
+          not a fault;
+        - the publisher's tracking verdict under the declared floor, when
+          initialized. This is the publisher's own bound (973b0a5) mirrored, not
+          the bare-count run-ender re-raised: that run-ender fired on
+          ``n_tracks`` summaries the pin reports as 0 beside healthy images and
+          stays removed from ``_visual_fault`` (dd0df20). Here the count can only
+          refuse to serve a pose at exactly the states the wire refuses to
+          carry, so this gate cannot be stricter than the publisher that owns
+          the floor -- if the verdict ever false-fires, the wire stops with it,
+          which is the publisher's declared behaviour, not a new mission failure
+          mode.
+
+        Refused states still land in ``_latest_state`` and ``_state_ring``:
+        ``_visual_fault`` needs the raw newest state to keep measuring the age
+        that fires the declared protective landing, and the ring is evidence.
+        What a refused state can never be again is a pose the mission acts on.
+        """
+        if state is None:
+            return None
+        if state.t_last_visual_ns and state.initialized:
+            if self._machine.visual_update_verdict(state) == "fail":
+                return None
+        if state.initialized and self._machine.tracking_verdict(state) == "fail":
+            return None
+        return state
+
     def _navigation_state(self) -> R.NavigationState | None:
-        state = self._latest_state
+        state = self._publishable_state(self._latest_state)
         if state is None or not self.alignment.sealed:
             return None
         sigma = state.sigma_pos_m
@@ -953,13 +997,13 @@ class MissionRuntime:
 
     def _position_odom(self) -> tuple[float, float, float] | None:
         """The aircraft's position in the mission's odom frame (aligned local NED)."""
-        state = self._latest_state
+        state = self._publishable_state(self._latest_state)
         if state is None or not self.alignment.sealed:
             return None
         return self.alignment.aligned_position_ned(state.position_m)
 
     def _speed(self) -> float:
-        state = self._latest_state
+        state = self._publishable_state(self._latest_state)
         if state is None or not self.alignment.sealed:
             return 0.0
         return float(np.linalg.norm(self.alignment.aligned_velocity_ned(state.velocity_mps)))
@@ -971,7 +1015,9 @@ class MissionRuntime:
             return None
         target_ns = sim_time_ns(record.sim_time_s if record.sim_time_s >= 0.0 else 0.0)
         best = min(ring, key=lambda entry: abs(entry[0] - target_ns))
-        state = best[1]
+        state = self._publishable_state(best[1])
+        if state is None:
+            return None
         controller_host = str(self._controller_status.get("host_id") or self.settings.host_id)
         controller_clock = str(self._controller_status.get("clock_id") or self.settings.clock_id)
         sigma = state.sigma_pos_m
