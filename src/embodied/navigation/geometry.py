@@ -36,9 +36,14 @@ class Envelope:
 
     body_radius_m: float
     error_allowance_m: float
+    # The sensor's near blind field: the matcher cannot report depth inside this,
+    # so no free-space evidence can exist there in any direction. It is declared
+    # as the depth window's own near bound, and it is what the self-occupied
+    # exemption below is derived from rather than chosen.
+    sensor_near_limit_m: float = 0.0
 
     def __post_init__(self) -> None:
-        for name in ("body_radius_m", "error_allowance_m"):
+        for name in ("body_radius_m", "error_allowance_m", "sensor_near_limit_m"):
             value = getattr(self, name)
             if not isinstance(value, float) or value < 0.0:
                 raise R.RecordError(f"envelope {name} must be a non-negative number")
@@ -50,6 +55,36 @@ class Envelope:
     @property
     def swept_radius_m(self) -> float:
         return self.body_radius_m + self.error_allowance_m
+
+    def self_occupied_radius_m(self, voxel_m: float) -> float:
+        """The radius treated as the vehicle's own, unobservable volume.
+
+        The exemption exists for the space the vehicle's own presence blinds the
+        sensor to. The matcher cannot report depth inside the near limit, so no
+        evidence can exist there in any direction, and a clearance ball around any
+        cell within about half a metre of the camera reaches space the sensor
+        provably cannot see. Without the exemption a plan can never start where the
+        aircraft stands, and — measured on J44-fly-1 — not one of the 26 neighbours
+        is searchable, so the aircraft never leaves its own cell.
+
+        The radius is the near limit plus **one body-diagonal step**, because a cell
+        one step away has its ball displaced by ``sqrt(3) * voxel`` from the
+        origin's, and every cell in that step must be startable for the mission to
+        move at all. It is never smaller than the envelope itself, which the
+        aircraft physically occupies.
+
+        It does not widen the free space ahead: the exemption marks cells free for
+        the *start* of a plan only. Every cell beyond it is still refused unless the
+        map itself carries evidence that it is free.
+
+        With the declared values this is ``max(0.475, 0.5 + 0.173) = 0.673 m``,
+        which selects the same discrete ball as the 0.675 m an independent mission
+        measured as sufficient. The derivation reproduces that measurement rather
+        than being fitted to it.
+        """
+        if self.sensor_near_limit_m <= 0.0:
+            return self.inflation_m
+        return max(self.inflation_m, self.sensor_near_limit_m + math.sqrt(3.0) * voxel_m)
 
     def fits(self, extent_m: float) -> bool:
         """Whether an observed extent leaves a positive corridor once inflated."""
@@ -298,12 +333,19 @@ def inflated_free_cells(
     space, the surface band and unknown space all disqualify it, because unknown is
     never free.
 
-    One bounded exemption: the cells the aircraft's own declared envelope occupies
-    at its current position are self-occupied by construction — the aircraft is
-    physically there, so that space is not unknown *to it*. Without the exemption a
-    plan could never start where the aircraft stands, because the space directly
-    below and behind a forward-looking camera pair is unobserved. The exemption is
-    limited to the envelope of the origin and never widens the free space ahead.
+    One bounded exemption: the cells the vehicle's own presence blinds the sensor to
+    are self-occupied by construction. The matcher cannot report depth inside the
+    declared near limit, so no evidence can exist there in any direction, and a
+    clearance ball around any cell within about half a metre of the camera reaches
+    space the sensor provably cannot see — measured on J44-fly-1 as 83 % of every
+    ball disqualifier, spread over all eight octants rather than sitting behind the
+    aircraft. Without the exemption a plan can never start where the aircraft stands,
+    and not one of the 26 neighbours is searchable.
+
+    Its radius is derived from the sensor's near limit rather than from the envelope
+    (``Envelope.self_occupied_radius_m``), and it never widens the free space ahead:
+    every cell beyond it is still refused unless the map itself carries evidence that
+    it is free. The clearance ball is unchanged.
     """
     config = store.config
     shape = config.shape()
@@ -315,7 +357,8 @@ def inflated_free_cells(
     reach = int(math.ceil(radius / config.voxel_m))
     if self_occupied_origin_odom_m is not None:
         origin_index = config.cell_index(self_occupied_origin_odom_m)
-        for dx, dy, dz in ball_offsets(config, radius):
+        self_occupied_radius = envelope.self_occupied_radius_m(config.voxel_m)
+        for dx, dy, dz in ball_offsets(config, self_occupied_radius):
             cell = (origin_index[0] + dx, origin_index[1] + dy, origin_index[2] + dz)
             if config.inside(cell):
                 free[cell] = True

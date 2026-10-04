@@ -326,6 +326,10 @@ CONFIG_SCHEMA: dict[str, Any] = {
             # The aircraft's own radius, and the pose error the mission acts on.
             "body_radius_m": float,
             "error_allowance_m": float,
+            # The sensor's near blind field. It mirrors the calibration section's
+            # depth_range_m near bound and it is what the self-occupied exemption
+            # is derived from, so it must be declared wherever the envelope is.
+            "sensor_near_limit_m": float,
         }
     ),
     "planner": _Optional(
