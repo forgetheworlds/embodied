@@ -112,6 +112,7 @@ from embodied.platform.webots_ardupilot import (
     PymavlinkSession,
     TcpSensorGateway,
     WebotsArduPilot,
+    baro_relative_altitude_m,
     measure_frame_quality,
     ppm_bytes,
 )
@@ -649,6 +650,17 @@ class MissionRuntime:
                 # Declared in the config (R2). A config that omits it keeps the
                 # module default, so nothing that declares nothing changes.
                 tracking_lost_min_tracks=int(bounds.get("tracking_lost_min_tracks", 5)),
+                # R24's z guard, same declared pattern: the residual bound, the
+                # offset window and the reference staleness are the guard's three
+                # parameters; the module defaults are the values
+                # configs/first_indoor.yaml declares with their derivation.
+                z_guard_max_residual_m=float(bounds.get("z_guard_max_residual_m", 0.6)),
+                z_guard_offset_window_s=float(
+                    bounds.get("z_guard_offset_window_ms", 10000) / 1000.0
+                ),
+                z_guard_baro_stale_after_s=float(
+                    bounds.get("z_guard_baro_stale_after_ms", 500) / 1000.0
+                ),
             )
         )
         self.alignment = loc.OdomAlignment(
@@ -785,6 +797,11 @@ class MissionRuntime:
         self._platform: WebotsArduPilot | None = None
         self._session: PymavlinkSession | None = None
         self._publisher: loc.ExternalNavPublisher | None = None
+        # The z guard's barometric datum: the run's first primary-barometer
+        # reading (pressure in hPa, temperature in centi-degrees C). Fixed once,
+        # so every later conversion shares one datum and the guard's fixed
+        # offset absorbs it whole.
+        self._baro_reference: tuple[float, int] | None = None
         self.result = MissionResult(flew=False, termination_reason="not_started")
         # The mission-loop watchdog, once run() starts it. A field on the
         # runtime (and not a local of run()) because the beats come from
@@ -1305,9 +1322,11 @@ class MissionRuntime:
                 return
             last_telemetry = time.monotonic()
             try:
-                platform.telemetry()
+                sample = platform.telemetry()
             except Exception as error:
                 self._machine.stop(time.monotonic_ns(), f"the telemetry stream failed: {error}")
+            else:
+                self._offer_baro(sample)
 
         bring_up_link: BringUpLink | None = None
         feed_thread: threading.Thread | None = None
@@ -1712,6 +1731,12 @@ class MissionRuntime:
         then stopped, and the reason was on this list and invisible. Deduped,
         order preserved, and the count survives a long list.
         """
+        # R24: if the z guard stopped the feed between setpoint ticks, the run's
+        # record still says so. The line is handed over exactly once, so a trip
+        # already surfaced in flight is not repeated here.
+        guard_line = self._publisher.z_guard_receipt_line() if self._publisher else None
+        if guard_line is not None:
+            self.result.log.append(guard_line)
         unique_refusals = list(dict.fromkeys(self._refusals_log))
         for entry in unique_refusals[:40]:
             self.result.log.append(f"refused: {entry}")
@@ -1734,6 +1759,32 @@ class MissionRuntime:
                 pass
 
     # -- estimator state -----------------------------------------------------
+
+    def _offer_baro(self, sample: Any) -> None:
+        """Convert the freshest primary-barometer reading for the z guard (R24).
+
+        The reference is the vehicle's own barometer, and the only honest carrier
+        of it on this firmware is SCALED_PRESSURE: GLOBAL_POSITION_INT is built
+        from the EKF's own position (send_global_position_int reads
+        ahrs.get_location; AP_NavEKF3_Outputs.cpp:316), and with EK3_SRC1_POSZ 6
+        that position is the vision feed — comparing them would be vision against
+        vision. The conversion is ArduPilot's own simple model with this run's
+        first reading as the datum, so the guard's fixed-offset window absorbs
+        the datum and no second atmospheric opinion enters.
+        """
+        if self._publisher is None:
+            return
+        pressure = getattr(sample, "press_abs_hpa", None)
+        temperature = getattr(sample, "press_temp_cdegc", None)
+        if pressure is None or temperature is None or pressure <= 0.0:
+            return
+        if self._baro_reference is None:
+            self._baro_reference = (pressure, temperature)
+            return
+        ref_pressure, ref_temperature = self._baro_reference
+        self._publisher.offer_baro(
+            baro_relative_altitude_m(pressure, temperature, ref_pressure, ref_temperature)
+        )
 
     def _on_state(self, state: loc.EstimatorState) -> None:
         self._latest_state = state
@@ -2411,6 +2462,12 @@ class MissionRuntime:
         motion target this runtime puts on the wire goes through this one
         method and the platform's one publisher.
         """
+        # R24: the run's own record must say why the vision feed stopped. The
+        # publisher owns the trip record; this line is what it owes the receipt,
+        # surfaced at the first setpoint tick after the trip.
+        guard_line = self._publisher.z_guard_receipt_line() if self._publisher else None
+        if guard_line is not None:
+            self.result.log.append(guard_line)
         active = self._active_goal
         if active is None:
             return "no_active_goal"

@@ -29,6 +29,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from statistics import median
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -477,6 +478,33 @@ class HealthBounds:
     # inside a ~6 m room. Declared well below any healthy sample: a gate-passing
     # P01-L flight tracks 44-59, and the runs that collapse read 0 or 1.
     tracking_lost_min_tracks: int = 5
+    # The R24 z guard (owner ruling 2026-10-04; work/runs/night/Z-CLIMB.md): a
+    # publisher-side bound on the vertical divergence between the estimate about
+    # to be published and the vehicle's own barometer. The FC's altitude channel
+    # IS the estimator's z (EK3_SRC1_POSZ 6), so a live-but-wrong estimate was
+    # indistinguishable from a moving aircraft all the way to the crash detector;
+    # this bound is the one check on the wire the estimator cannot talk out of,
+    # because the barometer is calibrated and fused for nothing. On breach the
+    # publisher stops and the firmware's own external-navigation-loss machinery
+    # (FS_EKF_ACTION 1) lands protectively. The defaults are the values
+    # configs/first_indoor.yaml declares with their derivation (R2).
+    #
+    # The bound is on the RESIDUAL after one fixed offset between (-vision z) and
+    # the barometer's pressure-altitude, estimated over the declared window: the
+    # two live in different frames (local NED, odom-origin datum vs a pressure
+    # datum), and the offset absorbs the datum and the sign so neither enters the
+    # bound. Declared safe at this scale by measurement, not assumption: the
+    # healthy population (<= 0.2 m) already spans the whole mission envelope,
+    # and the divergence being caught grows >= 1 m within 4 s of onset — a rate
+    # no barometric drift produces.
+    z_guard_max_residual_m: float = 0.6
+    # The offset window: the first seconds of PUBLISHED states, before any
+    # observation sweep. Before it closes the guard measures and never gates.
+    z_guard_offset_window_s: float = 10.0
+    # A barometer reference older than this gates nothing: the guard is a
+    # comparison, and without a fresh reference the comparison does not exist.
+    # (A frozen barometer must not false-trip a healthy climb or descent.)
+    z_guard_baro_stale_after_s: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -948,6 +976,28 @@ class ExternalNavPublisher:
         self._connection = None
         self.published = 0
         self.publish_failures: list[str] = []
+        # The R24 z guard's state. ``_baro`` is one tuple slot replaced
+        # atomically by the runtime's telemetry thread and read here — the same
+        # single-writer pattern the bridge's pose slot uses: (baro altitude in
+        # metres, up-positive, pacing-clock stamp).
+        self._baro: tuple[float, float] | None = None
+        # The fixed offset between (-vision z) and the baro altitude, estimated
+        # over the declared window of published states. None until the window
+        # closes, and the guard gates on nothing before it does.
+        self._z_guard_samples: list[float] = []
+        self._z_guard_offset_m: float | None = None
+        self._z_guard_window_start_s: float | None = None
+        self._z_guard_window_samples: int = 0
+        self._z_guard_window_closed: bool = False
+        # Stop-once: a breach latches. A fresh initialized state after the stop
+        # would otherwise recover the machine and re-open the wire while the
+        # divergence may still stand — the flap R24 forbids — so the refusal is
+        # the publisher's own memory, not only the machine's state.
+        self._z_guard_latched: bool = False
+        self._z_guard_trips: list[dict[str, object]] = []
+        # The one line the run's receipt owes R24 (why the feed stopped), handed
+        # over exactly once by ``z_guard_receipt_line``.
+        self._z_guard_line: str | None = None
 
     def retarget(self, endpoint: str) -> None:
         """Point the publisher at the autopilot link it will open in ``start()``.
@@ -967,6 +1017,126 @@ class ExternalNavPublisher:
         self._latest_offer_s = self._clock()
         self._newest_imu_ns = max(self._newest_imu_ns, newest_imu_ns)
         self._wake.set()
+
+    def offer_baro(self, altitude_m: float) -> None:
+        """Hand one barometric altitude (metres, up-positive) to the z guard.
+
+        Stamped with the pacing clock, so the guard's staleness bound is in the
+        same units as every other freshness bound on this publisher (simulated
+        time in the live run).
+        """
+        if not math.isfinite(altitude_m):
+            return
+        self._baro = (float(altitude_m), self._clock())
+
+    def z_guard_receipt_line(self) -> str | None:
+        """The one line the run's record owes R24: why the feed stopped — or
+        why the guard never gated. Returned once, then None."""
+        line = self._z_guard_line
+        self._z_guard_line = None
+        return line
+
+    def _z_guard_reason(self, state: EstimatorState, now_s: float) -> str | None:
+        """The R24 refusal for one candidate state, or None when it may publish.
+
+        The comparison is the bound's own words, |vision z − baro z| against the
+        declared maximum residual. The vision side is the z that actually goes
+        on the wire (the aligned local-NED z, down-positive); the baro side is
+        up-positive metres; the fixed offset estimated over the declared window
+        absorbs the sign and the datum between them, so the bound binds only the
+        residual.
+        """
+        bounds = self._machine.bounds
+        if self._z_guard_latched:
+            return "the z guard has stopped publication for this run"
+        if not self._machine.window_declared:
+            # The sigma bound's own shape: the guard protects the flying wire,
+            # and a stop while parked starves the firmware's VISO health window
+            # and refuses the arm (FIXER6) — the self-inflicted refusal the
+            # parked phase exists to avoid.
+            return None
+        if not self._alignment.sealed:
+            return None
+        baro = self._baro
+        if baro is None or now_s - baro[1] > bounds.z_guard_baro_stale_after_s:
+            # No fresh barometer reference: the comparison does not exist, so
+            # nothing is refused here. The FC's own external-navigation-loss
+            # machinery remains the declared failsafe for a silent vehicle.
+            return None
+        vision_z = self._alignment.aligned_position_ned(state.position_m)[2]
+        if self._z_guard_offset_m is None:
+            # The offset window has not closed: the guard measures and never
+            # gates before it does (declared in the configuration).
+            return None
+        residual = (-vision_z - baro[0]) - self._z_guard_offset_m
+        if abs(residual) <= bounds.z_guard_max_residual_m:
+            return None
+        trip = {
+            "at_s": round(now_s, 3),
+            "vision_z_ned_m": round(vision_z, 3),
+            "baro_alt_m": round(baro[0], 3),
+            "offset_m": round(self._z_guard_offset_m, 3),
+            "residual_m": round(residual, 3),
+            "bound_m": bounds.z_guard_max_residual_m,
+            "vision_time_ns": state.time_ns,
+            "baro_age_s": round(now_s - baro[1], 3),
+            "offset_window_samples": self._z_guard_window_samples,
+        }
+        self._z_guard_trips.append(trip)
+        self._z_guard_latched = True
+        self._z_guard_line = (
+            "vision feed stopped: |vision z − baro z| = {residual:.3f} m exceeds "
+            "the declared bound {bound:.3f} m (R24); vision z {vz:.3f} m NED, "
+            "baro {ba:.3f} m, fixed offset {off:.3f} m (window of {n} published "
+            "states), vision stamp {vt:.3f} s, baro age {age:.3f} s; the flight "
+            "controller's external-navigation-loss path owns the aircraft now"
+        ).format(
+            residual=residual,
+            bound=bounds.z_guard_max_residual_m,
+            vz=vision_z,
+            ba=baro[0],
+            off=self._z_guard_offset_m,
+            n=self._z_guard_window_samples,
+            vt=state.time_ns / 1e9,
+            age=now_s - baro[1],
+        )
+        self._machine.stop(
+            int(self._accounting_clock() * 1e9), f"z guard: {self._z_guard_line}"
+        )
+        return self._z_guard_line
+
+    def _z_guard_note_publication(self, state: EstimatorState, now_s: float) -> None:
+        """Feed the offset window: one sample per published state, until it closes.
+
+        The window is the declared first seconds of PUBLISHED states — pairs the
+        wire actually carried — so the offset is estimated from exactly the
+        samples the bound will later judge. A tick with no fresh barometer
+        reference contributes no sample.
+        """
+        if self._z_guard_offset_m is not None or self._z_guard_window_closed:
+            return
+        if not self._alignment.sealed:
+            return
+        if self._z_guard_window_start_s is None:
+            self._z_guard_window_start_s = now_s
+        baro = self._baro
+        if baro is not None and now_s - baro[1] <= self._machine.bounds.z_guard_baro_stale_after_s:
+            vision_z = self._alignment.aligned_position_ned(state.position_m)[2]
+            self._z_guard_samples.append((-vision_z) - baro[0])
+            self._z_guard_window_samples = len(self._z_guard_samples)
+        if now_s - self._z_guard_window_start_s >= self._machine.bounds.z_guard_offset_window_s:
+            self._z_guard_window_closed = True
+            if self._z_guard_samples:
+                self._z_guard_offset_m = median(self._z_guard_samples)
+            else:
+                # Named, never silent: a guard that never had a reference says
+                # so, and the run's record will carry the absence (the same
+                # discipline as every declared verdict here: a refusal is a
+                # failure, never an absence).
+                self._z_guard_line = (
+                    "z guard: no barometric reference arrived during the "
+                    "declared offset window; the guard never gated (R24)"
+                )
 
     def state_for_publish(self, now_s: float) -> EstimatorState | None:
         """The state the machine may act on, or None once the feed has gone silent.
@@ -1039,6 +1209,10 @@ class ExternalNavPublisher:
         # J43-move-3 measured: frames arriving, clock advancing, count at 1, and
         # an estimate 772 m from a 6 m room on the wire as a current position.
         if self._latest.initialized and self._machine.tracking_verdict(self._latest) == "fail":
+            return None
+        # The R24 z guard: the wire's last honest check. Every verdict above asks
+        # the estimator about itself; only this one asks the vehicle.
+        if self._z_guard_reason(self._latest, now_s) is not None:
             return None
         return self._latest
 
@@ -1117,6 +1291,7 @@ class ExternalNavPublisher:
                 self._machine.stop(failed_at_ns, f"publish failed: {error}")
                 return
             self._machine.on_published(state, accounted_ns, self._newest_imu_ns)
+            self._z_guard_note_publication(state, now)
             if self._on_publish is not None:
                 self._on_publish(state, self._alignment.aligned_state(state))
             self.published += 1
