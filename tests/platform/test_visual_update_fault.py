@@ -128,7 +128,12 @@ def test_the_pump_stops_and_records_when_the_visual_feed_has_stopped(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _state_with_tracks(*, n_tracks: int, time_ns: int = 100_000_000_000):
+def _state_with_tracks(
+    *,
+    n_tracks: int,
+    time_ns: int = 100_000_000_000,
+    visual_age_ns: int = 100_000_000,
+):
     from embodied.platform import localization as loc
 
     return loc.EstimatorState(
@@ -141,7 +146,7 @@ def _state_with_tracks(*, n_tracks: int, time_ns: int = 100_000_000_000):
         accel_bias=(0.0, 0.0, 0.0),
         sigma_pos_m=(0.1, 0.1, 0.1),
         n_tracks=n_tracks,
-        t_last_visual_ns=time_ns - 100_000_000,
+        t_last_visual_ns=time_ns - visual_age_ns,
         reset_counter=0,
     )
 
@@ -152,33 +157,52 @@ def test_a_healthy_tracker_is_not_a_fault(tmp_path):
     assert runtime._visual_fault() is None
 
 
-def test_a_collapsed_tracker_is_a_fault_even_though_the_feed_is_alive(tmp_path):
-    """The fault the age bounds cannot see: frames arriving, tracker at one."""
+def test_a_collapsed_tracker_field_is_a_diagnostic_not_a_bound(tmp_path):
+    """The wire field cannot gate a run, and this is the measurement.
+
+    ``n_tracks`` is filled from ``get_active_tracks``, which hands out the pin's
+    ``active_tracks_uvd`` — written only by ``retriangulate_active_tracks``,
+    keeping just the tracks that triangulate with positive depth and project
+    inside the image. It reads 0 whenever triangulation yields nothing, which is
+    exactly the stationary case a mission begins in. Measured on ``J48-fly-1``:
+    it read 0 on every summary while the feature database held 88 to 93 features
+    and the images were healthy (``left_sd`` 21.09), and a floor of 5 on it ended
+    five runs. The pin's own encoder records the count as a diagnostic.
+    """
     runtime = _runtime(tmp_path, "tracks-dead")
-    runtime._latest_state = _state_with_tracks(n_tracks=1)
-    reason = runtime._visual_fault()
-    assert reason is not None
-    assert "tracker" in reason
-    assert "below the declared floor" in reason
+    runtime._latest_state = _state_with_tracks(n_tracks=0)
+    assert runtime._visual_fault() is None, "a diagnostic must not end a run"
+    assert any("tracker diagnostic" in line for line in runtime.result.log)
 
 
-def test_the_tracking_floor_is_the_declared_one(tmp_path):
+def test_the_declared_tracking_floor_is_no_longer_consulted(tmp_path):
+    """The declared value stays for schema stability and is no longer a gate.
+
+    An unused declared bound is the trap this project has closed twice, so it is
+    named here rather than left for the next reader to find.
+    """
     runtime = _runtime(tmp_path, "tracks-declared")
     assert runtime._machine.bounds.tracking_lost_min_tracks == 5
+    runtime._latest_state = _state_with_tracks(n_tracks=1)
+    assert runtime._visual_fault() is None
 
 
-def test_the_transmission_path_refuses_a_collapsed_tracker(tmp_path):
-    """A dead-reckoned pose under a live feed must not reach the controller."""
+def test_the_transmission_path_is_guarded_by_the_visual_age_not_the_tracker(tmp_path):
+    """A feed that stops carrying usable updates is the fault that was declared."""
     runtime = _runtime(tmp_path, "tracks-publish")
     now_ns = 100_000_000_000
 
-    # A live feed whose tracker has collapsed. The feed's clock advances, so no
-    # age bound fires; the tracker's count is the only thing that says so.
+    # A live feed with a collapsed tracker is not a fault: the field is a
+    # diagnostic, so no run is ended on it.
     runtime._on_state(_state_with_tracks(n_tracks=1, time_ns=now_ns))
-    fault = runtime._visual_fault()
-    assert fault is not None, "a live feed with a collapsed tracker must be a fault"
-    assert "tracker" in fault, fault
-
-    # The same path with a healthy tracker is not a fault.
-    runtime._on_state(_state_with_tracks(n_tracks=40, time_ns=now_ns))
     assert runtime._visual_fault() is None
+
+    # The declared guard still fires: a newest estimate whose last visual update
+    # is past the bound. The tracker count is irrelevant to it.
+    past_ns = int(runtime._machine.bounds.visual_update_fail_s * 1e9) + 500_000_000
+    runtime._on_state(
+        _state_with_tracks(n_tracks=40, time_ns=now_ns, visual_age_ns=past_ns)
+    )
+    fault = runtime._visual_fault()
+    assert fault is not None, "a feed past its declared visual-update bound must be a fault"
+    assert "visual updates stopped" in fault, fault

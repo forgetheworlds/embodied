@@ -349,11 +349,28 @@ class MapStore:
         return self._cells.get(cell)
 
     def classify(self, cell: tuple[int, int, int], *, now_ns: int) -> str:
-        """free / occupied / unknown, by the declared thresholds and freshness."""
+        """free / occupied / unknown, by the declared thresholds.
+
+        Observed-free space does not expire to unknown. The owner ruled that a
+        cell stays free once evidence put it there and carries an age instead
+        (``age_of``) for a consumer that needs freshness.
+
+        Measured, J48-fly-1: with expiry at the declared 5 s, fresh free cells
+        fell from 19,036 to 0 within six seconds of the last observation of any
+        cell, and searchable cells from 1,838 to 33 — the whole map died about
+        five seconds after the aircraft stopped looking at it, so a mission that
+        explores and then returns finds its own route unknown. A wall does not
+        become unknown because the camera looked away.
+
+        The evidence requirements are untouched: a cell is free only if clearing
+        rays put it there, at the declared score threshold and ray floor, and it
+        is never free inside the surface band or above the occupied threshold.
+        Unknown is still never free, so nothing becomes free that was never
+        observed.
+        """
         evidence = self.evidence_at(cell)
         if evidence is None:
             return UNKNOWN
-        age = self._age_s(evidence, now_ns)
         if evidence.score >= self.config.occupied_threshold:
             return OCCUPIED
         if evidence.band:
@@ -363,8 +380,21 @@ class MapStore:
             evidence.score <= -self.config.free_threshold
             and evidence.clearing_rays >= self.config.min_clearing_rays
         ):
-            return UNKNOWN if age is None or age > self.config.freshness_s else FREE
+            return FREE
         return UNKNOWN
+
+    def age_of(self, cell: tuple[int, int, int], *, now_ns: int) -> float | None:
+        """Seconds since the evidence for a cell was last written, or None.
+
+        The map no longer expires free space to unknown, so this is how a
+        consumer that needs freshness reads it. The planner's certificate
+        carries a map revision for its own staleness check, and this is the
+        per-cell reading beside it.
+        """
+        evidence = self.evidence_at(cell)
+        if evidence is None:
+            return None
+        return self._age_s(evidence, now_ns)
 
     def unknown_reason(self, cell: tuple[float, float, float] | tuple[int, int, int], *, now_ns: int) -> str:
         """Why a cell is not free: never observed, stale, or conflicting evidence."""
@@ -373,9 +403,12 @@ class MapStore:
             return NEVER_OBSERVED
         if evidence.band:
             return SURFACE_BAND
-        age = self._age_s(evidence, now_ns)
-        if age is not None and age > self.config.freshness_s:
-            return STALE
+        # Age is deliberately NOT a reason. Observed-free space no longer expires
+        # (see `classify`), so an old observation cannot be why a cell is not
+        # free — the score and ray tests below are. STALE stays in the module's
+        # vocabulary and in the tally, where it is always zero, so a reader of a
+        # schema that names it is not surprised; it is simply never the answer to
+        # this question any more. The per-cell reading is `age_of`.
         if evidence.score > -self.config.free_threshold and (
             evidence.last_hit_ns is not None or evidence.clearing_rays > 0
         ):
@@ -528,21 +561,25 @@ class MapStore:
             "clearing_rays_short": 0,
             "unstamped": 0,
         }
+        ages: list[float] = []
         for evidence in self._cells.values():
             counts["observed"] += 1
             age = self._age_s(evidence, now_ns)
             if age is None:
                 counts["unstamped"] += 1
                 continue
+            ages.append(age)
             if evidence.score >= self.config.occupied_threshold:
                 counts[OCCUPIED] += 1
                 continue
             if evidence.band:
                 counts[SURFACE_BAND] += 1
                 continue
-            if age > self.config.freshness_s:
-                counts[STALE] += 1
-                continue
+            # Age does not disqualify a cell: observed-free space persists
+            # (see `classify`), so a cell can no longer be unknown *because* its
+            # evidence is old. STALE stays in the tally for schema stability and
+            # is always zero; the age spread below is what replaces it, so a
+            # reader can still see how fresh the evidence is.
             if evidence.score > -self.config.free_threshold:
                 counts["score_below_threshold"] += 1
                 continue
@@ -550,6 +587,10 @@ class MapStore:
                 counts["clearing_rays_short"] += 1
                 continue
             counts[FREE] += 1
+        if ages:
+            ages.sort()
+            counts["age_s_p50"] = ages[len(ages) // 2]
+            counts["age_s_max"] = ages[-1]
         return counts
 
 

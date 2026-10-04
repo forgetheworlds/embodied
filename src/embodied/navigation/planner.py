@@ -310,6 +310,72 @@ def _initial_durations(distances: np.ndarray, limits: PlanLimits) -> np.ndarray:
     return np.maximum(distances / (0.8 * limits.v_max_mps), 0.2)
 
 
+
+# The adjacency a path may use, written down once. `_neighbours`, `reachable_from`
+# and `_astar` all step by this, so "a cell is reachable" and "A* reaches it"
+# cannot answer differently. A vantage the mission accepts and admission then
+# refuses is this project's most expensive recurring defect, and it is exactly
+# that disagreement.
+_NEIGHBOUR_STEPS: tuple[tuple[int, int, int, float], ...] = tuple(
+    (dx, dy, dz, math.sqrt(dx * dx + dy * dy + dz * dz))
+    for dx in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dz in (-1, 0, 1)
+    if (dx, dy, dz) != (0, 0, 0)
+)
+
+
+def _neighbours(
+    cell: tuple[int, int, int], traversable: frozenset[tuple[int, int, int]]
+):
+    """Yield ``(neighbour, step_cost)`` for the cells a path may step to.
+
+    No corner cutting: a diagonal step also requires the straight steps sharing
+    its edges to be traversable, so a path never slips through the gap between
+    two occupied cells.
+    """
+    x, y, z = cell
+    for dx, dy, dz, step in _NEIGHBOUR_STEPS:
+        neighbour = (x + dx, y + dy, z + dz)
+        if neighbour not in traversable:
+            continue
+        if dx and dy and (x + dx, y, z) not in traversable:
+            continue
+        if dx and dz and (x + dx, y, z + dz) not in traversable:
+            continue
+        if dy and dz and (x, y + dy, z + dz) not in traversable:
+            continue
+        yield neighbour, step
+
+
+def reachable_from(
+    traversable: frozenset[tuple[int, int, int]], start_cell: tuple[int, int, int]
+) -> frozenset[tuple[int, int, int]]:
+    """The cells a path from ``start_cell`` can reach, by the rule A* walks.
+
+    This is admission's actual question. ``plan`` runs A* from the aircraft's own
+    cell and refuses with ``no_known_supported_route`` when no path connects it
+    to the goal region — so a region that holds free cells no route reaches is a
+    goal admission will refuse. Measured on ``J48-fly-1``: the vantage walk
+    accepted a target on membership alone, admission refused it, and the frontier
+    was marked blocked and never offered again.
+
+    The empty set is the honest answer when the start is not traversable: the
+    aircraft cannot take one step, and saying so is what lets the caller decline
+    the frontier rather than publish a hover as progress.
+    """
+    if start_cell not in traversable:
+        return frozenset()
+    seen = {start_cell}
+    stack = [start_cell]
+    while stack:
+        current = stack.pop()
+        for neighbour, _step in _neighbours(current, traversable):
+            if neighbour not in seen:
+                seen.add(neighbour)
+                stack.append(neighbour)
+    return frozenset(seen)
+
 def _astar(
     traversable: frozenset[tuple[int, int, int]],
     start_cell: tuple[int, int, int],
@@ -336,12 +402,6 @@ def _astar(
         position = np.asarray(cell, dtype=np.float64)
         return float(np.linalg.norm(np.maximum(np.maximum(goal_low - position, position - goal_high), 0.0)))
 
-    offsets = []
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dz in (-1, 0, 1):
-                if (dx, dy, dz) != (0, 0, 0):
-                    offsets.append((dx, dy, dz, math.sqrt(dx * dx + dy * dy + dz * dz)))
     frontier = [(heuristic(start_cell), 0.0, start_cell)]
     came_from: dict[tuple[int, int, int], tuple[int, int, int]] = {}
     cost = {start_cell: 0.0}
@@ -357,16 +417,7 @@ def _astar(
         expansions += 1
         if expansions > max_expansions:
             return BUDGET_EXHAUSTED
-        for dx, dy, dz, step in offsets:
-            neighbour = (current[0] + dx, current[1] + dy, current[2] + dz)
-            if neighbour not in traversable:
-                continue
-            if dx and dy and (current[0] + dx, current[1], current[2]) not in traversable:
-                continue
-            if dx and dz and (current[0] + dx, current[1], current[2] + dz) not in traversable:
-                continue
-            if dy and dz and (current[0], current[1] + dy, current[2] + dz) not in traversable:
-                continue
+        for neighbour, step in _neighbours(current, traversable):
             candidate = travelled + step
             if candidate < cost.get(neighbour, float("inf")):
                 cost[neighbour] = candidate
