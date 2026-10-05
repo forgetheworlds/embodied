@@ -79,15 +79,19 @@ probe:
   step_timeout_s:
     startup: 90
     ready: 60
-    flight: 180
-  budget_wall_clock_s: 900
+    flight: 240
+  budget_wall_clock_s: 1200
 
 # Absolute local-NED holds (world ENU x north, east = -y). Matches proposal
-# world ENU chain; residual 0.10 m; 8 s sim holds.
+# world ENU chain; residual 0.10 m; 8 s sim holds. Full control proof also
+# spins in place at the far end, then returns through the same holds.
 motion:
   hover_altitude_m: 1.5
   hold_per_waypoint_s: 8
   residual_max_m: 0.10
+  spin_rad: 3.141592653589793
+  spin_tolerance_rad: 0.40
+  return_waypoints: true
   waypoints_local_ned:
     - [-0.40, 0.00, 0.0]
     - [0.50, 0.00, 0.0]

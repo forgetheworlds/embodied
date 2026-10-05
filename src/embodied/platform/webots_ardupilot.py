@@ -73,8 +73,8 @@ from embodied.contracts.records import (
     RecordError,
     SetpointSource,
 )
-from embodied.platform import vehicle as vehicle_module
-from embodied.platform.vehicle import (
+from embodied.control import vehicle as vehicle_module
+from embodied.control.vehicle import (
     AutopilotControlEvidence,
     FrameError as _VehicleFrameError,
     LocalNedTarget,
@@ -132,7 +132,7 @@ class SimFdmState:
 def enu_to_ned(values: Sequence[float]) -> tuple[float, float, float]:
     """Convert a Webots ENU triple into ArduPilot's NED frame.
 
-    Implemented in :mod:`embodied.platform.vehicle` and re-exported here for the
+    Implemented in :mod:`embodied.control.vehicle` and re-exported here for the
     Webots controller and existing imports.
     """
     try:
