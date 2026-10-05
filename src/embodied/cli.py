@@ -123,6 +123,7 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {}
 # creating a cycle.
 COMMAND_MODULES = (
     "embodied.platform.webots_ardupilot",
+    "embodied.platform.vehicle_proof",
     "embodied.bench.cli",
     "embodied.platform.localization_check",
     # Registered for P05 by the integrator (2026-10-01, R9 serialized
