@@ -52,15 +52,17 @@ sensors:
   calibration: scenarios/compat/calibration.json
 
 # PlatformSettings still reads probe.*; values mirror motion.* for this scene.
+# Waypoints are absolute local-NED (EKF origin = world ENU origin). Iris spawn
+# is ENU (-1,0,*) → NED (-1,0,*); do NOT treat these as spawn-relative offsets.
 probe:
   hover_altitude_m: 1.5
   waypoints_local_ned:
-    - [0.60, 0.00, 0.0]
-    - [1.50, 0.00, 0.0]
-    - [3.50, -0.40, 0.0]
+    - [-0.40, 0.00, 0.0]
+    - [0.50, 0.00, 0.0]
+    - [2.50, -0.40, 0.0]
+    - [4.50, -1.20, 0.0]
     - [5.50, -1.20, 0.0]
-    - [6.50, -1.20, 0.0]
-    - [8.50, -0.50, 0.0]
+    - [7.50, -0.50, 0.0]
   hold_per_waypoint_s: 8
   stream_loss_window_s: 6
   settle_s: 1.5
@@ -80,18 +82,18 @@ probe:
     flight: 180
   budget_wall_clock_s: 900
 
-# Vehicle motion-proof: local-NED from takeoff/home ≈ spawn (-1, 0, *).
-# Residual 0.10 m; 8 s sim holds (tighter than open-field).
+# Absolute local-NED holds (world ENU x north, east = -y). Matches proposal
+# world ENU chain; residual 0.10 m; 8 s sim holds.
 motion:
   hover_altitude_m: 1.5
   hold_per_waypoint_s: 8
   residual_max_m: 0.10
   waypoints_local_ned:
-    - [0.60, 0.00, 0.0]
-    - [1.50, 0.00, 0.0]
-    - [3.50, -0.40, 0.0]
+    - [-0.40, 0.00, 0.0]
+    - [0.50, 0.00, 0.0]
+    - [2.50, -0.40, 0.0]
+    - [4.50, -1.20, 0.0]
     - [5.50, -1.20, 0.0]
-    - [6.50, -1.20, 0.0]
-    - [8.50, -0.50, 0.0]
+    - [7.50, -0.50, 0.0]
 
 output: work/runs/p00-motion-doorway
