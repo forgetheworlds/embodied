@@ -68,7 +68,7 @@ probe:
     kind: position_step
     magnitude_m: 30.0
     hold_s: 6
-    timebase_samples: 40
+  timebase_samples: 40
   realtime_window_s: 5.0
   realtime_ratio_envelope: [0.5, 1.5]
   timebase_poll_s: 0.005
