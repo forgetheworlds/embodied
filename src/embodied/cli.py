@@ -306,6 +306,9 @@ CONFIG_SCHEMA: dict[str, Any] = {
             "waypoints_local_ned": [[float]],
             "hold_per_waypoint_s": float,
             "residual_max_m": float,
+            "spin_rad": _Optional(float),
+            "spin_tolerance_rad": _Optional(float),
+            "return_waypoints": _Optional(bool),
         }
     ),
     # -------------------------------------------------------------------
