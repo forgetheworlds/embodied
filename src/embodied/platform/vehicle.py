@@ -107,6 +107,10 @@ CONTROL_RETRY_S = 5.0
 CONTROL_GRANT_GRACE_S = 3.0
 REFRESH_S = 0.05
 SPIN_RATE_RAD_S = 0.6
+# compat_arming.parm MOT_IDLE_SEC is 4.0: Copter holds GROUND_IDLE that long
+# after arm. NAV_TAKEOFF issued earlier returns MAV_RESULT_FAILED and the
+# aircraft never leaves the pad (motion-proof-live: cmd 22 result 4 at +1 s).
+POST_ARM_SPOOL_S = 4.5
 
 
 class Vehicle:
@@ -179,6 +183,11 @@ class Vehicle:
         altitude = None
         sample = adapter.latest_telemetry
         if evidence.armed:
+            spool_until = adapter._monotonic() + POST_ARM_SPOOL_S
+            while adapter._monotonic() < spool_until:
+                if drain is not None:
+                    drain()
+                adapter._sleep(0.1)
             adapter._session.takeoff(adapter.settings.hover_altitude_m)
             takeoff_at = adapter._monotonic()
             deadline = takeoff_at + timeout_s
