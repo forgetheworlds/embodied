@@ -2027,13 +2027,13 @@ BARO_STREAM_HZ = 10.0
 # Message identifiers this adapter asks the autopilot for.
 MSG_ID_ATTITUDE = 30
 MSG_ID_LOCAL_POSITION_NED = 32
-# The primary barometer's own report — the R24 z guard's reference. Deliberately
-# NOT GLOBAL_POSITION_INT: at the pinned commit that message's altitudes are the
-# EKF's position expressed in the origin datum (send_global_position_int reads
-# ahrs.get_location; AP_NavEKF3_Outputs.cpp:316 builds loc.alt from posD, the
-# fused down position) and with EK3_SRC1_POSZ 6 the fused z IS the vision feed —
-# the guard would compare vision with vision exactly when vision is wrong.
-# SCALED_PRESSURE is AP_Baro itself, untouched by the estimator
+# The primary barometer's own report — the R24 z guard's reference, kept under
+# R25 as the monitor of last resort. Deliberately NOT GLOBAL_POSITION_INT: at
+# the pinned commit that message's altitudes are the EKF's position expressed
+# in the origin datum (send_global_position_int reads ahrs.get_location;
+# AP_NavEKF3_Outputs.cpp:316 builds loc.alt from posD, the fused down position)
+# — an estimator output, not an independent reference, whatever the height
+# source is. SCALED_PRESSURE is AP_Baro itself, untouched by the estimator
 # (send_scaled_pressure_instance: barometer.get_pressure(instance), GCS_Common.cpp:2404).
 MSG_ID_SCALED_PRESSURE = 29
 MSG_ID_SERVO_OUTPUT_RAW = 36
@@ -4449,8 +4449,9 @@ class CompatibilityProbe:
             "from Webots devices through the flight-state packet, so this is compatibility "
             "evidence and not a sensor-derived result. The EKF-active parameter set feeds "
             "that same Webots pose to EKF3 as its external-navigation source "
-            "(VISION_POSITION_ESTIMATE, EK3_SRC1_* 6): the estimator flies on the "
-            "simulator's own state, not on an independently sensed one"
+            "(VISION_POSITION_ESTIMATE, EK3_SRC1_POSXY/VELXY/VELZ/YAW 6; POSZ stays "
+            "with the barometer, R25): the estimator flies on the simulator's own "
+            "state for everything but height, not on an independently sensed one"
             if self.settings.truth_republish
             else "sensor_mode is sensor-derived: localization.mode declares the "
             "sensor-derived arm, so this bridge republishes no simulator pose and no truth "

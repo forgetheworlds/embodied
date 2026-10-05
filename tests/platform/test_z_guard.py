@@ -1,8 +1,11 @@
 """The R24 z guard: a publisher-side bound on |vision z − baro z|.
 
-The FC's altitude channel IS the estimator's z (EK3_SRC1_POSZ 6), so a live but
-wrong estimate was indistinguishable from a moving aircraft all the way to the
-crash detector (work/runs/night/Z-CLIMB.md, J53-vantage-2). The guard compares
+The crashes it answers (work/runs/night/Z-CLIMB.md, J53-vantage-2) flew
+EK3_SRC1_POSZ 6, where the FC's altitude channel WAS the estimator's z, so a
+live but wrong estimate was indistinguishable from a moving aircraft all the
+way to the crash detector. Under R25 the barometer owns the altitude channel,
+and the guard remains the monitor of last resort: an estimate that lies about
+z is suspect overall. The guard compares
 each state about to be published against the vehicle's own barometer, stops the
 feed past the declared residual, and names the divergence in the run's record.
 These tests prove the declared behaviour, not the flight (R3): the falsifier is

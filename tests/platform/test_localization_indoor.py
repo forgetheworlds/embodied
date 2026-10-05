@@ -2199,9 +2199,10 @@ class TestOrderedBringUp:
 
         # Every window parameter is bounded: a window value, a restore value, a reason.
         rows = {row["name"]: row for row in window["parameter_window"]}
+        # R25 retired the height-source window: the barometer (EK3_SRC1_POSZ 1)
+        # is the standing configuration, so POSZ is pinned, not windowed.
         assert set(rows) == {
             "ARMING_SKIPCHK",
-            "EK3_SRC1_POSZ",
             "MOT_IDLE_SEC",
             "TKOFF_THR_MAX",
             "PILOT_SPD_UP",
@@ -2210,21 +2211,19 @@ class TestOrderedBringUp:
         }
         assert rows["ARMING_SKIPCHK"]["window_value"] == 8 | (1 << 18)
         assert rows["ARMING_SKIPCHK"]["restore_value"] == 0.0  # nothing skipped
-        assert rows["EK3_SRC1_POSZ"]["window_value"] == 1.0  # baro, its own sensor
-        assert rows["EK3_SRC1_POSZ"]["restore_value"] == 6.0  # ExternalNav, the seam
-        # The third one is the window's thrust path's other half: the airframe's own
+        # The second one is the window's thrust path's other half: the airframe's own
         # post-arm idle delay holds the motors in ground idle for longer than this
         # window's whole declared airtime once the spool state is finally asked for.
         assert rows["MOT_IDLE_SEC"]["window_value"] == 0.0  # the firmware's own default
         assert rows["MOT_IDLE_SEC"]["restore_value"] == 4.0  # compat_arming.parm's
         assert "GROUND_IDLE" in rows["MOT_IDLE_SEC"]["why"]
-        # The fourth one bounds the takeoff's open-loop ramp (see the class below for
+        # The third one bounds the takeoff's open-loop ramp (see the class below for
         # the derivation): a window value below the pin's own default, restored to it.
         assert rows["TKOFF_THR_MAX"]["window_value"] == (
             check.BRING_UP_TAKEOFF_RAMP_MAX_WINDOW_VALUE
         )
         assert rows["TKOFF_THR_MAX"]["restore_value"] == 0.9
-        # The fifth one bounds the climb rate the MODE may command at the rate the
+        # The fourth one bounds the climb rate the MODE may command at the rate the
         # window itself declares (the class below carries the derivation).
         assert rows["PILOT_SPD_UP"]["window_value"] == (
             check.BRING_UP_THROTTLE_CLIMB_RATE_M_S
@@ -2232,7 +2231,7 @@ class TestOrderedBringUp:
         assert check.BRING_UP_CLIMB_RATE_WINDOW_VALUE == 0.3
         assert rows["PILOT_SPD_UP"]["restore_value"] == 2.5  # the pin's own default
         assert all(row["why"] for row in rows.values())
-        # The sixth one paces the open-loop ramp itself (the release-energy fix's
+        # The fifth one paces the open-loop ramp itself (the release-energy fix's
         # second repair, 2026-09-29): the ground-hold bench measured the contact
         # pair holding the vehicle ~2.0 s past the spool's first nonzero command
         # at any thrust, so the ramp crosses ~1.4x the physics hover at the
@@ -2246,7 +2245,6 @@ class TestOrderedBringUp:
         # And the scored-window requirement is the restore column, exactly.
         assert {row["name"]: row["value"] for row in window["scored_window_requires"]} == {
             "ARMING_SKIPCHK": 0.0,
-            "EK3_SRC1_POSZ": 6.0,
             "MOT_IDLE_SEC": 4.0,
             "TKOFF_THR_MAX": 0.9,
             "PILOT_SPD_UP": 2.5,
@@ -2860,7 +2858,6 @@ class TestTheTakeoffRampIsBoundedByTheAirframesOwnHover:
         }
         restored = {
             "ARMING_SKIPCHK": 0.0,
-            "EK3_SRC1_POSZ": 6.0,
             "MOT_IDLE_SEC": 4.0,
             "TKOFF_THR_MAX": 0.8999999761581421,  # the vehicle's float32(0.9)
             "PILOT_SPD_UP": 2.5,
