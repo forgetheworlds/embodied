@@ -107,13 +107,14 @@ CONTROL_RETRY_S = 5.0
 CONTROL_GRANT_GRACE_S = 3.0
 REFRESH_S = 0.05
 SPIN_RATE_RAD_S = 0.6
-# After arm, Copter holds the motor interlock down for ARMING_DELAY_SEC (2.0 s)
-# then MOT_IDLE_SEC ground-idle (compat_arming.parm: 4.0). NAV_TAKEOFF inside
-# that window returns MAV_RESULT_FAILED (motion-proof-2: cmd 22 result 4 at
-# arm+5.6 s while servos still at 1100 us). Cover both intervals plus margin.
-POST_ARM_SPOOL_S = 7.0
-TAKEOFF_ATTEMPTS = 3
-TAKEOFF_RETRY_S = 2.0
+# GUIDED NAV_TAKEOFF converts the climb target into the EKF-origin frame
+# (ModeGuided::do_user_takeoff_start_m). Before GPS_GLOBAL_ORIGIN/home exist that
+# conversion fails and the command ACKs MAV_RESULT_FAILED. On a slow realtime
+# sim, origin can land 10+ wall-seconds after arm — wait for it, don't guess.
+TAKEOFF_READY_TIMEOUT_S = 45.0
+TAKEOFF_ATTEMPTS = 5
+TAKEOFF_RETRY_S = 1.5
+SERVO_IDLE_PWM = 1050
 
 
 class Vehicle:
@@ -186,8 +187,22 @@ class Vehicle:
         altitude = None
         sample = adapter.latest_telemetry
         if evidence.armed:
-            spool_until = adapter._monotonic() + POST_ARM_SPOOL_S
-            while adapter._monotonic() < spool_until:
+            # Wait until EKF origin/home is known and motors have left the
+            # interlock-down PWM floor. Wall-clock guesses fail when Webots runs
+            # under realtime (origin at arm+7 s sim ≈ arm+13 s wall).
+            ready_deadline = adapter._monotonic() + TAKEOFF_READY_TIMEOUT_S
+            idle_seen = False
+            while adapter._monotonic() < ready_deadline:
+                sample = adapter.telemetry()
+                servos = sample.servo_outputs
+                if servos is not None and len(servos) >= 4:
+                    if min(int(servos[i]) for i in range(4)) >= SERVO_IDLE_PWM:
+                        idle_seen = True
+                origin_ready = sample.home_position is not None
+                if origin_ready and idle_seen:
+                    break
+                if not (sample.in_guided_mode and sample.armed):
+                    break
                 if drain is not None:
                     drain()
                 adapter._sleep(0.1)
@@ -199,6 +214,9 @@ class Vehicle:
                 if (
                     takeoff_attempts < TAKEOFF_ATTEMPTS
                     and adapter._monotonic() >= next_command_at
+                    and sample.home_position is not None
+                    and sample.in_guided_mode
+                    and sample.armed
                 ):
                     adapter._session.takeoff(adapter.settings.hover_altitude_m)
                     takeoff_attempts += 1

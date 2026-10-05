@@ -1,0 +1,4 @@
+# Open-field motion proof: give a slow realtime Webots host time to publish the
+# EKF origin after arm before Copter::auto_disarm_check cuts motors. Default
+# DISARM_DELAY (10 s) races origin-at-arm+13 s wall on llvmpipe.
+DISARM_DELAY 30
