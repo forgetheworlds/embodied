@@ -1,14 +1,16 @@
-"""The observation sweep's hold is self-neutralizing (Z-CLIMB.md; J55 verdict).
+"""The observation sweep's hold is a velocity hold (XY-ROTATION-CRASH.md).
 
-During the §12.2 sweep the VIO estimate wanders under the declared 0.6 rad/s
-rotation. A hold captured once at the observe call converts that wander into a
-full-authority chase — J53 (AngErr 105) and J55 (AngErr 83) crashed in it;
-J54 survived by luck of the wander. The fix: for the sweep's declared 10 s
-window the hold re-pins to the CURRENT aligned position at every publication
-(own x, y, z), so no fixed target exists to chase — the commanded displacement
-against the live estimate is identically zero, structurally, not merely
-smaller. The yaw ramp is untouched, and the non-sweep renewal hold keeps its
-fixed declared hover altitude (J52's own fix; it must never re-pin).
+The captures settled the old story: the sweep's commanded yaw-ANGLE bursts —
+not a lying wire — excited the yaw snap-overshoot cascade that rolled both
+aircraft inverted (J56 27.0°/29.5° and J57 16.5°/15.6° steps; the wire was
+honest to ≤ 0.068 m when the rotation blinded the tracker), and a position
+pin — fixed or re-pinned — left Guided a displacement to chase from a
+possibly-blind estimate. For the sweep's declared 10 s window the target is
+therefore zero velocity plus the declared 0.6 rad/s yaw RATE, with position
+and yaw angle absent: a rate stream is step-free even at burst cadence, and
+with no position field there is nothing to chase. The non-sweep renewal hold
+keeps its fixed declared hover altitude (J52's own fix; it must never take
+the velocity branch).
 
 The tests drive the runtime's real publication machinery on injected states
 and an injected simulator clock (T18): only the platform boundary
@@ -18,7 +20,6 @@ runtime's own pose gate via ``_on_state``.
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +104,7 @@ class _RecordingPlatform:
             velocity_ned=target.velocity_ned,
             acceleration_ned=None,
             yaw_rad=target.yaw_rad,
-            yaw_rate_rad_s=None,
+            yaw_rate_rad_s=target.yaw_rate_rad_s,
         )
         self._sequence += 1
         setpoint = MotionSetpoint(
@@ -144,9 +145,9 @@ def _sweep_goal(hold_position_odom, *, hold_yaw_rad: float) -> MR._ActiveGoal:
 
 
 # J53's measured wander shape: decimetre drift, then 0.5-0.9 m jumps at each
-# vision resumption, then a whole-metre-class jump. Under the old fixed hold
-# the max commanded error over this trace is the largest jump; under the
-# re-pinned hold it must be exactly zero.
+# vision resumption, then a whole-metre-class jump. Under the velocity hold
+# every publication is identical whatever the estimate does — the wander can
+# reach the wire as nothing, because the wire carries no position to correct.
 WANDER = (
     (0.00, 0.00, -1.58),
     (0.52, -0.31, -1.10),
@@ -159,11 +160,11 @@ TICK_SIM_S = 0.1
 
 
 # ---------------------------------------------------------------------------
-# The sweep's hold tracks the live estimate; the chase cannot exist.
+# The sweep's hold is a velocity hold; nothing on the wire tracks the estimate.
 # ---------------------------------------------------------------------------
 
 
-def test_the_sweeps_published_holds_track_the_live_estimate(tmp_path):
+def test_the_sweeps_published_holds_are_velocity_holds(tmp_path):
     runtime = _runtime(tmp_path, "sweep-hold-track")
     runtime.alignment.seal((1.0, 0.0, 0.0, 0.0))
     platform = _RecordingPlatform()
@@ -176,31 +177,29 @@ def test_the_sweeps_published_holds_track_the_live_estimate(tmp_path):
         runtime._stats.sim_clock.observe(sim_s)
         assert runtime.publish_active() is None
 
-    # The wander is fed as raw estimator positions; the hold lives in the
-    # aligned odom frame the wire speaks, through the same frozen alignment.
-    aligned_wander = [
-        tuple(runtime.alignment.aligned_position_ned(estimate)) for estimate in WANDER
-    ]
-    # Every publication commanded exactly the estimate it was published with:
-    # the max commanded step over the whole wander trace is zero, so whatever
-    # the estimate did between ticks, Guided had no displacement to chase.
-    commanded_error = max(
-        math.dist(target.position_ned, aligned)
-        for target, aligned in zip(platform.targets, aligned_wander)
-    )
-    assert commanded_error == pytest.approx(0.0, abs=1e-12)
-    assert [tuple(target.position_ned) for target in platform.targets] == aligned_wander
-    # The pin is the goal's own durable state, so a refused publication would
-    # still record what the aircraft was actually holding.
-    assert runtime._active_goal.hold_position_odom == pytest.approx(aligned_wander[-1])
-    # A hold commands no velocity; its certificate reference is the goal itself.
-    assert all(
-        tuple(target.velocity_ned) == (0.0, 0.0, 0.0) for target in platform.targets
-    )
-    assert all(target.certificate_ref == "observe-1" for target in platform.targets)
+    # The wander is fed as raw estimator positions, jumps and all. Every
+    # publication is the SAME velocity hold anyway: zero velocity, no
+    # position, no yaw angle, the declared rate — Guided is never handed a
+    # displacement to chase, whatever the estimate did between ticks.
+    shapes = {
+        (
+            target.position_ned,
+            tuple(target.velocity_ned),
+            target.yaw_rad,
+            target.yaw_rate_rad_s,
+            target.certificate_ref,
+        )
+        for target in platform.targets
+    }
+    assert shapes == {
+        (None, (0.0, 0.0, 0.0), None, MR.OBSERVATION_YAW_RATE_RAD_S, "observe-1")
+    }
+    # The goal's own hold is never mutated: with no position field on the
+    # wire, a refused publication cannot invent a pin either.
+    assert runtime._active_goal.hold_position_odom == WANDER[0]
 
 
-def test_the_sweeps_yaw_ramp_is_unchanged_including_its_clamp(tmp_path):
+def test_the_sweeps_yaw_command_is_a_rate_stream_not_an_angle_ramp(tmp_path):
     runtime = _runtime(tmp_path, "sweep-hold-yaw")
     runtime.alignment.seal((1.0, 0.0, 0.0, 0.0))
     platform = _RecordingPlatform()
@@ -213,21 +212,27 @@ def test_the_sweeps_yaw_ramp_is_unchanged_including_its_clamp(tmp_path):
         runtime._stats.sim_clock.observe(sim_s)
         assert runtime.publish_active() is None
 
-    expected = tuple(
-        0.4 + MR.OBSERVATION_YAW_RATE_RAD_S * min(t, 10.0) for t in sim_times
+    # The captures' burst cadence (0.3–0.8 s between sweep ticks) cannot step
+    # the yaw any more: the command carries the declared RATE, not an angle,
+    # so every tick — inside the window and past it — is identical, and the
+    # old angle ramp (with its 10 s clamp) is gone from the wire.
+    assert [target.yaw_rad for target in platform.targets] == [None] * len(sim_times)
+    assert all(
+        target.yaw_rate_rad_s == pytest.approx(MR.OBSERVATION_YAW_RATE_RAD_S)
+        for target in platform.targets
     )
-    assert [target.yaw_rad for target in platform.targets] == pytest.approx(expected)
-    # Past the declared window the swept angle stops: the clamp is the declared
-    # window, measured on the simulator clock, unchanged by the re-pinning.
-    assert platform.targets[-1].yaw_rad == pytest.approx(0.4 + 6.0)
+    assert platform.targets[0].yaw_rate_rad_s == platform.targets[-1].yaw_rate_rad_s
 
 
-def test_a_sweep_publication_with_no_fresh_estimate_keeps_the_last_pin(tmp_path):
+def test_a_sweep_publication_with_no_fresh_estimate_still_coasts(tmp_path):
     """A tick whose pose the publisher's gate refuses invents nothing.
 
-    The honest behavior is the last pinned position — the same one the wire
-    already holds — never a guessed coordinate. The visual-fault machinery
-    ends the sweep on this condition; the publication itself must not fail.
+    The velocity hold does not read the estimate at all: with no position
+    field to pin and no angle to ramp, a refused pose changes nothing on the
+    wire — the aircraft coasts on the velocity loop through the blind window
+    (both captures flipped 0.48 s after their last publication, in holds that
+    DID depend on the estimate). The visual-fault machinery still ends the
+    sweep; the publication itself must not fail.
     """
     runtime = _runtime(tmp_path, "sweep-hold-nopose")
     platform = _RecordingPlatform()
@@ -236,7 +241,16 @@ def test_a_sweep_publication_with_no_fresh_estimate_keeps_the_last_pin(tmp_path)
     runtime._position_odom = lambda: None
     runtime._stats.sim_clock.observe(TICK_SIM_S)
     assert runtime.publish_active() is None
-    assert tuple(platform.targets[0].position_ned) == (0.1, 0.2, -1.5)
+    assert platform.targets[0].position_ned is None
+    assert tuple(platform.targets[0].velocity_ned) == (0.0, 0.0, 0.0)
+    assert platform.targets[0].yaw_rad is None
+    assert platform.targets[0].yaw_rate_rad_s == MR.OBSERVATION_YAW_RATE_RAD_S
+    # The commanded record is a faithful image of the wire: absent fields
+    # recorded as null, not as a pinned coordinate the wire never carried.
+    recorded = runtime._commanded[-1]
+    assert recorded["position_m"] is None
+    assert recorded["velocity_mps"] == [0.0, 0.0, 0.0]
+    assert recorded["yaw_rad"] is None
     assert runtime._active_goal.hold_position_odom == (0.1, 0.2, -1.5)
 
 
@@ -288,3 +302,80 @@ def test_the_renewal_hold_keeps_its_fixed_hover_altitude(tmp_path):
         target.yaw_rad == pytest.approx(MR.MISSION_YAW_HOLD_RAD)
         for target in platform.targets
     )
+    # And the wire shape is exactly what J52 flew: fixed position, zero
+    # velocity, an angle rather than a rate — no velocity-hold fields.
+    assert all(
+        tuple(target.velocity_ned) == (0.0, 0.0, 0.0) and target.yaw_rate_rad_s is None
+        for target in platform.targets
+    )
+
+
+# ---------------------------------------------------------------------------
+# A certificate-carrying goal publishes through the same seam (the verify
+# stage's blocker: 374cead's branch restructure left yaw_rad unbound in the
+# certificate branch and the FIRST publication of any certified goal raised
+# UnboundLocalError — XY-VERIFY.md stage 3).
+# ---------------------------------------------------------------------------
+
+
+def test_a_certified_goal_publishes_position_and_the_goals_hold_yaw(tmp_path):
+    runtime = _runtime(tmp_path, "sweep-hold-cert")
+    runtime.alignment.seal((1.0, 0.0, 0.0, 0.0))
+    platform = _RecordingPlatform()
+    runtime._platform = platform
+    certificate = MR.PL.TrajectoryCertificate(
+        certificate_id="cert-explore-frontier:0:0:0-0-rev-1",
+        nav_epoch="sweep-hold-test",
+        goal_id="goal-explore-frontier:0:0:0",
+        goal_revision=1,
+        mission_revision=1,
+        state_sequence=1,
+        snapshot_id="snap-1",
+        map_revision=1,
+        anchor_id="anchor-1",
+        anchor_revision=1,
+        target_refs=("frontier:0:0:0",),
+        start_position_odom_m=(0.0, 0.0, -1.5),
+        start_velocity_odom_mps=(0.0, 0.0, 0.0),
+        start_tolerance_m=0.2,
+        t_start_s=0.0,
+        t_end_s=1.0,
+        horizon_s=1.0,
+        swept_radius_m=0.55,
+        segments=(
+            MR.PL.Segment(
+                index=0,
+                t_start_s=0.0,
+                duration_s=1.0,
+                coefficients=((0.0, 0.0, -1.5, 0.0, 0.0, 0.0),) * 3,
+                low=(-0.5, -0.5, -2.0),
+                high=(0.5, 0.5, -1.0),
+                max_speed_mps=0.0,
+                max_acceleration_mps2=0.0,
+                max_jerk_mps3=0.0,
+                distance_m=0.0,
+            ),
+        ),
+        dependent_cells=(),
+        limiting_reasons=(),
+        constraints=(),
+        certified=True,
+        backup=None,
+    )
+    goal = MR._ActiveGoal(
+        goal_id="goal-explore-frontier:0:0:0",
+        hold_position_odom=None,
+        hold_yaw_rad=0.25,
+        hold_yaw_rate_rad_s=None,
+        hold_since_sim_s=0.0,
+    )
+    goal.certificate = certificate
+    runtime._active_goal = goal
+    runtime._on_state(_state((0.0, 0.0, -1.5), time_ns=1_000_000_000))
+    runtime._stats.sim_clock.observe(1.0)
+
+    assert runtime.publish_active() is None
+    (target,) = platform.targets
+    assert target.yaw_rad == pytest.approx(0.25)
+    assert target.yaw_rate_rad_s is None
+    assert target.certificate_ref == certificate.certificate_id
