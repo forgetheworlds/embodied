@@ -69,7 +69,7 @@ class MovingSession:
         if target.yaw_rate_rad_s is not None and not (
             setpoint.type_mask & TYPE_MASK_YAW_RATE_IGNORE
         ):
-            self.yaw += target.yaw_rate_rad_s * Vehicle.REFRESH_S
+            self.yaw += target.yaw_rate_rad_s * REFRESH_S
 
     def set_mode(self, mode_name: str) -> None:
         self.mode = mode_name
