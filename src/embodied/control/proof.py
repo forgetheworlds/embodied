@@ -8,8 +8,9 @@ Route:
 2. goto each outbound waypoint and hold
 3. explicit hold at the far end
 4. spin (relative yaw rate)
-5. goto return waypoints back toward the pad
-6. land
+5. reface (reverse yaw-rate spin back toward north)
+6. goto return waypoints back toward the pad
+7. land
 
 Run::
 
