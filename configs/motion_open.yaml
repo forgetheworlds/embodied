@@ -29,7 +29,6 @@ scenario:
   params:
     - scenarios/compat/params/compat_base.parm
     - scenarios/compat/params/compat_arming.parm
-    - scenarios/motion/params/motion_disarm.parm
   estimator_params:
     - scenarios/compat/params/compat_ekf.parm
 
@@ -59,7 +58,7 @@ probe:
     - [5.0, 5.0, 0.0]
     - [0.0, 5.0, 0.0]
     - [0.0, 0.0, 0.0]
-  hold_per_waypoint_s: 20
+  hold_per_waypoint_s: 6
   stream_loss_window_s: 6
   settle_s: 1.5
   at_rest_window_s: 2.0
@@ -75,16 +74,14 @@ probe:
   step_timeout_s:
     startup: 90
     ready: 60
-    flight: 300
-  budget_wall_clock_s: 1200
+    flight: 180
+  budget_wall_clock_s: 900
 
 # Vehicle motion-proof reads this section. Waypoints are local-NED offsets from
 # takeoff; z is added to hover_altitude_m (0.0 = level with takeoff hover).
 motion:
   hover_altitude_m: 1.5
-  # 6 s is enough at 1.0x sim; visible llvmpipe often runs ~0.5x, so a 5 m
-  # leg needs more wall time for transit + residual settle ≤ 0.15 m.
-  hold_per_waypoint_s: 20
+  hold_per_waypoint_s: 6
   residual_max_m: 0.15
   waypoints_local_ned:
     - [5.0, 0.0, 0.0]

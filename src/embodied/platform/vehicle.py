@@ -107,14 +107,22 @@ CONTROL_RETRY_S = 5.0
 CONTROL_GRANT_GRACE_S = 3.0
 REFRESH_S = 0.05
 SPIN_RATE_RAD_S = 0.6
-# GUIDED NAV_TAKEOFF converts the climb target into the EKF-origin frame
-# (ModeGuided::do_user_takeoff_start_m). Before GPS_GLOBAL_ORIGIN/home exist that
-# conversion fails and the command ACKs MAV_RESULT_FAILED. On a slow realtime
-# sim, origin can land 10+ wall-seconds after arm — wait for it, don't guess.
-TAKEOFF_READY_TIMEOUT_S = 45.0
 TAKEOFF_ATTEMPTS = 5
-TAKEOFF_RETRY_S = 1.5
-SERVO_IDLE_PWM = 1050
+TAKEOFF_RETRY_SIM_S = 1.5
+
+
+def _sim_time_s(adapter: WebotsArduPilot) -> float | None:
+    """Autopilot sim clock from MAVLink ``time_boot_ms``."""
+    sample = adapter.latest_telemetry
+    if sample is None or sample.boot_time_ms is None:
+        return None
+    return sample.boot_time_ms / 1000.0
+
+
+def _wall_backstop_s(adapter: WebotsArduPilot, sim_duration_s: float) -> float:
+    """Wall-clock ceiling when sim time must advance but the host runs slow."""
+    min_ratio = min(adapter.settings.realtime_ratio_envelope)
+    return sim_duration_s / min_ratio
 
 
 class Vehicle:
@@ -187,52 +195,65 @@ class Vehicle:
         altitude = None
         sample = adapter.latest_telemetry
         if evidence.armed:
-            # Wait until EKF origin/home is known and motors have left the
-            # interlock-down PWM floor. Wall-clock guesses fail when Webots runs
-            # under realtime (origin at arm+7 s sim ≈ arm+13 s wall).
-            ready_deadline = adapter._monotonic() + TAKEOFF_READY_TIMEOUT_S
-            idle_seen = False
-            while adapter._monotonic() < ready_deadline:
+            # GUIDED NAV_TAKEOFF needs EKF origin (HOME_POSITION). Wait in sim
+            # time so a slow realtime host does not fire the command too early.
+            origin_start_sim: float | None = None
+            origin_wall_until = adapter._monotonic() + _wall_backstop_s(
+                adapter, adapter.settings.pre_arm_wait_s
+            )
+            while (
+                sample.in_guided_mode
+                and sample.armed
+                and adapter._monotonic() < origin_wall_until
+            ):
                 sample = adapter.telemetry()
-                servos = sample.servo_outputs
-                if servos is not None and len(servos) >= 4:
-                    if min(int(servos[i]) for i in range(4)) >= SERVO_IDLE_PWM:
-                        idle_seen = True
-                origin_ready = sample.home_position is not None
-                if origin_ready and idle_seen:
+                if sample.home_position is not None:
                     break
-                if not (sample.in_guided_mode and sample.armed):
-                    break
+                sim = _sim_time_s(adapter)
+                if sim is not None:
+                    if origin_start_sim is None:
+                        origin_start_sim = sim
+                    elif sim - origin_start_sim >= adapter.settings.pre_arm_wait_s:
+                        break
                 if drain is not None:
                     drain()
                 adapter._sleep(0.1)
-            takeoff_at = adapter._monotonic()
-            deadline = takeoff_at + timeout_s
-            next_command_at = takeoff_at
+            climb_start_sim: float | None = None
+            next_takeoff_sim: float | None = None
             takeoff_attempts = 0
-            while adapter._monotonic() < deadline:
+            climb_wall_until = adapter._monotonic() + _wall_backstop_s(
+                adapter, timeout_s
+            )
+            while (
+                sample.in_guided_mode
+                and sample.armed
+                and adapter._monotonic() < climb_wall_until
+            ):
+                sim = _sim_time_s(adapter)
                 if (
                     takeoff_attempts < TAKEOFF_ATTEMPTS
-                    and adapter._monotonic() >= next_command_at
                     and sample.home_position is not None
-                    and sample.in_guided_mode
-                    and sample.armed
+                    and (
+                        next_takeoff_sim is None
+                        or (sim is not None and sim >= next_takeoff_sim)
+                    )
                 ):
                     adapter._session.takeoff(adapter.settings.hover_altitude_m)
                     takeoff_attempts += 1
-                    next_command_at = adapter._monotonic() + TAKEOFF_RETRY_S
+                    if sim is not None:
+                        if climb_start_sim is None:
+                            climb_start_sim = sim
+                        next_takeoff_sim = sim + TAKEOFF_RETRY_SIM_S
                 sample = adapter.telemetry()
                 position = sample.local_position_ned
                 if position is not None:
                     altitude = -position[2]
-                    if (
-                        sample.in_guided_mode
-                        and sample.armed
-                        and altitude >= 0.5 * adapter.settings.hover_altitude_m
-                    ):
+                    if altitude >= 0.5 * adapter.settings.hover_altitude_m:
                         break
-                if adapter._monotonic() - takeoff_at >= CONTROL_GRANT_GRACE_S and not (
-                    sample.in_guided_mode and sample.armed
+                if (
+                    climb_start_sim is not None
+                    and sim is not None
+                    and sim - climb_start_sim >= timeout_s
                 ):
                     break
                 if drain is not None:
@@ -328,9 +349,17 @@ class Vehicle:
         refresh_s: float = REFRESH_S,
     ) -> dict[str, Any]:
         adapter = self._adapter
-        until = adapter._monotonic() + duration_s
+        start_sim: float | None = None
+        wall_until = adapter._monotonic() + _wall_backstop_s(adapter, duration_s)
         publications = 0
-        while adapter._monotonic() < until:
+        while adapter._monotonic() < wall_until:
+            sample = adapter.telemetry()
+            sim = _sim_time_s(adapter)
+            if sim is not None:
+                if start_sim is None:
+                    start_sim = sim
+                elif sim - start_sim >= duration_s:
+                    break
             if self.publish(target) is None:
                 return {"ok": False, "publications": publications, "guided_lost": True}
             publications += 1
