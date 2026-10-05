@@ -107,10 +107,13 @@ CONTROL_RETRY_S = 5.0
 CONTROL_GRANT_GRACE_S = 3.0
 REFRESH_S = 0.05
 SPIN_RATE_RAD_S = 0.6
-# compat_arming.parm MOT_IDLE_SEC is 4.0: Copter holds GROUND_IDLE that long
-# after arm. NAV_TAKEOFF issued earlier returns MAV_RESULT_FAILED and the
-# aircraft never leaves the pad (motion-proof-live: cmd 22 result 4 at +1 s).
-POST_ARM_SPOOL_S = 4.5
+# After arm, Copter holds the motor interlock down for ARMING_DELAY_SEC (2.0 s)
+# then MOT_IDLE_SEC ground-idle (compat_arming.parm: 4.0). NAV_TAKEOFF inside
+# that window returns MAV_RESULT_FAILED (motion-proof-2: cmd 22 result 4 at
+# arm+5.6 s while servos still at 1100 us). Cover both intervals plus margin.
+POST_ARM_SPOOL_S = 7.0
+TAKEOFF_ATTEMPTS = 3
+TAKEOFF_RETRY_S = 2.0
 
 
 class Vehicle:
@@ -188,10 +191,18 @@ class Vehicle:
                 if drain is not None:
                     drain()
                 adapter._sleep(0.1)
-            adapter._session.takeoff(adapter.settings.hover_altitude_m)
             takeoff_at = adapter._monotonic()
             deadline = takeoff_at + timeout_s
+            next_command_at = takeoff_at
+            takeoff_attempts = 0
             while adapter._monotonic() < deadline:
+                if (
+                    takeoff_attempts < TAKEOFF_ATTEMPTS
+                    and adapter._monotonic() >= next_command_at
+                ):
+                    adapter._session.takeoff(adapter.settings.hover_altitude_m)
+                    takeoff_attempts += 1
+                    next_command_at = adapter._monotonic() + TAKEOFF_RETRY_S
                 sample = adapter.telemetry()
                 position = sample.local_position_ned
                 if position is not None:
@@ -214,7 +225,12 @@ class Vehicle:
                 mode_reached=sample.in_guided_mode,
                 armed=bool(sample.armed),
                 altitude_m=altitude,
-                refused=not (sample.in_guided_mode and sample.armed),
+                refused=not (
+                    sample.in_guided_mode
+                    and sample.armed
+                    and altitude is not None
+                    and altitude >= 0.5 * adapter.settings.hover_altitude_m
+                ),
             )
         adapter.evidence.write_json(
             "flight-state.json",
