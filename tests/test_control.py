@@ -157,6 +157,17 @@ def test_spin_uses_yaw_rate_not_angle() -> None:
     assert not (last.type_mask & TYPE_MASK_YAW_RATE_IGNORE)
 
 
+def test_reverse_spin_uses_negative_yaw_rate() -> None:
+    """Reface after +π must unwind via rate, not absolute yaw=0 (tip-strike)."""
+    adapter = _FakeAdapter()
+    vehicle = Vehicle(adapter)
+    result = vehicle.spin(-math.pi)
+    assert result["ok"] is True
+    last = adapter._session.setpoints[-1]
+    assert last.target.yaw_rad is None
+    assert last.target.yaw_rate_rad_s == -SPIN_RATE_RAD_S
+
+
 def test_publish_refused_when_not_guided() -> None:
     adapter = _FakeAdapter(armed=False, guided=True)
     vehicle = Vehicle(adapter)

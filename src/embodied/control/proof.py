@@ -210,25 +210,38 @@ def fly_control_route(
                 f"(tol {spin_tolerance_rad:.3f})"
             )
 
-    # Re-face north before inbound legs so return does not translate while yawed
-    # ~π into a 1 m doorway (first control proof: tip-strike on return[0]).
+    # Unwind with a rate-controlled reverse spin before inbound legs.
+    # Absolute yaw=0 after ~π tip-strikes (AngErr≈120); return while still
+    # yawed also tip-struck on return[0] through the 1 m doorway.
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
     ):
-        reface = vehicle.hold(hold_s, yaw_rad=0.0, drain=drain)
-        reface_ok = reface.get("ok") is True and not reface.get("guided_lost")
+        unwind = vehicle.spin(-spin_rad, drain=drain)
+        unwind_delta = unwind.get("delta_rad")
+        reface_ok = (
+            unwind.get("ok") is True
+            and not unwind.get("guided_lost")
+            and unwind_delta is not None
+            and abs(abs(unwind_delta) - abs(spin_rad)) <= spin_tolerance_rad
+        )
         steps.append(
             {
                 "task": "reface",
-                "residual_m": reface.get("residual_m"),
-                "publications": reface.get("publications"),
+                "requested_rad": unwind.get("requested_rad"),
+                "delta_rad": unwind_delta,
+                "publications": unwind.get("publications"),
                 "ok": reface_ok,
             }
         )
-        if reface.get("guided_lost"):
+        if unwind.get("guided_lost"):
             reasons.append("reface: guided flight lost")
+        elif unwind_delta is None:
+            reasons.append("reface: no yaw delta to score")
         elif not reface_ok:
-            reasons.append("reface: failed")
+            reasons.append(
+                f"reface: |delta| {abs(unwind_delta):.3f} rad vs requested "
+                f"{abs(spin_rad):.3f} (tol {spin_tolerance_rad:.3f})"
+            )
 
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
