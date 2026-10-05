@@ -2594,6 +2594,77 @@ class MissionRuntime:
 
     # -- frontier helpers ------------------------------------------------------
 
+    def _flyable_band_z(self) -> tuple[float, float] | None:
+        """The NED z band every goal this mission admits must stay inside, or None.
+
+        J54-zguard-1 measured the crash head-on: the admitted explore goal
+        regions carried z bands reaching +0.2 .. +0.8 — at and below the floor
+        datum — the aircraft chased one, dove below the floor plane and flipped
+        (``crash_disarm: AngErr=170``). The mission's goals fly at the declared
+        hover altitude, so the band is DERIVED (R2), not declared:
+
+        * the band is the declared hover band: the aligned origin's z minus
+          ``settings.hover_altitude_m`` — the same composition the return
+          target and the renewal hold are built from — widened by the
+          executor's own terminal-region half-extent, read off
+          ``approach_region``'s geometry rather than restated. A region built
+          around an in-band point therefore stays inside the band's faces too:
+          the offered vantage, the approach region and the terminal region are
+          constrained together.
+        * the map's own occupancy then TIGHTENS the band where it states a
+          surface beyond it. The floor and the ceiling are the map's occupied
+          evidence classes: the deepest (largest z, NED down) and the highest
+          occupied cell centres, each pulled half a declared voxel to its
+          room-side face. A side tightens only when its evidence reaches
+          beyond the hover band — the only case in which the map can correct
+          the declared band — so a partial map (one observed wall patch at eye
+          level, no floor or ceiling seen yet) leaves the declared band intact
+          instead of mistaking its own span for the room's.
+        * the grid's z bound is deliberately looser than the floor — it admits
+          a landed vehicle's own estimate — so it is not the floor and is not
+          used as one. The declared hover band alone already refuses J54's
+          floor-piercing vantages: hover + half a region is 0.95 m above the
+          spawn datum, and J54's admitted vantage sat 0.25 m BELOW it.
+
+        ``None`` means the band cannot be stated: the alignment is unsealed (no
+        mission frame, so no declared altitude is expressible — nothing
+        resolves or is offered in that state anyway), or the runtime is the
+        offline half some tests construct, which carries neither attribute. A
+        stated band is always returned — the declared hover band when the map
+        states no surface beyond it, tightened where it does — even when the
+        derivation leaves it empty: an empty band then refuses every vantage
+        honestly (every candidate counts ``out_of_band``) instead of silently
+        dropping the gate.
+        """
+        alignment = getattr(self, "alignment", None)
+        settings = getattr(self, "settings", None)
+        if alignment is None or settings is None or not alignment.sealed:
+            return None
+        origin = alignment.aligned_position_ned((0.0, 0.0, 0.0))
+        hover_z = origin[2] - settings.hover_altitude_m
+        half_region = GE.approach_region((0.0, 0.0, 0.0), ENVELOPE).extent()[2] / 2.0
+        low = hover_z - half_region
+        high = hover_z + half_region
+        config = self.store.config
+        occupied = self.store.occupied_cells(now_ns=self._now_ns())
+        if not occupied:
+            return (low, high)
+        centres_z = [config.cell_center(cell)[2] for cell in occupied]
+        half_face = config.voxel_m / 2.0
+        floor_face_z = max(centres_z) - half_face
+        ceiling_face_z = min(centres_z) + half_face
+        if floor_face_z > high:
+            # The map has seen a surface below the band's bottom face: the
+            # floor is stated, and the band's bottom keeps a region's height
+            # above it.
+            high = min(high, floor_face_z - half_region)
+        if ceiling_face_z < low:
+            # The map has seen a surface above the band's top face: the
+            # ceiling is stated, and the band's top keeps a region's height
+            # below it.
+            low = max(low, ceiling_face_z + half_region)
+        return (low, high)
+
     def frontier_regions(self) -> dict[str, GE.BoxRegion]:
         """The current frontier clusters, one terminal region each."""
         cells = GE.frontier_cells(self.store, now_ns=self._now_ns())
@@ -2621,8 +2692,19 @@ class MissionRuntime:
         here: tuple[float, float, float] | None = None,
         searchable: set[tuple[int, int, int]] | None = None,
         searchable_bounds: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None,
+        band: tuple[float, float] | None = None,
     ) -> tuple[float, float, float] | None:
         """The point an explore step would fly to for this frontier, or None.
+
+        ``band`` is the flyable band (:meth:`_flyable_band_z`): when it is
+        stated, a candidate whose z falls outside it is refused at the walk —
+        counted ``out_of_band``, never returned, never silently clamped. This
+        is the fix J54-zguard-1 asked for: the walk used to accept a vantage at
+        any altitude the searchable cells supported, the admitted region's z
+        band reached below the floor, and the aircraft dove into it. ``None``
+        (the band cannot be stated: unsealed alignment, or the offline half
+        some tests construct) skips the gate; nothing resolves or is offered in
+        that state anyway.
 
         A frontier is a boundary between observed free space and unknown
         space: an observation opportunity, not a destination (specification
@@ -2676,6 +2758,14 @@ class MissionRuntime:
             vantage = ideal + (index / steps) * (toward - ideal)
             target = vantage + GE.STANDOFF_M * direction
             target_point = tuple(float(value) for value in target)
+            if band is not None and not band[0] <= target_point[2] <= band[1]:
+                # The flyable band (J54-zguard-1): a goal here would command
+                # the aircraft below the floor or above the ceiling. Refused
+                # at the walk with its own tally -- the view direction is
+                # horizontal, so the terminal region around this point spans
+                # exactly the z the band forbids.
+                self._count_gate("out_of_band")
+                continue
             if float(np.linalg.norm(target - toward)) < GE.STANDOFF_M:
                 # Closer to what it is looking at than the mission's own
                 # declared standoff: there is no approach left to make.
@@ -2865,6 +2955,7 @@ class MissionRuntime:
             return ()
         searchable = self._searchable_cells(here)
         searchable_bounds = _index_bounds(searchable)
+        band = self._flyable_band_z()
         self._gate_counts = {}
         ranked: list[tuple[float, str]] = []
         if not searchable:
@@ -2884,6 +2975,7 @@ class MissionRuntime:
                     here=here,
                     searchable=searchable,
                     searchable_bounds=searchable_bounds,
+                    band=band,
                 )
                 if point is None:
                     continue
@@ -2900,21 +2992,24 @@ class MissionRuntime:
 
     def _frontier_vantage(
         self, region: GE.BoxRegion, ref: str = "?"
-    ) -> tuple[float, float, float]:
-        """The vantage for one frontier; the region's centre when it has none.
+    ) -> tuple[float, float, float] | None:
+        """The vantage for one frontier, or ``None`` when the walk admits none.
 
-        The centre is a fallback only, so that resolution still holds a target
-        for a frontier ``navigable_frontiers`` declined: admission then refuses
-        it with its own named reason rather than the goal vanishing silently.
-
-        The fallback hides the question the record most needs answered — *was
-        there an admissible vantage at all?* — so it says so, with the walk's own
-        gate counts for that frontier and the size of the set it searched. The
-        counts are reset here so they belong to this frontier alone rather than
-        being the accumulation of every frontier the last listing walked.
+        The centre used to be the fallback "so that resolution still holds a
+        target for a frontier ``navigable_frontiers`` declined: admission then
+        refuses it with its own named reason". J54-zguard-1 measured where that
+        fallback and an ungated walk land: the admitted goal regions carried z
+        bands at and below the floor datum, and the aircraft dove into one. A
+        frontier whose vantage cannot be expressed inside the flyable band
+        (:meth:`_flyable_band_z`) is now refused HERE — ``None``, with the
+        walk's own named gate counts for that frontier — rather than handed to
+        admission as a goal the aircraft must dive for. ``resolve_targets``
+        skips a ``None`` and the step reports blocked, the same honest shape as
+        any other unresolved ref.
         """
         self._gate_counts = {}
-        point = self._frontier_goal_point(region)
+        band = self._flyable_band_z()
+        point = self._frontier_goal_point(region, band=band)
         if point is not None:
             return point
         here = self._position_odom()
@@ -2923,10 +3018,13 @@ class MissionRuntime:
         centre = tuple(float(value) for value in region.center())
         self.result.log.append(
             "frontier {ref} has no admissible vantage: walk gates {gates}; "
+            "flyable band {band}; "
             "searched {searchable} searchable cell(s) of {free} free; "
-            "region centre ({cx:.2f}, {cy:.2f}, {cz:.2f}) is not evidence of one".format(
+            "region centre ({cx:.2f}, {cy:.2f}, {cz:.2f}) is refused, not "
+            "offered".format(
                 ref=ref,
                 gates=dict(self._gate_counts),
+                band="unstated" if band is None else "z[{:.2f}, {:.2f}]".format(*band),
                 searchable=len(searchable),
                 free=len(free),
                 cx=centre[0],
@@ -2934,7 +3032,7 @@ class MissionRuntime:
                 cz=centre[2],
             )
         )
-        return centre
+        return None
 
     def resolve_targets(self, proposal: R.SpatialGoal) -> tuple[R.GroundedTarget, ...]:
         """Resolve a proposal's target refs into grounded targets this runtime holds.

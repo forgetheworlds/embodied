@@ -192,9 +192,14 @@ def test_the_degenerate_listing_answers_without_walking_a_region():
 def test_the_degenerate_vantage_resolution_walks_no_region():
     """Resolving one frontier's vantage on the degenerate map stays bounded too.
 
-    ``_frontier_vantage`` is the per-frontier fallback admission resolves
+    ``_frontier_vantage`` is the per-frontier resolution admission resolves
     with; on an empty reachable set every vantage is refused before any
-    approach region's cells are needed.
+    approach region's cells are needed. The refusal is ``None`` -- resolution
+    holds no target -- where the code used to fall back to the region centre:
+    J54-zguard-1 measured that fallback publishing goal regions at and below
+    the floor datum, so a frontier with no admissible vantage is now refused
+    at the walk with its gate counts instead of being handed to admission as
+    a goal the aircraft must dive for.
     """
     config = STORE.config
     regions = _many_regions(config, DEGENERATE_REGION_COUNT)
@@ -205,7 +210,7 @@ def test_the_degenerate_vantage_resolution_walks_no_region():
     with _RegionCellCounter() as work:
         point = runtime._frontier_vantage(region, ref=ref)
 
-    assert point == tuple(float(v) for v in region.center())
+    assert point is None
     assert work.materialized == 0
     assert work.iterated == 0
     assert runtime._gate_counts, "the vantage walk still counted its refusals"

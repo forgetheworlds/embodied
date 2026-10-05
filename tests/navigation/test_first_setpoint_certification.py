@@ -86,7 +86,22 @@ class _Runtime(MissionRuntime):
         self._candidate_observation_ids = []
         self._last_observation_id = "obs-2"
         self._observation_counter = 2
-        self.alignment = type("A", (), {"sealed": True})()
+        # The mission frame: the aligned origin sits on the fixture's floor
+        # (its deepest occupied cell centre), so the declared hover altitude
+        # (configs/first_indoor.yaml probe.hover_altitude_m) is expressible
+        # and the flyable band is stated -- the admission chain under test now
+        # runs exactly as the live mission's does, band gate included.
+        self.alignment = type(
+            "A",
+            (),
+            {
+                "sealed": True,
+                "aligned_position_ned": staticmethod(
+                    lambda point: (0.0, 0.0, 2.95)
+                ),
+            },
+        )()
+        self.settings = type("S", (), {"hover_altitude_m": 1.5})()
 
     def _position_odom(self):
         return self._here
