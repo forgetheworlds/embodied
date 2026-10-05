@@ -308,3 +308,74 @@ def test_the_renewal_hold_keeps_its_fixed_hover_altitude(tmp_path):
         tuple(target.velocity_ned) == (0.0, 0.0, 0.0) and target.yaw_rate_rad_s is None
         for target in platform.targets
     )
+
+
+# ---------------------------------------------------------------------------
+# A certificate-carrying goal publishes through the same seam (the verify
+# stage's blocker: 374cead's branch restructure left yaw_rad unbound in the
+# certificate branch and the FIRST publication of any certified goal raised
+# UnboundLocalError — XY-VERIFY.md stage 3).
+# ---------------------------------------------------------------------------
+
+
+def test_a_certified_goal_publishes_position_and_the_goals_hold_yaw(tmp_path):
+    runtime = _runtime(tmp_path, "sweep-hold-cert")
+    runtime.alignment.seal((1.0, 0.0, 0.0, 0.0))
+    platform = _RecordingPlatform()
+    runtime._platform = platform
+    certificate = MR.PL.TrajectoryCertificate(
+        certificate_id="cert-explore-frontier:0:0:0-0-rev-1",
+        nav_epoch="sweep-hold-test",
+        goal_id="goal-explore-frontier:0:0:0",
+        goal_revision=1,
+        mission_revision=1,
+        state_sequence=1,
+        snapshot_id="snap-1",
+        map_revision=1,
+        anchor_id="anchor-1",
+        anchor_revision=1,
+        target_refs=("frontier:0:0:0",),
+        start_position_odom_m=(0.0, 0.0, -1.5),
+        start_velocity_odom_mps=(0.0, 0.0, 0.0),
+        start_tolerance_m=0.2,
+        t_start_s=0.0,
+        t_end_s=1.0,
+        horizon_s=1.0,
+        swept_radius_m=0.55,
+        segments=(
+            MR.PL.Segment(
+                index=0,
+                t_start_s=0.0,
+                duration_s=1.0,
+                coefficients=((0.0, 0.0, -1.5, 0.0, 0.0, 0.0),) * 3,
+                low=(-0.5, -0.5, -2.0),
+                high=(0.5, 0.5, -1.0),
+                max_speed_mps=0.0,
+                max_acceleration_mps2=0.0,
+                max_jerk_mps3=0.0,
+                distance_m=0.0,
+            ),
+        ),
+        dependent_cells=(),
+        limiting_reasons=(),
+        constraints=(),
+        certified=True,
+        backup=None,
+    )
+    goal = MR._ActiveGoal(
+        goal_id="goal-explore-frontier:0:0:0",
+        hold_position_odom=None,
+        hold_yaw_rad=0.25,
+        hold_yaw_rate_rad_s=None,
+        hold_since_sim_s=0.0,
+    )
+    goal.certificate = certificate
+    runtime._active_goal = goal
+    runtime._on_state(_state((0.0, 0.0, -1.5), time_ns=1_000_000_000))
+    runtime._stats.sim_clock.observe(1.0)
+
+    assert runtime.publish_active() is None
+    (target,) = platform.targets
+    assert target.yaw_rad == pytest.approx(0.25)
+    assert target.yaw_rate_rad_s is None
+    assert target.certificate_ref == certificate.certificate_id

@@ -2515,6 +2515,13 @@ class MissionRuntime:
             sample_t = min(time.monotonic(), certificate.t_end_s)
             position_ned, velocity_ned, _acceleration = certificate.sample(sample_t)
             certificate_ref = certificate.certificate_id
+            # A certified curve commands position and velocity; its yaw is the
+            # goal's own hold yaw, never a rate (the sweep holds carry the rate).
+            # Bound here explicitly: the branch restructure in 374cead left these
+            # unbound and the first publication of any certified goal raised
+            # UnboundLocalError (XY-VERIFY.md stage-3 repro).
+            yaw_rad = active.hold_yaw_rad
+            yaw_rate_rad_s = None
             self._log_certificate_shape(certificate)
         elif active.hold_position_odom is not None:
             # The §12.2 observation sweep's hold is a VELOCITY HOLD
