@@ -29,6 +29,7 @@ scenario:
   params:
     - scenarios/compat/params/compat_base.parm
     - scenarios/compat/params/compat_arming.parm
+    - scenarios/motion/params/motion_disarm.parm
   estimator_params:
     - scenarios/compat/params/compat_ekf.parm
 
