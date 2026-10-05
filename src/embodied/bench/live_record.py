@@ -31,8 +31,17 @@ simulator's pose stream that decide them — never the report):
   ``INSPECT_HOLD_S``. The radius is the planner's own stand-off (1.0 m) plus
   the declared tracking envelope; passing through one point is not an
   inspection, hence the hold.
-* ``return_verified`` — the last truth sample after landing within
-  ``RETURN_RADIUS_M`` horizontally of the first truth sample (the spawn).
+* ``return_verified`` — the last truth sample within ``RETURN_RADIUS_M``
+  horizontally of the first truth sample (the spawn), **and** an end state a
+  landing can leave behind (disarmed, upright within
+  ``END_STATE_MAX_LANDING_TILT_DEG``, with the attitude actually measured), and
+  a flown approach: the horizontal distance from the spawn not
+  increasing over the final ``RETURN_APPROACH_WINDOW_S`` of the truth stream.
+  All three are required (ROLL-DEPARTURE.md: the radius alone admitted J58's
+  crashed resting place — a monotone-away flight whose terminus happened to sit
+  0.79 m from the spawn, then a dead fall to a rest 0.70 m from it — as the
+  run's first ``return_verified: TRUE``), so a crashed aircraft's resting pose
+  is a geometry fact, never a return.
 * ``violations`` — the aircraft's own reports of a crash-disarm, any observed
   loss of Guided flight while armed, and an end state that no landing produces.
   The last of those exists because this record once affirmed that nothing went
@@ -93,6 +102,61 @@ INSPECT_RADIUS_M = 1.5
 INSPECT_HOLD_S = 1.0
 RETURN_RADIUS_M = 1.0
 
+# The flown-approach gate on ``return_verified`` (ROLL-DEPARTURE.md, grading
+# lane): the horizontal distance from the spawn must not be increasing over the
+# final window of the truth stream, so a trajectory still moving away cannot end
+# "returned" however its resting place sits.
+#
+# * The window is two seconds of truth samples. Measured on J58's pose stream
+#   (`platform/run-a/sensor-capture/records.jsonl`): pose rows arrive every
+#   0.020 s, so the window holds ~100 rows — far more than the two samples the
+#   radius needs, and short enough to sit inside a terminal approach.
+# * The tolerance is 0.10 m. Measured on J58's real in-flight hold
+#   (sim 61.5-63.5 s): the distance from spawn ranged 0.652-0.712 m across the
+#   window, a 0.06 m envelope of honest hover noise; 0.10 m clears that
+#   measured envelope with margin while staying a tenth of RETURN_RADIUS_M, so
+#   sustained away-motion (the J58 shape) is refused, not excused.
+RETURN_APPROACH_WINDOW_S = 2.0
+RETURN_APPROACH_TOLERANCE_M = 0.10
+
+# The physics-wedge detector (ROLL-DEPARTURE.md, transport lane): J58 flew into
+# a Webots wedge — the world clock, cameras and feeds kept running, but the
+# body's truth pose froze for 2.14 s (measured drift <= 5.5e-06 m per 0.020 s
+# row on the same capture) while armed, airborne and commanding thrust — and
+# the crash checker, reading the wedged state, disarmed at 2.15 m into a dead
+# fall. A frozen aircraft that the record then reads as a flight is exactly the
+# dishonesty this lane exists to refuse, so the signature is a named
+# ``sim_fault`` and grading is refused. Pause-on-freeze is R19: out of scope
+# here by ruling.
+#
+# Declared bounds (R2), each derived from the measured wedge and the measured
+# honest-flight populations on J58's own capture:
+#
+# * ``SIM_WEDGE_IMMOBILITY_M = 1e-4`` per truth row. Measured wedge window
+#   (sim 65.36-67.50 s): per-row displacement median 5.0e-07, max 5.5e-06.
+#   Measured flying hold (sim 61.5-63.5 s): median 3.6e-03, max 6.8e-03.
+#   1e-4 sits inside that gap with >18x margin to the wedge's worst row and
+#   >14x below the honest hold's median.
+# * ``SIM_WEDGE_MIN_FREEZE_S = 0.5`` on the host receipt clock. The measured
+#   wedge lasted 2.14 s of sim time; the run's realtime_ratio_envelope
+#   [0.5, 1.5] bounds the same interval to >= 1.05 s of host time, so the
+#   bound keeps >2x margin to the measured fault under the declared envelope
+#   while staying far below any control-loop timescale.
+# * ``SIM_WEDGE_AIRBORNE_M = 0.5``: the aircraft counts as airborne when its
+#   truth z is at least this far above the ground in the pose stream's NED
+#   frame. Measured ground rest reads z ~= -0.035 m (J58 spawn and crash rest);
+#   the declared hover is 1.5 m. This gate is what leaves a parked or landed
+#   aircraft's legitimate stillness outside the detector — a wedged run that
+#   disarms inverted on the ground is graded by the end-state rule, correctly.
+# * ``SIM_WEDGE_THRUST_FLOOR_US = 1100`` on SERVO_OUTPUT_RAW: motors cut is
+#   exactly 1000 us (measured, J58 67.238 s onward; J53 55.4 s onward) and the
+#   armed-idle spin sits just above it, so anything commanded reads above the
+#   floor. The airborne gate excludes the armed-idle-on-ground case.
+SIM_WEDGE_IMMOBILITY_M = 1e-4
+SIM_WEDGE_MIN_FREEZE_S = 0.5
+SIM_WEDGE_AIRBORNE_M = 0.5
+SIM_WEDGE_THRUST_FLOOR_US = 1100
+
 # The end-state predicate: what attitude a landing can leave behind. A multirotor
 # that has landed rests on its base, so its own up-axis sits near vertical; a
 # vehicle that came to rest on its side or on its back did not land.
@@ -138,7 +202,9 @@ class SuiteConfigError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def suite_config_path(root: Path | None = None, *, relative: Path | None = None) -> Path:
+def suite_config_path(
+    root: Path | None = None, *, relative: Path | None = None
+) -> Path:
     return (root or repository_root()) / (relative or SUITE_CONFIG_RELATIVE)
 
 
@@ -162,7 +228,9 @@ def suite_config_path_for(name: str, root: Path | None = None) -> Path:
     return (root or repository_root()) / SUITE_DIR_RELATIVE / f"{name}.yaml"
 
 
-def declared_path(document: dict[str, Any], key: str, *, root: Path | None = None) -> Path:
+def declared_path(
+    document: dict[str, Any], key: str, *, root: Path | None = None
+) -> Path:
     """A repository-relative path a suite declaration names, or a refusal.
 
     The declaration carries the pointers the transport reads — its scene and its
@@ -182,7 +250,9 @@ def load_suite_document(path: Path | None = None) -> dict[str, Any] | None:
         return None
     document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
-        raise SuiteConfigError(f"{config_path} does not hold a suite declaration object")
+        raise SuiteConfigError(
+            f"{config_path} does not hold a suite declaration object"
+        )
     for key in ("name", "registered_by", "localization_mode", "provider_budget"):
         if key not in document:
             raise SuiteConfigError(f"{config_path} is missing the required key {key!r}")
@@ -231,9 +301,15 @@ _SWAP_RE = re.compile(r"total = ([\d.]+)M\s+used = ([\d.]+)M\s+free = ([\d.]+)M"
 
 def host_state() -> dict[str, Any]:
     """The 1-minute load and the swap figures a flight is gated on."""
-    state: dict[str, Any] = {"load_1m": None, "swap_total_mb": None, "swap_free_mb": None}
+    state: dict[str, Any] = {
+        "load_1m": None,
+        "swap_total_mb": None,
+        "swap_free_mb": None,
+    }
     try:
-        text = subprocess.run(["uptime"], capture_output=True, text=True, check=True).stdout
+        text = subprocess.run(
+            ["uptime"], capture_output=True, text=True, check=True
+        ).stdout
         match = _LOAD_RE.search(text)
         if match:
             state["load_1m"] = float(match.group(1))
@@ -280,14 +356,18 @@ def host_blockers(state: dict[str, Any]) -> list[str]:
     blockers: list[str] = []
     load = state.get("load_1m")
     if load is None:
-        blockers.append("the 1-minute load could not be measured (uptime gave no figure)")
+        blockers.append(
+            "the 1-minute load could not be measured (uptime gave no figure)"
+        )
     elif load >= HOST_LOAD_1M_MAX:
         blockers.append(
             f"1-minute load {load:.2f} is not in single digits (BASELINE-GUARD row 17)"
         )
     free = state.get("swap_free_mb")
     if free is None:
-        blockers.append("the swap free figure could not be measured (sysctl gave no figure)")
+        blockers.append(
+            "the swap free figure could not be measured (sysctl gave no figure)"
+        )
     elif free < HOST_SWAP_FREE_MIN_MB:
         blockers.append(
             f"swap free {free:.0f} MB is under the declared {HOST_SWAP_FREE_MIN_MB:.0f} MB "
@@ -305,6 +385,12 @@ def host_blockers(state: dict[str, Any]) -> list[str]:
 class TruthSample:
     sim_time_s: float
     position_ned: tuple[float, float, float]
+    # The host receipt time of the record this sample came from (0 when the
+    # record carried no stamp). This is the join against the MAVLink stream's
+    # own receipt stamps, so the wedge detector never has to assume the
+    # simulator clock and the autopilot clock agree (ROLL-DEPARTURE.md
+    # transport lane).
+    receipt_monotonic_ns: int = 0
 
 
 @dataclass
@@ -321,10 +407,12 @@ class TruthCollector:
         pose = getattr(record, "pose", None)
         if pose is None:
             return
+        received = getattr(record, "received_stamp", None)
         self.samples.append(
             TruthSample(
                 sim_time_s=float(record.sim_time_s),
                 position_ned=tuple(float(value) for value in pose.position_xyz),
+                receipt_monotonic_ns=int(getattr(received, "monotonic_ns", 0) or 0),
             )
         )
 
@@ -335,7 +423,10 @@ class TruthCollector:
     ) -> tuple[bool, str]:
         """Whether the aircraft held inside the radius of the target, and why."""
         if not self.samples:
-            return False, "no truth samples were received, so proximity cannot be decided"
+            return (
+                False,
+                "no truth samples were received, so proximity cannot be decided",
+            )
         hold_start: float | None = None
         for sample in self.samples:
             dx = sample.position_ned[0] - target_ned[0]
@@ -354,7 +445,28 @@ class TruthCollector:
             f"no {hold_s:.1f} s interval inside {radius_m:.2f} m of the target was observed"
         )
 
-    def returned_near(self, *, radius_m: float) -> tuple[bool, str]:
+    def returned_near(
+        self, *, radius_m: float, end_state: dict[str, Any]
+    ) -> tuple[bool, str]:
+        """Whether the aircraft returned to its start, and why not when it did not.
+
+        Three conjuncts, all measured (ROLL-DEPARTURE.md, grading lane):
+
+        * the last truth sample lies within ``radius_m`` of the first,
+          horizontally — the geometry the old criterion was;
+        * the end state is one a landing can leave: disarmed, with a measured
+          attitude upright within ``END_STATE_MAX_LANDING_TILT_DEG``. An armed
+          end is mid-flight; an unmeasured attitude cannot tell a landing from
+          a crash; an inverted rest is the crashed end J58's record affirmed;
+        * the horizontal distance from the start was not increasing over the
+          final ``RETURN_APPROACH_WINDOW_S`` of truth samples (tolerance
+          ``RETURN_APPROACH_TOLERANCE_M``), so the run flew an approach to the
+          start instead of ending near it by coincidence or by falling.
+
+        The old criterion was the first conjunct alone, and it verified the
+        return of an aircraft that fell out of the sky inverted 0.70 m from its
+        spawn because its third explore terminus happened to sit 0.79 m away.
+        """
         if len(self.samples) < 2:
             return False, "fewer than two truth samples, so a return cannot be decided"
         start = self.samples[0].position_ned
@@ -362,9 +474,197 @@ class TruthCollector:
         dx = end[0] - start[0]
         dy = end[1] - start[1]
         distance = (dx * dx + dy * dy) ** 0.5
-        if distance <= radius_m:
-            return True, f"ended {distance:.2f} m from the start position"
-        return False, f"ended {distance:.2f} m from the start position (bound {radius_m:.2f} m)"
+        if distance > radius_m:
+            return (
+                False,
+                f"ended {distance:.2f} m from the start position (bound {radius_m:.2f} m)",
+            )
+        if not end_state:
+            return False, (
+                f"ended {distance:.2f} m from the start position, but the end state was "
+                "never measured, so a landing cannot be told from a crash"
+            )
+        if end_state.get("armed") is not False:
+            return False, (
+                f"ended {distance:.2f} m from the start position, but the aircraft was "
+                "still armed at the end, so no landing was observed"
+            )
+        landing_violation = end_state_violation(end_state)
+        if landing_violation is not None:
+            return False, (
+                f"ended {distance:.2f} m from the start position, but the end state is "
+                f"no landing: {landing_violation}"
+            )
+        if end_state_tilt_deg(end_state.get("attitude_rpy")) is None:
+            # ``end_state_violation`` passes an absent attitude as undecided, not
+            # upright; a verified return needs the landing decided, not undecided.
+            return False, (
+                f"ended {distance:.2f} m from the start position, but the end attitude "
+                "was not measured, so a landing cannot be told from a crash"
+            )
+        horizon = self.samples[-1].sim_time_s - RETURN_APPROACH_WINDOW_S
+        window = [sample for sample in self.samples if sample.sim_time_s >= horizon]
+        if len(window) < 2:
+            window = self.samples[-2:]
+        distances = [
+            (
+                (sample.position_ned[0] - start[0]) ** 2
+                + (sample.position_ned[1] - start[1]) ** 2
+            )
+            ** 0.5
+            for sample in window
+        ]
+        final = distances[-1]
+        # Away-motion signature: an earlier sample of the window sits well
+        # inside the final distance, so the aircraft was still travelling away
+        # from the start when the window closed. An approach (distances
+        # shrinking onto the final value) and honest hover noise around the
+        # rest position never produce that shape (ROLL-DEPARTURE.md grading
+        # lane).
+        growing = [
+            value
+            for value in distances[:-1]
+            if value < final - RETURN_APPROACH_TOLERANCE_M
+        ]
+        if growing:
+            return False, (
+                f"ended {distance:.2f} m from the start position (bound {radius_m:.2f} m), "
+                f"but the horizontal distance was still up to {final - min(growing):.2f} m "
+                f"smaller within the final {RETURN_APPROACH_WINDOW_S:.1f} s of truth "
+                f"samples (tolerance {RETURN_APPROACH_TOLERANCE_M:.2f} m) — the aircraft "
+                "was moving away from the start, not approaching it"
+            )
+        return True, (
+            f"ended {distance:.2f} m from the start position after a flown approach to "
+            "an upright, disarmed rest"
+        )
+
+
+def armed_thrust_rows(mavlink_log: Path | str) -> list[tuple[int, bool]]:
+    """When the run was commanding flight, on the host receipt clock.
+
+    One row per HEARTBEAT or SERVO_OUTPUT_RAW message that changed the picture,
+    as ``(receipt_monotonic_ns, flying)`` where *flying* is the aircraft's own
+    reported state: armed (HEARTBEAT ``base_mode``, the convention
+    ``decode_telemetry`` uses) **and** commanding thrust (any motor output above
+    ``SIM_WEDGE_THRUST_FLOOR_US``). Last-known-value semantics: a row speaks
+    until a later row contradicts it. Rows without a receipt stamp are skipped
+    rather than guessed, and a missing log answers an empty list — the detector
+    stays silent when there is no evidence a wedge would contradict.
+    """
+    from embodied.platform.webots_ardupilot import RECEIVED_AT_KEY
+
+    rows: list[tuple[int, bool]] = []
+    armed: bool | None = None
+    thrusting: bool | None = None
+    path = Path(mavlink_log)
+    if not path.is_file():
+        return rows
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(document, dict):
+                continue
+            kind = document.get("mavpackettype")
+            receipt_ns = document.get(RECEIVED_AT_KEY)
+            if receipt_ns is None:
+                continue
+            changed = False
+            if kind == "HEARTBEAT":
+                base_mode = document.get("base_mode")
+                if base_mode is not None:
+                    value = bool(base_mode & 128)
+                    changed = value != armed
+                    armed = value
+            elif kind == "SERVO_OUTPUT_RAW":
+                outputs = [
+                    float(document[key])
+                    for key in document
+                    if key.startswith("servo")
+                    and key.endswith("_raw")
+                    and isinstance(document[key], (int, float))
+                ]
+                if outputs:
+                    value = max(outputs) > SIM_WEDGE_THRUST_FLOOR_US
+                    changed = value != thrusting
+                    thrusting = value
+            if changed and armed is not None and thrusting is not None:
+                rows.append((int(receipt_ns), bool(armed and thrusting)))
+    return rows
+
+
+def sim_wedge_fault(
+    samples: "Sequence[TruthSample]",
+    flying_rows: Sequence[tuple[int, bool]],
+    *,
+    immobility_m: float = SIM_WEDGE_IMMOBILITY_M,
+    min_freeze_s: float = SIM_WEDGE_MIN_FREEZE_S,
+    airborne_m: float = SIM_WEDGE_AIRBORNE_M,
+) -> str | None:
+    """The named physics-wedge fault, or ``None`` when the flight moved.
+
+    ROLL-DEPARTURE.md transport lane: a Webots wedge froze the body's truth
+    pose for 2.14 s — drift at most 5.5e-06 m per row — while the world clock
+    ran on, the aircraft stayed armed and its motors stayed on the rails; the
+    crash checker then read the wedged state and disarmed into a dead fall. The
+    signature is therefore: truth pose immobile beyond ``min_freeze_s`` (on the
+    host receipt clock the samples and the MAVLink stream share), while armed,
+    airborne and commanding thrust. Any one condition absent means the
+    stillness has an honest explanation — parked, landed, disarmed, or
+    motors cut — and there is no fault to name.
+
+    Returns the fault text for the longest qualifying window, so the record
+    names what froze, where, and for how long.
+    """
+    if len(samples) < 2 or not flying_rows:
+        return None
+    rows = sorted(flying_rows)
+    row_index = 0
+    flying = False
+    best: tuple[float, TruthSample, TruthSample] | None = None
+    run_start: int | None = None
+    for index, sample in enumerate(samples):
+        while (
+            row_index < len(rows) and rows[row_index][0] <= sample.receipt_monotonic_ns
+        ):
+            flying = rows[row_index][1]
+            row_index += 1
+        still = (
+            flying
+            and sample.position_ned[2] <= -airborne_m
+            and index > 0
+            and math.dist(samples[index - 1].position_ned, sample.position_ned)
+            <= immobility_m
+        )
+        if still:
+            if run_start is None:
+                run_start = index - 1
+        elif run_start is not None:
+            first, last = samples[run_start], samples[index - 1]
+            span_s = (last.receipt_monotonic_ns - first.receipt_monotonic_ns) / 1e9
+            if span_s >= min_freeze_s and (best is None or span_s > best[0]):
+                best = (span_s, first, last)
+            run_start = None
+    if run_start is not None:
+        span_s = (
+            samples[-1].receipt_monotonic_ns - samples[run_start].receipt_monotonic_ns
+        ) / 1e9
+        if span_s >= min_freeze_s and (best is None or span_s > best[0]):
+            best = (span_s, samples[run_start], samples[-1])
+    if best is None:
+        return None
+    span_s, first, last = best
+    position = ", ".join(f"{value:.3f}" for value in last.position_ned)
+    return (
+        f"sim_fault: the simulator's truth pose held still for {span_s:.2f} s while the "
+        f"aircraft was armed, airborne and commanding thrust (immobility bound "
+        f"{immobility_m:g} m per row, fault bound {min_freeze_s:.2f} s; window ends at "
+        f"truth pose ({position})). A physics wedge manufactured the state the crash "
+        "checker read, so this episode cannot be graded as a flight (ROLL-DEPARTURE.md)"
+    )
 
 
 def truth_world_state(seed: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -374,7 +674,9 @@ def truth_world_state(seed: dict[str, Any]) -> tuple[dict[str, Any], dict[str, A
     layout) or at the top level; both name the same facts, and the facts are
     what the referee records, never the wrapper.
     """
-    state = seed.get("world_state") if isinstance(seed.get("world_state"), dict) else seed
+    state = (
+        seed.get("world_state") if isinstance(seed.get("world_state"), dict) else seed
+    )
     targets = state.get("targets")
     counts = state.get("world_counts")
     return targets or {}, counts or {}
@@ -392,7 +694,9 @@ def load_truth_seed(path: Path) -> dict[str, Any]:
         raise SuiteConfigError(f"{path} must declare a targets object")
     for name, entry in targets.items():
         if not isinstance(entry, dict) or not isinstance(entry.get("present"), bool):
-            raise SuiteConfigError(f"{path} target {name!r} must declare a boolean present")
+            raise SuiteConfigError(
+                f"{path} target {name!r} must declare a boolean present"
+            )
     if not counts:
         raise SuiteConfigError(f"{path} must declare world_counts")
     return document
@@ -422,12 +726,16 @@ def target_position_ned(seed: dict[str, Any], name: str) -> tuple[float, float, 
     values = entry.get("position_ned_from_world_origin_m")
     if values is not None:
         if len(values) != 3:
-            raise SuiteConfigError(f"identity[{name}].position_ned_from_world_origin_m must hold three numbers")
+            raise SuiteConfigError(
+                f"identity[{name}].position_ned_from_world_origin_m must hold three numbers"
+            )
         return tuple(float(value) for value in values)
     values = entry.get("position_enu_m")
     if values is not None:
         if len(values) != 3:
-            raise SuiteConfigError(f"identity[{name}].position_enu_m must hold three numbers")
+            raise SuiteConfigError(
+                f"identity[{name}].position_enu_m must hold three numbers"
+            )
         return enu_to_ned(tuple(float(value) for value in values))
     raise SuiteConfigError(
         f"identity[{name}] declares no position (position_ned_from_world_origin_m or "
@@ -546,7 +854,10 @@ def _guidance_departures(
     losses: list[dict[str, Any]] = []
     for index, event in enumerate(departures):
         terminal = index == len(departures) - 1
-        ends_the_mission = str(event.get("to_mode") or "") in (LANDING_MODE, GUIDED_MODE)
+        ends_the_mission = str(event.get("to_mode") or "") in (
+            LANDING_MODE,
+            GUIDED_MODE,
+        )
         if terminal and declared_landing and ends_the_mission:
             continue
         losses.append(event)
@@ -620,7 +931,10 @@ def end_state_violation(end_state: dict[str, Any]) -> str | None:
         # the runs it would judge, which is what ``rederive_end_state_violation``
         # exists for. It is only that this record cannot decide it.
         return None
-    roll, pitch = (float(end_state["attitude_rpy"][0]), float(end_state["attitude_rpy"][1]))
+    roll, pitch = (
+        float(end_state["attitude_rpy"][0]),
+        float(end_state["attitude_rpy"][1]),
+    )
     return (
         f"end_state_inverted: the vehicle came to rest {tilt:.1f} deg from vertical "
         f"(roll {roll:.1f}, pitch {pitch:.1f}) while disarmed, past the "
@@ -628,7 +942,9 @@ def end_state_violation(end_state: dict[str, Any]) -> str | None:
     )
 
 
-def end_state_attitude_from_telemetry(run_dir: Path) -> tuple[float, float, float] | None:
+def end_state_attitude_from_telemetry(
+    run_dir: Path,
+) -> tuple[float, float, float] | None:
     """The attitude a run ended in, read from that run's own recorded telemetry.
 
     ``attitude_rpy`` reaches an end state only for runs recorded after the field
@@ -664,14 +980,58 @@ def end_state_attitude_from_telemetry(run_dir: Path) -> tuple[float, float, floa
     return None
 
 
+def _attitude_for_reading(end_state: dict[str, Any], reading: str) -> list[float]:
+    """The attitude triple the named tilt reading was computed from."""
+    values = [float(value) for value in end_state["attitude_rpy"]]
+    if reading == "radians-stored-raw":
+        return [math.degrees(value) for value in values]
+    return values
+
+
+def _end_state_tilt_readings(
+    attitude_rpy: Sequence[float] | None,
+) -> list[tuple[str, float]]:
+    """Every tilt the recorded attitude could honestly mean, with its reading.
+
+    The bench rule reads degrees, and the live record now writes degrees — but
+    runs recorded before that conversion stored the telemetry sample's radians
+    raw (ROLL-DEPARTURE.md: J58's [3.141, −0.0008, 2.613] rad read as a 3.1
+    degree tilt under the degrees rule). A radians triple is bounded by pi in
+    every component, so when the recorded values all sit inside that bound the
+    radians reading is possible and is reported beside the degrees one. The
+    radians reading of an honest landing can never cross the 45-degree bound
+    (pi radians read as degrees is 3.14), so the extra reading can only ever
+    add a violation a units mismatch hid — it cannot invent one.
+    """
+    primary = end_state_tilt_deg(attitude_rpy)
+    readings: list[tuple[str, float]] = []
+    if primary is not None:
+        readings.append(("degrees", primary))
+    if attitude_rpy and len(attitude_rpy) == 3:
+        try:
+            values = [float(value) for value in attitude_rpy]
+        except (TypeError, ValueError):
+            return readings
+        if all(
+            math.isfinite(value) and abs(value) <= math.pi + 0.01 for value in values
+        ):
+            converted = end_state_tilt_deg([math.degrees(value) for value in values])
+            if converted is not None:
+                readings.append(("radians-stored-raw", converted))
+    return readings
+
+
 def rederive_end_state_violation(run_dir: Path) -> dict[str, Any]:
     """What the end-state rule says about a run already on disk.
 
     A run recorded before ``attitude_rpy`` existed cannot be re-scored by
     re-running the transport, so this reads what that run itself recorded: its
     end state from ``mission.json`` and, when that carries no attitude, the last
-    ``ATTITUDE`` message from its own platform log. It returns the finding; the
-    caller decides where it goes, and nothing here writes to the run.
+    ``ATTITUDE`` message from its own platform log. When the recorded attitude
+    is a raw radians triple (the pre-conversion live records), the radians
+    reading is judged beside the degrees one (ROLL-DEPARTURE.md grading lane).
+    It returns the finding; the caller decides where it goes, and nothing here
+    writes to the run.
     """
     run_dir = Path(run_dir)
     summary_path = run_dir / "mission.json"
@@ -690,8 +1050,29 @@ def rederive_end_state_violation(run_dir: Path) -> dict[str, Any]:
         else:
             end_state["attitude_rpy"] = list(telemetry)
             source = "platform/*/mavlink.jsonl (the last ATTITUDE message)"
-    tilt = end_state_tilt_deg(end_state.get("attitude_rpy"))
-    violation = end_state_violation(end_state)
+    readings = _end_state_tilt_readings(end_state.get("attitude_rpy"))
+    tilt = next((value for name, value in readings if name == "degrees"), None)
+    radians_tilt = next(
+        (value for name, value in readings if name == "radians-stored-raw"), None
+    )
+    # The violation is judged through the one rule, on the end state each
+    # reading produces, so live and rederived paths cannot drift apart. The
+    # degrees reading is the default and speaks plainly; only a finding that
+    # depends on the radians reading carries the reading's name.
+    violation = None
+    for name, value in readings:
+        if value > END_STATE_MAX_LANDING_TILT_DEG:
+            finding = end_state_violation(
+                dict(end_state, attitude_rpy=_attitude_for_reading(end_state, name))
+            )
+            if finding is not None:
+                suffix = (
+                    ""
+                    if name == "degrees"
+                    else f" [the {name} reading of the recorded attitude]"
+                )
+                violation = finding + suffix
+                break
     return {
         "run": run_dir.name,
         "recorded_violations": recorded,
@@ -703,9 +1084,39 @@ def rederive_end_state_violation(run_dir: Path) -> dict[str, Any]:
             else None
         ),
         "tilt_deg": None if tilt is None else round(tilt, 3),
+        "tilt_deg_radians_reading": (
+            None if radians_tilt is None else round(radians_tilt, 3)
+        ),
         "violation": violation,
         "violations_rederived": [*recorded, violation] if violation else list(recorded),
     }
+
+
+def receipt_verdict(
+    *, flew: bool, crashed: bool, sim_fault: str | None
+) -> tuple[CommandStatus, GateStatus]:
+    """What the recording receipt reads, without lying about the flight.
+
+    Two different dishonesties, two different answers:
+
+    * A **crashed** flight (truth records crash_disarm — J56/J57/J58) keeps the
+      command status ``complete`` — the command did record its episode — and
+      fails its gate, with the crash named in the reasons and, above this
+      transport, in the mission's own ``crashed`` termination. It must not read
+      ``blocked``: the P06 comparison classifies a blocked receipt as an
+      instrument failure and pools the aircraft's failure with the host's
+      (specification 20.5 — a policy crash is an outcome and stays in the
+      table).
+    * A **sim_fault** (the physics wedge, ROLL-DEPARTURE.md transport lane)
+      reads ``blocked``: a frozen-physics episode is an instrument failure, the
+      episode is recorded as evidence, and the grader refuses it — it is not a
+      flight and must never enter a comparison as one.
+    """
+    if sim_fault:
+        return CommandStatus.BLOCKED, GateStatus.FAIL
+    if crashed:
+        return CommandStatus.COMPLETE, GateStatus.FAIL
+    return CommandStatus.COMPLETE, GateStatus.PASS if flew else GateStatus.FAIL
 
 
 def measure_physical_outcome(
@@ -717,26 +1128,36 @@ def measure_physical_outcome(
     crash_statustexts: list[str],
     guidance_events: list[dict[str, Any]],
     autopilot_mode_changes: Sequence[str] = (),
+    sim_fault: str | None = None,
 ) -> dict[str, Any]:
     """The bench side's own per-run physical outcome.
 
     Measured from the simulator's pose stream and the aircraft's own reported
     state — never from the mission's report. ``end_state`` is recorded beside
-    the flags so a reader can see what the aircraft was doing at the end.
+    the flags so a reader can see what the aircraft was doing at the end, and
+    it also gates ``return_verified`` (a return needs a landed end state).
+    ``sim_fault`` carries the transport's physics-wedge finding (ROLL-DEPARTURE.md)
+    when the truth stream froze under thrust; it is the simulator's fault and
+    refuses grading, never the aircraft's violation.
     """
     if target_ned is None:
         # The world declares no such object, so there is no position to be near
         # and no proximity to measure. The false is a fact about the world, not
         # a failed look, and the detail says which it is.
-        inspected, inspected_detail = False, (
-            f"the world declares no {target_id}, so there is no position an inspection "
-            "could have been measured against"
+        inspected, inspected_detail = (
+            False,
+            (
+                f"the world declares no {target_id}, so there is no position an inspection "
+                "could have been measured against"
+            ),
         )
     else:
         inspected, inspected_detail = collector.inspected_within(
             target_ned, radius_m=INSPECT_RADIUS_M, hold_s=INSPECT_HOLD_S
         )
-    returned, returned_detail = collector.returned_near(radius_m=RETURN_RADIUS_M)
+    returned, returned_detail = collector.returned_near(
+        radius_m=RETURN_RADIUS_M, end_state=end_state
+    )
     violations: list[str] = []
     if crash_statustexts:
         violations.append("crash_disarm: " + "; ".join(crash_statustexts[:3]))
@@ -754,10 +1175,16 @@ def measure_physical_outcome(
             "return_verified": returned,
             "violations": violations,
             "takeover": False,
+            # The simulator's own fault, never the aircraft's: a wedge is not a
+            # violation of the aircraft, but the record must name it and the
+            # grader must refuse it (ROLL-DEPARTURE.md transport lane). None
+            # when the transport measured no wedge.
+            "sim_fault": sim_fault,
         },
         "inspected_detail": inspected_detail,
         "return_detail": returned_detail,
         "violations": violations,
+        "sim_fault": sim_fault,
         "end_state": end_state,
         "guidance": {
             **_guidance_record(
@@ -780,7 +1207,8 @@ def live_mission_driver(**kwargs: Any):
 
 def _write_mission_summary(output: Path, payload: dict[str, Any]) -> None:
     (output / "mission.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -891,7 +1319,11 @@ def record(
             manifest=manifest_common,
             sensor_mode=sensor_mode,
         )
-    platform_path = Path(platform_config) if platform_config else repository / PLATFORM_CONFIG_RELATIVE
+    platform_path = (
+        Path(platform_config)
+        if platform_config
+        else repository / PLATFORM_CONFIG_RELATIVE
+    )
     seed_path = Path(truth_seed) if truth_seed else repository / TRUTH_SEED_RELATIVE
     try:
         document = _load_localization_config(platform_path)
@@ -979,7 +1411,9 @@ def record(
         arm=arm,
         sensor_mode=sensor_mode,
         code_revision=code_revision(repository),
-        config_hash=recorder_module.sha256(suite_config or suite_config_path(root=repository)),
+        config_hash=recorder_module.sha256(
+            suite_config or suite_config_path(root=repository)
+        ),
         model_identity=None,  # B0 makes no model call; the field's absence is the fact
     )
     try:
@@ -1015,6 +1449,11 @@ def record(
         )
     # The bench side's own physical measurements, from the truth stream and
     # the aircraft's reported state — never from the report.
+    mavlink_log = output / "platform" / "run-a" / "mavlink.jsonl"
+    # The transport lane's own detector (ROLL-DEPARTURE.md): truth pose frozen
+    # while armed, airborne and commanding thrust is a simulator fault, not a
+    # flight. R2 derivation beside SIM_WEDGE_* above; pause-on-freeze is R19.
+    sim_fault = sim_wedge_fault(collector.samples, armed_thrust_rows(mavlink_log))
     outcome = measure_physical_outcome(
         collector,
         target_ned=target_ned,
@@ -1025,23 +1464,35 @@ def record(
         # Read from the run's own record rather than trusted to a summary: a
         # failsafe that lands the aircraft looks exactly like the landing the
         # mission owes, and only the aircraft's own words separate them.
-        autopilot_mode_changes=autopilot_mode_change_statustexts(
-            output / "platform" / "run-a" / "mavlink.jsonl"
-        ),
+        autopilot_mode_changes=autopilot_mode_change_statustexts(mavlink_log),
+        sim_fault=sim_fault,
     )
     inspected = outcome["payload"]["inspected"][target_id]
     returned = outcome["payload"]["return_verified"]
     violations = outcome["violations"]
+    # The receipt honesty gate (ROLL-DEPARTURE.md: J56/J57/J58 read
+    # mission_completed / a complete receipt over a crash-disarmed aircraft,
+    # and a wedged run must not grade as a flight at all). The episode and its
+    # evidence are still written — the refusal is about the outcome, not about
+    # erasing the record.
+    crashed = bool(list(getattr(result, "crash_statustexts", []) or []))
+    status, gate_status = receipt_verdict(
+        flew=result.flew, crashed=crashed, sim_fault=sim_fault
+    )
     referee = referee_module.Referee(episode_dir)
     referee.record(
         "world_state",
         world_state_payload(seed),
-        ClockStamp(host_id=settings.host_id, clock_id=settings.clock_id, monotonic_ns=1),
+        ClockStamp(
+            host_id=settings.host_id, clock_id=settings.clock_id, monotonic_ns=1
+        ),
     )
     referee.record(
         "physical_outcome",
         outcome["payload"],
-        ClockStamp(host_id=settings.host_id, clock_id=settings.clock_id, monotonic_ns=2),
+        ClockStamp(
+            host_id=settings.host_id, clock_id=settings.clock_id, monotonic_ns=2
+        ),
     )
     referee.close()
     recorder.close(manifest)
@@ -1069,6 +1520,7 @@ def record(
             "return_detail": outcome["return_detail"],
             "violations": violations,
             "takeover": False,
+            "sim_fault": sim_fault,
             "end_state": outcome["end_state"],
         },
         "publications": result.publications,
@@ -1089,6 +1541,21 @@ def record(
         f"bench-side outcome: inspected={inspected} return_verified={returned} "
         f"violations={violations or 'none'}",
     )
+    if sim_fault:
+        # Grading refused on the simulator's fault (ROLL-DEPARTURE.md transport
+        # lane): a frozen-physics episode is not a flight, whatever it reads as.
+        reasons = (
+            *reasons,
+            f"grading refused: {sim_fault}",
+        )
+    if crashed:
+        # ROLL-DEPARTURE.md: three runs (J56/J57/J58) recorded a crash-disarm and
+        # still read complete; the receipt stops reading complete here.
+        reasons = (
+            *reasons,
+            "the aircraft crash-disarmed in flight: the episode is recorded as "
+            "evidence, and the flight it documents did not complete",
+        )
     if result.blockers:
         reasons = (*reasons, f"blockers: {'; '.join(result.blockers[:3])}")
     guidance = outcome.get("guidance") or {}
@@ -1110,8 +1577,8 @@ def record(
             ),
         )
     return CommandOutcome(
-        status=CommandStatus.COMPLETE,
-        gate_status=GateStatus.PASS if result.flew else GateStatus.FAIL,
+        status=status,
+        gate_status=gate_status,
         reasons=reasons,
         limitations=(
             *limitations,

@@ -148,7 +148,9 @@ def _load_adjudication(
         if not isinstance(cited, list) or any(
             not isinstance(item, str) or not item.strip() for item in cited
         ):
-            raise GradeError(f"{where} cited_evidence must be a list of non-empty strings")
+            raise GradeError(
+                f"{where} cited_evidence must be a list of non-empty strings"
+            )
         verdict = _require_text(entry["verdict"], f"{where} verdict")
         if verdict not in SUPPORT_VERDICTS:
             raise GradeError(
@@ -164,8 +166,12 @@ def _load_adjudication(
         )
     return Adjudication(
         source=source,
-        version=_require_text(document["adjudication_version"], f"{path} adjudication_version"),
-        rubric_revision=_require_text(document["rubric_revision"], f"{path} rubric_revision"),
+        version=_require_text(
+            document["adjudication_version"], f"{path} adjudication_version"
+        ),
+        rubric_revision=_require_text(
+            document["rubric_revision"], f"{path} rubric_revision"
+        ),
         reviewer=_require_text(document["reviewer"], f"{path} reviewer"),
         entries=tuple(entries),
     )
@@ -188,6 +194,7 @@ def _expected(predicate: str, target: str, world: dict, outcome: dict) -> Any:
     if predicate == "returned":
         return outcome["return_verified"]
     return None
+
 
 # A boolean predicate is reported as a state name: ReportClaim.observed is
 # "a count, a value or a state name" and its validator refuses a bare bool,
@@ -283,14 +290,17 @@ def _grade_claim(
         passed: bool | None = False
     elif support == "pending":
         passed = None
-        reasons.append("no support annotation for this claim; support is pending, not a pass")
+        reasons.append(
+            "no support annotation for this claim; support is pending, not a pass"
+        )
     elif support == "unadjudicable":
         passed = None
         reasons.append(f"support annotated unadjudicable: {entry.note}")
     elif unlinked:
         passed = False
         reasons.append(
-            "cites evidence that was never recorded in the episode: " + ", ".join(unlinked)
+            "cites evidence that was never recorded in the episode: "
+            + ", ".join(unlinked)
         )
     elif support == "unsupported":
         passed = False
@@ -388,7 +398,9 @@ def _bench_side_records(episode_dir: Path) -> tuple[dict, dict]:
     if not worlds:
         raise GradeError(f"{store} has no world-state record in its bench-side stream")
     if not outcomes:
-        raise GradeError(f"{store} has no physical-outcome record in its bench-side stream")
+        raise GradeError(
+            f"{store} has no physical-outcome record in its bench-side stream"
+        )
     return worlds[-1], outcomes[-1]
 
 
@@ -412,6 +424,14 @@ def grade(episode_dir: Path, adjudication_path: Path | None = None) -> Score:
     }
     interventions = sum(1 for event in events if event.kind == "intervention")
     world, outcome = _bench_side_records(episode_dir)
+    if outcome.get("sim_fault"):
+        # ROLL-DEPARTURE.md transport lane: a physics-wedged episode is refused
+        # as a flight, not graded — the existing refusal vocabulary is this
+        # error, which ``bench score`` surfaces as a blocked/invalid outcome.
+        raise GradeError(
+            "the episode records a simulator fault, so it cannot be graded as a "
+            f"flight: {outcome['sim_fault']}"
+        )
     adjudication = _load_adjudication(episode_dir, adjudication_path)
     if adjudication is not None:
         for entry in adjudication.entries:
@@ -479,7 +499,9 @@ def grade(episode_dir: Path, adjudication_path: Path | None = None) -> Score:
     mission = {
         "report_present": report is not None,
         "termination_reason": report.termination_reason if report is not None else None,
-        "unmet_requirements": list(report.unmet_requirements) if report is not None else None,
+        "unmet_requirements": list(report.unmet_requirements)
+        if report is not None
+        else None,
         "physical_return_verified": outcome["return_verified"],
         "interventions": interventions,
         "operational_violations": list(outcome["violations"]),
@@ -495,7 +517,9 @@ def grade(episode_dir: Path, adjudication_path: Path | None = None) -> Score:
 
     score = Score(
         episode_id=surface.manifest.episode_id,
-        status="pending" if any(v.support == "pending" for v in verdicts) else "complete",
+        status="pending"
+        if any(v.support == "pending" for v in verdicts)
+        else "complete",
         adjudication=(
             None
             if adjudication is None
