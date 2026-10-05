@@ -102,7 +102,7 @@ DISPATCH_REGISTRATION_NOTE = (
 SEAM_REQUIREMENTS: tuple[tuple[str, float, str], ...] = (
     ("EK3_SRC1_POSXY", 6.0, "merged compat_ekf.parm"),
     ("EK3_SRC1_VELXY", 6.0, "merged compat_ekf.parm"),
-    ("EK3_SRC1_POSZ", 6.0, "merged compat_ekf.parm"),
+    ("EK3_SRC1_POSZ", 1.0, "merged compat_ekf.parm"),
     ("EK3_SRC1_YAW", 6.0, "merged compat_ekf.parm"),
     ("EK3_SRC1_VELZ", 6.0, "merged compat_ekf.parm"),
     ("VISO_TYPE", 1.0, "merged compat_ekf.parm"),
@@ -415,7 +415,7 @@ BRING_UP_ARMING_PARAMETER = "ARMING_SKIPCHK"
 # recorded as one.)
 BRING_UP_MODE = "ALT_HOLD"
 
-# The one arming check no mask can except, and the window's answer to it.
+# The one arming check no mask can except, and R25's standing answer to it.
 # `alt_checks` fails with "Need Alt Estimate" unless the mode has manual
 # throttle (AP_Arming_Copter.cpp:551-557); it is reached from
 # run_pre_arm_checks (:82) in the normal path AND from mandatory_checks
@@ -428,24 +428,23 @@ BRING_UP_MODE = "ALT_HOLD"
 # `!hgtTimeout && ...` (AP_NavEKF3_Control.cpp:795) and hgtTimeout clears only
 # on a height fusion from the SELECTED source (AP_NavEKF3_PosVelFusion.cpp:
 # 1363-1379 for ExternalNav, :1046-1060 for the timeout), with no fallback from
-# EXTNAV to BARO (AP_NavEKF_Source.cpp getPosZSource). So an aircraft whose
-# only height source is the external navigation it has not received yet cannot
-# arm in any mode that can take off -- and the window exists precisely because
-# that stream does not exist yet. The window therefore carries a HEIGHT SOURCE
-# for its own duration: the airframe's own barometer, the only height reference
-# that is not simulator truth. It is a height reference only (no horizontal
-# position, no attitude, no velocity), and it is restored to the seam's
-# ExternalNav before the scored window opens, verified by the vehicle's own
-# readback like every other window parameter.
-BRING_UP_HEIGHT_SOURCE_PARAMETER = "EK3_SRC1_POSZ"
-BRING_UP_HEIGHT_SOURCE_WINDOW_VALUE = 1.0  # AP_NavEKF_Source.h SourceZ::BARO
-BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE = 6.0  # SourceZ::EXTNAV, the declared seam
+# EXTNAV to BARO (AP_NavEKF_Source.cpp getPosZSource). Under the old pin --
+# EK3_SRC1_POSZ 6 -- that is why an aircraft without a latched estimator could
+# not arm in any mode that can take off, and the window carried a HEIGHT SOURCE
+# for its own duration. R25 (owner ruling 2026-10-04) selects the barometer as
+# the height source (EK3_SRC1_POSZ 1, ArduPilot's own VIO configuration): a
+# height fusion exists from boot, the mandatory altitude check needs no
+# exception, and the window carries no height source. The former
+# baro-during-excitation window that restored ExternalNav for the scored window
+# is retired -- baro is the standing configuration, and the vehicle's own
+# readback of the pinned source set remains the proof.
 
 # The window's parameter writes, each with the value it holds DURING the
 # window, the value it is RESTORED to before the claimed arm, and the pinned
 # source that makes the window value necessary or harmless. The scored arm's
-# declared state is the restore column: no check skipped (ARMING_SKIPCHK 0) and
-# EK3_SRC1_POSZ 6 (ExternalNav, the seam's own declared height source). A window
+# declared state is the restore column: no check skipped (ARMING_SKIPCHK 0).
+# The altitude channel is not a window parameter: the barometer owns it
+# throughout (EK3_SRC1_POSZ 1, R25), pinned rather than windowed. A window
 # parameter that is not restored exactly is a blocker, not a warning
 # (`_bring_up_closure_blockers`).
 #
@@ -639,14 +638,6 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
         "at AP_Arming.cpp:747-750, 'AHRS: waiting for home'). The parameter name "
         "is the pinned one (ARMING_SKIPCHK, AP_Arming.cpp:199-205): the plan's "
         "ARMING_CHECK is the pre-4.7 name and does not resolve at this pin",
-    ),
-    (
-        BRING_UP_HEIGHT_SOURCE_PARAMETER,
-        BRING_UP_HEIGHT_SOURCE_WINDOW_VALUE,
-        BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE,
-        "the mandatory altitude check above: baro is the airframe's own height "
-        "reference, needed only while the external navigation does not exist yet, "
-        "and restored to ExternalNav before the scored window opens",
     ),
     (
         BRING_UP_MOTOR_IDLE_PARAMETER,
@@ -864,7 +855,9 @@ BRING_UP_ARM_RETRY_S = 1.0
 BRING_UP_ORIGIN_ECHO_TIMEOUT_S = 5.0
 BRING_UP_TAKEOFF_ACK_TIMEOUT_S = 5.0
 # The seam's own parameters, read back after the window so the receipt shows
-# the claimed arm's declared source set restored rather than assumed.
+# the claimed arm's declared source set standing as pinned rather than assumed
+# (under R25 every value here is the merged parm's own; none is a window
+# restore).
 BRING_UP_SEAM_READBACK: tuple[str, ...] = (
     "VISO_TYPE",
     "EK3_SRC1_POSXY",
@@ -2269,12 +2262,11 @@ def _bring_up_window(settings: PlatformSettings) -> dict[str, Any]:
                     "checks are disabled (AP_Arming.cpp:1910)"
                 ),
                 "resolution": (
-                    "the window carries its own height reference "
-                    f"({BRING_UP_HEIGHT_SOURCE_PARAMETER} = "
-                    f"{BRING_UP_HEIGHT_SOURCE_WINDOW_VALUE:g}, baro) instead of "
-                    "excepting the check, and restores it to the seam's "
-                    f"{BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE:g} (ExternalNav) before the "
-                    "claimed arm"
+                    "no exception and no window value: the selected height source "
+                    "is the airframe's own barometer (EK3_SRC1_POSZ 1, R25), so "
+                    "the check's height fusion exists from boot, and the claimed "
+                    "arm's readback of the pinned source set proves it stood "
+                    "through the window"
                 ),
             },
         ],
@@ -3901,12 +3893,13 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             "the claimed arm was reached through a DECLARED ordered bring-up: a bounded "
             "exception window (plan sections 0.6 item 6, 0.8 item 7) whose elements, "
             "citations, flight and restoration readbacks are in bring-up.json. The "
-            "exception changed only WHEN the aircraft could move -- and the aircraft's own "
-            "height reference during the window was its barometer, because an external-nav "
-            "height source does not exist before the estimator latches. It was lifted, with "
-            "the vehicle's own readback as proof, before the scored window opened. The "
-            "estimator's input was stereo and inertial throughout, the bridge's truth "
-            "republish stayed off, and no predeclared bound was relaxed",
+            "exception changed only WHEN the aircraft could move -- and the aircraft's "
+            "height source throughout is its barometer (EK3_SRC1_POSZ 1, R25), so no "
+            "height-source exception is carried at all. The window's remaining "
+            "parameters were restored, with the vehicle's own readback as proof, "
+            "before the scored window opened. The estimator's input was stereo and "
+            "inertial throughout, the bridge's truth republish stayed off, and no "
+            "predeclared bound was relaxed",
             "a passing E1 is bounded by this route and this scene: two waypoints with 8 s "
             "holds indoors, never a general navigation claim",
             "reset-signalling agreement (H2) records the adapter's reset counter; the "
@@ -4673,8 +4666,8 @@ def _run_ordered_bring_up(
             )
         else:
             # The climb's rise is measured from the readback at the accepted takeoff:
-            # the windowed height source is the barometer, whose parked drift an
-            # absolute threshold can mistake for altitude -- measured, run
+            # the height source is the barometer throughout (R25), whose parked
+            # drift an absolute threshold can mistake for altitude -- measured, run
             # p01l-streak-2-20260930T015214Z, where the climb window closed
             # altitude_reached at 2.2 s on a takeoff that had just been refused.
             for _ in range(20):
@@ -4846,11 +4839,11 @@ def _run_ordered_bring_up(
             timespec="milliseconds"
         )
         record["height_source_statement"] = (
-            "baro supplied the aircraft's height during the bring-up window only; the "
-            "claimed arm's vertical source is ExternalNav (EK3_SRC1_POSZ "
-            f"{BRING_UP_HEIGHT_SOURCE_RESTORE_VALUE:g}, restored and verified by the "
-            "vehicle's own readback before the claimed arm). Baro supplied no horizontal "
-            "position, no attitude and no velocity, and no truth reached the estimator"
+            "the barometer supplied the aircraft's height throughout (R25: "
+            "EK3_SRC1_POSZ 1, verified by the vehicle's own readback before the "
+            "claimed arm); vision supplied horizontal position, horizontal velocity "
+            "and vertical velocity. Baro supplied no horizontal position, no "
+            "attitude and no velocity, and no truth reached the estimator"
         )
         # The one line the receipt owes a reader about the thrust path, stated in
         # the same place as the height source it sits beside.
@@ -4897,10 +4890,12 @@ def _run_ordered_bring_up(
                 )
         record["seam"] = {
             "statement": (
-                "the seam (VISO_TYPE 1, EK3_SRC1_* = 6) is the claimed arm's declared "
-                "state; the height source returns to ExternalNav here, which changes the "
-                "EKF's aiding and is recorded as a nav_epoch reset (SYSTEM-SPECIFICATION "
-                "sections 4.3 and 6.3), not as a continuation"
+                "the seam (VISO_TYPE 1, EK3_SRC1_* = 6 except POSZ 1) is the claimed "
+                "arm's declared state; the barometer owns the height source "
+                "throughout (R25), so no height-source transition occurs across the "
+                "window and none is recorded. The nav_epoch reset convention "
+                "(SYSTEM-SPECIFICATION sections 4.3 and 6.3) applies to any future "
+                "height-source change, not to this arm"
             ),
             "readback_after_window": record["readbacks"]["seam_after_window"],
         }

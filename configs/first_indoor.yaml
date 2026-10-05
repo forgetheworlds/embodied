@@ -797,23 +797,24 @@ localization:
   #              No default changes: the applied parameter files above are
   #              untouched, and the write is a runtime parameter on this
   #              invocation's own vehicle.
-  #   the height reference the window needs, and why it is not an exception:
-  #              alt_checks is MANDATORY -- "Need Alt Estimate"
-  #              (AP_Arming_Copter.cpp:551-557) is reached from
-  #              run_pre_arm_checks (:82) and from mandatory_checks (:654-665)
-  #              when the mask skips everything (:72-73), so no mask can except
-  #              it -- and it requires copter.ekf_alt_ok() = VERT_POS && VERT_VEL
+  #   the altitude check, and why it needs no exception: alt_checks is
+  #              MANDATORY -- "Need Alt Estimate" (AP_Arming_Copter.cpp:551-557)
+  #              is reached from run_pre_arm_checks (:82) and from
+  #              mandatory_checks (:654-665) when the mask skips everything
+  #              (:72-73), so no mask can except it -- and it requires
+  #              copter.ekf_alt_ok() = VERT_POS && VERT_VEL
   #              (ArduCopter/system.cpp:294-308), which exist only once a
   #              height measurement of the SELECTED source is fused
   #              (AP_NavEKF3_Control.cpp:795; hgtTimeout clears only on such a
-  #              fusion, AP_NavEKF3_PosVelFusion.cpp:1363-1379). With
-  #              EK3_SRC1_POSZ = 6 (ExternalNav) and no external-nav data yet
-  #              there is no height at all -- the very state the window exists
-  #              to end. The window therefore sets EK3_SRC1_POSZ = 1 (Baro), the
-  #              airframe's OWN height sensor and not simulator truth, for its
-  #              duration only, and restores it to 6 with a readback. It is a
-  #              height reference only: no horizontal position, no attitude, no
-  #              velocity, and nothing about it supplies the scored pose.
+  #              fusion, AP_NavEKF3_PosVelFusion.cpp:1363-1379). R25 (owner
+  #              ruling 2026-10-04) makes the barometer the SELECTED source
+  #              (EK3_SRC1_POSZ = 1, the airframe's OWN height sensor and not
+  #              simulator truth): the fusion exists from boot, the check needs
+  #              no exception, and the window carries no height source. (The
+  #              former baro-during-excitation window that restored 6 is
+  #              retired; baro is the standing configuration.) And nothing
+  #              about the barometer supplies the scored pose: no horizontal
+  #              position, no attitude, no velocity.
   #              ALT_HOLD is used and not STABILIZE/ACRO because only the
   #              position-holding modes have a user takeoff (mode.h:132), and
   #              they need the height estimate their mode check also wants.
@@ -827,9 +828,9 @@ localization:
   #              leaves VISO_TYPE alone and the Check::VISION exception covers
   #              the interval before the adapter's first publication.)
   #
-  #   the window's THROTTLE PATH, and why it is the window's: the baro element
-  #              above answers the ALTITUDE check, and it does not make the
-  #              aircraft move. With GPS off and the estimator unlatched the only
+  #   the window's THROTTLE PATH, and why it is the window's: the barometer's
+  #              own height (R25) answers the ALTITUDE check and does not make
+  #              the aircraft move. With GPS off and an unlatched estimator, only
   #              modes that can arm are the position-free ones, and every one of
   #              them lifts on the PILOT throttle: a mode that needs a position
   #              (GUIDED, AUTO, LOITER) cannot arm at all
@@ -1069,11 +1070,13 @@ localization:
     tracking_lost_min_tracks: 5
     # ---------------------------------------------------------------------------
     # R24 — the vision-publication z guard (owner ruling 2026-10-04; the crash
-    # mechanism is work/runs/night/Z-CLIMB.md). The FC's altitude channel IS the
-    # estimator's z (EK3_SRC1_POSZ 6), so J53-vantage-2's wandering estimate was
-    # indistinguishable from real motion: Guided held a fixed target against it
-    # with saturated motors until the crash detector disarmed a flipped aircraft.
-    # On breach of the residual bound below, the ExternalNavPublisher STOPS
+    # mechanism is work/runs/night/Z-CLIMB.md), kept in force as the monitor of
+    # last resort under R25. The crashes it answers flew EK3_SRC1_POSZ 6, where
+    # the FC's altitude channel WAS the estimator's z, so J53-vantage-2's
+    # wandering estimate was indistinguishable from real motion: Guided held a
+    # fixed target against it with saturated motors until the crash detector
+    # disarmed a flipped aircraft. On breach of the residual bound below, the
+    # ExternalNavPublisher STOPS
     # publishing vision and the firmware's own external-navigation-loss machinery
     # (FS_EKF_ACTION 1) lands protectively. The bound refuses to publish; it never
     # edits the estimator's output, the FC's fusion, or any existing declared
@@ -1082,8 +1085,8 @@ localization:
     # The reference is the vehicle's own barometer, read as SCALED_PRESSURE — the
     # primary barometer itself. GLOBAL_POSITION_INT would not do: at the pinned
     # commit its altitudes are the EKF's position in the origin datum
-    # (AP_NavEKF3_Outputs.cpp:316), which with EK3_SRC1_POSZ 6 is the vision feed,
-    # so the guard would compare vision with vision exactly when vision is wrong.
+    # (AP_NavEKF3_Outputs.cpp:316) — an estimator output, not an independent
+    # reference, whatever the height source is.
     #
     # z_guard_max_residual_m -- 0.6 m, the midpoint of the owner's 0.5-0.75 m
     # band, which separates the measured regimes with margin on both sides:

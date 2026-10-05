@@ -88,7 +88,7 @@ FIXTURE_PARAMETER_VALUES = {
         "EK2_ENABLE": 0.0,
         "EK3_SRC1_POSXY": 6.0,
         "EK3_SRC1_VELXY": 6.0,
-        "EK3_SRC1_POSZ": 6.0,
+        "EK3_SRC1_POSZ": 1.0,  # R25: the barometer, the pinned altitude channel
         "EK3_SRC1_YAW": 6.0,
         "EK3_SRC1_VELZ": 6.0,
         "VISO_TYPE": 1.0,

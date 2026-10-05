@@ -480,12 +480,15 @@ class HealthBounds:
     tracking_lost_min_tracks: int = 5
     # The R24 z guard (owner ruling 2026-10-04; work/runs/night/Z-CLIMB.md): a
     # publisher-side bound on the vertical divergence between the estimate about
-    # to be published and the vehicle's own barometer. The FC's altitude channel
-    # IS the estimator's z (EK3_SRC1_POSZ 6), so a live-but-wrong estimate was
-    # indistinguishable from a moving aircraft all the way to the crash detector;
-    # this bound is the one check on the wire the estimator cannot talk out of,
-    # because the barometer is calibrated and fused for nothing. On breach the
-    # publisher stops and the firmware's own external-navigation-loss machinery
+    # to be published and the vehicle's own barometer. The crashes it answers
+    # flew EK3_SRC1_POSZ 6, where the FC's altitude channel WAS the estimator's
+    # z and a live-but-wrong estimate was indistinguishable from a moving
+    # aircraft all the way to the crash detector; under R25 the barometer owns
+    # the altitude channel, and the guard remains in force as the monitor of
+    # last resort -- an estimate that lies about z is suspect overall. It is
+    # the one check on the wire the estimator cannot talk out of, because the
+    # barometer is calibrated and fused for nothing. On breach the publisher
+    # stops and the firmware's own external-navigation-loss machinery
     # (FS_EKF_ACTION 1) lands protectively. The defaults are the values
     # configs/first_indoor.yaml declares with their derivation (R2).
     #

@@ -33,7 +33,12 @@ EK2_ENABLE 0
 # Compass Fallback, 6:ExternalNav, 8:GSF" for YAW):
 EK3_SRC1_POSXY 6
 EK3_SRC1_VELXY 6
-EK3_SRC1_POSZ 6
+# R25 (owner ruling 2026-10-04): the altitude channel belongs to the barometer -
+# ArduPilot's own VIO configuration (common-vio-tracking-camera.html prescribes
+# POSZ 1, "Baro which is safer because of the camera's weakness to high
+# vibrations"), with vision owning XY position, XY velocity and Z velocity. Any
+# move of this value away from 1 needs a new ruling with measured cause.
+EK3_SRC1_POSZ 1
 EK3_SRC1_YAW 6
 # VELZ is the fifth source field, and it was the one left at its firmware default
 # (GPS, 3) while the other four were set for this arm. The pre-arm check walks

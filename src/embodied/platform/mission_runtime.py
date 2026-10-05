@@ -1801,11 +1801,12 @@ class MissionRuntime:
         The reference is the vehicle's own barometer, and the only honest carrier
         of it on this firmware is SCALED_PRESSURE: GLOBAL_POSITION_INT is built
         from the EKF's own position (send_global_position_int reads
-        ahrs.get_location; AP_NavEKF3_Outputs.cpp:316), and with EK3_SRC1_POSZ 6
-        that position is the vision feed — comparing them would be vision against
-        vision. The conversion is ArduPilot's own simple model with this run's
-        first reading as the datum, so the guard's fixed-offset window absorbs
-        the datum and no second atmospheric opinion enters.
+        ahrs.get_location; AP_NavEKF3_Outputs.cpp:316) and is an estimator
+        output whatever the height source is, so an independent reference cannot
+        pass through the estimator. The conversion is ArduPilot's own simple
+        model with this run's first reading as the datum, so the guard's
+        fixed-offset window absorbs the datum and no second atmospheric opinion
+        enters.
         """
         if self._publisher is None:
             return
@@ -1919,14 +1920,17 @@ class MissionRuntime:
         nothing in the mission noticed.
 
         The mechanism those runs show is worth stating, because it is not
-        obvious. ``EK3_SRC1_POSZ`` is ExternalNav, so the altitude channel is
-        the estimator's own z. When the view degenerates the estimator's z
-        drifts low: on the run whose dataflash is ``00000238.BIN`` the
-        published altitude read 1.76 m while the simulator's own state said
-        2.44 m, an error that grew to 1.12 m. GUIDED then holds the *estimated*
-        position, so a drifting estimate is chased by real motion — the
-        aircraft climbed about a metre to keep a falling number where it was,
-        struck the 2.5 m ceiling, and the crash detector did the rest.
+        obvious. They flew ``EK3_SRC1_POSZ`` 6: the altitude channel WAS the
+        estimator's own z, so when the view degenerated and the estimator's z
+        drifted low, GUIDED — which holds the *estimated* position — chased
+        the falling number with real motion. On the run whose dataflash is
+        ``00000238.BIN`` the published altitude read 1.76 m while the
+        simulator's own state said 2.44 m, an error that grew to 1.12 m; the
+        aircraft climbed about a metre to keep the falling number where it was,
+        struck the 2.5 m ceiling, and the crash detector did the rest. Under
+        R25 the barometer owns the altitude channel and a drifting z can no
+        longer command the aircraft, but an estimate that lies about z is
+        suspect overall, and R24's guard remains the monitor of last resort.
 
         So the bound is not a statistic about the log. Past it the estimate is
         no longer a pose, and the only honest options are the declared
