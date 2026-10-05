@@ -489,51 +489,6 @@ def _raise_in_thread(thread_id: int, exception: type[BaseException]) -> int:
     return setter(ctypes.c_ulong(thread_id), ctypes.py_object(exception))
 
 
-def _capture_sensor_record(
-    capture: sensor_capture.SensorCapture | None,
-    record: Any,
-    *,
-    width: int,
-    height: int,
-    left_luma: bytes | None,
-    right_luma: bytes | None,
-) -> None:
-    """Hand one feed record to the run's sensor capture, when one is on.
-
-    The measured debt (ESTIMATOR-FEJ-ZUPT.md §§1.1, 3): no replayable capture
-    of a flown mission exists anywhere, and the estimator A/B lane (resumption
-    chi-square, bias-RW sigmas) is blocked on one. The recorder is the replay
-    surface's own ``SensorCapture`` — the exact rows and format
-    ``localization_check`` already writes at its own seam, not a second format
-    — fed here with the exact arguments the feed's encoders received, in feed
-    order. ``capture`` is None unless EMBODIED_SENSOR_CAPTURE=1; then this
-    call does nothing and nothing on the flown path changes.
-    """
-    if capture is None:
-        return
-    if record.kind is Kind.PAIR and record.pair is not None:
-        capture.pair(
-            sim_time_ns(record.sim_time_s),
-            record.pair.capture_host_ns,
-            width,
-            height,
-            left_luma,
-            right_luma,
-        )
-    elif record.kind is Kind.IMU and record.imu is not None:
-        capture.imu(
-            sim_time_ns(record.sim_time_s),
-            record.imu.capture_host_ns,
-            record.imu.gyro,
-            record.imu.accelerometer,
-        )
-    elif record.kind is Kind.POSE and record.pose is not None:
-        capture.pose(
-            sim_time_ns(record.sim_time_s),
-            record.pose.position_xyz,
-            record.pose.attitude_rpy,
-        )
-
 # Section 12.2's conditional observation objective, and the declared parameters
 # that bound it (R2).
 #
@@ -1329,13 +1284,14 @@ class MissionRuntime:
             # The mission's replayable capture rides this same seam: one row
             # per record, in feed order, with the exact arguments the encoders
             # above received.
-            _capture_sensor_record(
+            sensor_capture.capture_record(
                 capture,
                 record,
                 width=self.settings.stereo.width,
                 height=self.settings.stereo.height,
                 left_luma=left_luma,
                 right_luma=right_luma,
+                sim_time_ns=sim_time_ns,
             )
         # One stereo frame may wait here for the inertial samples that must precede it;
         # see OrderedPairFeed for what sending it early does to the estimator.

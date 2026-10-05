@@ -8,7 +8,7 @@ the rows the replay surface already consumes) at ITS seam, inert unless
 EMBODIED_SENSOR_CAPTURE=1: unset, no recorder exists, no files are opened and
 the flown path is untouched.
 
-The tests drive ``_capture_sensor_record`` — the exact function
+The tests drive ``sensor_capture.capture_record`` — the exact function
 ``feed_record`` calls, once per record in feed order — on synthetic records of
 the wire's own payload shapes, against a real ``EvidenceWriter`` in tmp_path.
 """
@@ -22,6 +22,7 @@ from pathlib import Path
 
 from embodied.platform import mission_runtime as MR
 from embodied.platform import sensor_capture
+from embodied.platform.sensors import sim_time_ns
 
 HOST, CLOCK = "capture-test-0", "monotonic"
 
@@ -110,13 +111,14 @@ def _feed_through(capture, records) -> None:
         if record.kind is Kind.PAIR and record.pair is not None:
             left_luma = loc.grayscale_rgb8(record.pair.left_bytes, 4, 2)
             right_luma = loc.grayscale_rgb8(record.pair.right_bytes, 4, 2)
-        MR._capture_sensor_record(
+        sensor_capture.capture_record(
             capture,
             record,
             width=4,
             height=2,
             left_luma=left_luma,
             right_luma=right_luma,
+            sim_time_ns=sim_time_ns,
         )
 
 

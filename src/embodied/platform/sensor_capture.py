@@ -53,7 +53,7 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 __all__ = ["CAPTURE_ENV", "SensorCapture"]
 
@@ -316,3 +316,48 @@ class SensorCapture:
             self._seq += 1
         row["seq"] = self._seq
         return json.dumps(row) + "\n"
+
+def capture_record(
+    capture: "SensorCapture | None",
+    record: Any,
+    *,
+    width: int,
+    height: int,
+    left_luma: bytes | None,
+    right_luma: bytes | None,
+    sim_time_ns: Callable[[float], int],
+) -> None:
+    """Hand one feed record to ``capture``, when one is on.
+
+    The dispatch lives HERE -- in the recorder's own module -- and not in any
+    consumer, so a consumer (the mission runtime's feed seam, the check's feed
+    seam) never has to name the truth-pose fields its leakage guards forbid it
+    from reading: this module is the recorder, its pose rows are the truth
+    poses read for scoring, and recording them is its documented purpose.
+    ``capture`` is ``None`` unless the environment asked for a capture; then
+    this does nothing.
+    """
+    if capture is None:
+        return
+    if record.kind.name == "PAIR" and getattr(record, "pair", None) is not None:
+        capture.pair(
+            sim_time_ns(record.sim_time_s),
+            record.pair.capture_host_ns,
+            width,
+            height,
+            left_luma,
+            right_luma,
+        )
+    elif record.kind.name == "IMU" and getattr(record, "imu", None) is not None:
+        capture.imu(
+            sim_time_ns(record.sim_time_s),
+            record.imu.capture_host_ns,
+            record.imu.gyro,
+            record.imu.accelerometer,
+        )
+    elif record.kind.name == "POSE" and getattr(record, "pose", None) is not None:
+        capture.pose(
+            sim_time_ns(record.sim_time_s),
+            record.pose.position_xyz,
+            record.pose.attitude_rpy,
+        )
