@@ -1,12 +1,12 @@
-"""Sim proof for the vehicle motion layer — three tasks, real Webots + SITL.
+"""Sim proof for the vehicle motion layer — open field, real Webots + SITL.
 
 1. takeoff to hover
-2. goto waypoint A and hold (residual ≤ 0.15 m)
-3. goto waypoint B and hold, then land
+2. goto each motion waypoint and hold (residual ≤ configured limit)
+3. land
 
 Skipped when Webots / SITL are not installed on the host. Run explicitly::
 
-    python -m embodied motion-proof --config configs/first_indoor.yaml \\
+    python -m embodied motion-proof --config configs/motion_open.yaml \\
         --output work/runs/motion-proof-1
 """
 
@@ -22,7 +22,7 @@ from embodied.platform import vehicle_proof
 from embodied.platform.webots_ardupilot import PlatformSettings, check_prerequisites
 
 REPO = Path(__file__).resolve().parents[2]
-CONFIG = REPO / "configs" / "first_indoor.yaml"
+CONFIG = REPO / "configs" / "motion_open.yaml"
 
 
 def _sim_ready() -> bool:
@@ -34,18 +34,20 @@ def _sim_ready() -> bool:
 
 
 @pytest.mark.skipif(not _sim_ready(), reason="Webots + ArduPilot SITL not installed")
-def test_vehicle_flies_three_preset_waypoint_tasks(tmp_path):
-    """Launch the scene and fly takeoff → waypoint A → waypoint B through Vehicle."""
+def test_vehicle_flies_open_field_motion_route(tmp_path):
+    """Launch the open field and fly the full motion waypoint route through Vehicle."""
     args = type("Args", (), {"config": CONFIG})()
     output = tmp_path / "motion-proof"
     outcome = vehicle_proof._command(args, output)
     assert outcome.status == CommandStatus.COMPLETE, outcome.reasons
     assert outcome.gate_status == GateStatus.PASS, outcome.reasons
     steps = outcome.manifest["steps"]
+    motion = load_config(CONFIG)["motion"]
+    waypoint_count = len(motion["waypoints_local_ned"])
     assert [step["task"] for step in steps] == [
         "takeoff",
-        "goto[0]",
-        "goto[1]",
+        *[f"goto[{index}]" for index in range(waypoint_count)],
         "land",
     ]
     assert all(step["ok"] for step in steps)
+    assert "open_field" in str(outcome.manifest["world"])

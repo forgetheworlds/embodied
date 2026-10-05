@@ -1,0 +1,131 @@
+#VRML_SIM R2025a utf8
+# P00 motion layer: open field for multi-waypoint Vehicle proofs.
+#
+# A flat 30 x 30 m pad with no walls or obstacles on the flight path. Spawn is at
+# the centre; ground markers sit at the declared NED waypoints in
+# configs/motion_open.yaml (ENU x north, y west, z up). Same Iris + compat
+# controller as scenarios/compat/worlds/compat_stereo.wbt.
+EXTERNPROTO "../../compat/protos/Iris.proto"
+
+WorldInfo {
+  title "P00 motion: open field"
+  basicTimeStep 2
+  FPS 20
+  optimalThreadCount 1
+  randomSeed 0
+}
+Viewpoint {
+  orientation 0.25 -0.85 -0.40 2.40
+  position -8.0 -10.0 12.0
+  follow "Iris"
+  followSmoothness 0.01
+}
+Background {
+  skyColor [ 0.55 0.65 0.82 ]
+}
+DirectionalLight {
+  direction 0.2 -0.4 -1
+  intensity 1.1
+}
+Solid {
+  name "floor"
+  translation 0 0 -0.02
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.52 0.54 0.56
+        roughness 0.95
+      }
+      geometry Plane {
+        size 30 30
+      }
+    }
+  ]
+  boundingObject Plane {
+    size 30 30
+  }
+}
+# Ground markers at the motion-proof waypoints (ENU from NED north/east).
+Solid {
+  name "marker_north"
+  translation 5.0 0.0 0.01
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.15 0.15
+        roughness 0.8
+      }
+      geometry Box { size 0.6 0.6 0.02 }
+    }
+  ]
+}
+Solid {
+  name "marker_ne"
+  translation 5.0 -5.0 0.01
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.15 0.75 0.25
+        roughness 0.8
+      }
+      geometry Box { size 0.6 0.6 0.02 }
+    }
+  ]
+}
+Solid {
+  name "marker_east"
+  translation 0.0 -5.0 0.01
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.15 0.35 0.85
+        roughness 0.8
+      }
+      geometry Box { size 0.6 0.6 0.02 }
+    }
+  ]
+}
+Solid {
+  name "marker_home"
+  translation 0.0 0.0 0.01
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.85 0.75 0.15
+        roughness 0.8
+      }
+      geometry Box { size 0.6 0.6 0.02 }
+    }
+  ]
+}
+Iris {
+  translation 0 0 0.09
+  controller "compat_vehicle_controller"
+  controllerArgs [
+    "--sitl-address"
+    "127.0.0.1"
+    "--sitl-port"
+    "9002"
+    "--controller-port"
+    "9010"
+    "--motors"
+    "m1_motor, m2_motor, m3_motor, m4_motor"
+    "--camera-left"
+    "camera left"
+    "--camera-right"
+    "camera right"
+    "--camera-period-ms"
+    "100"
+    "--accelerometer"
+    "accelerometer"
+    "--gyro"
+    "gyro"
+    "--inertial-unit"
+    "inertial unit"
+    "--gps"
+    "gps"
+    "--imu-period-ms"
+    "2"
+  ]
+  customData "{\"world_zero\": \"floor level, ENU\", \"scene\": \"open_field\", \"note\": \"30 m pad for multi-waypoint motion proofs\"}"
+}

@@ -298,6 +298,16 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "step_timeout_s": {"startup": float, "ready": float, "flight": float},
         "budget_wall_clock_s": float,
     },
+    # P00 motion layer: open-field multi-waypoint proof tasks. Optional so the
+    # compatibility gate configuration keeps loading unchanged.
+    "motion": _Optional(
+        {
+            "hover_altitude_m": float,
+            "waypoints_local_ned": [[float]],
+            "hold_per_waypoint_s": float,
+            "residual_max_m": float,
+        }
+    ),
     # -------------------------------------------------------------------
     # R2 (2026-10-03): the values that decide whether a flight moves.
     #
