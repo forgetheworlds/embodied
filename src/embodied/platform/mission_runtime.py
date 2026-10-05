@@ -73,6 +73,7 @@ from embodied.perception import camera as camera_module
 from embodied.perception import grounding as G
 from embodied.perception.detector import DetectorUnavailable
 from embodied.platform import localization as loc
+from embodied.platform import sensor_capture
 # The worked example's own machinery, imported rather than rebuilt: the
 # declared ordered bring-up, the simulator-second window, the estimator
 # process and the pre-arm checks are the ones P01-L measured with.
@@ -486,6 +487,52 @@ def _raise_in_thread(thread_id: int, exception: type[BaseException]) -> int:
     setter.argtypes = (ctypes.c_ulong, ctypes.py_object)
     setter.restype = ctypes.c_int
     return setter(ctypes.c_ulong(thread_id), ctypes.py_object(exception))
+
+
+def _capture_sensor_record(
+    capture: sensor_capture.SensorCapture | None,
+    record: Any,
+    *,
+    width: int,
+    height: int,
+    left_luma: bytes | None,
+    right_luma: bytes | None,
+) -> None:
+    """Hand one feed record to the run's sensor capture, when one is on.
+
+    The measured debt (ESTIMATOR-FEJ-ZUPT.md §§1.1, 3): no replayable capture
+    of a flown mission exists anywhere, and the estimator A/B lane (resumption
+    chi-square, bias-RW sigmas) is blocked on one. The recorder is the replay
+    surface's own ``SensorCapture`` — the exact rows and format
+    ``localization_check`` already writes at its own seam, not a second format
+    — fed here with the exact arguments the feed's encoders received, in feed
+    order. ``capture`` is None unless EMBODIED_SENSOR_CAPTURE=1; then this
+    call does nothing and nothing on the flown path changes.
+    """
+    if capture is None:
+        return
+    if record.kind is Kind.PAIR and record.pair is not None:
+        capture.pair(
+            sim_time_ns(record.sim_time_s),
+            record.pair.capture_host_ns,
+            width,
+            height,
+            left_luma,
+            right_luma,
+        )
+    elif record.kind is Kind.IMU and record.imu is not None:
+        capture.imu(
+            sim_time_ns(record.sim_time_s),
+            record.imu.capture_host_ns,
+            record.imu.gyro,
+            record.imu.accelerometer,
+        )
+    elif record.kind is Kind.POSE and record.pose is not None:
+        capture.pose(
+            sim_time_ns(record.sim_time_s),
+            record.pose.position_xyz,
+            record.pose.attitude_rpy,
+        )
 
 # Section 12.2's conditional observation objective, and the declared parameters
 # that bound it (R2).
@@ -1194,6 +1241,18 @@ class MissionRuntime:
         )
         self._platform, self._session, self._publisher = platform, session, publisher
 
+        # The mission's sensor capture (the replay surface; the measured debt
+        # is ESTIMATOR-FEJ-ZUPT.md §§1.1, 3): one flight's whole sensor stream
+        # on disk, inert unless EMBODIED_SENSOR_CAPTURE=1 asks for it. Wired at
+        # THIS seam exactly as localization_check wires its own: every frame
+        # the estimator receives passes through feed_record as the exact
+        # arguments of the encoders below, in feed order, so a replay of the
+        # record reproduces the estimator's input byte for byte. Capture files
+        # land under the run's evidence dir (run-a/sensor-capture/), the layout
+        # the P01-L captures used. Unset, no recorder exists, nothing opens,
+        # and the flown path's behaviour and timing are untouched.
+        capture = sensor_capture.SensorCapture.from_env(os.environ, self.evidence)
+
         def file_record(record: Any) -> None:
             if record.kind is not Kind.PAIR or record.pair is None:
                 return
@@ -1207,6 +1266,10 @@ class MissionRuntime:
         platform.record_sink = file_record
 
         def feed_record(record: Any) -> None:
+            # The luma planes the PAIR branch converts, kept for the sensor
+            # capture at the end of this function; every other kind records
+            # without planes.
+            left_luma = right_luma = None
             # The simulator's clock is read on the one path that consumes the
             # whole stream, exactly as the worked example does.
             if self._first_record_kind is None:
@@ -1229,17 +1292,17 @@ class MissionRuntime:
                     sim_time_s=record.sim_time_s,
                 )
                 self._stats.pair_latencies_ns.append(capture_latency_ns(sample))
-                left = loc.grayscale_rgb8(
+                left_luma = loc.grayscale_rgb8(
                     pair.left_bytes, self.settings.stereo.width, self.settings.stereo.height
                 )
-                right = loc.grayscale_rgb8(
+                right_luma = loc.grayscale_rgb8(
                     pair.right_bytes, self.settings.stereo.width, self.settings.stereo.height
                 )
                 client.send(
                     loc.encode_stereo(
                         sim_time_ns(record.sim_time_s),
-                        left,
-                        right,
+                        left_luma,
+                        right_luma,
                         self.settings.stereo.width,
                         self.settings.stereo.height,
                     )
@@ -1263,6 +1326,17 @@ class MissionRuntime:
                 self._stats.truth_attitudes.append(
                     (sim_time_ns(record.sim_time_s), tuple(record.pose.attitude_rpy))
                 )
+            # The mission's replayable capture rides this same seam: one row
+            # per record, in feed order, with the exact arguments the encoders
+            # above received.
+            _capture_sensor_record(
+                capture,
+                record,
+                width=self.settings.stereo.width,
+                height=self.settings.stereo.height,
+                left_luma=left_luma,
+                right_luma=right_luma,
+            )
         # One stereo frame may wait here for the inertial samples that must precede it;
         # see OrderedPairFeed for what sending it early does to the estimator.
         ordered_pairs = OrderedPairFeed(
@@ -1484,6 +1558,11 @@ class MissionRuntime:
                 self._shutdown(
                     platform, publisher, estimator_process, feed_stop, feed_thread, bring_up_link
                 )
+                if capture is not None:
+                    # The feed thread is joined; drain the capture writer so
+                    # the evidence dir holds the complete stream on every exit
+                    # path (atexit covers a crash past this point).
+                    capture.close()
                 self.result.publications = self._publication_count
                 self.result.publish_refusals = self._publish_refusal_count
                 self._surface_refusals()
@@ -2478,6 +2557,27 @@ class MissionRuntime:
             certificate_ref = certificate.certificate_id
             self._log_certificate_shape(certificate)
         elif active.hold_position_odom is not None:
+            # The §12.2 observation sweep's hold is SELF-NEUTRALIZING
+            # (work/runs/night/Z-CLIMB.md §§2-3; J55-flyband-1 verdict): at the
+            # declared 0.6 rad/s the rotation destabilizes the VIO, and a hold
+            # FIXED at the observe call turns the wandering estimate into a
+            # full-authority chase — J53 (AngErr 105) and J55 (AngErr 83)
+            # crashed in it; J54 survived by luck of the wander. For the
+            # sweep's declared 10 s window the target therefore re-pins to the
+            # CURRENT aligned position at every publication — own x, y and z —
+            # so the error Guided sees stays ~zero whatever the estimate does:
+            # no fixed target exists to chase, which makes the wander→chase
+            # conversion structurally impossible, not merely smaller. The pin
+            # includes z, so the aircraft holds its own current altitude and
+            # the land-disarm protection is not at risk (the sweep is bounded
+            # and nothing descends); J52's FIXED hover altitude is kept where
+            # it belongs, on the non-sweep renewal hold (_renewal_hold_position,
+            # rate 0), which must NOT re-pin. No declared value moves: the rate
+            # and window stay declared, and the yaw ramp below is unchanged.
+            if active.hold_yaw_rate_rad_s:
+                current = self._position_odom()
+                if current is not None:
+                    active.hold_position_odom = current
             position_ned = active.hold_position_odom
             velocity_ned = (0.0, 0.0, 0.0)
             certificate_ref = active.goal_id
