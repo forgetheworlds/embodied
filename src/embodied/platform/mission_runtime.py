@@ -2478,6 +2478,27 @@ class MissionRuntime:
             certificate_ref = certificate.certificate_id
             self._log_certificate_shape(certificate)
         elif active.hold_position_odom is not None:
+            # The §12.2 observation sweep's hold is SELF-NEUTRALIZING
+            # (work/runs/night/Z-CLIMB.md §§2-3; J55-flyband-1 verdict): at the
+            # declared 0.6 rad/s the rotation destabilizes the VIO, and a hold
+            # FIXED at the observe call turns the wandering estimate into a
+            # full-authority chase — J53 (AngErr 105) and J55 (AngErr 83)
+            # crashed in it; J54 survived by luck of the wander. For the
+            # sweep's declared 10 s window the target therefore re-pins to the
+            # CURRENT aligned position at every publication — own x, y and z —
+            # so the error Guided sees stays ~zero whatever the estimate does:
+            # no fixed target exists to chase, which makes the wander→chase
+            # conversion structurally impossible, not merely smaller. The pin
+            # includes z, so the aircraft holds its own current altitude and
+            # the land-disarm protection is not at risk (the sweep is bounded
+            # and nothing descends); J52's FIXED hover altitude is kept where
+            # it belongs, on the non-sweep renewal hold (_renewal_hold_position,
+            # rate 0), which must NOT re-pin. No declared value moves: the rate
+            # and window stay declared, and the yaw ramp below is unchanged.
+            if active.hold_yaw_rate_rad_s:
+                current = self._position_odom()
+                if current is not None:
+                    active.hold_position_odom = current
             position_ned = active.hold_position_odom
             velocity_ned = (0.0, 0.0, 0.0)
             certificate_ref = active.goal_id
