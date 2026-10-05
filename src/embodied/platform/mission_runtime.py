@@ -2517,52 +2517,49 @@ class MissionRuntime:
             certificate_ref = certificate.certificate_id
             self._log_certificate_shape(certificate)
         elif active.hold_position_odom is not None:
-            # The §12.2 observation sweep's hold is SELF-NEUTRALIZING
-            # (work/runs/night/Z-CLIMB.md §§2-3; J55-flyband-1 verdict): at the
-            # declared 0.6 rad/s the rotation destabilizes the VIO, and a hold
-            # FIXED at the observe call turns the wandering estimate into a
-            # full-authority chase — J53 (AngErr 105) and J55 (AngErr 83)
-            # crashed in it; J54 survived by luck of the wander. For the
-            # sweep's declared 10 s window the target therefore re-pins to the
-            # CURRENT aligned position at every publication — own x, y and z —
-            # so the error Guided sees stays ~zero whatever the estimate does:
-            # no fixed target exists to chase, which makes the wander→chase
-            # conversion structurally impossible, not merely smaller. The pin
-            # includes z, so the aircraft holds its own current altitude and
-            # the land-disarm protection is not at risk (the sweep is bounded
-            # and nothing descends); J52's FIXED hover altitude is kept where
-            # it belongs, on the non-sweep renewal hold (_renewal_hold_position,
-            # rate 0), which must NOT re-pin. No declared value moves: the rate
-            # and window stay declared, and the yaw ramp below is unchanged.
+            # The §12.2 observation sweep's hold is a VELOCITY HOLD
+            # (work/runs/night/XY-ROTATION-CRASH.md §4; OVERNIGHT-DECISIONS.md):
+            # both captures show the sweep's commanded yaw-ANGLE bursts — not a
+            # lying wire — excited the yaw snap-overshoot cascade that rolled
+            # the aircraft inverted (J56 27.0°/29.5° and J57 16.5°/15.6° steps,
+            # divergence step-locked 5°→46°→115°, achieved rates 2–4.1× the
+            # declared 34°/s), while the vision wire itself was honest to
+            # ≤ 0.068 m when the rotation blinded the tracker (71→0 / 58→0).
+            # A position pin — fixed or re-pinned — left Guided a displacement
+            # to chase from whatever the estimate said, and 0.48 s after the
+            # last publication the aircraft flipped. For the sweep's declared
+            # 10 s window the target is therefore zero velocity plus the
+            # declared yaw RATE, with position and yaw angle absent (the type
+            # mask ignores both): a rate stream is step-free even at burst
+            # cadence, and with no position field on the wire there is nothing
+            # to chase when vision stops — the velocity loop coasts on the EKF.
+            # The observation still turns the aircraft where it stands, so the
+            # camera sees parts of the room no earlier frame covered. The
+            # declared rate 0.6 rad/s and the 10 s window are used verbatim —
+            # no declared value moves (R19). The non-sweep renewal hold
+            # (_renewal_hold_position, rate 0) keeps its FIXED position and
+            # declared hover altitude — J52's land-disarm protection — and
+            # must never take this branch.
             if active.hold_yaw_rate_rad_s:
-                current = self._position_odom()
-                if current is not None:
-                    active.hold_position_odom = current
-            position_ned = active.hold_position_odom
-            velocity_ned = (0.0, 0.0, 0.0)
-            certificate_ref = active.goal_id
+                position_ned = None
+                velocity_ned = (0.0, 0.0, 0.0)
+                certificate_ref = active.goal_id
+                yaw_rad = None
+                yaw_rate_rad_s = OBSERVATION_YAW_RATE_RAD_S
+            else:
+                position_ned = active.hold_position_odom
+                velocity_ned = (0.0, 0.0, 0.0)
+                certificate_ref = active.goal_id
+                yaw_rad = active.hold_yaw_rad
+                yaw_rate_rad_s = None
         else:
             return "no_published_trajectory"
-        # The commanded yaw. A zero rate is the mission's declared hold yaw. A
-        # non-zero one is an observation: the aircraft turns where it stands, so
-        # the camera sees parts of the room no earlier frame covered, and the
-        # space it needs to certify stops being space nobody has looked at.
-        yaw_rad = active.hold_yaw_rad
-        if active.hold_yaw_rate_rad_s:
-            # Measured on the SAME clock the sweep's declared window is spent on.
-            # On the wall clock the swept angle depended on the host's own speed:
-            # J44-fly-1 swept 3.08 rad against a declared 6.0. Clamped to the
-            # declared window, so a clock that jumps cannot command an angle the
-            # sweep never declared.
-            elapsed_sim_s = min(
-                self._sim_now_s() - active.hold_since_sim_s, OBSERVATION_SWEEP_SIM_S
-            )
-            yaw_rad = active.hold_yaw_rad + elapsed_sim_s * active.hold_yaw_rate_rad_s
         sent = self._platform.send_local_ned(
             LocalNedTarget(
                 position_ned=position_ned,
                 velocity_ned=velocity_ned,
                 yaw_rad=yaw_rad,
+                yaw_rate_rad_s=yaw_rate_rad_s,
                 deadline_s=SETPOINT_DEADLINE_S,
                 certificate_ref=certificate_ref,
             )
@@ -2587,7 +2584,7 @@ class MissionRuntime:
         *,
         position_ned,
         velocity_ned,
-        yaw_rad: float,
+        yaw_rad: float | None,
         certificate_ref: str,
         goal_ref: str,
     ) -> None:
@@ -2599,7 +2596,9 @@ class MissionRuntime:
         COMMANDED_SAMPLE_SIM_S of simulator time is enough to put the command
         beside the achieved altitude. Nothing here changes what is sent; it
         records it, in the frame it was sent in, with the goal and certificate
-        it came from.
+        it came from. A field the wire does not carry — the velocity hold's
+        absent position and yaw angle — is recorded as null, so the record
+        stays a faithful image of the commanded setpoint.
         """
         sim_now = self._stats.sim_clock.newest_s
         if sim_now is None:
@@ -2614,9 +2613,13 @@ class MissionRuntime:
             {
                 "sim_s": round(float(sim_now), 3),
                 "frame": "local_ned",
-                "position_m": [round(float(value), 4) for value in position_ned],
+                "position_m": (
+                    None
+                    if position_ned is None
+                    else [round(float(value), 4) for value in position_ned]
+                ),
                 "velocity_mps": [round(float(value), 4) for value in velocity_ned],
-                "yaw_rad": round(float(yaw_rad), 4),
+                "yaw_rad": None if yaw_rad is None else round(float(yaw_rad), 4),
                 "goal_ref": goal_ref,
                 "certificate_ref": certificate_ref,
             }

@@ -3074,6 +3074,13 @@ class LocalNedTarget:
     yaw_rad: float | None
     deadline_s: float
     certificate_ref: str | None
+    # The yaw command as a RATE, not an angle. A rate stream is step-free even
+    # at the sweep's measured burst cadence, and the two are mutually
+    # exclusive downstream (MotionTarget refuses both at once), so None means
+    # every existing target stays an angle-or-nothing target. The observation
+    # sweep's velocity hold is the one caller that sets it
+    # (work/runs/night/XY-ROTATION-CRASH.md §4).
+    yaw_rate_rad_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -4011,7 +4018,7 @@ class WebotsArduPilot:
             velocity_ned=target.velocity_ned,
             acceleration_ned=None,
             yaw_rad=target.yaw_rad,
-            yaw_rate_rad_s=None,
+            yaw_rate_rad_s=target.yaw_rate_rad_s,
         )
         self._sequence += 1
         setpoint = MotionSetpoint(
