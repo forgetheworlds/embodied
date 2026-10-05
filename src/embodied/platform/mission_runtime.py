@@ -59,7 +59,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -74,6 +74,7 @@ from embodied.perception import grounding as G
 from embodied.perception.detector import DetectorUnavailable
 from embodied.platform import localization as loc
 from embodied.platform import sensor_capture
+
 # The worked example's own machinery, imported rather than rebuilt: the
 # declared ordered bring-up, the simulator-second window, the estimator
 # process and the pre-arm checks are the ones P01-L measured with.
@@ -93,6 +94,7 @@ from embodied.platform.localization_check import (
     _declared_start_attitude,
     _declared_start_origin,
     _gps_aiding_verdict,
+    _last_heartbeat_armed,
     _param_error_refusals,
     _readback_blockers,
     _run_ordered_bring_up,
@@ -839,7 +841,9 @@ class MissionRuntime:
         from embodied.pilot.mission_executive import MissionPilot, load_runtime_config
         from embodied.pilot.provider import LiveTransport, ModelConfig
 
-        document = load_runtime_config(repository_root() / RUNTIME_MODEL_CONFIG_RELATIVE)
+        document = load_runtime_config(
+            repository_root() / RUNTIME_MODEL_CONFIG_RELATIVE
+        )
         return MissionPilot.for_arm(
             arm=arm,
             config_document=document,
@@ -897,7 +901,9 @@ class MissionRuntime:
             + (f" refusal={plan.refusal_reason!r}" if plan.refusal_reason else "")
         )
 
-    def _tick_cloud(self, observation: R.Observation, payloads: dict[str, bytes]) -> None:
+    def _tick_cloud(
+        self, observation: R.Observation, payloads: dict[str, bytes]
+    ) -> None:
         """One in-flight step for a cloud arm, after the latch has closed.
 
         Two fields are real runtime state and one is a declared proxy, and the
@@ -917,9 +923,13 @@ class MissionRuntime:
         """
         signature = float(len(self.store.free_cells(now_ns=self._now_ns())))
         new_targets = tuple(
-            target for target in self._candidate_targets if target not in self._told_targets
+            target
+            for target in self._candidate_targets
+            if target not in self._told_targets
         )
-        scene = SceneStatus(signature=signature, new_targets=new_targets, horizon_s=None)
+        scene = SceneStatus(
+            signature=signature, new_targets=new_targets, horizon_s=None
+        )
         outcomes = self._pilot.tick(scene, observation, payloads, self._clock())
         self._told_targets.update(new_targets)
         for outcome in outcomes:
@@ -931,19 +941,33 @@ class MissionRuntime:
                     "proposal_id": outcome.proposal_id,
                 }
             )
-            self.result.log.append(f"cloud {self.arm}: {outcome.kind} — {outcome.reason}")
+            self.result.log.append(
+                f"cloud {self.arm}: {outcome.kind} — {outcome.reason}"
+            )
 
     def _now_ns(self) -> int:
-        return self._capture_clock_ns if self._capture_clock_ns is not None else time.monotonic_ns()
-
-    def _state_stamp(self) -> R.ClockStamp:
-        controller_host = str(self._controller_status.get("host_id") or self.settings.host_id)
-        controller_clock = str(self._controller_status.get("clock_id") or self.settings.clock_id)
-        return R.ClockStamp(
-            host_id=controller_host, clock_id=controller_clock, monotonic_ns=self._now_ns()
+        return (
+            self._capture_clock_ns
+            if self._capture_clock_ns is not None
+            else time.monotonic_ns()
         )
 
-    def _publishable_state(self, state: loc.EstimatorState | None) -> loc.EstimatorState | None:
+    def _state_stamp(self) -> R.ClockStamp:
+        controller_host = str(
+            self._controller_status.get("host_id") or self.settings.host_id
+        )
+        controller_clock = str(
+            self._controller_status.get("clock_id") or self.settings.clock_id
+        )
+        return R.ClockStamp(
+            host_id=controller_host,
+            clock_id=controller_clock,
+            monotonic_ns=self._now_ns(),
+        )
+
+    def _publishable_state(
+        self, state: loc.EstimatorState | None
+    ) -> loc.EstimatorState | None:
         """One raw estimator state, only while the publisher's verdicts would publish it.
 
         ESTIMATOR-DIVERGENCE.md measured where divergence reached this mission:
@@ -1025,7 +1049,9 @@ class MissionRuntime:
         state = self._publishable_state(self._latest_state)
         if state is None or not self.alignment.sealed:
             return 0.0
-        return float(np.linalg.norm(self.alignment.aligned_velocity_ned(state.velocity_mps)))
+        return float(
+            np.linalg.norm(self.alignment.aligned_velocity_ned(state.velocity_mps))
+        )
 
     def _capture_pose(self, record: Any) -> R.PoseEstimate | None:
         """The estimator pose nearest one pair's capture instant, on its own clock."""
@@ -1037,8 +1063,12 @@ class MissionRuntime:
         state = self._publishable_state(best[1])
         if state is None:
             return None
-        controller_host = str(self._controller_status.get("host_id") or self.settings.host_id)
-        controller_clock = str(self._controller_status.get("clock_id") or self.settings.clock_id)
+        controller_host = str(
+            self._controller_status.get("host_id") or self.settings.host_id
+        )
+        controller_clock = str(
+            self._controller_status.get("clock_id") or self.settings.clock_id
+        )
         sigma = state.sigma_pos_m
         return R.PoseEstimate(
             parent_frame="odom",
@@ -1155,7 +1185,9 @@ class MissionRuntime:
     def run(self) -> MissionResult:
         log = self.result.log
         estimator = self._localization["estimator"]
-        estimator_process = _start_estimator(estimator, repository_root(), self.evidence)
+        estimator_process = _start_estimator(
+            estimator, repository_root(), self.evidence
+        )
         if estimator_process is None:
             self.result.termination_reason = "estimator_unavailable"
             self.result.blockers.append(
@@ -1189,7 +1221,9 @@ class MissionRuntime:
             self.settings,
             runner=LowPrioritySubprocessRunner(),
             session=session,
-            gateway=TcpSensorGateway(stamp=lambda: self.settings.capture_stamp(time.monotonic_ns())),
+            gateway=TcpSensorGateway(
+                stamp=lambda: self.settings.capture_stamp(time.monotonic_ns())
+            ),
             evidence=self.evidence,
             label="run-a",
             extra_params=self.settings.estimator_params,
@@ -1248,10 +1282,14 @@ class MissionRuntime:
                 )
                 self._stats.pair_latencies_ns.append(capture_latency_ns(sample))
                 left_luma = loc.grayscale_rgb8(
-                    pair.left_bytes, self.settings.stereo.width, self.settings.stereo.height
+                    pair.left_bytes,
+                    self.settings.stereo.width,
+                    self.settings.stereo.height,
                 )
                 right_luma = loc.grayscale_rgb8(
-                    pair.right_bytes, self.settings.stereo.width, self.settings.stereo.height
+                    pair.right_bytes,
+                    self.settings.stereo.width,
+                    self.settings.stereo.height,
                 )
                 client.send(
                     loc.encode_stereo(
@@ -1293,6 +1331,7 @@ class MissionRuntime:
                 right_luma=right_luma,
                 sim_time_ns=sim_time_ns,
             )
+
         # One stereo frame may wait here for the inertial samples that must precede it;
         # see OrderedPairFeed for what sending it early does to the estimator.
         ordered_pairs = OrderedPairFeed(
@@ -1354,7 +1393,9 @@ class MissionRuntime:
             try:
                 sample = platform.telemetry()
             except Exception as error:
-                self._machine.stop(time.monotonic_ns(), f"the telemetry stream failed: {error}")
+                self._machine.stop(
+                    time.monotonic_ns(), f"the telemetry stream failed: {error}"
+                )
             else:
                 self._offer_baro(sample)
 
@@ -1373,7 +1414,9 @@ class MissionRuntime:
                 f"{readiness.pair_seen}, imu_seen={readiness.imu_seen}, "
                 f"status={readiness.telemetry.system_status}"
             )
-            feed_thread = threading.Thread(target=feed_loop, name="estimator-feed", daemon=True)
+            feed_thread = threading.Thread(
+                target=feed_loop, name="estimator-feed", daemon=True
+            )
             feed_thread.start()
             feed_endpoint = _autopilot_feed_endpoint(
                 self.evidence.path("sitl.log"), self.settings.mavlink_endpoint
@@ -1404,11 +1447,15 @@ class MissionRuntime:
                     "is not off, so this sensor-derived arm is refused"
                 )
             blockers.extend(_readback_blockers(applied, refusals))
-            blockers.extend(_gps_aiding_verdict(self.evidence.path("mavlink.jsonl"))["blockers"])
+            blockers.extend(
+                _gps_aiding_verdict(self.evidence.path("mavlink.jsonl"))["blockers"]
+            )
             if blockers:
                 self.result.blockers.extend(blockers)
                 self.result.termination_reason = "preflight_refused"
-                log.append("not starting the flight: a precondition of the scored arm failed")
+                log.append(
+                    "not starting the flight: a precondition of the scored arm failed"
+                )
                 return self.result
             publisher.start()
             # The link speaks as the vehicle's OWN declared GCS system id, read
@@ -1482,7 +1529,9 @@ class MissionRuntime:
             # impossible.
             if self._pilot is not None:
                 self._plan_before_liftoff(drain)
-            control = platform.arm_and_guided(self.settings.step_timeout_s.flight, drain=drain)
+            control = platform.arm_and_guided(
+                self.settings.step_timeout_s.flight, drain=drain
+            )
             if control.refused:
                 self.result.blockers.append(
                     f"the autopilot refused Guided flight: mode_reached={control.mode_reached}, "
@@ -1512,7 +1561,12 @@ class MissionRuntime:
             try:
                 self._watchdog_stop()
                 self._shutdown(
-                    platform, publisher, estimator_process, feed_stop, feed_thread, bring_up_link
+                    platform,
+                    publisher,
+                    estimator_process,
+                    feed_stop,
+                    feed_thread,
+                    bring_up_link,
                 )
                 if capture is not None:
                     # The feed thread is joined; drain the capture writer so
@@ -1554,7 +1608,9 @@ class MissionRuntime:
                     "perception_depth_s": round(self._perception_depth_s, 3),
                     "commanded_setpoints": list(self._commanded),
                     "publisher_published": getattr(publisher, "published", None),
-                    "publisher_failures": list(getattr(publisher, "publish_failures", [])),
+                    "publisher_failures": list(
+                        getattr(publisher, "publish_failures", [])
+                    ),
                     # The arm, the one reasoned call's own document, and every
                     # in-flight cloud exchange. The transport already carries this
                     # dict into the run's record verbatim, so the receipt can tell
@@ -1666,7 +1722,9 @@ class MissionRuntime:
             self.result.phases.append(
                 PhaseOutcome(outcome.status, outcome.reason, outcome.steps)
             )
-            self.result.log.append(f"phase {phase}: {outcome.status} — {outcome.reason}")
+            self.result.log.append(
+                f"phase {phase}: {outcome.status} — {outcome.reason}"
+            )
             if outcome.status == "budget_exhausted":
                 termination = "mission_budget_exhausted"
                 break
@@ -1703,6 +1761,14 @@ class MissionRuntime:
         # recipes reached, the aircraft comes down and the report says which
         # obligations were met.
         self._land(drain)
+        # The receipt honesty gate (ROLL-DEPARTURE.md: J56/J57/J58 each read
+        # mission_completed over a crash-disarmed aircraft, because the phase
+        # loop's default outlived the aircraft). ``_land`` has drained the run's
+        # own crash-disarm STATUSTEXTs; a crashed flight terminates under its
+        # own name.
+        termination = final_termination_reason(
+            termination, self.result.crash_statustexts
+        )
         self.result.found = mission_module.ClaimEvidence(
             bool(self._candidate_observation_ids),
             tuple(dict.fromkeys(self._candidate_observation_ids))[:4],
@@ -1750,6 +1816,17 @@ class MissionRuntime:
             )
         except Exception:
             self.result.crash_statustexts = []
+        # The sampled armed flag races the disarm readback (ROLL-DEPARTURE.md:
+        # the race that hid J58's end_state_inverted from the live record), so
+        # the vehicle's own complete heartbeat stream corrects it — toward
+        # disarmed only, never back toward armed.
+        corrected, correction = reconcile_armed_readback(
+            self.result.end_state,
+            _last_heartbeat_armed(self.evidence.path("mavlink.jsonl")),
+        )
+        self.result.end_state = corrected
+        if correction is not None:
+            self.result.log.append(correction)
         self.result.guidance_events = [
             event.document() for event in getattr(self._platform, "control_events", [])
         ]
@@ -1780,11 +1857,16 @@ class MissionRuntime:
                 f"refused: ... and {len(unique_refusals) - 40} further distinct refusals"
             )
 
-    def _shutdown(self, platform, publisher, estimator_process, feed_stop, feed_thread, link) -> None:
+    def _shutdown(
+        self, platform, publisher, estimator_process, feed_stop, feed_thread, link
+    ) -> None:
         for action in (
             lambda: link.close() if link is not None else None,
             publisher.stop,
-            lambda: (feed_stop.set(), feed_thread.join(timeout=5.0) if feed_thread else None),
+            lambda: (
+                feed_stop.set(),
+                feed_thread.join(timeout=5.0) if feed_thread else None,
+            ),
             platform.stop,
             estimator_process.terminate,
         ):
@@ -1819,7 +1901,9 @@ class MissionRuntime:
             return
         ref_pressure, ref_temperature = self._baro_reference
         self._publisher.offer_baro(
-            baro_relative_altitude_m(pressure, temperature, ref_pressure, ref_temperature)
+            baro_relative_altitude_m(
+                pressure, temperature, ref_pressure, ref_temperature
+            )
         )
 
     def _on_state(self, state: loc.EstimatorState) -> None:
@@ -1828,7 +1912,9 @@ class MissionRuntime:
         if len(self._state_ring) > POSE_RING:
             del self._state_ring[0]
 
-    def _on_publish(self, state: loc.EstimatorState, aligned: dict[str, object]) -> None:
+    def _on_publish(
+        self, state: loc.EstimatorState, aligned: dict[str, object]
+    ) -> None:
         self._latest_aligned = aligned
 
     # -- perception ----------------------------------------------------------
@@ -2077,7 +2163,9 @@ class MissionRuntime:
         # transformed on. Stamping the map with simulator time while measuring
         # its age on the host clock would make every cell read stale the moment
         # it was written.
-        self._capture_clock_ns = max(self._capture_clock_ns or 0, int(pair.capture_host_ns))
+        self._capture_clock_ns = max(
+            self._capture_clock_ns or 0, int(pair.capture_host_ns)
+        )
         # The alignment has to be sealed before a capture-time pose can be built:
         # an unsealed one has no odom rotation, and its own accessor refuses
         # rather than guessing the frame's unobservable yaw. So ask for the
@@ -2187,7 +2275,9 @@ class MissionRuntime:
                 description=f"candidate {candidate.candidate_id} of query {self._query!r}",
                 confidence=None,
             )
-            self._sink("selection", R.to_dict(selection), self._clock(), observation.sim_time_s)
+            self._sink(
+                "selection", R.to_dict(selection), self._clock(), observation.sim_time_s
+            )
             target = G.ground(
                 selection, observation, depth, pose, state, self.calibration
             )
@@ -2339,7 +2429,9 @@ class MissionRuntime:
         sequence = self._observation_counter
         pair = record.pair
         host_id = str(self._controller_status.get("host_id") or self.settings.host_id)
-        clock_id = str(self._controller_status.get("clock_id") or self.settings.clock_id)
+        clock_id = str(
+            self._controller_status.get("clock_id") or self.settings.clock_id
+        )
         left_payload = right_payload = None
         if store_payload and self._payload_count < MAX_EVIDENCE_PAYLOADS:
             left_name = f"obs-{sequence:05d}-left.ppm"
@@ -2350,7 +2442,10 @@ class MissionRuntime:
             self.recorder.write_payload(
                 right_name, ppm_bytes(pair.right_bytes, pair.width, pair.height)
             )
-            left_payload, right_payload = f"payloads/{left_name}", f"payloads/{right_name}"
+            left_payload, right_payload = (
+                f"payloads/{left_name}",
+                f"payloads/{right_name}",
+            )
             self._payload_count += 1
         observation = R.Observation(
             episode_id=self.episode_id,
@@ -2362,7 +2457,9 @@ class MissionRuntime:
             ),
             sequence=sequence,
             capture_stamp=R.ClockStamp(
-                host_id=host_id, clock_id=clock_id, monotonic_ns=int(pair.capture_host_ns)
+                host_id=host_id,
+                clock_id=clock_id,
+                monotonic_ns=int(pair.capture_host_ns),
             ),
             receipt_stamp=record.received_stamp,
             sim_time_s=record.sim_time_s if record.sim_time_s >= 0.0 else None,
@@ -2394,7 +2491,9 @@ class MissionRuntime:
         # frame waited in the perception queue) carry a later stamp than this
         # one, and the recorder refuses a stream whose order and stamps
         # disagree.
-        self._sink("observation", R.to_dict(observation), self._clock(), record.sim_time_s)
+        self._sink(
+            "observation", R.to_dict(observation), self._clock(), record.sim_time_s
+        )
         self._last_observation_id = observation.record_id
         return observation
 
@@ -2459,7 +2558,9 @@ class MissionRuntime:
         while not window.expired():
             self._beat_watchdog()
             if self._visual_fault_reason is not None:
-                stopped = f"the estimate stopped being a pose: {self._visual_fault_reason}"
+                stopped = (
+                    f"the estimate stopped being a pose: {self._visual_fault_reason}"
+                )
                 break
             now = time.monotonic()
             if now >= next_perception:
@@ -2479,7 +2580,8 @@ class MissionRuntime:
         # publish, and the next step must admit one rather than inherit a hold.
         self._active_goal = None
         subject = (
-            f"traversal {target_ref!r}" if target_ref is not None
+            f"traversal {target_ref!r}"
+            if target_ref is not None
             else "the query's unmeasurable selection"
         )
         self.result.log.append(
@@ -2657,8 +2759,12 @@ class MissionRuntime:
                 t0=certificate.t_start_s,
                 t1=certificate.t_end_s,
                 now=now,
-                a0=first[0][0], a1=first[0][1], a2=first[0][2],
-                b0=last[0][0], b1=last[0][1], b2=last[0][2],
+                a0=first[0][0],
+                a1=first[0][1],
+                a2=first[0][2],
+                b0=last[0][0],
+                b1=last[0][1],
+                b2=last[0][2],
             )
         )
 
@@ -2761,7 +2867,8 @@ class MissionRuntime:
         *,
         here: tuple[float, float, float] | None = None,
         searchable: set[tuple[int, int, int]] | None = None,
-        searchable_bounds: tuple[tuple[int, int, int], tuple[int, int, int]] | None = None,
+        searchable_bounds: tuple[tuple[int, int, int], tuple[int, int, int]]
+        | None = None,
         band: tuple[float, float] | None = None,
     ) -> tuple[float, float, float] | None:
         """The point an explore step would fly to for this frontier, or None.
@@ -2899,7 +3006,10 @@ class MissionRuntime:
                 return None
             centres = [self.store.config.cell_center(cell) for cell in cells]
             return tuple(
-                (round(min(c[axis] for c in centres), 2), round(max(c[axis] for c in centres), 2))
+                (
+                    round(min(c[axis] for c in centres), 2),
+                    round(max(c[axis] for c in centres), 2),
+                )
                 for axis in range(3)
             )
 
@@ -3114,7 +3224,8 @@ class MissionRuntime:
         """
         resolved: list[R.GroundedTarget] = []
         citation = (
-            self._candidate_observation_ids[-1] if self._candidate_observation_ids
+            self._candidate_observation_ids[-1]
+            if self._candidate_observation_ids
             else self._last_observation_id
         )
         for ref in proposal.target_refs:
@@ -3190,6 +3301,14 @@ def _end_state_record(sample: Any) -> dict[str, Any]:
     armed flag, a plausible position — which is how a vertical-error measurement
     was once taken on a crashed, inverted aircraft and read as an estimator
     property.
+
+    The attitude is recorded in degrees, the bench-side convention
+    (``live_record.end_state_tilt_deg`` reads degrees, and the rederivation's
+    telemetry path converts with ``math.degrees`` before it stores into this
+    same field). ROLL-DEPARTURE.md: the telemetry sample arrives in radians and
+    the raw radians were stored here, so J58's inverted rest — attitude
+    [3.141, −0.0008, 2.613] rad — was measured as a 3.1-degree tilt and the
+    ``end_state_inverted`` violation never fired on the live record.
     """
     return {
         "armed": sample.armed,
@@ -3197,10 +3316,55 @@ def _end_state_record(sample: Any) -> dict[str, Any]:
         "local_position_ned": list(sample.local_position_ned)
         if sample.local_position_ned is not None
         else None,
-        "attitude_rpy": list(sample.attitude_rpy)
+        "attitude_rpy": [math.degrees(value) for value in sample.attitude_rpy]
         if sample.attitude_rpy is not None
         else None,
     }
+
+
+def final_termination_reason(termination: str, crash_statustexts: Sequence[str]) -> str:
+    """The honest termination: a crash-disarmed run never reads ``mission_completed``.
+
+    ROLL-DEPARTURE.md: J56, J57 and J58 each recorded a crash-disarm mid-mission
+    and each receipt still read ``mission_completed`` — the mission kept
+    gathering observations beside a dead aircraft and the phase loop's default
+    termination outlived the aircraft. When the run's own STATUSTEXT stream
+    records a crash-disarm, the complete-mission termination is replaced by the
+    named, distinct ``crashed``. Every other termination already says what
+    actually ended the mission, and is left alone.
+    """
+    if crash_statustexts and termination == "mission_completed":
+        return "crashed"
+    return termination
+
+
+def reconcile_armed_readback(
+    end_state: dict[str, Any], stream_armed: bool | None
+) -> tuple[dict[str, Any], str | None]:
+    """Correct the end state's armed flag from the vehicle's own heartbeat stream.
+
+    ROLL-DEPARTURE.md: the live record missed J58's ``end_state_inverted``
+    because the end-state sample was taken in the armed-readback race around the
+    crash disarm — the recorded end state carried ``armed: false`` and the
+    inverted attitude beside it, but the violation's guard must have seen an
+    armed (or undecided) flag at measure time. The heartbeat stream is the
+    vehicle's own complete record, so when the sampled flag and the stream's
+    last heartbeat disagree, the correction runs only toward ``disarmed``:
+    it can complete a violation the race suppressed, and it can never suppress
+    one by arming a record back up.
+    """
+    if stream_armed is not False:
+        return end_state, None
+    if not end_state or end_state.get("armed") is False:
+        return end_state, None
+    corrected = dict(end_state)
+    corrected["armed"] = False
+    return corrected, (
+        "end state armed readback corrected from the run's own heartbeat stream: "
+        "the sampled flag raced the disarm readback, the stream's last heartbeat "
+        "is disarmed (ROLL-DEPARTURE.md: the armed-readback race that hid "
+        "end_state_inverted on J58)"
+    )
 
 
 def _quality_of(pair, settings):
@@ -3229,9 +3393,8 @@ class _LiveAdmission:
                 proposal_id=proposal.proposal_id,
                 request_id=proposal.request_id or proposal.proposal_id,
                 disposition=R.GoalDisposition.REJECTED,
-                reason=(
-                    "no_grounded_target" if not targets else "no_navigation_state"
-                ) + ": the proposal cannot be admitted from the evidence this runtime holds",
+                reason=("no_grounded_target" if not targets else "no_navigation_state")
+                + ": the proposal cannot be admitted from the evidence this runtime holds",
                 admission_ref=None,
                 current_disposition=R.ExecutionDisposition.BLOCKED,
             )
@@ -3269,10 +3432,15 @@ class _LiveAdmission:
                 "t {t0:.3f}..{t1:.3f} ({dur:.3f} s)".format(
                     intent=proposal.intent,
                     refs=list(proposal.target_refs),
-                    lx=region.low[0], hx=region.high[0],
-                    ly=region.low[1], hy=region.high[1],
-                    lz=region.low[2], hz=region.high[2],
-                    px=start[0], py=start[1], pz=start[2],
+                    lx=region.low[0],
+                    hx=region.high[0],
+                    ly=region.low[1],
+                    hy=region.high[1],
+                    lz=region.low[2],
+                    hz=region.high[2],
+                    px=start[0],
+                    py=start[1],
+                    pz=start[2],
                     inside=region.contains(start),
                     t0=result.certificate.t_start_s,
                     t1=result.certificate.t_end_s,
@@ -3294,7 +3462,9 @@ class _LiveAdmission:
         runtime._note_new_vantage()
         return result.status
 
-    def cancel(self, goal_id: str, expected_revision: int, idempotency_key: str) -> R.GoalStatus:
+    def cancel(
+        self, goal_id: str, expected_revision: int, idempotency_key: str
+    ) -> R.GoalStatus:
         runtime = self._runtime
         if runtime._active_goal is not None and runtime._active_goal.goal_id == goal_id:
             runtime._active_goal.execution = R.ExecutionDisposition.CANCELLED
@@ -3323,10 +3493,10 @@ class _LiveAdmission:
             )
         return R.ExecutionStatus(
             goal_ref=goal_id,
-            certificate_ref=active.certificate.certificate_id if active.certificate else None,
-            command_ref=(
-                active.setpoints[-1].sample_ref if active.setpoints else None
-            ),
+            certificate_ref=active.certificate.certificate_id
+            if active.certificate
+            else None,
+            command_ref=(active.setpoints[-1].sample_ref if active.setpoints else None),
             disposition=active.execution,
             evidence=(f"proposal:{active.proposal.proposal_id}",),
             reasons=(),
@@ -3494,7 +3664,10 @@ class _LiveRunnerWorld:
         # observe for.
         if target_ref is not None and runtime._active_goal is None:
             refused_reason = runtime._blocked_refs.get(target_ref)
-            if refused_reason is not None and target_ref not in runtime._observed_targets:
+            if (
+                refused_reason is not None
+                and target_ref not in runtime._observed_targets
+            ):
                 runtime._observed_targets.add(target_ref)
                 before_observations = runtime._observation_counter
                 observed, detail = runtime.observe_in_place(
@@ -3571,11 +3744,17 @@ class _LiveRunnerWorld:
         self._finish(action, target_ref)
         return ()
 
-    def completion(self, action: str, target_ref: str | None) -> tuple[str, tuple[str, ...]]:
+    def completion(
+        self, action: str, target_ref: str | None
+    ) -> tuple[str, tuple[str, ...]]:
         runtime = self._runtime
         active = runtime._active_goal
         observations = tuple(dict.fromkeys(self._step_observations))[:4]
-        if active is None or active.certificate is None or active.terminal_region is None:
+        if (
+            active is None
+            or active.certificate is None
+            or active.terminal_region is None
+        ):
             return "blocked", observations
         position = runtime._position_odom()
         if position is None:
@@ -3734,7 +3913,9 @@ def _pilot_section(root: Path) -> dict[str, Any]:
     """The declared pilot parameters, from their one config file."""
     import yaml
 
-    return yaml.safe_load((root / "configs" / "runtime-model.yaml").read_text())["pilot"]
+    return yaml.safe_load((root / "configs" / "runtime-model.yaml").read_text())[
+        "pilot"
+    ]
 
 
 def write_final_report(runtime: MissionRuntime) -> R.FinalReport:
