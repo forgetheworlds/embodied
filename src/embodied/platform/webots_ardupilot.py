@@ -1196,11 +1196,14 @@ class PlatformSettings:
         argv = [
             str(self.webots_binary),
             "--batch",
-            "--minimize",
             f"--mode={self.webots_mode}",
             "--stdout",
             "--stderr",
         ]
+        # Default keeps the window out of the way for headless proofs. Set
+        # EMBODIED_WEBOTS_VISIBLE=1 to leave the 3D view on screen for live watching.
+        if os.environ.get("EMBODIED_WEBOTS_VISIBLE", "") != "1":
+            argv.insert(2, "--minimize")
         if os.environ.get("EMBODIED_WEBOTS_NO_RENDERING", "") == "1":
             argv.append("--no-rendering")
         argv.append(str(self.world))

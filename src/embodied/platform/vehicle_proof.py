@@ -175,6 +175,8 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
     residual_max_m = float(motion["residual_max_m"])
 
     writer = EvidenceWriter(output_dir, "run-a")
+    # Same EKF-active layering as compat: without it SITL stays on simulator AHRS
+    # (AHRS_EKF_TYPE 10), which diverges under local-NED targets mid-route.
     platform = WebotsArduPilot(
         settings,
         runner=SubprocessRunner(),
@@ -184,6 +186,7 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
         ),
         evidence=writer,
         label="motion-proof",
+        extra_params=settings.compat_estimator_params,
     )
     try:
         platform.start()
