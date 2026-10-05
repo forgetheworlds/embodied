@@ -434,10 +434,16 @@ class Vehicle:
             raise ValueError("spin rate must be non-zero")
         sample = self._adapter.latest_telemetry
         start_yaw = None if sample is None or sample.attitude_rpy is None else sample.attitude_rpy[2]
+        # Hold XY/Z while yawing. Ignoring position during spin lets the
+        # horizontal controller go open-loop; re-engaging it on the next goto
+        # tip-struck on return[0] (AngErr≈90) after a clean ±π pair.
+        position = None if sample is None else sample.local_position_ned
+        if position is None:
+            position = (0.0, 0.0, -self._adapter.settings.hover_altitude_m)
         duration = abs(angle_rad) / abs(rate_rad_s)
         signed_rate = rate_rad_s if angle_rad >= 0.0 else -rate_rad_s
         target = LocalNedTarget(
-            position_ned=None,
+            position_ned=position,
             velocity_ned=(0.0, 0.0, 0.0),
             yaw_rad=None,
             yaw_rate_rad_s=signed_rate,

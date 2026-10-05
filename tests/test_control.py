@@ -1,7 +1,8 @@
 """Deterministic control-layer contract tests (no Webots / SITL).
 
 Checks the Vehicle API behaviour we rely on: ENU↔NED, setpoint masks,
-yaw-rate spin (not angle slam), and refuse-publish when not armed Guided.
+yaw-rate spin with position held (not angle slam / open-loop XY), and
+refuse-publish when not armed Guided.
 """
 
 from __future__ import annotations
@@ -151,8 +152,9 @@ def test_spin_uses_yaw_rate_not_angle() -> None:
     assert last.frame is Frame.ODOM
     assert last.target.yaw_rad is None
     assert last.target.yaw_rate_rad_s == SPIN_RATE_RAD_S
-    assert last.target.position_ned is None
-    assert last.type_mask & TYPE_MASK_POSITION_IGNORE
+    # Position is held during spin so XY control stays closed-loop.
+    assert last.target.position_ned == (0.0, 0.0, -1.5)
+    assert not (last.type_mask & TYPE_MASK_POSITION_IGNORE)
     assert last.type_mask & TYPE_MASK_YAW_IGNORE
     assert not (last.type_mask & TYPE_MASK_YAW_RATE_IGNORE)
 
@@ -166,6 +168,7 @@ def test_reverse_spin_uses_negative_yaw_rate() -> None:
     last = adapter._session.setpoints[-1]
     assert last.target.yaw_rad is None
     assert last.target.yaw_rate_rad_s == -SPIN_RATE_RAD_S
+    assert last.target.position_ned == (0.0, 0.0, -1.5)
 
 
 def test_publish_refused_when_not_guided() -> None:

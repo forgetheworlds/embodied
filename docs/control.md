@@ -49,9 +49,10 @@ Control only publishes setpoints once the adapter reports armed GUIDED.
    vehicle stops being guided.
 2. **Refuse when not armed GUIDED** — `publish` returns `None` and the proof
    scores `guided_lost` rather than commanding blind.
-3. **Spin is yaw-rate only.** Absolute yaw after a large heading change tip-strikes
-   (`Crash: AngErr=…`). After a +π spin, reface with `spin(-π)`, not
-   `hold(yaw_rad=0)`.
+3. **Spin is yaw-rate only, with position held.** Absolute yaw after a large
+   heading change tip-strikes (`Crash: AngErr=…`). Ignoring XY during spin also
+   tip-strikes on the next goto when the horizontal controller re-engages.
+   After a +π spin, reface with `spin(-π)`, not `hold(yaw_rad=0)`.
 4. **Doorway residual** for this layer proof is **0.10 m**; open-field scenes
    historically used 0.15 m.
 5. Return legs reverse the outbound chain (skipping the far endpoint) only after
