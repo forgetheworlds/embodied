@@ -210,6 +210,26 @@ def fly_control_route(
                 f"(tol {spin_tolerance_rad:.3f})"
             )
 
+    # Re-face north before inbound legs so return does not translate while yawed
+    # ~π into a 1 m doorway (first control proof: tip-strike on return[0]).
+    if return_waypoints and not any(
+        "guided flight lost" in reason for reason in reasons
+    ):
+        reface = vehicle.hold(hold_s, yaw_rad=0.0, drain=drain)
+        reface_ok = reface.get("ok") is True and not reface.get("guided_lost")
+        steps.append(
+            {
+                "task": "reface",
+                "residual_m": reface.get("residual_m"),
+                "publications": reface.get("publications"),
+                "ok": reface_ok,
+            }
+        )
+        if reface.get("guided_lost"):
+            reasons.append("reface: guided flight lost")
+        elif not reface_ok:
+            reasons.append("reface: failed")
+
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
     ):
