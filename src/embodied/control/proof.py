@@ -12,10 +12,9 @@ Route:
 6. goto return waypoints back toward the pad
 7. land
 
-Run::
+Run the layer gate::
 
-    python -m embodied motion-proof --config configs/motion_doorway.yaml \\
-        --output work/runs/motion-proof-control
+    ./configs/layers/control
 """
 
 from __future__ import annotations
