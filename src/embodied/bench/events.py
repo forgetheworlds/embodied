@@ -110,13 +110,17 @@ class Event:
             if isinstance(self.sim_time_s, bool) or not isinstance(
                 self.sim_time_s, (int, float)
             ):
-                raise EventError(f"sim_time_s must be a number or None, got {self.sim_time_s!r}")
+                raise EventError(
+                    f"sim_time_s must be a number or None, got {self.sim_time_s!r}"
+                )
             if not math.isfinite(float(self.sim_time_s)):
                 raise EventError("sim_time_s must be finite")
         validate_payload(self.kind, self.payload)
 
 
-def _check_exact_keys(payload: dict[str, Any], expected: Sequence[str], where: str) -> None:
+def _check_exact_keys(
+    payload: dict[str, Any], expected: Sequence[str], where: str
+) -> None:
     missing = sorted(set(expected) - set(payload))
     unknown = sorted(set(payload) - set(expected))
     if missing or unknown:
@@ -125,7 +129,9 @@ def _check_exact_keys(payload: dict[str, Any], expected: Sequence[str], where: s
             detail.append(f"missing {', '.join(missing)}")
         if unknown:
             detail.append(f"unknown {', '.join(unknown)}")
-        raise EventError(f"{where} payload must hold exactly {', '.join(expected)} ({'; '.join(detail)})")
+        raise EventError(
+            f"{where} payload must hold exactly {', '.join(expected)} ({'; '.join(detail)})"
+        )
 
 
 def _check_flag(value: Any, where: str) -> None:
@@ -171,22 +177,50 @@ def _check_truth_payload(kind: str, payload: dict[str, Any]) -> None:
             raise EventError("world_state.world_counts must be an object")
         for name, count in counts.items():
             if not isinstance(name, str) or not name.strip():
-                raise EventError("world_state.world_counts keys must be non-empty strings")
+                raise EventError(
+                    "world_state.world_counts keys must be non-empty strings"
+                )
             if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                raise EventError(f"world_state.world_counts[{name}] must be a non-negative integer")
+                raise EventError(
+                    f"world_state.world_counts[{name}] must be a non-negative integer"
+                )
         return
     if kind == "physical_outcome":
-        _check_exact_keys(
-            payload, ("inspected", "return_verified", "violations", "takeover"), "physical_outcome"
-        )
+        # ``sim_fault`` is optional and backwards-compatible: episodes recorded
+        # before the physics-wedge detector (ROLL-DEPARTURE.md transport lane)
+        # carry the four original keys, and a recorded fault is a non-empty
+        # string when present. The transport writes it explicitly as ``None``
+        # when no wedge was measured.
+        outcome_fields = ("inspected", "return_verified", "violations", "takeover")
+        missing = sorted(set(outcome_fields) - set(payload))
+        unknown = sorted(set(payload) - set(outcome_fields) - {"sim_fault"})
+        if missing or unknown:
+            detail = []
+            if missing:
+                detail.append(f"missing {', '.join(missing)}")
+            if unknown:
+                detail.append(f"unknown {', '.join(unknown)}")
+            raise EventError(
+                f"physical_outcome payload must hold exactly {', '.join(outcome_fields)} "
+                f"plus optional sim_fault ({'; '.join(detail)})"
+            )
         _check_named_flags(payload["inspected"], "physical_outcome.inspected")
         _check_flag(payload["return_verified"], "physical_outcome.return_verified")
         violations = payload["violations"]
         if not isinstance(violations, list) or any(
             not isinstance(entry, str) or not entry.strip() for entry in violations
         ):
-            raise EventError("physical_outcome.violations must be a list of non-empty strings")
+            raise EventError(
+                "physical_outcome.violations must be a list of non-empty strings"
+            )
         _check_flag(payload["takeover"], "physical_outcome.takeover")
+        sim_fault = payload.get("sim_fault")
+        if sim_fault is not None and (
+            not isinstance(sim_fault, str) or not sim_fault.strip()
+        ):
+            raise EventError(
+                "physical_outcome.sim_fault must be None or a non-empty string"
+            )
         return
     raise EventError(f"unknown truth-stream kind {kind!r}")
 
@@ -205,7 +239,9 @@ def validate_payload(kind: str, payload: Any) -> dict[str, Any]:
             try:
                 from_dict(record_name, payload)
             except RecordError as error:
-                raise EventError(f"payload of a {kind} event is not a valid {record_name}: {error}")
+                raise EventError(
+                    f"payload of a {kind} event is not a valid {record_name}: {error}"
+                )
     else:
         raise EventError(f"unknown event kind {kind!r}")
     return payload
@@ -223,8 +259,12 @@ def build_event(
         try:
             payload = to_dict(payload)
         except RecordError:
-            raise EventError(f"cannot encode a {type(payload).__name__} as a {kind} payload")
-    return Event(seq=seq, kind=kind, stamp=stamp, sim_time_s=sim_time_s, payload=payload)
+            raise EventError(
+                f"cannot encode a {type(payload).__name__} as a {kind} payload"
+            )
+    return Event(
+        seq=seq, kind=kind, stamp=stamp, sim_time_s=sim_time_s, payload=payload
+    )
 
 
 def encode_event(event: Event) -> dict[str, Any]:
@@ -238,9 +278,7 @@ def encode_event(event: Event) -> dict[str, Any]:
     }
 
 
-def decode_event(
-    document: Any, allowed_kinds: frozenset[str], stream: str
-) -> Event:
+def decode_event(document: Any, allowed_kinds: frozenset[str], stream: str) -> Event:
     """Decode one line, refusing any kind outside the reading stream's vocabulary."""
     if not isinstance(document, dict):
         raise EventError(f"a {stream} event line must be a JSON object")
@@ -252,7 +290,9 @@ def decode_event(
             detail.append(f"missing {', '.join(missing)}")
         if unknown:
             detail.append(f"unknown {', '.join(unknown)}")
-        raise EventError(f"a {stream} event must hold exactly {', '.join(_EVENT_FIELDS)} ({'; '.join(detail)})")
+        raise EventError(
+            f"a {stream} event must hold exactly {', '.join(_EVENT_FIELDS)} ({'; '.join(detail)})"
+        )
     kind = document["kind"]
     if not isinstance(kind, str) or not kind.strip():
         raise EventError("kind must be a non-empty string")

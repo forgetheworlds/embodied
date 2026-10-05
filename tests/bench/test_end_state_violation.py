@@ -40,7 +40,7 @@ class _Collector:
     def inspected_within(self, target_ned, *, radius_m, hold_s):
         return False, "declared"
 
-    def returned_near(self, *, radius_m):
+    def returned_near(self, *, radius_m, end_state):
         return True, "declared"
 
 
@@ -70,7 +70,11 @@ def test_a_run_that_came_to_rest_inverted_is_a_violation():
         {
             "armed": False,
             "mode": "LAND",
-            "local_position_ned": [-49.57256317138672, 30.603376388549805, -0.515224277973175],
+            "local_position_ned": [
+                -49.57256317138672,
+                30.603376388549805,
+                -0.515224277973175,
+            ],
             "attitude_rpy": [179.1, 0.4, 96.7],
         }
     )
@@ -122,7 +126,8 @@ def test_a_landing_is_not_a_violation():
         [-1.0, 0.5, 179.0],
     ):
         assert (
-            live_record.end_state_violation({**LANDED, "attitude_rpy": attitude}) is None
+            live_record.end_state_violation({**LANDED, "attitude_rpy": attitude})
+            is None
         ), attitude
 
 
@@ -135,7 +140,9 @@ def test_a_run_that_ended_still_flying_is_not_judged():
     statement and must not be recorded as a pass.
     """
     assert (
-        live_record.end_state_violation({"armed": True, "attitude_rpy": [179.0, 0.0, 0.0]})
+        live_record.end_state_violation(
+            {"armed": True, "attitude_rpy": [179.0, 0.0, 0.0]}
+        )
         is None
     )
     assert live_record.end_state_violation({"attitude_rpy": [179.0, 0.0, 0.0]}) is None
@@ -160,6 +167,7 @@ def test_the_tilt_is_the_angle_the_up_axis_makes_with_vertical():
     assert live_record.end_state_tilt_deg([45.0, 30.0, 200.0]) == pytest.approx(
         live_record.end_state_tilt_deg([45.0, 30.0, 0.0])
     )
+
     # Then a cross-check by a different route: compose the three elementary
     # rotations and take the angle of the rotated up-axis to vertical. This is
     # not an independent authority for the numbers above — it is a check that the
@@ -239,7 +247,12 @@ def test_a_run_recorded_before_the_field_is_judged_on_its_own_telemetry(tmp_path
         },
         telemetry=[
             {"mavpackettype": "HEARTBEAT"},
-            {"mavpackettype": "ATTITUDE", "roll": math.radians(0.2), "pitch": 0.0, "yaw": 0.0},
+            {
+                "mavpackettype": "ATTITUDE",
+                "roll": math.radians(0.2),
+                "pitch": 0.0,
+                "yaw": 0.0,
+            },
             {
                 "mavpackettype": "ATTITUDE",
                 "roll": math.radians(179.1),
@@ -280,8 +293,18 @@ def test_a_good_landing_is_left_alone_by_the_rederivation(tmp_path):
         tmp_path,
         end_state={"armed": False, "mode": "LAND"},
         telemetry=[
-            {"mavpackettype": "ATTITUDE", "roll": math.radians(-0.2), "pitch": 0.0, "yaw": 0.0},
-            {"mavpackettype": "ATTITUDE", "roll": 0.0, "pitch": math.radians(0.1), "yaw": 1.0},
+            {
+                "mavpackettype": "ATTITUDE",
+                "roll": math.radians(-0.2),
+                "pitch": 0.0,
+                "yaw": 0.0,
+            },
+            {
+                "mavpackettype": "ATTITUDE",
+                "roll": 0.0,
+                "pitch": math.radians(0.1),
+                "yaw": 1.0,
+            },
         ],
     )
     finding = live_record.rederive_end_state_violation(run_dir)
@@ -328,3 +351,43 @@ def test_the_rederivation_keeps_the_violations_the_run_already_had(tmp_path):
     ]
     assert finding["violations_rederived"][0] == finding["recorded_violations"][0]
     assert finding["violations_rederived"][1].startswith("end_state_inverted:")
+
+
+def test_the_rederivation_reads_a_raw_radians_record_at_its_own_units(tmp_path):
+    """J58's recorded end state: [3.141, -0.0008, 2.613] radians, read by the
+    degrees rule as a 3-degree tilt — the units mismatch that hid the inversion.
+    The radians reading is judged beside the degrees one and names itself."""
+    run_dir = _write_run(
+        tmp_path,
+        end_state={
+            "armed": False,
+            "mode": "GUIDED",
+            "attitude_rpy": [3.141, -0.0008, 2.613],
+        },
+        telemetry=None,
+        violations=["crash_disarm: Crash: Disarming: AngErr=49>30, Accel=0.0<3.0"],
+    )
+    finding = live_record.rederive_end_state_violation(run_dir)
+    assert finding["tilt_deg"] == pytest.approx(3.141, abs=0.01)
+    assert finding["tilt_deg_radians_reading"] == pytest.approx(179.943, abs=0.01)
+    assert finding["violation"] is not None
+    assert finding["violation"].startswith("end_state_inverted:")
+    assert "radians-stored-raw" in finding["violation"]
+    assert finding["violations_rederived"][-1] == finding["violation"]
+
+
+def test_the_radians_reading_cannot_invent_a_violation_for_a_level_record(tmp_path):
+    """A level rest in radians reads level under both readings."""
+    run_dir = _write_run(
+        tmp_path,
+        end_state={
+            "armed": False,
+            "mode": "LAND",
+            "attitude_rpy": [0.01, -0.01, 1.2],
+        },
+        telemetry=None,
+        violations=[],
+    )
+    finding = live_record.rederive_end_state_violation(run_dir)
+    assert finding["violation"] is None
+    assert finding["violations_rederived"] == []

@@ -9,6 +9,8 @@ all along and nothing wrote it down.
 
 from __future__ import annotations
 
+import pytest
+
 from embodied.platform import webots_ardupilot as W
 from embodied.platform.mission_runtime import _end_state_record
 
@@ -38,14 +40,35 @@ def _sample(*, attitude_rpy, local_position_ned):
 
 
 def test_an_inverted_end_state_is_visible_in_the_record() -> None:
-    """A vehicle that ended on its back must not read like one that landed level."""
+    """A vehicle that ended on its back must not read like one that landed level.
+
+    The telemetry sample carries radians (ATTITUDE's own fields); the record
+    converts to degrees, the bench-side convention ``live_record.end_state_tilt_deg``
+    reads — ROLL-DEPARTURE.md: J58's radians triple stored raw was measured as a
+    3-degree tilt and the inversion never fired on the live record.
+    """
     record = _end_state_record(
         _sample(attitude_rpy=(3.13, 0.02, 0.50), local_position_ned=(0.2, 0.1, -0.1))
     )
     assert record["mode"] == "LAND"
     assert record["armed"] is False
     assert record["local_position_ned"] == [0.2, 0.1, -0.1]
-    assert record["attitude_rpy"] == [3.13, 0.02, 0.50]
+    # 3.13 rad is ~179.3 deg: on its back, and now legible as that.
+    assert record["attitude_rpy"] == pytest.approx([179.336, 1.146, 28.648], abs=0.01)
+
+
+def test_the_converted_end_state_satisfies_the_bench_side_tilt_rule() -> None:
+    """The same record, through the rule that judges it: inverted is a violation."""
+    from embodied.bench import live_record
+
+    record = _end_state_record(
+        _sample(attitude_rpy=(3.13, 0.02, 0.50), local_position_ned=(0.2, 0.1, -0.1))
+    )
+    assert live_record.end_state_violation(record) is not None
+    level = _end_state_record(
+        _sample(attitude_rpy=(0.01, -0.01, 0.5), local_position_ned=(0.2, 0.1, -0.1))
+    )
+    assert live_record.end_state_violation(level) is None
 
 
 def test_an_attitude_never_seen_is_missing_rather_than_a_default() -> None:

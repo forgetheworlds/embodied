@@ -147,7 +147,9 @@ def unpack_controls(packet: bytes) -> tuple[float, ...]:
     motor values are the simulator model's business, and nothing here builds one.
     """
     if len(packet) != CONTROL_SIZE:
-        raise FramingError(f"control packet is {len(packet)} bytes, expected {CONTROL_SIZE}")
+        raise FramingError(
+            f"control packet is {len(packet)} bytes, expected {CONTROL_SIZE}"
+        )
     return struct.unpack(CONTROL_FORMAT, packet)
 
 
@@ -212,7 +214,12 @@ class Message:
 
 
 def pack_message(
-    kind: Kind, *, sim_time_s: float, sequence: int, payload: bytes = b"", flags: int = 0
+    kind: Kind,
+    *,
+    sim_time_s: float,
+    sequence: int,
+    payload: bytes = b"",
+    flags: int = 0,
 ) -> bytes:
     """Frame one message. The layout is fixed here and versioned by FORMAT_VERSION."""
     if not isinstance(kind, Kind):
@@ -322,7 +329,6 @@ MAX_QUEUED_STREAM_BYTES = 8 << 20
 # applied, and the reader would report a request it cannot confirm. The lane is small
 # because these frames are: a status is about a kilobyte and an acknowledgement less.
 MAX_QUEUED_CONTROL_BYTES = 256 << 10
-
 
 
 class OutboundStream:
@@ -700,7 +706,9 @@ def encode_pose_payload(
 ) -> bytes:
     """Pack one pose sample with its capture stamp."""
     if len(position_xyz) != 3 or len(attitude_rpy) != 3:
-        raise FramingError("a pose sample carries three position and three attitude values")
+        raise FramingError(
+            "a pose sample carries three position and three attitude values"
+        )
     return struct.pack(
         POSE_PAYLOAD_FORMAT, int(capture_host_ns), *position_xyz, *attitude_rpy
     )
@@ -775,7 +783,9 @@ def bgra_to_rgb8(buffer: bytes, width: int, height: int) -> bytes:
     """
     expected = width * height * 4
     if len(buffer) != expected:
-        raise FramingError(f"camera buffer holds {len(buffer)} bytes, expected {expected}")
+        raise FramingError(
+            f"camera buffer holds {len(buffer)} bytes, expected {expected}"
+        )
     out = bytearray(width * height * 3)
     out[0::3] = buffer[2::4]
     out[1::3] = buffer[1::4]
@@ -788,6 +798,8 @@ def ppm_bytes(rgb: bytes, width: int, height: int) -> bytes:
     if len(rgb) != width * height * 3:
         raise FramingError("a PPM payload must be packed RGB of the stated size")
     return b"P6\n%d %d\n255\n" % (width, height) + rgb
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -968,7 +980,9 @@ class PlatformSettings:
 
     def capture_stamp(self, monotonic_ns: int) -> ClockStamp:
         """A stamp in this host's monotonic domain."""
-        return ClockStamp(host_id=self.host_id, clock_id=self.clock_id, monotonic_ns=monotonic_ns)
+        return ClockStamp(
+            host_id=self.host_id, clock_id=self.clock_id, monotonic_ns=monotonic_ns
+        )
 
     @staticmethod
     def from_config(
@@ -1101,7 +1115,9 @@ class PlatformSettings:
                 f"got {self.stereo.encoding}"
             )
         if not 0.0 < self.stereo.identical_channel_fraction_limit <= 1.0:
-            raise ConfigError("sensors.stereo.identical_channel_fraction_limit must be in (0, 1]")
+            raise ConfigError(
+                "sensors.stereo.identical_channel_fraction_limit must be in (0, 1]"
+            )
         if self.stereo.width <= 0 or self.stereo.height <= 0:
             raise ConfigError("sensors.stereo width and height must be positive")
         if self.stereo.baseline_m <= 0.0:
@@ -1109,7 +1125,9 @@ class PlatformSettings:
         if self.stereo.left == self.stereo.right:
             raise ConfigError("sensors.stereo needs two different device names")
         if not self.params:
-            raise ConfigError("scenario.params must name at least the pinned parameter file")
+            raise ConfigError(
+                "scenario.params must name at least the pinned parameter file"
+            )
         if not self.estimator_params:
             raise ConfigError(
                 "scenario.estimator_params must name the EKF-active set; without it the "
@@ -1118,13 +1136,17 @@ class PlatformSettings:
         if self.hover_altitude_m <= 0.0:
             raise ConfigError("probe.hover_altitude_m must be positive")
         if self.settle_s <= 0.0:
-            raise ConfigError("probe.settle_s must be positive: the scene needs time to settle")
+            raise ConfigError(
+                "probe.settle_s must be positive: the scene needs time to settle"
+            )
         if self.at_rest_window_s <= 0.0:
             raise ConfigError("probe.at_rest_window_s must be positive")
         if self.pre_arm_wait_s <= 0.0:
             raise ConfigError("probe.pre_arm_wait_s must be positive")
         if not self.waypoints_local_ned:
-            raise ConfigError("probe.waypoints_local_ned must name at least one waypoint")
+            raise ConfigError(
+                "probe.waypoints_local_ned must name at least one waypoint"
+            )
         if self.timebase_samples < 2:
             raise ConfigError("probe.timebase_samples must be at least 2 to fit a line")
         if self.timebase_poll_s <= 0.0:
@@ -1140,8 +1162,13 @@ class PlatformSettings:
                 "probe.realtime_ratio_envelope must be a rising pair of positive ratios, "
                 f"got {envelope_low}..{envelope_high}"
             )
-        if self.estimator_fault.magnitude_m <= 0.0 or self.estimator_fault.hold_s <= 0.0:
-            raise ConfigError("probe.estimator_fault magnitude and hold must be positive")
+        if (
+            self.estimator_fault.magnitude_m <= 0.0
+            or self.estimator_fault.hold_s <= 0.0
+        ):
+            raise ConfigError(
+                "probe.estimator_fault magnitude and hold must be positive"
+            )
         if self.budget_wall_clock_s <= 0.0:
             raise ConfigError("probe.budget_wall_clock_s must be positive")
         if self.endpoints.fdm_port <= 0 or self.endpoints.controller_port <= 0:
@@ -1285,14 +1312,18 @@ def _git_head(root: Path) -> str | None:
     try:
         completed = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
     except (OSError, subprocess.CalledProcessError):
         return None
     return completed.stdout.strip()
 
 
-def check_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[Prerequisite, ...]:
+def check_prerequisites(
+    settings: PlatformSettings, output_dir: Path
+) -> tuple[Prerequisite, ...]:
     """Check every prerequisite before any process is started.
 
     Every item is reported, not only the first failure, because a blocked run is
@@ -1302,7 +1333,9 @@ def check_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[P
     """
     checks: list[Prerequisite] = []
 
-    present = settings.webots_binary.is_file() and os.access(settings.webots_binary, os.X_OK)
+    present = settings.webots_binary.is_file() and os.access(
+        settings.webots_binary, os.X_OK
+    )
     checks.append(
         Prerequisite(
             "webots_application",
@@ -1314,7 +1347,9 @@ def check_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[P
 
     installed_version = None
     if settings.webots_version_file.is_file():
-        installed_version = settings.webots_version_file.read_text(encoding="utf-8").strip()
+        installed_version = settings.webots_version_file.read_text(
+            encoding="utf-8"
+        ).strip()
     version_matches = installed_version == settings.webots_version
     checks.append(
         Prerequisite(
@@ -1328,7 +1363,9 @@ def check_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[P
         Prerequisite("scenario_world", settings.world.is_file(), f"{settings.world}")
     )
     for name in (*settings.params, *settings.estimator_params):
-        checks.append(Prerequisite(f"parameter_file[{name.name}]", name.is_file(), f"{name}"))
+        checks.append(
+            Prerequisite(f"parameter_file[{name.name}]", name.is_file(), f"{name}")
+        )
     checks.append(
         Prerequisite(
             "calibration_declaration",
@@ -1346,12 +1383,15 @@ def check_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[P
             f"{settings.ardupilot_root} is at {head}, configured {settings.ardupilot_commit}",
         )
     )
-    sitl_present = settings.sitl_binary.is_file() and os.access(settings.sitl_binary, os.X_OK)
+    sitl_present = settings.sitl_binary.is_file() and os.access(
+        settings.sitl_binary, os.X_OK
+    )
     checks.append(
         Prerequisite(
             "sitl_binary",
             sitl_present,
-            f"{settings.sitl_binary}" + ("" if sitl_present else " is not a built binary"),
+            f"{settings.sitl_binary}"
+            + ("" if sitl_present else " is not a built binary"),
         )
     )
 
@@ -1384,13 +1424,16 @@ def check_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[P
     return tuple(checks)
 
 
-def require_prerequisites(settings: PlatformSettings, output_dir: Path) -> tuple[Prerequisite, ...]:
+def require_prerequisites(
+    settings: PlatformSettings, output_dir: Path
+) -> tuple[Prerequisite, ...]:
     """Return the prerequisite table, raising when any item is unsatisfied."""
     checks = check_prerequisites(settings, output_dir)
     missing = [check for check in checks if not check.satisfied]
     if missing:
         raise PlatformUnavailable(
-            "missing prerequisites: " + "; ".join(f"{check.name}: {check.detail}" for check in missing)
+            "missing prerequisites: "
+            + "; ".join(f"{check.name}: {check.detail}" for check in missing)
         )
     return checks
 
@@ -1402,13 +1445,17 @@ def load_calibration_declaration(path: Path) -> Any:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except OSError as error:
-        raise PlatformUnavailable(f"cannot read the calibration declaration {path}: {error}") from error
+        raise PlatformUnavailable(
+            f"cannot read the calibration declaration {path}: {error}"
+        ) from error
     except json.JSONDecodeError as error:
         raise CommandError(f"{path} is not valid JSON: {error}") from error
     try:
         return from_dict(Calibration, document)
     except Exception as error:  # noqa: BLE001 - the record names its own problem
-        raise CommandError(f"{path} is not a valid Calibration record: {error}") from error
+        raise CommandError(
+            f"{path} is not a valid Calibration record: {error}"
+        ) from error
 
 
 # ---------------------------------------------------------------------------
@@ -1435,7 +1482,9 @@ class Injection:
     apply: bool
 
     @staticmethod
-    def publish(index: int, kind: str, magnitude_m: float, hold_s: float) -> "Injection":
+    def publish(
+        index: int, kind: str, magnitude_m: float, hold_s: float
+    ) -> "Injection":
         return Injection(
             injection_id=f"inj-{index:03d}-{kind}",
             kind=kind,
@@ -1554,8 +1603,12 @@ class TelemetrySample:
             "local_position_ned": list(self.local_position_ned)
             if self.local_position_ned is not None
             else None,
-            "velocity_ned": list(self.velocity_ned) if self.velocity_ned is not None else None,
-            "servo_outputs": list(self.servo_outputs) if self.servo_outputs is not None else None,
+            "velocity_ned": list(self.velocity_ned)
+            if self.velocity_ned is not None
+            else None,
+            "servo_outputs": list(self.servo_outputs)
+            if self.servo_outputs is not None
+            else None,
             "ekf_flags": self.ekf_flags,
             "ekf_velocity_variance": self.ekf_velocity_variance,
             "ekf_pos_horiz_variance": self.ekf_pos_horiz_variance,
@@ -1576,6 +1629,7 @@ def _triple(message: dict[str, Any], *fields: str) -> tuple[float, float, float]
     if any(value is None for value in values):
         return None
     return (float(values[0]), float(values[1]), float(values[2]))
+
 
 def decode_telemetry(
     messages: Iterable[dict[str, Any]],
@@ -1672,7 +1726,8 @@ def decode_telemetry(
                 latest["press_temp_cdegc"] = int(message["temperature"])
         elif kind == "SERVO_OUTPUT_RAW":
             latest["servo_outputs"] = tuple(
-                UNKNOWN_SERVO_RAW if message.get(f"servo{index}_raw") is None
+                UNKNOWN_SERVO_RAW
+                if message.get(f"servo{index}_raw") is None
                 else int(message[f"servo{index}_raw"])
                 for index in range(1, 9)
             )
@@ -1756,8 +1811,10 @@ def baro_relative_altitude_m(
     """
     temp_k = (ref_temp_cdegc / 100.0) + 273.15
     scaling = press_abs_hpa / ref_press_abs_hpa
-    return BARO_ALTITUDE_KELVIN_SCALE * temp_k * (
-        1.0 - math.exp(BARO_ALTITUDE_LOG_COEFFICIENT * math.log(scaling))
+    return (
+        BARO_ALTITUDE_KELVIN_SCALE
+        * temp_k
+        * (1.0 - math.exp(BARO_ALTITUDE_LOG_COEFFICIENT * math.log(scaling)))
     )
 
 
@@ -1787,8 +1844,13 @@ def fit_timebase(samples: Sequence[tuple[float, float]]) -> tuple[float, float, 
     mean_host = sum(host for host, _ in samples) / count
     variance = sum((boot - mean_boot) ** 2 for _, boot in samples)
     if variance == 0.0:
-        raise ProbeFailure("the device clock did not advance, so the join is undetermined")
-    scale = sum((boot - mean_boot) * (host - mean_host) for host, boot in samples) / variance
+        raise ProbeFailure(
+            "the device clock did not advance, so the join is undetermined"
+        )
+    scale = (
+        sum((boot - mean_boot) * (host - mean_host) for host, boot in samples)
+        / variance
+    )
     offset = mean_host - scale * mean_boot
     residuals_ms = [1000.0 * (host - (offset + scale * boot)) for host, boot in samples]
     return offset, (scale - 1.0) * 1e6, max(residuals_ms) - min(residuals_ms)
@@ -1930,7 +1992,9 @@ def realtime_windows(
     start = ordered[0][0]
     buckets: dict[int, list[tuple[float, float]]] = {}
     for host_s, simulated_s in ordered:
-        buckets.setdefault(int((host_s - start) // window_s), []).append((host_s, simulated_s))
+        buckets.setdefault(int((host_s - start) // window_s), []).append(
+            (host_s, simulated_s)
+        )
     windows: list[RealtimeWindow] = []
     for index in sorted(buckets):
         window = buckets[index]
@@ -2065,6 +2129,57 @@ ALLOWED_OUTBOUND_TYPES = frozenset(
         "VISION_POSITION_ESTIMATE",
     }
 )
+
+# The outbound motion commands the recorder captures into mavlink.jsonl.
+# ROLL-DEPARTURE.md mission lane: the run's outgoing SET_POSITION_TARGET_LOCAL_NED
+# (and ATTITUDE_TARGET, when one is ever issued) were unrecorded — the capture
+# held the vehicle->host stream only (Z-CLIMB.md section 1 documented why:
+# ArduPilot does not echo setpoints, so a sent target appears on no inbound
+# stream) — and without the demand side J58's pitch divergence could not be
+# attributed to the position/velocity loop or to the attitude loop. The set is
+# the motion-command vocabulary, deliberately not every outbound frame: the
+# vision pose feed runs at a steady 10 Hz beside the flight and would spend the
+# log's line budget on a stream the aircraft commands nothing with.
+#
+# ATTITUDE_TARGET is in the capture set while ALLOWED_OUTBOUND_TYPES — the gate
+# that refuses any attitude command — still refuses to send one; a type that
+# cannot be sent can never be recorded, so listing it here weakens nothing and
+# means the day the vocabulary admits an attitude target, its demand rows are
+# captured without anyone having to remember this seam.
+RECORDED_OUTBOUND_TYPES = frozenset(
+    {
+        "SET_POSITION_TARGET_LOCAL_NED",
+        "ATTITUDE_TARGET",
+    }
+)
+
+# The outbound sibling of RECEIVED_AT_KEY: the host-monotonic instant the frame
+# left this program, stamped at the same choke point, so the demand rows join
+# the vehicle's answer rows on one clock.
+SENT_AT_KEY = "sent_monotonic_ns"
+
+# The marker that separates the two directions in one file. The inbound rows
+# carry no direction key — the file predates the outbound capture and the
+# readers that scan it (crash-disarm STATUSTEXTs, the last ATTITUDE, the
+# mode-change texts) key on mavpackettype alone — so absence is inbound and
+# the marker is unambiguous.
+OUTBOUND_DIRECTION_KEY = "direction"
+OUTBOUND_DIRECTION = "outbound"
+
+
+def outbound_record(message: Any, *, sent_monotonic_ns: int) -> dict[str, Any]:
+    """The record of one outbound motion command, in the inbound rows' shape.
+
+    Same convention as ``drain``: the decoded fields, a ``mavpackettype``, and a
+    host-monotonic stamp — here the instant the frame left, not the instant one
+    arrived.
+    """
+    document = dict(message.to_dict())
+    document.setdefault("mavpackettype", message.get_type())
+    document[OUTBOUND_DIRECTION_KEY] = OUTBOUND_DIRECTION
+    document[SENT_AT_KEY] = int(sent_monotonic_ns)
+    return document
+
 
 # The DECLARED ORDERED BRING-UP's own outbound vocabulary (plan sections 0.6 item 6
 # and 0.8 item 7, "Deliverable B"). Four message types, each one a declaration the
@@ -2203,7 +2318,9 @@ class SubprocessRunner:
                 preexec_fn=(lambda: os.nice(10)) if low_priority else None,
             )
         self._processes[name] = process
-        return ChildProcess(name=name, argv=tuple(argv), pid=process.pid, log_path=log_path)
+        return ChildProcess(
+            name=name, argv=tuple(argv), pid=process.pid, log_path=log_path
+        )
 
     def poll(self, child: ChildProcess) -> int | None:
         process = self._processes.get(child.name)
@@ -2257,7 +2374,6 @@ class SubprocessRunner:
         return text[-lines:]
 
 
-
 class LowPrioritySubprocessRunner(SubprocessRunner):
     """A runner whose every child is demoted (nice 10).
 
@@ -2273,6 +2389,7 @@ class LowPrioritySubprocessRunner(SubprocessRunner):
             name, argv, log_path=log_path, cwd=cwd, env=env, low_priority=True
         )
 
+
 class PymavlinkSession:
     """The real MAVLink session, wrapping pymavlink.
 
@@ -2281,13 +2398,19 @@ class PymavlinkSession:
     attitude command can leave this program by accident.
     """
 
-    def __init__(self, *, source_system: int = 250, source_component: int = 190) -> None:
+    def __init__(
+        self, *, source_system: int = 250, source_component: int = 190
+    ) -> None:
         self._source_system = source_system
         self._source_component = source_component
         self._connection = None
         self._mavutil = None
         self.target_system = 0
         self.target_component = 0
+        # The outbound recorder's sink, installed by the adapter that owns the
+        # evidence directory. ``None`` is the honest default: a session with
+        # nowhere to record records nothing, and never guesses a path.
+        self.on_outbound: Callable[[dict[str, Any]], None] | None = None
         # One lock around the wire: the vision feed sends from its own thread at a
         # steady rate while the checklist's thread sends modes, parameters and
         # setpoints between phases. pymavlink does not serialize concurrent sends,
@@ -2299,14 +2422,20 @@ class PymavlinkSession:
         try:
             from pymavlink import mavutil
         except ImportError as error:  # pragma: no cover - pinned dependency
-            raise ProbeFailure(f"pymavlink is required for the autopilot session: {error}") from error
+            raise ProbeFailure(
+                f"pymavlink is required for the autopilot session: {error}"
+            ) from error
         self._mavutil = mavutil
         self._connection = mavutil.mavlink_connection(
-            endpoint, source_system=self._source_system, source_component=self._source_component
+            endpoint,
+            source_system=self._source_system,
+            source_component=self._source_component,
         )
         heartbeat = self._connection.wait_heartbeat(timeout=timeout_s)
         if heartbeat is None:
-            raise ProbeFailure(f"no MAVLink heartbeat on {endpoint} within {timeout_s:.0f}s")
+            raise ProbeFailure(
+                f"no MAVLink heartbeat on {endpoint} within {timeout_s:.0f}s"
+            )
         self.target_system = self._connection.target_system
         self.target_component = self._connection.target_component
         return {
@@ -2325,9 +2454,31 @@ class PymavlinkSession:
             )
         with self._send_lock:
             self._connection.mav.send(message)
+        if message_type in RECORDED_OUTBOUND_TYPES and self.on_outbound is not None:
+            # The outgoing motion commands are recorded beside the inbound
+            # stream, stamped in the same host-monotonic domain the inbound
+            # rows carry (RECEIVED_AT_KEY / SENT_AT_KEY), so the demand side of
+            # the flight can be laid against the vehicle's answer on one
+            # clock (ROLL-DEPARTURE.md mission lane: J58's pitch divergence
+            # could not be attributed because neither the outgoing
+            # SET_POSITION_TARGET_LOCAL_NED nor an ATTITUDE_TARGET was
+            # recorded — Z-CLIMB.md section 1 documented the inbound-only
+            # capture). Recorded after the wire send: the log holds what
+            # actually left.
+            self.on_outbound(
+                outbound_record(message, sent_monotonic_ns=time.monotonic_ns())
+            )
 
     def send_vision_position_estimate(
-        self, *, usec: int, x: float, y: float, z: float, roll: float, pitch: float, yaw: float
+        self,
+        *,
+        usec: int,
+        x: float,
+        y: float,
+        z: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
     ) -> None:
         """Publish one simulator pose to the autopilot's external-navigation path.
 
@@ -2477,7 +2628,9 @@ class PymavlinkSession:
             Frame.BODY: MAV_FRAME_BODY_NED,
         }.get(setpoint.frame)
         if frame is None:
-            raise ProbeFailure(f"{setpoint.frame} is not a frame this adapter publishes in")
+            raise ProbeFailure(
+                f"{setpoint.frame} is not a frame this adapter publishes in"
+            )
         self._send(
             self._connection.mav.set_position_target_local_ned_encode(
                 0,
@@ -2619,7 +2772,10 @@ class BringUpLink:
         if self._connection is None:
             raise ProbeFailure("the bring-up link is not connected")
         self._connection.mav.send(message)
-        record = {"at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), **declaration}
+        record = {
+            "at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            **declaration,
+        }
         self.sent.append(record)
         return record
 
@@ -2736,7 +2892,9 @@ class BringUpLink:
             },
         )
 
-    def send_rc_channels_override(self, pwm: int, *, channel: int = RC_THROTTLE_CHANNEL) -> dict[str, Any]:
+    def send_rc_channels_override(
+        self, pwm: int, *, channel: int = RC_THROTTLE_CHANNEL
+    ) -> dict[str, Any]:
         """The window's ONE bounded thrust path: one RC channel, or its release.
 
         Exactly one field is set and the other seven carry MAVLink's own "ignore
@@ -2797,7 +2955,10 @@ class BringUpLink:
     def command_ack(self, command: int) -> dict[str, Any] | None:
         """The autopilot's own answer to one command, if it has arrived."""
         for reply in reversed(self.replies):
-            if reply.get("mavpackettype") == "COMMAND_ACK" and reply.get("command") == command:
+            if (
+                reply.get("mavpackettype") == "COMMAND_ACK"
+                and reply.get("command") == command
+            ):
                 return reply
         return None
 
@@ -2810,6 +2971,7 @@ class BringUpLink:
             if value is not None:
                 return int(value)
         return None
+
 
 class TcpSensorGateway:
     """The sensor stream client: one loopback connection carries records both ways."""
@@ -2835,7 +2997,9 @@ class TcpSensorGateway:
                 last_error = error
                 time.sleep(0.1)
         else:
-            raise ProbeFailure(f"no controller connection on {host}:{port}: {last_error}")
+            raise ProbeFailure(
+                f"no controller connection on {host}:{port}: {last_error}"
+            )
         self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._socket.setblocking(False)
 
@@ -2901,7 +3065,9 @@ class TcpSensorGateway:
         try:
             self._socket.sendall(framed)
         except OSError as error:
-            raise ProbeFailure(f"cannot send the injection to the controller: {error}") from error
+            raise ProbeFailure(
+                f"cannot send the injection to the controller: {error}"
+            ) from error
 
     def close(self) -> None:
         if self._socket is not None:
@@ -2962,16 +3128,27 @@ def find_colour_witness(
     try:
         import numpy
     except ImportError as error:  # pragma: no cover - numpy is a pinned dependency
-        raise ProbeFailure(f"numpy is required to find the colour witness: {error}") from error
+        raise ProbeFailure(
+            f"numpy is required to find the colour witness: {error}"
+        ) from error
     if len(expected_rgb) != 3:
         raise CommandError("the scene's witness colour must be three channel values")
     expected_dominant = dominant_channel(expected_rgb)
-    image = numpy.frombuffer(rgb, dtype=numpy.uint8).reshape(height, width, 3).astype(numpy.int16)
+    image = (
+        numpy.frombuffer(rgb, dtype=numpy.uint8)
+        .reshape(height, width, 3)
+        .astype(numpy.int16)
+    )
     order = {"red": 0, "green": 1, "blue": 2}
     leading = order[expected_dominant]
     others = [index for index in range(3) if index != leading]
-    margin = 40  # a saturated marker is far from neutral; this ignores grey scene pixels
-    mask = (image[:, :, leading] - numpy.maximum(image[:, :, others[0]], image[:, :, others[1]])) > margin
+    margin = (
+        40  # a saturated marker is far from neutral; this ignores grey scene pixels
+    )
+    mask = (
+        image[:, :, leading]
+        - numpy.maximum(image[:, :, others[0]], image[:, :, others[1]])
+    ) > margin
     pixels = int(mask.sum())
     document: dict[str, Any] = {
         "expected_dominant_channel": expected_dominant,
@@ -2991,7 +3168,11 @@ def find_colour_witness(
         return document
     rows, columns = numpy.nonzero(mask)
     selected = image[mask].astype(numpy.float64)
-    means = (float(selected[:, 0].mean()), float(selected[:, 1].mean()), float(selected[:, 2].mean()))
+    means = (
+        float(selected[:, 0].mean()),
+        float(selected[:, 1].mean()),
+        float(selected[:, 2].mean()),
+    )
     document.update(
         {
             "mean_rgb": list(means),
@@ -3038,7 +3219,9 @@ class EvidenceWriter:
     def write_json(self, name: str, document: Any) -> str:
         with self._lock:
             target = self.path(name)
-            target.write_text(json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8")
+            target.write_text(
+                json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8"
+            )
             return str(target.relative_to(self.output_dir))
 
     def write_bytes(self, name: str, data: bytes) -> str:
@@ -3064,6 +3247,7 @@ class EvidenceWriter:
 # ---------------------------------------------------------------------------
 # The adapter
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class LocalNedTarget:
@@ -3269,6 +3453,12 @@ class WebotsArduPilot:
         self.evidence = evidence
         self._runner = runner
         self._session = session
+        # Outbound motion commands share the run's own mavlink.jsonl (see
+        # RECORDED_OUTBOUND_TYPES for why the demand side is recorded at all).
+        # The guard keeps the test doubles that predate the sink working: a
+        # session without the attribute has nothing to install it on.
+        if hasattr(self._session, "on_outbound"):
+            self._session.on_outbound = self._record_mavlink
         self._gateway = gateway
         self._extra_params = tuple(extra_params)
         self.controller_status: dict[str, Any] = {}
@@ -3285,7 +3475,9 @@ class WebotsArduPilot:
         # stop the reading and let a bounded queue fill and drop. telemetry() and
         # sensor_record() consume those queues; before start() they read the
         # sockets in the caller's thread, as they always did.
-        self._handoff: queue.Queue[SensorRecord] = queue.Queue(maxsize=SENSOR_HANDOFF_RECORDS)
+        self._handoff: queue.Queue[SensorRecord] = queue.Queue(
+            maxsize=SENSOR_HANDOFF_RECORDS
+        )
         self._mavlink_handoff: queue.Queue[dict[str, Any]] = queue.Queue(
             maxsize=MAX_QUEUED_MAVLINK_MESSAGES
         )
@@ -3319,7 +3511,9 @@ class WebotsArduPilot:
         # tuple reference — the reader replaces it atomically and the feed reads
         # whole tuples — and the feed owns no state the checklist reads except the
         # account stop() records.
-        self._latest_pose: tuple[float, tuple[float, float, float], tuple[float, float, float]] | None = None
+        self._latest_pose: (
+            tuple[float, tuple[float, float, float], tuple[float, float, float]] | None
+        ) = None
         self._vision_feed_thread: threading.Thread | None = None
         self._vision_feed_stop = threading.Event()
         self._vision_feed_error: BaseException | None = None
@@ -3372,14 +3566,19 @@ class WebotsArduPilot:
         deadline = self._monotonic() + timeout_s
         pending = list(names)
         while pending and self._monotonic() < deadline:
-            batch, pending = pending[:PARAMETER_READ_BATCH], pending[PARAMETER_READ_BATCH:]
+            batch, pending = (
+                pending[:PARAMETER_READ_BATCH],
+                pending[PARAMETER_READ_BATCH:],
+            )
             for name in batch:
                 self._session.request_parameter(name)
             # One batch is waited for only as long as it deserves. A parameter the
             # firmware never answers — a driver that is off hides its parameters —
             # used to consume the whole deadline, so the batches behind it were never
             # even requested and thirty readable names were reported as unanswered.
-            batch_deadline = min(deadline, self._monotonic() + PARAMETER_READ_BATCH_TIMEOUT_S)
+            batch_deadline = min(
+                deadline, self._monotonic() + PARAMETER_READ_BATCH_TIMEOUT_S
+            )
             while self._monotonic() < batch_deadline:
                 if drain is not None:
                     drain()
@@ -3389,7 +3588,6 @@ class WebotsArduPilot:
                     break
                 self._sleep(0.05)
         return reported
-
 
     def parameter_files(self) -> tuple[Path, ...]:
         """Every parameter file this run layers, in layering order."""
@@ -3450,7 +3648,11 @@ class WebotsArduPilot:
         self.request_telemetry_streams()
         self.evidence.write_json(
             "connection.json",
-            {"autopilot": connection, "sitl_argv": list(sitl.argv), "webots_argv": list(simulator.argv)},
+            {
+                "autopilot": connection,
+                "sitl_argv": list(sitl.argv),
+                "webots_argv": list(simulator.argv),
+            },
         )
         return StartupEvidence(
             webots=simulator,
@@ -3497,12 +3699,7 @@ class WebotsArduPilot:
                     imu_seen = True
                     parked.append(record)
             sample = self.telemetry()
-            if (
-                status_seen
-                and pair_seen
-                and imu_seen
-                and autopilot_is_ready(sample)
-            ):
+            if status_seen and pair_seen and imu_seen and autopilot_is_ready(sample):
                 self._pending_records = parked + self._pending_records
                 return ReadinessEvidence(
                     controller_status=self.controller_status,
@@ -3546,7 +3743,9 @@ class WebotsArduPilot:
                 "enabled": self.settings.truth_republish,
                 "published": self._vision_feed_published,
                 "period_s": VISION_POSE_PERIOD_S,
-                "error": None if self._vision_feed_error is None else repr(self._vision_feed_error),
+                "error": None
+                if self._vision_feed_error is None
+                else repr(self._vision_feed_error),
             },
         )
         try:
@@ -3558,7 +3757,9 @@ class WebotsArduPilot:
         for name, child in self._children.items():
             exits[name] = self._runner.terminate(child)
             tails[name] = self._runner.tail(child, lines=200)
-            self.evidence.write_json(f"{name}-tail.json", {"lines": tails[name], "exit": exits[name]})
+            self.evidence.write_json(
+                f"{name}-tail.json", {"lines": tails[name], "exit": exits[name]}
+            )
         self.evidence.write_json("shutdown.json", {"exits": exits})
         self._children = {}
         return ShutdownEvidence(exits=exits, log_tails=tails)
@@ -3911,7 +4112,6 @@ class WebotsArduPilot:
             except queue.Empty:
                 return messages
 
-
     # -- command -----------------------------------------------------------
 
     def arm_and_guided(
@@ -3946,9 +4146,8 @@ class WebotsArduPilot:
                         and altitude >= 0.5 * self.settings.hover_altitude_m
                     ):
                         break
-                if (
-                    self._monotonic() - takeoff_at >= CONTROL_GRANT_GRACE_S
-                    and not (sample.in_guided_mode and sample.armed)
+                if self._monotonic() - takeoff_at >= CONTROL_GRANT_GRACE_S and not (
+                    sample.in_guided_mode and sample.armed
                 ):
                     # A mode that has not become Guided will not become Guided by waiting.
                     break
@@ -4036,7 +4235,9 @@ class WebotsArduPilot:
             source=SetpointSource.NORMAL,
         )
         self._session.send_setpoint(setpoint)
-        publication = SetpointPublication(setpoint=setpoint, published_stamp=self._stamp())
+        publication = SetpointPublication(
+            setpoint=setpoint, published_stamp=self._stamp()
+        )
         self._publications.append(publication)
         return publication
 
@@ -4072,17 +4273,29 @@ class WebotsArduPilot:
                 continue
             self.evidence.append_jsonl(
                 "injections.jsonl",
-                {"injection": fault.injection_id, "kind": fault.kind, "apply": fault.apply, "ack": ack},
+                {
+                    "injection": fault.injection_id,
+                    "kind": fault.kind,
+                    "apply": fault.apply,
+                    "ack": ack,
+                },
             )
             return InjectionReceipt(
                 requested=fault,
                 applied=bool(ack.get("applied")),
                 acknowledged_state=ack.get("state"),
-                reason=None if ack.get("applied") == fault.apply else str(ack.get("reason")),
+                reason=None
+                if ack.get("applied") == fault.apply
+                else str(ack.get("reason")),
             )
         self.evidence.append_jsonl(
             "injections.jsonl",
-            {"injection": fault.injection_id, "kind": fault.kind, "apply": fault.apply, "ack": None},
+            {
+                "injection": fault.injection_id,
+                "kind": fault.kind,
+                "apply": fault.apply,
+                "ack": None,
+            },
         )
         return InjectionReceipt(
             requested=fault,
@@ -4214,11 +4427,15 @@ def build_observation(
         episode_id=label,
         record_id=f"{label}-obs-{sequence:05d}",
         sensor_ids=SensorIds(
-            left=settings.stereo.left, right=settings.stereo.right, imu=settings.imu.inertial_unit
+            left=settings.stereo.left,
+            right=settings.stereo.right,
+            imu=settings.imu.inertial_unit,
         ),
         sequence=sequence,
         capture_stamp=ClockStamp(
-            host_id=str(host_id), clock_id=str(clock_id), monotonic_ns=int(pair.capture_host_ns)
+            host_id=str(host_id),
+            clock_id=str(clock_id),
+            monotonic_ns=int(pair.capture_host_ns),
         ),
         receipt_stamp=ClockStamp(
             host_id=record.received_stamp.host_id,
@@ -4299,7 +4516,9 @@ class ProbeResult:
 
     @property
     def reasons(self) -> tuple[str, ...]:
-        return tuple(f"{check.name}: {check.reason}" for check in self.failed if check.reason)
+        return tuple(
+            f"{check.name}: {check.reason}" for check in self.failed if check.reason
+        )
 
 
 class _FlightLog:
@@ -4395,7 +4614,11 @@ class CompatibilityProbe:
 
     def reader_stats(self) -> dict[str, Any]:
         """What this process's own reading of the sensor stream looked like."""
-        return {key: value for key, value in self._reader_stats.items() if key != "last_drain_at"}
+        return {
+            key: value
+            for key, value in self._reader_stats.items()
+            if key != "last_drain_at"
+        }
 
     def _stamp(self) -> ClockStamp:
         """One reading of this host's monotonic clock, in this run's clock domain."""
@@ -4419,7 +4642,11 @@ class CompatibilityProbe:
             self._write_json(
                 "prerequisites.json",
                 [
-                    {"name": check.name, "satisfied": check.satisfied, "detail": check.detail}
+                    {
+                        "name": check.name,
+                        "satisfied": check.satisfied,
+                        "detail": check.detail,
+                    }
                     for check in self._prerequisites
                 ],
             )
@@ -4487,7 +4714,8 @@ class CompatibilityProbe:
             "records_revision": RECORDS_REVISION,
             "sensor_mode": self.settings.sensor_mode.value,
             "prerequisites": [
-                {"name": check.name, "detail": check.detail} for check in self._prerequisites
+                {"name": check.name, "detail": check.detail}
+                for check in self._prerequisites
             ],
             "run_a": manifest_a,
             "run_b": manifest_b,
@@ -4532,13 +4760,19 @@ class CompatibilityProbe:
                 )
                 return tuple(checks), manifest, tuple(notes)
 
-            at_rest_imu, pre_settle = self._collect_imu(adapter, writer, log, label=label)
-            checks.append(self._item_frames_and_timebases(adapter, writer, log, label=label))
+            at_rest_imu, pre_settle = self._collect_imu(
+                adapter, writer, log, label=label
+            )
+            checks.append(
+                self._item_frames_and_timebases(adapter, writer, log, label=label)
+            )
             motion_check = self._item_guided_motion(adapter, writer, log)
             checks.append(motion_check)
             checks.append(self._item_actuator_mapping(adapter, writer, log))
             checks.append(self._item_stereo_pairs(adapter, writer, log, label=label))
-            checks.append(self._item_imu_stream(adapter, writer, at_rest_imu, pre_settle, log))
+            checks.append(
+                self._item_imu_stream(adapter, writer, at_rest_imu, pre_settle, log)
+            )
             checks.append(self._item_stream_loss(adapter, writer, log))
             selected_estimator = configured_estimator(adapter.parameter_files())
             if selected_estimator in EKF_ESTIMATOR_TYPES:
@@ -4559,7 +4793,9 @@ class CompatibilityProbe:
                                 "the parameter files applied to this run do not select an "
                                 "EKF, so there is no estimator running to degrade"
                             ),
-                            "parameter_evidence": self._parameter_evidence("AHRS_EKF_TYPE"),
+                            "parameter_evidence": self._parameter_evidence(
+                                "AHRS_EKF_TYPE"
+                            ),
                         },
                     )
                 )
@@ -4577,7 +4813,10 @@ class CompatibilityProbe:
             window_s=self.settings.realtime_window_s,
             envelope=self.settings.realtime_ratio_envelope,
         )
-        manifest["shutdown"] = {"exits": shutdown.exits, "log_tails": shutdown.log_tails}
+        manifest["shutdown"] = {
+            "exits": shutdown.exits,
+            "log_tails": shutdown.log_tails,
+        }
         return tuple(checks), manifest, tuple(notes)
 
     def _new_adapter(
@@ -4597,7 +4836,11 @@ class CompatibilityProbe:
         )
 
     def _run_manifest(
-        self, label: str, adapter: WebotsArduPilot, writer: EvidenceWriter, extra_params: Sequence[Path]
+        self,
+        label: str,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        extra_params: Sequence[Path],
     ) -> dict[str, Any]:
         """The configuration identity of one run: what ran, not what it concluded."""
         return {
@@ -4617,7 +4860,9 @@ class CompatibilityProbe:
                 "sim_model": self.settings.sim_model,
                 "home": self.settings.sitl_home,
                 "argv": [str(part) for part in self.settings.sitl_argv(extra_params)],
-                "parameter_files": [str(name) for name in (*self.settings.params, *extra_params)],
+                "parameter_files": [
+                    str(name) for name in (*self.settings.params, *extra_params)
+                ],
                 "firmware": firmware_identity(adapter.latest_telemetry),
                 "mavlink_messages_logged": adapter.mavlink_message_count,
             },
@@ -4666,7 +4911,11 @@ class CompatibilityProbe:
     # -- checklist item 1 --------------------------------------------------
 
     def _item_startup(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, label: str
+        self,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        label: str,
     ) -> ProbeCheck:
         startup = adapter.start()
         readiness = adapter.wait_ready(self.settings.step_timeout_s.startup)
@@ -4686,8 +4935,7 @@ class CompatibilityProbe:
         mismatches = [
             f"{name}: files say {configured[name]:g}, autopilot reports {reported[name]:g}"
             for name in sorted(configured)
-            if name in reported
-            and not values_agree(configured[name], reported[name])
+            if name in reported and not values_agree(configured[name], reported[name])
         ]
         unanswered = sorted(name for name in configured if name not in reported)
         document = {
@@ -4718,7 +4966,9 @@ class CompatibilityProbe:
         if sample.heartbeats == 0:
             reasons.append("no MAVLink heartbeat arrived")
         if not firmware:
-            reasons.append("AUTOPILOT_VERSION did not arrive, so the firmware identity is unknown")
+            reasons.append(
+                "AUTOPILOT_VERSION did not arrive, so the firmware identity is unknown"
+            )
         if unanswered:
             reasons.append(
                 "the autopilot did not report "
@@ -4754,7 +5004,12 @@ class CompatibilityProbe:
     # -- checklist item 2 --------------------------------------------------
 
     def _sample_autopilot_clock(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+        self,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        *,
+        label: str,
     ) -> list[tuple[float, float]]:
         """Pair host receipt times with the autopilot's own clock.
 
@@ -4802,14 +5057,20 @@ class CompatibilityProbe:
             take_sample()
             if (
                 len(pairs) >= self.settings.timebase_samples
-                and max(host for host, _ in pairs) - min(host for host, _ in pairs) >= window_s
+                and max(host for host, _ in pairs) - min(host for host, _ in pairs)
+                >= window_s
             ):
                 break
             self._sleep(self.settings.timebase_poll_s)
         return pairs
 
     def _item_frames_and_timebases(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+        self,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        *,
+        label: str,
     ) -> ProbeCheck:
         pairs = self._sample_autopilot_clock(adapter, writer, log, label=label)
         window_s = self.settings.realtime_window_s
@@ -4845,7 +5106,10 @@ class CompatibilityProbe:
                     "axes": "gravity-aligned local NED, horizontal axes fixed at start",
                     "source": "declaration; the autopilot's local frame is the conversion target",
                 },
-                "world": {"zero_point": world_zero, "source": "the scene's own declaration"},
+                "world": {
+                    "zero_point": world_zero,
+                    "source": "the scene's own declaration",
+                },
                 "autopilot_local_origin": {
                     "home": self.settings.sitl_home,
                     "source": "the configured --home and the origin SITL reports",
@@ -4880,7 +5144,9 @@ class CompatibilityProbe:
         self._record_artifacts(path)
         reasons: list[str] = []
         if not join.measured:
-            reasons.append(f"the host and autopilot clocks cannot be related: {join.reason}")
+            reasons.append(
+                f"the host and autopilot clocks cannot be related: {join.reason}"
+            )
         if (
             simulator_join.measured is False
             and simulator_join.reason is not None
@@ -4932,7 +5198,9 @@ class CompatibilityProbe:
     def _write_json(self, name: str, document: Any) -> str:
         target = self.output_dir / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8")
+        target.write_text(
+            json.dumps(document, indent=2, default=str) + "\n", encoding="utf-8"
+        )
         return str(target.relative_to(self.output_dir))
 
     def _record_artifacts(self, *paths: str | None) -> None:
@@ -4975,9 +5243,6 @@ class CompatibilityProbe:
                 if fields and fields[0] == parameter:
                     found.append({"file": path.name, "line": stripped})
         return found
-
-
-
 
     def _collect_imu(
         self,
@@ -5052,7 +5317,11 @@ class CompatibilityProbe:
             )
         if record.pair is not None:
             self._file_pair(
-                record, writer, log, label=label, controller_status=adapter.controller_status
+                record,
+                writer,
+                log,
+                label=label,
+                controller_status=adapter.controller_status,
             )
         elif record.imu is not None:
             phase = adapter.reader_phase
@@ -5172,7 +5441,9 @@ class CompatibilityProbe:
         if description.observation is not None:
             log.observations.append(description.observation)
 
-    def _write_imu_sample(self, writer: EvidenceWriter, phase: str, record: SensorRecord) -> None:
+    def _write_imu_sample(
+        self, writer: EvidenceWriter, phase: str, record: SensorRecord
+    ) -> None:
         """One inertial sample, tagged with the window it arrived in."""
         sample = record.imu
         assert sample is not None
@@ -5195,7 +5466,12 @@ class CompatibilityProbe:
         )
 
     def _sample_once(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+        self,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        *,
+        label: str,
     ) -> TelemetrySample:
         sample = adapter.telemetry()
         log.telemetry.append(sample)
@@ -5314,17 +5590,25 @@ class CompatibilityProbe:
             record = {
                 "waypoint": list(waypoint),
                 "target_ned": list(target),
-                "setpoint_sequence": None if published is None else published.command_sequence,
-                "setpoint_type_mask": None if published is None else published.type_mask,
+                "setpoint_sequence": None
+                if published is None
+                else published.command_sequence,
+                "setpoint_type_mask": None
+                if published is None
+                else published.type_mask,
                 "setpoint_frame": None if published is None else published.frame.value,
                 "publications": publications_here,
                 "published_at_monotonic_ns": (
-                    None if publication is None else publication.published_stamp.monotonic_ns
+                    None
+                    if publication is None
+                    else publication.published_stamp.monotonic_ns
                 ),
                 "deadline_s": None if published is None else published.deadline_s,
                 "position_before_ned": list(start) if start is not None else None,
                 "position_after_ned": list(end) if end is not None else None,
-                "displacement_ned": list(displacement) if displacement is not None else None,
+                "displacement_ned": list(displacement)
+                if displacement is not None
+                else None,
                 "tracking_residual_m": residual_m,
                 "sample_ages_s": sample_ages,
                 "refusals": refusals_here,
@@ -5332,12 +5616,19 @@ class CompatibilityProbe:
             }
             log.waypoints.append(record)
             writer.append_jsonl("motion.jsonl", record)
-            self._record_artifacts(str((writer.directory / "motion.jsonl").relative_to(self.output_dir)))
+            self._record_artifacts(
+                str((writer.directory / "motion.jsonl").relative_to(self.output_dir))
+            )
         if not flight.mode_reached and not reasons:
             reasons.append("Guided mode was never reached")
         displacements = [entry["displacement_ned"] for entry in log.waypoints]
-        measured = [value for entry in displacements if entry is not None for value in entry]
-        if measured and max(abs(value) for value in measured) < MOTION_MIN_DISPLACEMENT_M:
+        measured = [
+            value for entry in displacements if entry is not None for value in entry
+        ]
+        if (
+            measured
+            and max(abs(value) for value in measured) < MOTION_MIN_DISPLACEMENT_M
+        ):
             reasons.append(
                 "the vehicle did not move: the largest measured displacement was "
                 f"{max(abs(value) for value in measured):.3f} m"
@@ -5385,7 +5676,9 @@ class CompatibilityProbe:
                 "waypoints": log.waypoints,
                 "publications": len(log.publications),
                 "refused_publications": len(adapter.refusals),
-                "control_events": [event.document() for event in adapter.control_events],
+                "control_events": [
+                    event.document() for event in adapter.control_events
+                ],
                 "adoption": "publication is recorded; adoption is judged from the telemetry above",
             },
             reason="; ".join(reasons) if reasons else None,
@@ -5407,7 +5700,9 @@ class CompatibilityProbe:
                 active, best = count, table
         if best is None:
             # No sample at all is a different finding from a sample showing nothing.
-            reasons.append("SERVO_OUTPUT_RAW never arrived, so actuation was never observed")
+            reasons.append(
+                "SERVO_OUTPUT_RAW never arrived, so actuation was never observed"
+            )
         elif not log.publications:
             # An output that never left idle while nothing was commanded is not evidence
             # of an unmapped actuator, so it is reported as what it is.
@@ -5446,7 +5741,12 @@ class CompatibilityProbe:
     # -- checklist item 5 --------------------------------------------------
 
     def _item_stereo_pairs(
-        self, adapter: WebotsArduPilot, writer: EvidenceWriter, log: _FlightLog, *, label: str
+        self,
+        adapter: WebotsArduPilot,
+        writer: EvidenceWriter,
+        log: _FlightLog,
+        *,
+        label: str,
     ) -> ProbeCheck:
         reasons: list[str] = []
         metadata = log.pair_metadata
@@ -5477,7 +5777,9 @@ class CompatibilityProbe:
                 "produced an image"
             )
         colourless = [
-            entry for entry in frames_with_content if not entry["left_quality"]["is_colour"]
+            entry
+            for entry in frames_with_content
+            if not entry["left_quality"]["is_colour"]
         ]
         if colourless:
             first = colourless[0]
@@ -5488,7 +5790,9 @@ class CompatibilityProbe:
                 f"(declared limit {self.settings.stereo.identical_channel_fraction_limit})"
             )
         witness = None
-        declaration = (adapter.controller_status.get("scene") or {}).get("witness_colour_rgb")
+        declaration = (adapter.controller_status.get("scene") or {}).get(
+            "witness_colour_rgb"
+        )
         if frames_with_content and not declaration:
             reasons.append(
                 "the scene did not declare a known-colour object, so channel order cannot be "
@@ -5499,7 +5803,9 @@ class CompatibilityProbe:
             # reason: an empty buffer says nothing about channel order.
             witness = frames_with_content[0].get("witness")
             if witness is None:
-                reasons.append("the colour witness was not measured in the first usable pair")
+                reasons.append(
+                    "the colour witness was not measured in the first usable pair"
+                )
             elif witness["matched_pixels"] == 0:
                 reasons.append(
                     "the scene's known-colour object was not found in the frame, so the colour "
@@ -5512,7 +5818,9 @@ class CompatibilityProbe:
                     f"{witness['expected_dominant_channel']!r}: the channel order is wrong"
                 )
         capture_times = [
-            entry["capture_monotonic_ns"] / 1e9 for entry in metadata if "capture_monotonic_ns" in entry
+            entry["capture_monotonic_ns"] / 1e9
+            for entry in metadata
+            if "capture_monotonic_ns" in entry
         ]
         intervals = [
             later - earlier for earlier, later in zip(capture_times, capture_times[1:])
@@ -5528,7 +5836,9 @@ class CompatibilityProbe:
                 "seconds": intervals[worst],
                 "from_sim_time_s": metadata[worst].get("sim_time_s"),
                 "to_sim_time_s": metadata[worst + 1].get("sim_time_s"),
-                "from_capture_monotonic_ns": metadata[worst].get("capture_monotonic_ns"),
+                "from_capture_monotonic_ns": metadata[worst].get(
+                    "capture_monotonic_ns"
+                ),
                 "pairs_before": worst + 1,
                 "pairs_after": len(metadata) - worst - 1,
             }
@@ -5543,7 +5853,9 @@ class CompatibilityProbe:
                 f"{longest['from_sim_time_s']}s and {longest['to_sim_time_s']}s"
             )
         if len(metadata) < 2:
-            reasons.append(f"only {len(metadata)} stereo pair(s) arrived during the run")
+            reasons.append(
+                f"only {len(metadata)} stereo pair(s) arrived during the run"
+            )
         if not log.observations:
             reasons.append(
                 "no stereo pair was stored, so no Observation record exists for this run"
@@ -5632,7 +5944,9 @@ class CompatibilityProbe:
         non_finite = [
             index
             for index, sample in enumerate(at_rest)
-            if not all(math.isfinite(value) for value in sample.accelerometer + sample.gyro)
+            if not all(
+                math.isfinite(value) for value in sample.accelerometer + sample.gyro
+            )
         ]
         if non_finite:
             reasons.append(
@@ -5654,12 +5968,18 @@ class CompatibilityProbe:
                 f"the inertial stream stalled for {largest_gap:.2f}s inside a sampling "
                 f"window, beyond the declared {self.settings.imu_stale_after_s:.2f}s"
             )
-        measured = [sample for index, sample in enumerate(at_rest) if index not in non_finite]
-        at_rest_mean = axis_mean_and_spread([sample.accelerometer for sample in measured])
+        measured = [
+            sample for index, sample in enumerate(at_rest) if index not in non_finite
+        ]
+        at_rest_mean = axis_mean_and_spread(
+            [sample.accelerometer for sample in measured]
+        )
         gravity_expected = GRAVITY_NED_Z
         gravity_ok = None
         if at_rest_mean["mean"] is not None:
-            gravity_ok = abs(at_rest_mean["mean"][2] - gravity_expected) <= GRAVITY_TOLERANCE
+            gravity_ok = (
+                abs(at_rest_mean["mean"][2] - gravity_expected) <= GRAVITY_TOLERANCE
+            )
             if not gravity_ok:
                 reasons.append(
                     f"at rest the accelerometer reads {at_rest_mean['mean'][2]:+.2f} m/s^2 on the "
@@ -5723,7 +6043,9 @@ class CompatibilityProbe:
         sample = samples[-1]
         nearest = min(
             log.telemetry,
-            key=lambda item: abs(item.received_stamp.monotonic_ns - sample.capture_host_ns),
+            key=lambda item: abs(
+                item.received_stamp.monotonic_ns - sample.capture_host_ns
+            ),
         )
         if nearest.attitude_rpy is None:
             return {
@@ -5733,7 +6055,9 @@ class CompatibilityProbe:
             }
         differences = [
             abs(measured - reported)
-            for measured, reported in zip(sample.inertial_unit_rpy, nearest.attitude_rpy)
+            for measured, reported in zip(
+                sample.inertial_unit_rpy, nearest.attitude_rpy
+            )
         ]
         document = {
             "joined": True,
@@ -5779,7 +6103,9 @@ class CompatibilityProbe:
         window_until = self._monotonic() + self.settings.stream_loss_window_s
         while self._monotonic() < window_until:
             self._check_budget()
-            window_samples.append(self._sample_once(adapter, writer, log, label=adapter.label).document())
+            window_samples.append(
+                self._sample_once(adapter, writer, log, label=adapter.label).document()
+            )
             self._sleep(0.2)
         resumed: list[dict[str, Any]] = []
         regained = False
@@ -5805,7 +6131,9 @@ class CompatibilityProbe:
                 resumed.append(sample.document())
                 self._sleep(0.2)
             regained = bool(
-                resumed and resumed[-1]["mode_name"] == "GUIDED" and resumed[-1]["armed"]
+                resumed
+                and resumed[-1]["mode_name"] == "GUIDED"
+                and resumed[-1]["armed"]
             )
         if len(window_samples) < 2:
             reasons.append(
@@ -5879,9 +6207,13 @@ class CompatibilityProbe:
             during.append(adapter.telemetry().document())
             self._read_records(adapter, writer, log, label=label)
             self._sleep(0.2)
-        removal = adapter.inject(Injection.clear(1, kind=self.settings.estimator_fault.kind))
+        removal = adapter.inject(
+            Injection.clear(1, kind=self.settings.estimator_fault.kind)
+        )
         if not removal.applied:
-            reasons.append("the injection was not removed, so the run cannot report a recovery")
+            reasons.append(
+                "the injection was not removed, so the run cannot report a recovery"
+            )
         after: list[dict[str, Any]] = []
         recover_until = self._monotonic() + 2.0
         while self._monotonic() < recover_until:
@@ -5904,7 +6236,9 @@ class CompatibilityProbe:
         ratio = None
         if baseline is not None and peak is not None and baseline > 0.0:
             ratio = peak / baseline
-        observable = bool(ratio is not None and ratio >= EKF_VARIANCE_GROWTH) or len(flags) > 1
+        observable = (
+            bool(ratio is not None and ratio >= EKF_VARIANCE_GROWTH) or len(flags) > 1
+        )
         if receipt.applied and not observable:
             reasons.append(
                 "the injected degradation produced no observable estimator signal: "
@@ -5920,7 +6254,6 @@ class CompatibilityProbe:
                 "hold_s": self.settings.estimator_fault.hold_s,
                 "requested": injection.injection_id,
                 "applied": receipt.applied,
-
                 "acknowledged_state": receipt.acknowledged_state,
                 "removed": removal.applied,
             },
@@ -6097,9 +6430,12 @@ def axis_mean_and_spread(samples: Sequence[Sequence[float]]) -> dict[str, Any]:
     """Mean and spread per axis, or None when there is nothing to average."""
     if not samples:
         return {"mean": None, "spread": None, "samples": 0}
-    means = tuple(sum(sample[axis] for sample in samples) / len(samples) for axis in range(3))
+    means = tuple(
+        sum(sample[axis] for sample in samples) / len(samples) for axis in range(3)
+    )
     spreads = tuple(
-        max(sample[axis] for sample in samples) - min(sample[axis] for sample in samples)
+        max(sample[axis] for sample in samples)
+        - min(sample[axis] for sample in samples)
         for axis in range(3)
     )
     return {"mean": list(means), "spread": list(spreads), "samples": len(samples)}
@@ -6173,7 +6509,9 @@ def scenario_proto_assets(world: Path) -> list[dict[str, Any]]:
         if len(reference) < 2 or _is_remote_reference(reference[1]):
             continue
         proto = (world.parent / reference[1]).resolve()
-        assets.append({"role": "proto", "path": str(proto), "sha256": _file_sha256(proto)})
+        assets.append(
+            {"role": "proto", "path": str(proto), "sha256": _file_sha256(proto)}
+        )
         try:
             proto_text = proto.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -6194,7 +6532,9 @@ def _is_remote_reference(reference: str) -> bool:
     return reference.startswith(("http://", "https://", "webots://"))
 
 
-def build_compatibility_probe(settings: PlatformSettings, output_dir: Path) -> CompatibilityProbe:
+def build_compatibility_probe(
+    settings: PlatformSettings, output_dir: Path
+) -> CompatibilityProbe:
     """Build the probe with the real seams.
 
     This is the one place that decides which process runner, MAVLink session and
@@ -6204,7 +6544,9 @@ def build_compatibility_probe(settings: PlatformSettings, output_dir: Path) -> C
     return CompatibilityProbe(settings, output_dir=Path(output_dir))
 
 
-def run_compatibility_probe(settings: PlatformSettings, output_dir: Path) -> ProbeResult:
+def run_compatibility_probe(
+    settings: PlatformSettings, output_dir: Path
+) -> ProbeResult:
     """Run the live compatibility checklist against the real simulator and autopilot."""
     return build_compatibility_probe(settings, output_dir).run()
 
@@ -6255,7 +6597,11 @@ def _compat_command(args: Any, output_dir: Path) -> CommandOutcome:
                 "stage": settings.stage,
                 "name": settings.name,
                 "prerequisites": [
-                    {"name": check.name, "satisfied": check.satisfied, "detail": check.detail}
+                    {
+                        "name": check.name,
+                        "satisfied": check.satisfied,
+                        "detail": check.detail,
+                    }
                     for check in check_prerequisites(settings, output_dir)
                 ],
                 "configuration": _configuration_document(settings),
@@ -6311,7 +6657,9 @@ def _configuration_document(settings: PlatformSettings) -> dict[str, Any]:
             "sitl_binary": str(settings.sitl_binary),
             "home": settings.sitl_home,
             "parameter_files": [str(name) for name in settings.params],
-            "estimator_parameter_files": [str(name) for name in settings.estimator_params],
+            "estimator_parameter_files": [
+                str(name) for name in settings.estimator_params
+            ],
         },
         "scenario": {"world": str(settings.world)},
         "calibration": {"declaration": str(settings.calibration_path)},

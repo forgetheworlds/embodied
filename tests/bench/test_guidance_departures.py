@@ -71,7 +71,9 @@ def test_the_recorded_mission_lifecycle_is_not_a_control_loss():
     ``not event["guidance_held"]``, which every bring-up and landing transition
     satisfies, so it reported seven losses for a flight that had none.
     """
-    losses, departures = live_record._guidance_departures(the_recorded_mission(), LANDED)
+    losses, departures = live_record._guidance_departures(
+        the_recorded_mission(), LANDED
+    )
     assert losses == []
     # One departure did happen: the mission's own landing, which is why it must be
     # excluded by the end state rather than by ignoring the events.
@@ -161,9 +163,13 @@ def test_a_terminal_landing_is_a_loss_when_the_run_did_not_end_landed():
     termination that makes a landing ordinary.
     """
     events = [event(0, "GUIDED", "LAND", True, True)]
-    losses, _ = live_record._guidance_departures(events, {"armed": True, "mode": "LAND"})
+    losses, _ = live_record._guidance_departures(
+        events, {"armed": True, "mode": "LAND"}
+    )
     assert len(losses) == 1
-    losses, _ = live_record._guidance_departures(events, {"armed": False, "mode": "LOITER"})
+    losses, _ = live_record._guidance_departures(
+        events, {"armed": False, "mode": "LOITER"}
+    )
     assert len(losses) == 1
 
 
@@ -177,7 +183,7 @@ class _Collector:
     def inspected_within(self, target_ned, *, radius_m, hold_s):
         return self._inspected, "declared"
 
-    def returned_near(self, *, radius_m):
+    def returned_near(self, *, radius_m, end_state):
         return self._returned, "declared"
 
 
@@ -263,7 +269,9 @@ def test_the_autopilot_mode_change_scan_reads_the_runs_own_record(tmp_path):
 
 def test_the_scan_is_empty_when_there_is_no_record(tmp_path):
     """A run with no log has no mode changes to report, and must not fail."""
-    assert live_record.autopilot_mode_change_statustexts(tmp_path / "absent.jsonl") == []
+    assert (
+        live_record.autopilot_mode_change_statustexts(tmp_path / "absent.jsonl") == []
+    )
 
 
 def test_a_crash_disarm_is_still_reported_alongside_guidance():

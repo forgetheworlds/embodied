@@ -132,7 +132,6 @@ class FakeClock:
         self.now += max(float(seconds), self.step_s)
 
 
-
 class TickingClock(FakeClock):
     """A clock that advances on every read, for a valve measured against wall time.
 
@@ -152,6 +151,7 @@ class TickingClock(FakeClock):
         self.now += self.step_s
         return self.now
 
+
 class FakeRunner:
     """Spawns nothing, and remembers what it was asked to spawn and terminate."""
 
@@ -163,7 +163,9 @@ class FakeRunner:
     def spawn(self, name, argv, *, log_path, cwd=None, env=None):
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(f"{name} started: {' '.join(argv)}\n", encoding="utf-8")
-        child = W.ChildProcess(name=name, argv=tuple(argv), pid=4200 + len(self.spawned), log_path=log_path)
+        child = W.ChildProcess(
+            name=name, argv=tuple(argv), pid=4200 + len(self.spawned), log_path=log_path
+        )
         self.spawned.append((name, tuple(argv), dict(env or {})))
         return child
 
@@ -190,7 +192,15 @@ class FakeGateway:
 
     RECORDS_PER_SECOND = 110.0
 
-    def __init__(self, clock, *, pair_bytes=None, colourless=False, acknowledge=True, motors=("m1_motor", "m2_motor", "m3_motor", "m4_motor")):
+    def __init__(
+        self,
+        clock,
+        *,
+        pair_bytes=None,
+        colourless=False,
+        acknowledge=True,
+        motors=("m1_motor", "m2_motor", "m3_motor", "m4_motor"),
+    ):
         self.clock = clock
         self.pair_bytes = pair_bytes
         self.colourless = colourless
@@ -212,10 +222,21 @@ class FakeGateway:
             sim_time_s=self.clock.monotonic() - 1000.0,
             sequence=0,
             flags=0,
-            received_stamp=W.ClockStamp(host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()),
+            received_stamp=W.ClockStamp(
+                host_id="test-host",
+                clock_id="monotonic",
+                monotonic_ns=self.clock.monotonic_ns(),
+            ),
             status={
-                "python": {"executable": sys.executable, "version": sys.version, "platform": sys.platform},
-                "shared_module": {"file": "test", "records_revision": R.RECORDS_REVISION},
+                "python": {
+                    "executable": sys.executable,
+                    "version": sys.version,
+                    "platform": sys.platform,
+                },
+                "shared_module": {
+                    "file": "test",
+                    "records_revision": R.RECORDS_REVISION,
+                },
                 "host_id": "test-host",
                 "clock_id": "monotonic",
                 "devices": {
@@ -235,7 +256,10 @@ class FakeGateway:
                     "frames_dropped": 0,
                     "reader_connected": True,
                 },
-                "scene": {"witness_colour_rgb": [217, 13, 13], "witness_note": "test panel"},
+                "scene": {
+                    "witness_colour_rgb": [217, 13, 13],
+                    "witness_note": "test panel",
+                },
             },
         )
 
@@ -261,7 +285,9 @@ class FakeGateway:
             sequence=self.pair_counter,
             flags=0,
             received_stamp=W.ClockStamp(
-                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+                host_id="test-host",
+                clock_id="monotonic",
+                monotonic_ns=self.clock.monotonic_ns(),
             ),
             pair=payload,
         )
@@ -273,7 +299,9 @@ class FakeGateway:
             sequence=self.pair_counter,
             flags=0,
             received_stamp=W.ClockStamp(
-                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+                host_id="test-host",
+                clock_id="monotonic",
+                monotonic_ns=self.clock.monotonic_ns(),
             ),
             imu=W.ImuPayload(
                 capture_host_ns=self.clock.monotonic_ns(),
@@ -324,7 +352,9 @@ class FakeGateway:
                 sequence=0,
                 flags=0,
                 received_stamp=W.ClockStamp(
-                    host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+                    host_id="test-host",
+                    clock_id="monotonic",
+                    monotonic_ns=self.clock.monotonic_ns(),
                 ),
                 fault_ack={
                     "injection_id": injection.injection_id,
@@ -359,7 +389,9 @@ class PoseStreamingGateway(FakeGateway):
             sequence=self.pose_counter,
             flags=0,
             received_stamp=W.ClockStamp(
-                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+                host_id="test-host",
+                clock_id="monotonic",
+                monotonic_ns=self.clock.monotonic_ns(),
             ),
             pose=W.PosePayload(
                 capture_host_ns=self.clock.monotonic_ns(),
@@ -464,7 +496,15 @@ class ScriptedMavlinkSession:
 
     def send_vision_position_estimate(self, *, usec, x, y, z, roll, pitch, yaw):
         self.vision_poses.append(
-            {"usec": usec, "x": x, "y": y, "z": z, "roll": roll, "pitch": pitch, "yaw": yaw}
+            {
+                "usec": usec,
+                "x": x,
+                "y": y,
+                "z": z,
+                "roll": roll,
+                "pitch": pitch,
+                "yaw": yaw,
+            }
         )
 
     def request_parameter(self, name):
@@ -662,7 +702,9 @@ def write_scene(tmp_path, **overrides):
     binary.write_text("#!/bin/sh\necho webots\n", encoding="utf-8")
     binary.chmod(0o755)
     (webots_home / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
-    (webots_home / "Contents" / "Resources" / "version.txt").write_text("R2025a", encoding="utf-8")
+    (webots_home / "Contents" / "Resources" / "version.txt").write_text(
+        "R2025a", encoding="utf-8"
+    )
 
     ardupilot = tmp_path / "ardupilot"
     (ardupilot / "build" / "sitl" / "bin").mkdir(parents=True, exist_ok=True)
@@ -673,13 +715,26 @@ def write_scene(tmp_path, **overrides):
         subprocess.run(["git", "init", "-q", str(ardupilot)], check=True)
         subprocess.run(["git", "-C", str(ardupilot), "add", "-A"], check=True)
         subprocess.run(
-            ["git", "-C", str(ardupilot), "-c", "user.email=t@example.com", "-c", "user.name=t",
-             "commit", "-q", "-m", "pinned"],
+            [
+                "git",
+                "-C",
+                str(ardupilot),
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "pinned",
+            ],
             check=True,
         )
     commit = subprocess.run(
         ["git", "-C", str(ardupilot), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
     document = {
@@ -694,7 +749,11 @@ def write_scene(tmp_path, **overrides):
             "sim_model": "webots-python",
             "vehicle": "ArduCopter",
             "sitl_home": "-35.363261,149.165230,584,353",
-            "endpoints": {"sitl": "tcp:127.0.0.1:5760", "fdm_port": free_port(), "controller_port": free_port()},
+            "endpoints": {
+                "sitl": "tcp:127.0.0.1:5760",
+                "fdm_port": free_port(),
+                "controller_port": free_port(),
+            },
         },
         "scenario": {
             "world": str(SCENE / "worlds" / "compat_stereo.wbt"),
@@ -734,7 +793,11 @@ def write_scene(tmp_path, **overrides):
             "settle_s": 0.1,
             "at_rest_window_s": 0.2,
             "pre_arm_wait_s": 5.0,
-            "estimator_fault": {"kind": "position_step", "magnitude_m": 30.0, "hold_s": 2.0},
+            "estimator_fault": {
+                "kind": "position_step",
+                "magnitude_m": 30.0,
+                "hold_s": 2.0,
+            },
             "timebase_samples": 5,
             # The scripted clock advances 0.05 s per wait, so a window is a fraction of a
             # second here: the relation only has to span one window to be measurable, and
@@ -781,6 +844,7 @@ def run_probe(
     runner = runner or FakeRunner()
     config_path = write_scene(tmp_path, **(config_overrides or {}))
     settings = settings_for(config_path, tmp_path)
+
     # The scripted vehicle reports the values transcribed from the fixture .parm
     # files, never the product parser's reading of them: the startup read-back
     # compares the parser's report of the files against what the vehicle says it
@@ -824,10 +888,14 @@ def check(result, name):
     for entry in result.checks:
         if entry.name.startswith(name):
             return entry
-    raise AssertionError(f"{name} was not reported; got {[c.name for c in result.checks]}")
+    raise AssertionError(
+        f"{name} was not reported; got {[c.name for c in result.checks]}"
+    )
 
 
-def test_the_iteration_no_rendering_knob_reaches_the_simulator_argv(tmp_path, monkeypatch):
+def test_the_iteration_no_rendering_knob_reaches_the_simulator_argv(
+    tmp_path, monkeypatch
+):
     """``EMBODIED_WEBOTS_NO_RENDERING=1`` is an iteration-only speed knob.
 
     It appends Webots' own ``--no-rendering``, which disables the main 3D view and
@@ -847,6 +915,7 @@ def test_the_iteration_no_rendering_knob_reaches_the_simulator_argv(tmp_path, mo
     # The flag lands immediately before the world and changes nothing else.
     assert list(with_flag) == [*baseline[:-1], "--no-rendering", baseline[-1]]
 
+
 def test_the_fast_iteration_arm_loads_and_declares_no_clamp():
     """``configs/first_indoor_fast.yaml`` is the iteration arm, not a scored one.
 
@@ -860,6 +929,7 @@ def test_the_fast_iteration_arm_loads_and_declares_no_clamp():
     assert settings.sim_wall_clamp is False
     assert "--mode=fast" in settings.simulator_argv()
 
+
 # ---------------------------------------------------------------------------
 # Framing
 # ---------------------------------------------------------------------------
@@ -868,7 +938,9 @@ def test_the_fast_iteration_arm_loads_and_declares_no_clamp():
 def test_framing_round_trips_every_message_kind():
     for kind in W.Kind:
         payload = bytes(range(40))
-        framed = W.pack_message(kind, sim_time_s=12.5, sequence=7, payload=payload, flags=3)
+        framed = W.pack_message(
+            kind, sim_time_s=12.5, sequence=7, payload=payload, flags=3
+        )
         message, consumed = W.read_message(framed)
         assert consumed == len(framed)
         assert message.kind is kind
@@ -887,22 +959,30 @@ def test_a_truncated_header_or_payload_is_rejected():
 
 
 def test_a_wrong_magic_version_or_kind_is_rejected():
-    framed = bytearray(W.pack_message(W.Kind.STATUS, sim_time_s=1.0, sequence=1, payload=b"{}"))
+    framed = bytearray(
+        W.pack_message(W.Kind.STATUS, sim_time_s=1.0, sequence=1, payload=b"{}")
+    )
     framed[0:4] = b"XXXX"
     with pytest.raises(W.FramingError):
         W.read_message(bytes(framed))
-    framed = bytearray(W.pack_message(W.Kind.STATUS, sim_time_s=1.0, sequence=1, payload=b"{}"))
+    framed = bytearray(
+        W.pack_message(W.Kind.STATUS, sim_time_s=1.0, sequence=1, payload=b"{}")
+    )
     framed[4:6] = struct.pack(">H", W.FORMAT_VERSION + 1)
     with pytest.raises(W.FramingError):
         W.read_message(bytes(framed))
-    framed = bytearray(W.pack_message(W.Kind.STATUS, sim_time_s=1.0, sequence=1, payload=b"{}"))
+    framed = bytearray(
+        W.pack_message(W.Kind.STATUS, sim_time_s=1.0, sequence=1, payload=b"{}")
+    )
     framed[6] = 99
     with pytest.raises(W.FramingError):
         W.read_message(bytes(framed))
 
 
 def test_the_stream_reader_waits_for_a_whole_message():
-    framed = W.pack_message(W.Kind.PAIR, sim_time_s=2.0, sequence=2, payload=b"0123456789")
+    framed = W.pack_message(
+        W.Kind.PAIR, sim_time_s=2.0, sequence=2, payload=b"0123456789"
+    )
     reader = W.FrameReader()
     reader.feed(framed[:12])
     assert reader.next_message() is None
@@ -1004,11 +1084,21 @@ def test_the_flight_state_packet_layout_matches_the_pinned_model():
     expected = struct.pack(
         "d" * 16,
         3.5,
-        0.1, 0.2, 0.3,
-        1.0, 2.0, 3.0,
-        0.4, 0.5, 0.6,
-        4.0, 5.0, 6.0,
-        7.0, 8.0, 9.0,
+        0.1,
+        0.2,
+        0.3,
+        1.0,
+        2.0,
+        3.0,
+        0.4,
+        0.5,
+        0.6,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        8.0,
+        9.0,
     )
     assert W.pack_fdm(state) == expected
 
@@ -1034,6 +1124,7 @@ def test_propeller_thrust_is_linearized_before_it_reaches_the_motor():
     assert W.propeller_velocity(-0.25, max_velocity=100.0) == pytest.approx(-50.0)
     assert W.propeller_velocity(0.0, max_velocity=100.0) == pytest.approx(0.0)
 
+
 def test_iris_motor_order_and_roll_pitch_geometry_match_the_quad_x_mixer():
     """Pin scene facts, not the refuted analytic prediction about yaw torque.
 
@@ -1042,18 +1133,30 @@ def test_iris_motor_order_and_roll_pitch_geometry_match_the_quad_x_mixer():
     the upstream thrust/multiplier pairing that produces upward thrust.
     """
     scene = (SCENE / "protos" / "Iris.proto").read_text()
-    centers = [(float(x), float(y)) for x, y in re.findall(
-        r"centerOfThrust\s+([+-]?[0-9.]+)\s+([+-]?[0-9.]+)\s+[+-]?[0-9.]+", scene
-    )]
+    centers = [
+        (float(x), float(y))
+        for x, y in re.findall(
+            r"centerOfThrust\s+([+-]?[0-9.]+)\s+([+-]?[0-9.]+)\s+[+-]?[0-9.]+", scene
+        )
+    ]
     assert re.findall(r'name "(m[1-4]_motor)"', scene) == [
-        "m1_motor", "m2_motor", "m3_motor", "m4_motor"
+        "m1_motor",
+        "m2_motor",
+        "m3_motor",
+        "m4_motor",
     ]
     assert centers == [(0.13, -0.22), (-0.13, 0.2), (0.13, 0.22), (-0.13, -0.2)]
     assert [float(v) for v in re.findall(r"thrustConstants\s+([^\s]+)\s+0", scene)] == [
-        0.0012, 0.0012, -0.0012, -0.0012
+        0.0012,
+        0.0012,
+        -0.0012,
+        -0.0012,
     ]
     assert [int(v) for v in re.findall(r"multiplier\s+(-?1)\b", scene)] == [
-        1, 1, -1, -1
+        1,
+        1,
+        -1,
+        -1,
     ]
 
 
@@ -1071,7 +1174,9 @@ def test_colour_measurement_separates_a_colour_frame_from_a_copied_channel():
     assert quality.channel_identical_fraction < 0.99
 
     copied_left, _ = synthetic_pair(colourless=True)
-    copied = W.measure_frame_quality(copied_left, 64, 48, identical_channel_fraction_limit=0.99)
+    copied = W.measure_frame_quality(
+        copied_left, 64, 48, identical_channel_fraction_limit=0.99
+    )
     assert not copied.is_colour
     assert copied.channel_identical_fraction == 1.0
 
@@ -1152,7 +1257,10 @@ def test_gateway_assembles_a_pair_from_the_wire():
         ),
     )
     status_message = W.pack_message(
-        W.Kind.STATUS, sim_time_s=4.0, sequence=0, payload=W.encode_status_payload({"ok": True})
+        W.Kind.STATUS,
+        sim_time_s=4.0,
+        sequence=0,
+        payload=W.encode_status_payload({"ok": True}),
     )
     stop = threading.Event()
     serve_messages([status_message + pair_message], port, stop)
@@ -1264,8 +1372,12 @@ def test_a_control_frame_never_overtakes_a_frame_that_is_half_sent():
     accepted.setblocking(False)
     client.settimeout(5.0)
     stream = W.OutboundStream(max_queued_bytes=16 << 20)
-    bulk = W.pack_message(W.Kind.PAIR, sim_time_s=1.0, sequence=1, payload=b"p" * (8 << 20))
-    control = W.pack_message(W.Kind.FAULT_ACK, sim_time_s=2.0, sequence=2, payload=b"ack")
+    bulk = W.pack_message(
+        W.Kind.PAIR, sim_time_s=1.0, sequence=1, payload=b"p" * (8 << 20)
+    )
+    control = W.pack_message(
+        W.Kind.FAULT_ACK, sim_time_s=2.0, sequence=2, payload=b"ack"
+    )
     try:
         assert stream.queue(bulk) is True
         stream.flush(accepted)
@@ -1469,7 +1581,11 @@ def test_the_scene_assets_are_read_from_the_world_and_hashed():
 
 
 def test_telemetry_is_decoded_from_recorded_messages():
-    messages = [json.loads(line) for line in (FIXTURES / "telemetry_guided.jsonl").read_text().splitlines() if line]
+    messages = [
+        json.loads(line)
+        for line in (FIXTURES / "telemetry_guided.jsonl").read_text().splitlines()
+        if line
+    ]
     stamp = W.ClockStamp(host_id="host", clock_id="monotonic", monotonic_ns=1)
     sample = W.decode_telemetry(messages, stamp=stamp)
     assert sample.mode_name == "GUIDED"
@@ -1593,7 +1709,8 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert result.manifest["run_a"]["sensors"]["stereo"]["baseline_m"] == 0.1
     assert result.manifest["run_a"]["ports"]["controller_port"] > 0
     assert [
-        Path(name).name for name in result.manifest["run_a"]["autopilot"]["parameter_files"]
+        Path(name).name
+        for name in result.manifest["run_a"]["autopilot"]["parameter_files"]
     ] == ["compat_base.parm", "compat_arming.parm", "compat_ekf.parm"]
     assert Path(result.manifest["run_b"]["autopilot"]["parameter_files"][-1]).name == (
         "compat_ekf.parm"
@@ -1608,7 +1725,9 @@ def test_the_probe_passes_every_item_with_a_scripted_vehicle(tmp_path):
     assert all(asset["sha256"] for asset in protos)
 
     # The firmware identity answers one request, not a stream.
-    assert all(W.MSG_ID_AUTOPILOT_VERSION in session.requested_messages for session in sessions)
+    assert all(
+        W.MSG_ID_AUTOPILOT_VERSION in session.requested_messages for session in sessions
+    )
 
     # Both runs stopped both children, and recorded their exit codes.
     assert runner.terminated == ["webots", "sitl", "webots", "sitl"]
@@ -1676,11 +1795,15 @@ def test_a_probe_run_tolerates_a_stream_that_carries_pose_records(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path, gateway_class=PoseStreamingGateway)
     assert result.gate_status is cli.GateStatus.PASS, result.reasons
     for label in ("run-a", "run-b"):
-        feed = json.loads((tmp_path / "out" / label / "vision-pose-feed.json").read_text())
+        feed = json.loads(
+            (tmp_path / "out" / label / "vision-pose-feed.json").read_text()
+        )
         assert feed["error"] is None
 
 
-def test_motion_is_published_as_a_guided_setpoint_and_never_as_a_motor_command(tmp_path):
+def test_motion_is_published_as_a_guided_setpoint_and_never_as_a_motor_command(
+    tmp_path,
+):
     _, _, _, sessions, _ = run_probe(tmp_path)
     published = [setpoint for session in sessions for setpoint in session.sent]
     assert published, "no setpoint was published"
@@ -1696,7 +1819,9 @@ def test_motion_is_published_as_a_guided_setpoint_and_never_as_a_motor_command(t
     assert ("set_mode", "GUIDED") in commands
 
 
-def test_the_gate_fails_when_the_stream_carries_no_colour_but_the_run_completes(tmp_path):
+def test_the_gate_fails_when_the_stream_carries_no_colour_but_the_run_completes(
+    tmp_path,
+):
     result, _, _, _, _ = run_probe(tmp_path, gateway_kwargs={"colourless": True})
     assert result.gate_status is cli.GateStatus.FAIL
     stereo = check(result, "5_stereo_colour_pairs")
@@ -1714,7 +1839,9 @@ def test_unmapped_actuation_is_reported(tmp_path):
 
 
 def test_a_refused_guided_mode_fails_the_motion_item_and_publishes_nothing(tmp_path):
-    result, _, _, sessions, _ = run_probe(tmp_path, session_kwargs={"refuse_guided": True})
+    result, _, _, sessions, _ = run_probe(
+        tmp_path, session_kwargs={"refuse_guided": True}
+    )
     motion = check(result, "3_guided_local_ned_motion")
     assert motion.status == "fail"
     assert "did not enter Guided flight" in motion.reason
@@ -1809,7 +1936,10 @@ def test_a_descent_to_the_commanded_altitude_is_not_opposite_motion(tmp_path):
     commanded step it is exactly the motion that was asked for.
     """
     result, _, _, _, _ = run_probe(tmp_path, session_class=OvershootThenDescend)
-    for name in ("3_guided_local_ned_motion[run-a]", "3_guided_local_ned_motion[run-b]"):
+    for name in (
+        "3_guided_local_ned_motion[run-a]",
+        "3_guided_local_ned_motion[run-b]",
+    ):
         motion = next(entry for entry in result.checks if entry.name == name)
         assert motion.status == "pass", motion.reason
         first = motion.evidence["waypoints"][0]
@@ -1917,11 +2047,18 @@ def test_publication_is_recorded_and_adoption_is_left_to_telemetry(tmp_path):
         for setpoint in sessions[0].sent
         if setpoint.command_sequence == first_waypoint["setpoint_sequence"]
     )
-    assert first_waypoint["published_at_monotonic_ns"] == publication.issue_stamp.monotonic_ns
+    assert (
+        first_waypoint["published_at_monotonic_ns"]
+        == publication.issue_stamp.monotonic_ns
+    )
 
 
-def test_an_injection_is_not_reported_as_applied_until_the_controller_acknowledges(tmp_path):
-    result, _, gateway, _, _ = run_probe(tmp_path, gateway_kwargs={"acknowledge": False})
+def test_an_injection_is_not_reported_as_applied_until_the_controller_acknowledges(
+    tmp_path,
+):
+    result, _, gateway, _, _ = run_probe(
+        tmp_path, gateway_kwargs={"acknowledge": False}
+    )
     estimator = check(result, "8_estimator_health_loss")
     assert estimator.status == "fail"
     assert "requested but not applied" in estimator.reason
@@ -1953,13 +2090,17 @@ def test_the_estimator_item_is_measured_wherever_the_files_select_an_ekf(tmp_pat
         tmp_path,
         output_name="out-pinned",
         config_overrides={
-            "scenario": {"estimator_params": [str(SCENE / "params" / "compat_base.parm")]}
+            "scenario": {
+                "estimator_params": [str(SCENE / "params" / "compat_base.parm")]
+            }
         },
     )
     reported = {entry.name for entry in pinned.checks}
     assert not any(name.startswith("8_estimator_health_loss") for name in reported)
     declaration = json.loads(
-        (tmp_path / "out-pinned" / "run-a" / "estimator-not-applicable.json").read_text()
+        (
+            tmp_path / "out-pinned" / "run-a" / "estimator-not-applicable.json"
+        ).read_text()
     )
     assert declaration["applicable"] is False
     assert declaration["selected_estimator"] == 10.0
@@ -1988,19 +2129,23 @@ def test_the_scene_controller_only_uses_shared_names_the_adapter_exposes():
             ):
                 used.add(node.attr)
         for name in re.findall(
-            r"from embodied\.platform\.webots_ardupilot import ([A-Za-z_][\w, ]*)", source
+            r"from embodied\.platform\.webots_ardupilot import ([A-Za-z_][\w, ]*)",
+            source,
         ):
             used.update(part.strip() for part in name.split(",") if part.strip())
     assert used, "the controller no longer reaches the shared module"
     missing = sorted(name for name in used if not hasattr(W, name))
     assert missing == [], f"the adapter does not expose {missing}"
 
+
 def test_stream_loss_reports_what_the_telemetry_showed(tmp_path):
     result, _, _, _, _ = run_probe(tmp_path)
     loss = check(result, "7_setpoint_stream_loss")
     assert loss.status == "pass"
     assert loss.evidence["samples_in_window"]
-    assert loss.evidence["last_publication"]["type_mask"] == R.TYPE_MASK_POSITION_VELOCITY
+    assert (
+        loss.evidence["last_publication"]["type_mask"] == R.TYPE_MASK_POSITION_VELOCITY
+    )
     assert loss.evidence["control_regained"] is False
     modes = {sample["mode_name"] for sample in loss.evidence["samples_in_window"]}
     assert "LOITER" in modes  # observed in telemetry, not asserted as safe behaviour
@@ -2012,7 +2157,9 @@ def test_stream_loss_reports_what_the_telemetry_showed(tmp_path):
 
 
 def test_publication_resumes_when_the_autopilot_stays_in_guided(tmp_path):
-    result, _, _, sessions, _ = run_probe(tmp_path, session_kwargs={"guided_timeout_s": 600.0})
+    result, _, _, sessions, _ = run_probe(
+        tmp_path, session_kwargs={"guided_timeout_s": 600.0}
+    )
     loss = check(result, "7_setpoint_stream_loss")
     assert loss.status == "pass"
     assert loss.evidence["resume_refused"] is None
@@ -2032,7 +2179,10 @@ def test_a_mode_change_stops_the_adapter_assuming_control(tmp_path):
     assert "Guided flight was lost" in motion.reason
     assert motion.evidence["refused_publications"] >= 1
     events = motion.evidence["control_events"]
-    assert any(event["to_mode"] == "LOITER" and event["guidance_held"] is False for event in events)
+    assert any(
+        event["to_mode"] == "LOITER" and event["guidance_held"] is False
+        for event in events
+    )
     # Publication stopped at the change: exactly the two setpoints published before the
     # autopilot left Guided, and nothing afterwards.
     assert len(sessions[0].sent) == 2
@@ -2145,15 +2295,21 @@ def test_the_published_setpoint_is_a_position_and_velocity_target_the_autopilot_
     assert R.TYPE_MASK_ACCELERATION_IGNORE == acceleration_group
     assert R.TYPE_MASK_FORCE_SET == dialect.POSITION_TARGET_TYPEMASK_FORCE_SET
     assert R.TYPE_MASK_YAW_IGNORE == dialect.POSITION_TARGET_TYPEMASK_YAW_IGNORE
-    assert R.TYPE_MASK_YAW_RATE_IGNORE == dialect.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+    assert (
+        R.TYPE_MASK_YAW_RATE_IGNORE == dialect.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+    )
 
     _, _, _, sessions, _ = run_probe(tmp_path)
     published = [setpoint for session in sessions for setpoint in session.sent]
     assert published, "no setpoint was published"
     for setpoint in published:
         mask = setpoint.type_mask
-        assert not mask & position_group, "the autopilot would ignore the position target"
-        assert not mask & velocity_group, "the autopilot would ignore the velocity target"
+        assert not mask & position_group, (
+            "the autopilot would ignore the position target"
+        )
+        assert not mask & velocity_group, (
+            "the autopilot would ignore the velocity target"
+        )
         assert mask & acceleration_group == acceleration_group
         assert mask & dialect.POSITION_TARGET_TYPEMASK_YAW_IGNORE
         assert mask & dialect.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
@@ -2260,8 +2416,10 @@ def test_the_flown_yaw_pairing_is_the_firmware_stock_paired_with_the_flown_rate_
     with their sources rather than left to the pin's vestigial context.
     """
     layered = W.read_configured_parameters(
-        [SCENE / "params" / name for name in
-         ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")]
+        [
+            SCENE / "params" / name
+            for name in ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")
+        ]
     )
     # Angle P, all three axes, the firmware's own stock: AC_ATTITUDE_CONTROL_ANGLE_P
     # 4.5f, "default angle P gain for roll, pitch and yaw", applied to roll, pitch
@@ -2294,8 +2452,10 @@ def test_guided_takeoff_uses_a_brakeable_climb_speed_for_this_short_hover():
     predicted 1 m/s² stopping distance at 0.5 m, not 2.76 m at 2.35 m/s.
     """
     layered = W.read_configured_parameters(
-        [SCENE / "params" / name for name in
-         ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")]
+        [
+            SCENE / "params" / name
+            for name in ("compat_base.parm", "compat_arming.parm", "compat_ekf.parm")
+        ]
     )
     assert layered["WP_SPD_UP"] == 1.0
 
@@ -2337,7 +2497,6 @@ def test_a_vehicle_whose_pre_arm_checks_never_clear_is_recorded_as_refusing(tmp_
     assert "PreArm: 3D Accel calibration needed" in flight["refusals"]
 
 
-
 def test_a_vehicle_running_different_parameters_fails_the_startup_item(tmp_path):
     """The read-back is the check that a parameter file was actually applied."""
     result, _, _, _, _ = run_probe(
@@ -2348,6 +2507,8 @@ def test_a_vehicle_running_different_parameters_fails_the_startup_item(tmp_path)
     assert "not running the configured parameters" in startup.reason
     assert "FRAME_CLASS" in startup.reason
     assert startup.evidence["parameters"]["reported_by_autopilot"]["FRAME_CLASS"] == 0.0
+
+
 # ---------------------------------------------------------------------------
 # The command: configuration, prerequisites, receipt and exit codes
 # ---------------------------------------------------------------------------
@@ -2448,7 +2609,10 @@ def test_a_passing_probe_is_exit_zero_with_a_pass_gate(tmp_path, monkeypatch):
     assert receipt["receipt_version"] == cli.RECEIPT_VERSION
     assert receipt["config_hash"] and len(receipt["config_hash"]) == 64
     assert receipt["code_revision"]
-    assert receipt["started_at_utc"] and receipt["finished_at_monotonic_s"] >= receipt["started_at_monotonic_s"]
+    assert (
+        receipt["started_at_utc"]
+        and receipt["finished_at_monotonic_s"] >= receipt["started_at_monotonic_s"]
+    )
     artifacts = {entry["path"]: entry for entry in receipt["artifacts"]}
     assert artifacts["manifest.json"]["sha256"]
     assert artifacts["checks.json"]["bytes"] > 0
@@ -2459,7 +2623,9 @@ def test_a_failed_check_is_exit_zero_with_a_fail_gate(tmp_path, monkeypatch):
     """A completed run whose checks fail the gate is still a valid result."""
     config_path = write_scene(tmp_path)
     monkeypatch.setattr(
-        W, "build_compatibility_probe", fake_probe_factory(gateway_kwargs={"colourless": True})
+        W,
+        "build_compatibility_probe",
+        fake_probe_factory(gateway_kwargs={"colourless": True}),
     )
     output = tmp_path / "run"
     code = cli.main(["compat", "--config", str(config_path), "--output", str(output)])
@@ -2539,7 +2705,10 @@ def test_a_settings_value_that_cannot_describe_a_run_is_refused(tmp_path):
         settings_for(path, tmp_path)
     assert "rgb8" in str(refusal.value)
 
-def test_the_sim_wall_clamp_is_off_by_default_and_reaches_the_simulator_process(tmp_path):
+
+def test_the_sim_wall_clamp_is_off_by_default_and_reaches_the_simulator_process(
+    tmp_path,
+):
     # The scored path's pacing (owner ruling 2026-09-30): an absent key is the
     # configuration every earlier run and fixture was measured on, so the clamp
     # defaults off and the simulator's environment is unchanged.
@@ -2620,15 +2789,24 @@ def test_usage_problems_and_the_pending_status_map_to_the_declared_codes(capsys)
         status=cli.CommandStatus.PENDING, gate_status=cli.GateStatus.NOT_APPLICABLE
     )
     assert pending.exit_code() == 3
-    assert cli.CommandOutcome(
-        status=cli.CommandStatus.COMPLETE, gate_status=cli.GateStatus.FAIL
-    ).exit_code() == 0
-    assert cli.CommandOutcome(
-        status=cli.CommandStatus.BLOCKED, gate_status=cli.GateStatus.NOT_APPLICABLE
-    ).exit_code() == 2
-    assert cli.CommandOutcome(
-        status=cli.CommandStatus.INVALID, gate_status=cli.GateStatus.NOT_APPLICABLE
-    ).exit_code() == 1
+    assert (
+        cli.CommandOutcome(
+            status=cli.CommandStatus.COMPLETE, gate_status=cli.GateStatus.FAIL
+        ).exit_code()
+        == 0
+    )
+    assert (
+        cli.CommandOutcome(
+            status=cli.CommandStatus.BLOCKED, gate_status=cli.GateStatus.NOT_APPLICABLE
+        ).exit_code()
+        == 2
+    )
+    assert (
+        cli.CommandOutcome(
+            status=cli.CommandStatus.INVALID, gate_status=cli.GateStatus.NOT_APPLICABLE
+        ).exit_code()
+        == 1
+    )
 
 
 def test_registering_the_same_command_twice_is_refused():
@@ -2677,8 +2855,12 @@ def _wait_until_gone(pid, timeout_s=5.0):
         time.sleep(0.05)
 
 
-@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups are a POSIX facility")
-def test_the_real_runner_stops_a_sigterm_ignoring_child_and_the_process_group_it_forked(tmp_path):
+@pytest.mark.skipif(
+    not hasattr(os, "killpg"), reason="process groups are a POSIX facility"
+)
+def test_the_real_runner_stops_a_sigterm_ignoring_child_and_the_process_group_it_forked(
+    tmp_path,
+):
     """The stop owns the child's group, stays bounded, and never raises.
 
     The suite replaces the runner everywhere else, so this is the real stop path:
@@ -2707,7 +2889,9 @@ def test_the_real_runner_stops_a_sigterm_ignoring_child_and_the_process_group_it
                 break
         else:
             time.sleep(0.05)
-    assert grandchild_pid is not None, "the child never forked, so the test would prove nothing"
+    assert grandchild_pid is not None, (
+        "the child never forked, so the test would prove nothing"
+    )
 
     # SIGTERM is ignored: the stop must escalate inside its own bound and return
     # the observed status instead of raising.
@@ -2771,7 +2955,9 @@ class EndlessGateway:
             sequence=self.produced,
             flags=0,
             received_stamp=W.ClockStamp(
-                host_id="test-host", clock_id="monotonic", monotonic_ns=self.clock.monotonic_ns()
+                host_id="test-host",
+                clock_id="monotonic",
+                monotonic_ns=self.clock.monotonic_ns(),
             ),
             imu=W.ImuPayload(
                 capture_host_ns=self.clock.monotonic_ns(),
@@ -2887,7 +3073,9 @@ def test_the_consumer_pass_reports_when_its_own_valve_stops_it(tmp_path):
     writer = W.EvidenceWriter(tmp_path / "out", "run-a")
     adapter = probe._new_adapter(writer, "run-a", ())
     log = W._FlightLog()
-    adapter.record_sink = lambda record: None  # the valve, not the filing, is under test
+    adapter.record_sink = lambda record: (
+        None
+    )  # the valve, not the filing, is under test
     adapter.start()
     try:
         first = probe._read_records(adapter, writer, log, label="run-a")
@@ -3102,12 +3290,16 @@ def test_the_ack_wait_keeps_up_with_a_full_handoff(tmp_path, monkeypatch):
     # The wait paid no 50 ms tax at all: a single sleep would have moved this
     # fake clock by a whole step.
     assert clock.now - started < 0.05
-    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    line = json.loads(
+        (writer.directory / "injections.jsonl").read_text().splitlines()[-1]
+    )
     assert line["injection"] == fault.injection_id
     assert line["ack"]["applied"] is True
 
 
-def test_the_ack_wait_still_sleeps_on_an_empty_stream_and_finds_a_late_ack(tmp_path, monkeypatch):
+def test_the_ack_wait_still_sleeps_on_an_empty_stream_and_finds_a_late_ack(
+    tmp_path, monkeypatch
+):
     """The empty path keeps its courtesy sleep and still catches the answer.
 
     The pacing change removes the tax on returned records, not the wait's
@@ -3135,11 +3327,15 @@ def test_the_ack_wait_still_sleeps_on_an_empty_stream_and_finds_a_late_ack(tmp_p
     # rather than spinning; the deadline was never reached.
     assert clock.now > started
     assert clock.now - started < 2.0
-    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    line = json.loads(
+        (writer.directory / "injections.jsonl").read_text().splitlines()[-1]
+    )
     assert line["ack"]["injection_id"] == fault.injection_id
 
 
-def test_an_acknowledgement_that_never_arrives_is_reported_at_the_deadline(tmp_path, monkeypatch):
+def test_an_acknowledgement_that_never_arrives_is_reported_at_the_deadline(
+    tmp_path, monkeypatch
+):
     """No acknowledgement means applied: False, with the documented reason.
 
     A missing acknowledgement is reported as missing information, never
@@ -3160,14 +3356,20 @@ def test_an_acknowledgement_that_never_arrives_is_reported_at_the_deadline(tmp_p
     assert gateway.faults, "the injection was not even sent"
     assert receipt.applied is False
     assert receipt.acknowledged_state is None
-    assert receipt.reason == "the controller did not acknowledge the injection within 10 s"
+    assert (
+        receipt.reason == "the controller did not acknowledge the injection within 10 s"
+    )
     # The wait stopped at its deadline instead of wandering past it.
     assert clock.now - started < 0.5
-    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    line = json.loads(
+        (writer.directory / "injections.jsonl").read_text().splitlines()[-1]
+    )
     assert line["ack"] is None
 
 
-def test_a_foreign_acknowledgement_is_parked_without_spinning_the_wait(tmp_path, monkeypatch):
+def test_a_foreign_acknowledgement_is_parked_without_spinning_the_wait(
+    tmp_path, monkeypatch
+):
     """An answer to another injection is kept, not re-read in place for ever.
 
     The mismatch branch hands the record back to ``_pending_records``, which
@@ -3203,14 +3405,195 @@ def test_a_foreign_acknowledgement_is_parked_without_spinning_the_wait(tmp_path,
     finally:
         adapter.stop()
     assert gateway.faults == [fault]
-    assert receipt.applied is False, "another injection's answer is not this fault's answer"
+    assert receipt.applied is False, (
+        "another injection's answer is not this fault's answer"
+    )
     assert receipt.acknowledged_state is None
     # The foreign record was kept for the next reader, not consumed by this wait.
-    parked = [record.fault_ack for record in adapter._pending_records if record.fault_ack]
+    parked = [
+        record.fault_ack for record in adapter._pending_records if record.fault_ack
+    ]
     assert [entry["injection_id"] for entry in parked] == [foreign.injection_id]
     # And the wait walked its own deadline out instead of spinning in place.
     assert clock.now > started
     assert clock.now - started <= 1.0
-    line = json.loads((writer.directory / "injections.jsonl").read_text().splitlines()[-1])
+    line = json.loads(
+        (writer.directory / "injections.jsonl").read_text().splitlines()[-1]
+    )
     assert line["injection"] == fault.injection_id
     assert line["ack"] is None
+
+
+# ---------------------------------------------------------------------------
+# The outbound motion commands are recorded beside the inbound stream
+# (ROLL-DEPARTURE.md mission lane: J58's pitch divergence could not be
+# attributed because neither the outgoing SET_POSITION_TARGET_LOCAL_NED nor an
+# ATTITUDE_TARGET was recorded; Z-CLIMB.md section 1 documented the inbound-only
+# capture this closes)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOutboundMessage:
+    """The pymavlink message surface ``_send`` touches: get_type and to_dict."""
+
+    def __init__(self, kind, fields):
+        self._kind = kind
+        self._fields = fields
+
+    def get_type(self):
+        return self._kind
+
+    def to_dict(self):
+        return dict(self._fields)
+
+
+class _Wire:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, message):
+        self.sent.append(message)
+
+
+class _Connection:
+    def __init__(self):
+        self.mav = _Wire()
+
+
+class _RecordingSession(W.PymavlinkSession):
+    """A real session whose wire is a sink, so the choke point is under test."""
+
+    def __init__(self):
+        super().__init__()
+        self._connection = _Connection()
+
+
+def test_the_demand_side_of_the_flight_is_recorded_on_the_same_clock():
+    session = _RecordingSession()
+    captured = []
+    session.on_outbound = captured.append
+    message = _FakeOutboundMessage(
+        "SET_POSITION_TARGET_LOCAL_NED",
+        {"time_boot_ms": 0, "x": -0.15, "y": -0.05, "z": -1.95, "type_mask": 2496},
+    )
+    session._send(message)
+    assert len(session._connection.mav.sent) == 1, "the frame still goes on the wire"
+    assert len(captured) == 1
+    document = captured[0]
+    assert document["mavpackettype"] == "SET_POSITION_TARGET_LOCAL_NED"
+    assert document[W.OUTBOUND_DIRECTION_KEY] == "outbound"
+    assert document["x"] == -0.15 and document["type_mask"] == 2496
+    assert isinstance(document[W.SENT_AT_KEY], int), (
+        "the demand row joins the vehicle's answer rows through the same "
+        "host-monotonic domain the inbound rows are stamped in"
+    )
+
+
+def test_an_attitude_target_would_be_recorded_too():
+    """The set names the message J59 will look for if the mission ever sends one.
+
+    ``ALLOWED_OUTBOUND_TYPES`` still refuses to *send* an attitude target — the
+    capture listing it weakens nothing — so the row shape is proven through the
+    same builder the choke point calls.
+    """
+    assert "ATTITUDE_TARGET" in W.RECORDED_OUTBOUND_TYPES
+    assert "ATTITUDE_TARGET" not in W.ALLOWED_OUTBOUND_TYPES
+    row = W.outbound_record(
+        _FakeOutboundMessage("ATTITUDE_TARGET", {"body_pitch_rate": 0.0}),
+        sent_monotonic_ns=7,
+    )
+    assert row["mavpackettype"] == "ATTITUDE_TARGET"
+    assert row[W.OUTBOUND_DIRECTION_KEY] == "outbound"
+    assert row[W.SENT_AT_KEY] == 7
+
+
+def test_the_session_records_only_the_motion_vocabulary_outbound():
+    """The vision feed's 10 Hz sensor stream must not spend the log's line budget."""
+    assert "VISION_POSITION_ESTIMATE" not in W.RECORDED_OUTBOUND_TYPES
+    assert "SET_POSITION_TARGET_LOCAL_NED" in W.ALLOWED_OUTBOUND_TYPES
+    session = _RecordingSession()
+    captured = []
+    session.on_outbound = captured.append
+    session._send(_FakeOutboundMessage("VISION_POSITION_ESTIMATE", {"usec": 1}))
+    assert captured == []
+
+
+def test_a_session_with_nowhere_to_record_records_nothing():
+    """The honest default: no sink, no guess, no error."""
+    session = _RecordingSession()
+    session._send(_FakeOutboundMessage("SET_POSITION_TARGET_LOCAL_NED", {"x": 1.0}))
+    assert len(session._connection.mav.sent) == 1
+
+
+def test_the_adapter_files_outbound_rows_into_the_run_s_own_mavlink_log(tmp_path):
+    clock = FakeClock()
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+
+    class Session:
+        """A pre-detector double: it has the sink attribute and nothing to put in it."""
+
+        def __init__(self):
+            self.on_outbound = None
+
+        def drain(self):
+            return []
+
+        def close(self):
+            return None
+
+    session = Session()
+    writer = W.EvidenceWriter(tmp_path / "out", "run-a")
+    adapter = W.WebotsArduPilot(
+        settings,
+        runner=FakeRunner(),
+        session=session,
+        gateway=FakeGateway(clock),
+        evidence=writer,
+        label="run-a",
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert session.on_outbound is not None, (
+        "the adapter installs the evidence sink on the session it was built with"
+    )
+    session.on_outbound(
+        {
+            "mavpackettype": "SET_POSITION_TARGET_LOCAL_NED",
+            "x": -0.15,
+            W.SENT_AT_KEY: 5,
+            W.OUTBOUND_DIRECTION_KEY: "outbound",
+        }
+    )
+    row = json.loads((writer.directory / "mavlink.jsonl").read_text().splitlines()[-1])
+    assert row["x"] == -0.15 and row[W.SENT_AT_KEY] == 5
+
+
+def test_an_older_session_without_the_sink_attribute_still_builds(tmp_path):
+    """The probe's scripted doubles predate the sink; the wiring is a guard, not a
+    requirement."""
+    clock = FakeClock()
+    settings = settings_for(write_scene(tmp_path), tmp_path)
+
+    class Session:
+        def drain(self):
+            return []
+
+        def close(self):
+            return None
+
+    adapter = W.WebotsArduPilot(
+        settings,
+        runner=FakeRunner(),
+        session=Session(),
+        gateway=FakeGateway(clock),
+        evidence=W.EvidenceWriter(tmp_path / "out", "run-a"),
+        label="run-a",
+        monotonic_ns=clock.monotonic_ns,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert adapter is not None
+    assert not hasattr(Session(), "on_outbound"), (
+        "the guard leaves a session without the attribute untouched"
+    )

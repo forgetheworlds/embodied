@@ -220,7 +220,6 @@ def test_record_refuses_a_loaded_host(tmp_path, monkeypatch):
     assert not (output / "episode").exists()
 
 
-
 def test_a_held_port_is_seen_by_the_gate():
     """The port gate's own detection, on a port this test really holds.
 
@@ -251,6 +250,7 @@ def test_a_held_port_blocks_the_run(tmp_path, monkeypatch):
     assert any("5760" in reason for reason in outcome.reasons)
     assert not (output / "episode").exists()
 
+
 def test_registration_is_idempotent_and_a_foreign_claim_is_refused(tmp_path):
     fixture = _write_fixture_root(tmp_path / "repo")
     document = live_record.load_suite_document(fixture["suite_path"])
@@ -268,7 +268,14 @@ def test_registration_is_idempotent_and_a_foreign_claim_is_refused(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _run_record(tmp_path, monkeypatch, suite_path: Path, suite_name: str, *extra, mode="sensor-derived"):
+def _run_record(
+    tmp_path,
+    monkeypatch,
+    suite_path: Path,
+    suite_name: str,
+    *extra,
+    mode="sensor-derived",
+):
     from embodied.bench import cli as bench_cli  # registers the bench command
     from embodied.cli import main
 
@@ -283,18 +290,25 @@ def _run_record(tmp_path, monkeypatch, suite_path: Path, suite_name: str, *extra
     output = tmp_path / "run"
     code = main(
         [
-            "bench", "record",
-            "--suite", suite_name,
-            "--sensor-mode", mode,
-            "--arm", extra[0] if extra else "B0",
-            "--output", str(output),
+            "bench",
+            "record",
+            "--suite",
+            suite_name,
+            "--sensor-mode",
+            mode,
+            "--arm",
+            extra[0] if extra else "B0",
+            "--output",
+            str(output),
         ]
     )
     receipt = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
     return code, receipt
 
 
-def test_a_cloud_arm_is_admitted_only_against_a_recorded_budget_cap(tmp_path, monkeypatch):
+def test_a_cloud_arm_is_admitted_only_against_a_recorded_budget_cap(
+    tmp_path, monkeypatch
+):
     """A paid arm runs against a recorded cap, and is refused by name without one.
 
     The arm gate's own condition is a recorded budget cap, so a capped cloud arm
@@ -336,9 +350,7 @@ def test_a_cloud_arm_is_admitted_only_against_a_recorded_budget_cap(tmp_path, mo
 
 
 def test_a_sensor_mode_the_suite_does_not_declare_is_blocked(tmp_path, monkeypatch):
-    fixture = _write_fixture_root(
-        tmp_path / "repo", localization_mode="pose-assisted"
-    )
+    fixture = _write_fixture_root(tmp_path / "repo", localization_mode="pose-assisted")
     code, receipt = _run_record(
         tmp_path, monkeypatch, fixture["suite_path"], fixture["suite"]["name"]
     )
@@ -701,11 +713,16 @@ def test_the_cli_records_a_held_out_suite_against_its_own_truth(tmp_path, monkey
     output = tmp_path / "run"
     code = main(
         [
-            "bench", "record",
-            "--suite", "holdout-e-wide",
-            "--sensor-mode", "sensor-derived",
-            "--arm", "B0",
-            "--output", str(output),
+            "bench",
+            "record",
+            "--suite",
+            "holdout-e-wide",
+            "--sensor-mode",
+            "sensor-derived",
+            "--arm",
+            "B0",
+            "--output",
+            str(output),
         ]
     )
     assert code == 0
@@ -768,7 +785,12 @@ def test_the_agent_projection_cannot_reach_the_bench_side_store(tmp_path):
     # Nothing in the episode directory is a bench-private member.
     assert not (episode / "truth-events.jsonl").exists()
     members = {entry.name for entry in episode.iterdir()}
-    assert members == {"manifest.json", "agent-events.jsonl", "final-report.json", "payloads"}
+    assert members == {
+        "manifest.json",
+        "agent-events.jsonl",
+        "final-report.json",
+        "payloads",
+    }
     # And replay reconstructs the agent stream without opening the store.
     document = replay(episode)
     assert document["event_count"] == len(surface.agent_events())
@@ -776,7 +798,9 @@ def test_the_agent_projection_cannot_reach_the_bench_side_store(tmp_path):
 
 def test_the_runtime_never_reads_a_truth_pose():
     """The runtime's own source: pose records are dispatched out, not read in."""
-    source = (REPOSITORY / "src" / "embodied" / "platform" / "mission_runtime.py").read_text()
+    source = (
+        REPOSITORY / "src" / "embodied" / "platform" / "mission_runtime.py"
+    ).read_text()
     # The estimator's input is stereo and inertial only: the client is written
     # in exactly two places, and neither is a truth branch.
     assert source.count("client.send(") == 2
@@ -821,7 +845,9 @@ def test_the_instruction_is_interpreted_from_its_own_words():
     assert contract.return_obligation == "return to the start position and land"
     with pytest.raises(ValueError):
         mission_module.mission_contract(
-            mission_id="m1", instruction="do something",budget=(("mission_sim_s", 300.0),)
+            mission_id="m1",
+            instruction="do something",
+            budget=(("mission_sim_s", 300.0),),
         )
 
 
@@ -841,7 +867,9 @@ def test_a_claim_states_its_outcome_and_cites_its_evidence():
     assert by_predicate["found"].support_refs == ("obs-1",)
     assert by_predicate["inspected"].observed == "not_inspected"
     assert by_predicate["inspected"].kind is ClaimKind.INFERENCE
-    assert by_predicate["inspected"].unmet_requirements == ("requirement_inspected_unmet",)
+    assert by_predicate["inspected"].unmet_requirements == (
+        "requirement_inspected_unmet",
+    )
     assert report.unmet_requirements == ("requirement_inspected_unmet",)
     assert report.physical_return_status == "returned"
     assert all(claim.target == "red_block" for claim in report.claims)
@@ -864,7 +892,9 @@ def test_the_proposer_finds_the_declared_colour_and_shape_only():
     assert len(green) == 1
     assert green[0].region == pytest.approx((200.0, 150.0, 270.0, 220.0))
     # A query with no colour word refuses rather than guessing.
-    assert isinstance(proposer.candidates(image, "the thing on the table"), DetectorUnavailable)
+    assert isinstance(
+        proposer.candidates(image, "the thing on the table"), DetectorUnavailable
+    )
     # Determinism: the same frame proposes the same candidates.
     assert [c.candidate_id for c in proposer.candidates(image, "red block")] == [
         candidate.candidate_id for candidate in found
@@ -886,7 +916,10 @@ def test_the_proposer_rejects_a_shape_the_query_does_not_name():
 
 
 def _runtime(tmp_path):
-    from embodied.platform.localization_check import _load_localization_config, _platform_settings
+    from embodied.platform.localization_check import (
+        _load_localization_config,
+        _platform_settings,
+    )
     from embodied.platform.mission_runtime import MissionRuntime
     from embodied.bench.recorder import Recorder
 
@@ -919,15 +952,25 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
     runtime, _ = _runtime(tmp_path)
     # The mission frame is the aligned frame, so nothing can resolve before the
     # alignment seals from the estimator's first healthy state.
-    assert runtime.resolve_targets(
-        SpatialGoal(
-            proposal_id="p-unsealed", request_id=None, fingerprint="fp-u",
-            mission_revision=0, base_goal_revision=0, selection_ids=(),
-            target_refs=("start",), intent="return", constraints=(),
-            completion_condition="c", lease_bounds=(("step_lease_s", 30.0),),
-            local_discretion_bounds=(),
+    assert (
+        runtime.resolve_targets(
+            SpatialGoal(
+                proposal_id="p-unsealed",
+                request_id=None,
+                fingerprint="fp-u",
+                mission_revision=0,
+                base_goal_revision=0,
+                selection_ids=(),
+                target_refs=("start",),
+                intent="return",
+                constraints=(),
+                completion_condition="c",
+                lease_bounds=(("step_lease_s", 30.0),),
+                local_discretion_bounds=(),
+            )
         )
-    ) == ()
+        == ()
+    )
     runtime.alignment.seal((1.0, 0.0, 0.0, 0.0))
     calibration = runtime.calibration
     height, width = 480, 640
@@ -964,7 +1007,12 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
     # capture clock, so the test drives them together exactly as a pair would.
     runtime._capture_clock_ns = 500_000_000
     runtime.store.integrate(
-        product, pose, calibration, stamp_ns=500_000_000, observation_id="obs-1", now_ns=500_000_000
+        product,
+        pose,
+        calibration,
+        stamp_ns=500_000_000,
+        observation_id="obs-1",
+        now_ns=500_000_000,
     )
     assert runtime.store.free_cells(now_ns=500_000_000)
     regions = runtime.frontier_regions()
@@ -972,14 +1020,25 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
     assert all(name.startswith("frontier:") for name in regions)
     # Without a recorded observation there is nothing to cite, so a map-derived
     # target is refused rather than fabricated.
-    assert runtime.resolve_targets(
-        SpatialGoal(
-            proposal_id="p-none", request_id=None, fingerprint="fp0", mission_revision=0,
-            base_goal_revision=0, selection_ids=(), target_refs=("start",), intent="return",
-            constraints=(), completion_condition="c", lease_bounds=(("step_lease_s", 30.0),),
-            local_discretion_bounds=(),
+    assert (
+        runtime.resolve_targets(
+            SpatialGoal(
+                proposal_id="p-none",
+                request_id=None,
+                fingerprint="fp0",
+                mission_revision=0,
+                base_goal_revision=0,
+                selection_ids=(),
+                target_refs=("start",),
+                intent="return",
+                constraints=(),
+                completion_condition="c",
+                lease_bounds=(("step_lease_s", 30.0),),
+                local_discretion_bounds=(),
+            )
         )
-    ) == ()
+        == ()
+    )
     runtime._last_observation_id = "obs-1"
     goal = SpatialGoal(
         proposal_id="p-start",
@@ -1006,9 +1065,12 @@ def test_frontiers_cluster_and_the_start_target_is_grounded(tmp_path):
     # The mission frame is world-anchored local NED, so the spawn sits at the
     # world's own vehicle translation and the hover band above it.
     origin = runtime.alignment.aligned_position_ned((0.0, 0.0, 0.0))
-    assert region.contains((origin[0], origin[1], origin[2] - runtime.settings.hover_altitude_m))
+    assert region.contains(
+        (origin[0], origin[1], origin[2] - runtime.settings.hover_altitude_m)
+    )
     assert region == GE.approach_region(
-        targets[0].geometry, GE.Envelope(body_radius_m=0.3, error_allowance_m=0.15),
+        targets[0].geometry,
+        GE.Envelope(body_radius_m=0.3, error_allowance_m=0.15),
         direction=(1.0, 0.0, 0.0),
     )
     # A frontier ref resolves to a map-evidenced target at the current revision.
@@ -1036,8 +1098,13 @@ def test_the_seed_reads_the_suites_world_state_layout(tmp_path):
     """The suite nests its world state under ``world_state``; both shapes work."""
     nested = {
         "schema": "first-indoor-truth-1",
-        "world_state": {"targets": {"red_block": {"present": True}}, "world_counts": {"red_block": 1}},
-        "identity": {"red_block": {"position_ned_from_world_origin_m": [8.8, 1.6, -0.9]}},
+        "world_state": {
+            "targets": {"red_block": {"present": True}},
+            "world_counts": {"red_block": 1},
+        },
+        "identity": {
+            "red_block": {"position_ned_from_world_origin_m": [8.8, 1.6, -0.9]}
+        },
     }
     seed_path = tmp_path / "truth.yaml"
     seed_path.write_text(yaml.safe_dump(nested, sort_keys=False), encoding="utf-8")
@@ -1046,15 +1113,22 @@ def test_the_seed_reads_the_suites_world_state_layout(tmp_path):
         "targets": {"red_block": {"present": True}},
         "world_counts": {"red_block": 1},
     }
-    assert live_record.target_position_ned(seed, "red_block") == pytest.approx((8.8, 1.6, -0.9))
+    assert live_record.target_position_ned(seed, "red_block") == pytest.approx(
+        (8.8, 1.6, -0.9)
+    )
 
 
 def test_the_seed_must_declare_the_target_position(tmp_path):
-    seed = {"targets": {"red_block": {"present": True}}, "world_counts": {"red_block": 1}}
+    seed = {
+        "targets": {"red_block": {"present": True}},
+        "world_counts": {"red_block": 1},
+    }
     with pytest.raises(live_record.SuiteConfigError):
         live_record.target_position_ned(seed, "red_block")
     good = dict(seed, identity={"red_block": {"position_enu_m": [4.0, 0.0, 0.9]}})
-    assert live_record.target_position_ned(good, "red_block") == pytest.approx((4.0, -0.0, -0.9))
+    assert live_record.target_position_ned(good, "red_block") == pytest.approx(
+        (4.0, -0.0, -0.9)
+    )
 
 
 def test_the_bench_side_envelope_refuses_a_target_entry_with_extra_keys(tmp_path):
@@ -1078,7 +1152,7 @@ def test_physical_predicates_need_a_sustained_hold_and_a_return():
     collector = live_record.TruthCollector()
     for sim_s, xyz in [
         (0.0, (0.0, 0.0, -0.1)),
-        (0.5, (4.0, 0.0, -0.9)),   # a single pass, not a hold
+        (0.5, (4.0, 0.0, -0.9)),  # a single pass, not a hold
         (1.0, (9.0, 9.0, -0.9)),
         (2.0, (0.1, 0.0, -0.1)),
     ]:
@@ -1087,11 +1161,16 @@ def test_physical_predicates_need_a_sustained_hold_and_a_return():
         (4.0, 0.0, -0.9), radius_m=1.5, hold_s=1.0
     )
     assert inspected is False and "interval" in detail
-    returned, _ = collector.returned_near(radius_m=1.0)
+    returned, _ = collector.returned_near(
+        radius_m=1.0,
+        end_state={"armed": False, "mode": "LAND", "attitude_rpy": [0.5, -0.5, 0.0]},
+    )
     assert returned is True
     sustained = live_record.TruthCollector()
     for sim_s in (0.0, 0.5, 1.0, 1.5):
         sustained(_FakeTruthRecord(sim_s, (4.0, 0.2, -0.9)))
-    inspected, detail = sustained.inspected_within((4.0, 0.0, -0.9), radius_m=1.5, hold_s=1.0)
+    inspected, detail = sustained.inspected_within(
+        (4.0, 0.0, -0.9), radius_m=1.5, hold_s=1.0
+    )
     assert inspected is True
     assert "held within" in detail

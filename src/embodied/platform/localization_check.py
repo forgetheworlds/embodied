@@ -28,6 +28,7 @@ Evaluator truth measures error; it never enters the runtime. On a branch
 without the merged gate's truth channel the E1 statistics are recorded as
 ``not_measured`` with the reason, and the gate cannot pass.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -589,7 +590,9 @@ BRING_UP_TAKEOFF_SLEW_RESTORE_VALUE = 2.0  # Parameters.cpp:978, the pin's defau
 # below); full stick now expresses the declared 0.3 m/s. Restored to the
 # firmware's own default 2.5 before the scored window opens.
 BRING_UP_CLIMB_RATE_PARAMETER = "PILOT_SPD_UP"
-BRING_UP_CLIMB_RATE_WINDOW_VALUE = 0.3  # re-declared from 0.5, see the 2026-09-29 note above
+BRING_UP_CLIMB_RATE_WINDOW_VALUE = (
+    0.3  # re-declared from 0.5, see the 2026-09-29 note above
+)
 BRING_UP_CLIMB_RATE_RESTORE_VALUE = 2.5  # the pin's own default
 
 # The window's sixth parameter, and the one the whole excitation turns on: the
@@ -791,7 +794,9 @@ BRING_UP_WINDOW_PARAMETERS: tuple[tuple[str, float, float, str], ...] = (
 # which is the same class of defect as a parameter write under a name the vehicle
 # does not have. The PWM actually sent is recorded in the receipt, so the
 # declaration is a rate and the receipt is the measurement.
-BRING_UP_THROTTLE_CLIMB_RATE_M_S = 0.3  # re-declared from 0.5, see BRING_UP_CLIMB_RATE_WINDOW_VALUE above
+BRING_UP_THROTTLE_CLIMB_RATE_M_S = (
+    0.3  # re-declared from 0.5, see BRING_UP_CLIMB_RATE_WINDOW_VALUE above
+)
 # The rate the window will not exceed: the airframe's declared maximum pilot
 # climb rate is WP_SPD_UP 1.0 m/s (compat_arming.parm), and a rate above it would
 # be a faster climb than any other part of this project commands.
@@ -1221,7 +1226,9 @@ def _port_is_free(port: int) -> bool:
             return False
 
 
-def _pin_evidence(localization: dict[str, Any], root: Path) -> tuple[dict[str, Any], list[str]]:
+def _pin_evidence(
+    localization: dict[str, Any], root: Path
+) -> tuple[dict[str, Any], list[str]]:
     """The pin's version evidence, measured on disk rather than quoted (plan section 3).
 
     A pin that is only asserted is not a pin. This re-derives the pinned tarball's
@@ -1235,7 +1242,9 @@ def _pin_evidence(localization: dict[str, Any], root: Path) -> tuple[dict[str, A
     estimator = localization["estimator"]
     build_log = root / estimator["build_log"]
     build_text = (
-        build_log.read_text(encoding="utf-8", errors="replace") if build_log.is_file() else None
+        build_log.read_text(encoding="utf-8", errors="replace")
+        if build_log.is_file()
+        else None
     )
     measured_tarball = _sha256(root / estimator["tarball_path"])
     record = {
@@ -1245,13 +1254,17 @@ def _pin_evidence(localization: dict[str, Any], root: Path) -> tuple[dict[str, A
         "tarball_path": estimator["tarball_path"],
         "tarball_sha256_configured": estimator["tarball_sha256"],
         "tarball_sha256_measured": measured_tarball,
-        "tarball_matches_configured_pin": measured_tarball == estimator["tarball_sha256"],
+        "tarball_matches_configured_pin": measured_tarball
+        == estimator["tarball_sha256"],
         "build_log": estimator["build_log"],
         "build_success_marker": estimator["build_success_marker"],
         "build_marker_present": bool(
             build_text is not None and estimator["build_success_marker"] in build_text
         ),
-        "library": {"path": estimator["library"], "sha256": _sha256(root / estimator["library"])},
+        "library": {
+            "path": estimator["library"],
+            "sha256": _sha256(root / estimator["library"]),
+        },
         "executable": {
             "path": estimator["executable"],
             "sha256": _sha256(root / estimator["executable"]),
@@ -1259,7 +1272,9 @@ def _pin_evidence(localization: dict[str, Any], root: Path) -> tuple[dict[str, A
     }
     blockers: list[str] = []
     if measured_tarball is None:
-        blockers.append(f"the pinned tarball {estimator['tarball_path']} is not on disk")
+        blockers.append(
+            f"the pinned tarball {estimator['tarball_path']} is not on disk"
+        )
     elif not record["tarball_matches_configured_pin"]:
         blockers.append(
             f"the pinned tarball's sha256 {measured_tarball} does not match the configured pin "
@@ -1277,7 +1292,9 @@ def _pin_evidence(localization: dict[str, Any], root: Path) -> tuple[dict[str, A
             "estimator tree is evidenced"
         )
     if record["library"]["sha256"] is None:
-        blockers.append(f"the built estimator library {estimator['library']} is not on disk")
+        blockers.append(
+            f"the built estimator library {estimator['library']} is not on disk"
+        )
     return record, blockers
 
 
@@ -1338,6 +1355,7 @@ def _seam_blockers(document: dict[str, Any], root: Path) -> list[str]:
         )
     return blockers
 
+
 def _mode_blockers(document: dict[str, Any], mode: SensorMode) -> list[str]:
     """The arm the configuration declares and the arm asked for must be the same arm.
 
@@ -1374,7 +1392,9 @@ def _truth_republish_blockers(settings: PlatformSettings) -> list[str]:
     ]
 
 
-def _readback_blockers(applied: dict[str, float], refusals: dict[str, int]) -> list[str]:
+def _readback_blockers(
+    applied: dict[str, float], refusals: dict[str, int]
+) -> list[str]:
     """The vehicle's own parameter readback against the claimed arm (plan section 4.7).
 
     The applied file is what we asked for; this is what the autopilot reported about
@@ -1445,7 +1465,11 @@ def _decode_param_error(document: dict[str, Any]) -> dict[str, Any] | None:
         index = document.get("param_index")
         error = document.get("error")
         if param_id and index is not None and error is not None:
-            return {"param_id": param_id, "param_index": int(index), "error": int(error)}
+            return {
+                "param_id": param_id,
+                "param_index": int(index),
+                "error": int(error),
+            }
         return None
     if kind != f"UNKNOWN_{PARAM_ERROR_MSG_ID}":
         return None
@@ -1454,8 +1478,8 @@ def _decode_param_error(document: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if frame[7] | (frame[8] << 8) | (frame[9] << 16) != PARAM_ERROR_MSG_ID:
         return None
-    param_index, target_system, target_component, raw_id, error = _PARAM_ERROR_PAYLOAD.unpack(
-        frame[10 : 10 + _PARAM_ERROR_PAYLOAD.size]
+    param_index, target_system, target_component, raw_id, error = (
+        _PARAM_ERROR_PAYLOAD.unpack(frame[10 : 10 + _PARAM_ERROR_PAYLOAD.size])
     )
     param_id = raw_id.split(b"\x00")[0].decode("utf-8", errors="replace")
     return {
@@ -1553,7 +1577,9 @@ def _gps_aiding_verdict(mavlink_log: Path) -> dict[str, Any]:
     }
 
 
-def _params_applied_record(applied: dict[str, float], refusals: dict[str, int]) -> dict[str, Any]:
+def _params_applied_record(
+    applied: dict[str, float], refusals: dict[str, int]
+) -> dict[str, Any]:
     """Every required name with its outcome kept distinct (plan section 4.7 G2)."""
     record: dict[str, Any] = {}
     for name, expected, source in VEHICLE_REQUIREMENTS:
@@ -1665,6 +1691,7 @@ def _declared_start_origin(world: Path) -> tuple[float, float, float]:
         "from the scene (plan section 0.3 item 3)"
     )
 
+
 _VEHICLE_ROTATION_RE = re.compile(
     r"^\s*rotation\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)"
     r"\s+(-?\d+(?:\.\d+)?)"
@@ -1688,7 +1715,9 @@ def _declared_start_attitude(world: Path) -> tuple[float, float, float]:
         if line.strip().startswith("Iris {"):
             for candidate in lines[index + 1 : index + 20]:
                 stripped = candidate.strip()
-                if stripped.startswith("controllerArgs") or stripped.startswith("children"):
+                if stripped.startswith("controllerArgs") or stripped.startswith(
+                    "children"
+                ):
                     break
                 match = _VEHICLE_ROTATION_RE.match(candidate)
                 if match:
@@ -1756,6 +1785,7 @@ def _autopilot_feed_endpoint(
         "into an unserved one is a silent void (plan section 0.5)"
     )
 
+
 def _fast_keypoint_counts(frame_paths: Sequence[Path]) -> list[int] | None:
     """Measure frames with exactly the detector call the pinned tracker makes.
 
@@ -1765,7 +1795,9 @@ def _fast_keypoint_counts(frame_paths: Sequence[Path]) -> list[int] | None:
         import cv2
     except ImportError:
         return None
-    detector = cv2.FastFeatureDetector_create(threshold=FAST_THRESHOLD, nonmaxSuppression=True)
+    detector = cv2.FastFeatureDetector_create(
+        threshold=FAST_THRESHOLD, nonmaxSuppression=True
+    )
     counts: list[int] = []
     for frame_path in frame_paths:
         image = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
@@ -1797,7 +1829,9 @@ def _stereo_capture_measurement(pairs_dir: Path, limit: int) -> dict[str, Any]:
     }
     pairs: list[tuple[Path, Path]] = []
     for left_path in left_paths:
-        right_path = left_path.with_name(left_path.name.replace("-left.ppm", "-right.ppm"))
+        right_path = left_path.with_name(
+            left_path.name.replace("-left.ppm", "-right.ppm")
+        )
         if not right_path.is_file():
             measurement["missing_right"].append(left_path.name)
             continue
@@ -1852,7 +1886,9 @@ def _scene_admission_check(
     current_sha256 = _sha256(settings.world)
     unhashed = 0
     unusable = 0
-    for pairs_dir in sorted(capture_dirs, key=lambda path: path.stat().st_mtime, reverse=True):
+    for pairs_dir in sorted(
+        capture_dirs, key=lambda path: path.stat().st_mtime, reverse=True
+    ):
         if not any(pairs_dir.glob("*-left.ppm")):
             continue
         recorded = _recorded_world_sha256(pairs_dir.parent)
@@ -1938,7 +1974,9 @@ def _zupt_frame_decisions(lines: Sequence[str]) -> list[dict[str, Any]]:
                 {
                     **(pending or {}),
                     "decision": (
-                        "accepted" if verdict.group(1) == "accepted" else "declined_motion"
+                        "accepted"
+                        if verdict.group(1) == "accepted"
+                        else "declined_motion"
                     ),
                     "velocity_m_s": float(verdict.group(2)),
                     "chi2": float(verdict.group(3)),
@@ -2049,12 +2087,15 @@ def _initialization_blocker(diagnostics: dict[str, Any]) -> str:
         "is unavailable-navigation, not a delayed arm"
     )
 
+
 # ---------------------------------------------------------------------------
 # The declared ordered bring-up (plan sections 0.6 item 6, 0.8 item 7)
 # ---------------------------------------------------------------------------
 
 
-_SITL_HOME_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)")
+_SITL_HOME_RE = re.compile(
+    r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)"
+)
 
 
 def _sitl_home_origin_datum(sitl_home: str) -> tuple[float, float, float]:
@@ -2103,7 +2144,9 @@ def _bring_up_throttle_pwm(
     the ideal one. A calibration that cannot express the rate inside the channel's
     own range raises rather than returning a value that means something else.
     """
-    missing = [name for name in BRING_UP_THROTTLE_CALIBRATION if name not in calibration]
+    missing = [
+        name for name in BRING_UP_THROTTLE_CALIBRATION if name not in calibration
+    ]
     if missing:
         raise ConfigError(
             "the throttle override's derivation needs the vehicle's own answers for "
@@ -2434,6 +2477,8 @@ def _bring_up_closure_blockers(
             "not open"
         )
     return blockers
+
+
 # ---------------------------------------------------------------------------
 # Preflight: everything the claimed arm needs, reported in one pass
 # ---------------------------------------------------------------------------
@@ -2485,7 +2530,9 @@ def _preflight(
     )
     satisfied = satisfied and scene_ok
     for check in check_prerequisites(settings, output_dir):
-        rows.append({"name": check.name, "satisfied": check.satisfied, "detail": check.detail})
+        rows.append(
+            {"name": check.name, "satisfied": check.satisfied, "detail": check.detail}
+        )
         satisfied = satisfied and check.satisfied
     mavlink_port = _parse_mavlink_port(settings.mavlink_endpoint)
     port_free = mavlink_port is not None and _port_is_free(mavlink_port)
@@ -2494,7 +2541,11 @@ def _preflight(
             "name": "port_mavlink",
             "satisfied": port_free,
             "detail": f"tcp {settings.mavlink_endpoint} is "
-            + ("free" if port_free else "already in use; kill orphaned SITL processes first"),
+            + (
+                "free"
+                if port_free
+                else "already in use; kill orphaned SITL processes first"
+            ),
         }
     )
     satisfied = satisfied and port_free
@@ -2575,7 +2626,9 @@ def _pose_assisted_outcome(
     )
 
 
-def _localize_check_command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
+def _localize_check_command(
+    args: argparse.Namespace, output_dir: Path
+) -> CommandOutcome:
     mode = SensorMode(args.mode)
     document = _load_localization_config(Path(args.config))
     if mode is SensorMode.POSE_ASSISTED:
@@ -2593,7 +2646,9 @@ def _localize_check_command(args: argparse.Namespace, output_dir: Path) -> Comma
         json.dumps(preflight, indent=2) + "\n", encoding="utf-8"
     )
     if not satisfied:
-        blockers = tuple(f"{row['name']}: {row['detail']}" for row in rows if not row["satisfied"])
+        blockers = tuple(
+            f"{row['name']}: {row['detail']}" for row in rows if not row["satisfied"]
+        )
         return _blocked_unresolved(
             blockers,
             (
@@ -2630,8 +2685,9 @@ SIMULATOR_CLOCK_SOURCE = (
     "reads it on every record. A window declared in simulated seconds is spent "
     "against this clock, so the window means the same thing on a fast host and on a "
     "loaded one -- the unit probe's own windows already declare "
-    "(\"a window measured in simulated time is comparable between the realtime and "
-    "fast modes\", configs/first_indoor.yaml)")
+    '("a window measured in simulated time is comparable between the realtime and '
+    'fast modes", configs/first_indoor.yaml)'
+)
 #
 # Simulation time arrives as a float, so a window that ends exactly on a frame
 # boundary can miss it by a rounding step; the bridge's own sim-time window carries
@@ -2750,11 +2806,7 @@ class _SimWindow:
 
     def elapsed_wall_s(self) -> float:
         """Host seconds this window cost, frozen once it has ended."""
-        end = (
-            self.ended_wall_s
-            if self.ended_wall_s is not None
-            else self._wall_clock()
-        )
+        end = self.ended_wall_s if self.ended_wall_s is not None else self._wall_clock()
         return max(0.0, end - self.started_wall_s)
 
     def expired(self) -> bool:
@@ -2785,6 +2837,7 @@ class _SimWindow:
         if self.ended_by is None:
             self._freeze()
             self.ended_by = reason
+
     def document(self) -> dict[str, Any]:
         """A JSON-ready view: the budget, what it cost in each clock, and what ended it."""
         elapsed = self.elapsed_simulator_s()
@@ -2927,7 +2980,9 @@ def _write_environment(
     )
 
 
-def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> CommandOutcome:
+def _run_sensor_derived_live(
+    document: dict[str, Any], output_dir: Path
+) -> CommandOutcome:
     root = repository_root()
     settings = _platform_settings(document, root)
     localization = document["localization"]
@@ -3061,7 +3116,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         ):
             scene_capture["last_s"] = now
             index = scene_capture["count"] + 1
-            header = f"P6\n{settings.stereo.width} {settings.stereo.height}\n255\n".encode()
+            header = (
+                f"P6\n{settings.stereo.width} {settings.stereo.height}\n255\n".encode()
+            )
             writer.write_bytes(
                 f"pairs/{index:05d}-left.ppm", header + bytes(record.pair.left_bytes)
             )
@@ -3093,7 +3150,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             handle.write(
                 json.dumps(
                     {
-                        "published_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                        "published_at_utc": datetime.now(timezone.utc).isoformat(
+                            timespec="milliseconds"
+                        ),
                         **aligned,
                         "n_tracks": state.n_tracks,
                         "t_last_visual_ns": state.t_last_visual_ns,
@@ -3128,7 +3187,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         settings,
         runner=LowPrioritySubprocessRunner(),
         session=session,
-        gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
+        gateway=TcpSensorGateway(
+            stamp=lambda: settings.capture_stamp(time.monotonic_ns())
+        ),
         evidence=writer,
         label="run-a",
         extra_params=settings.estimator_params,
@@ -3345,7 +3406,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
     scored_end_state: dict[str, Any] | None = None
     shutdown: Any = None
 
-    def gate_the_scored_arm(applied: dict[str, float], refusals: dict[str, int]) -> list[str]:
+    def gate_the_scored_arm(
+        applied: dict[str, float], refusals: dict[str, int]
+    ) -> list[str]:
         """Sections 4.6 and 4.7, as observation: what was sent, and what the vehicle reports.
 
         Every item is read from the things that acted — the bridge's own count of
@@ -3461,10 +3524,14 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         applied: dict[str, float] = {}
         for name, _expected, _source in VEHICLE_REQUIREMENTS:
             applied.update(
-                platform.read_parameters((name,), timeout_s=PARAMETER_READ_TIMEOUT_S, drain=drain)
+                platform.read_parameters(
+                    (name,), timeout_s=PARAMETER_READ_TIMEOUT_S, drain=drain
+                )
             )
         refusals = _param_error_refusals(writer.path("mavlink.jsonl"))
-        writer.write_json("params-applied.json", _params_applied_record(applied, refusals))
+        writer.write_json(
+            "params-applied.json", _params_applied_record(applied, refusals)
+        )
         log_lines.append(
             f"autopilot parameter readback: {applied}; refused by the vehicle: {sorted(refusals)}"
         )
@@ -3478,7 +3545,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
             live_blockers.append(str(error))
             log_lines.append(f"UNRESOLVED: {error}")
 
-        scene_blocker = _scene_capture_gate(writer, settings, drain, scene_capture, log_lines)
+        scene_blocker = _scene_capture_gate(
+            writer, settings, drain, scene_capture, log_lines
+        )
         if scene_blocker:
             live_blockers.append(scene_blocker)
         # The DECLARED ORDERED BRING-UP (plan sections 0.6 item 6, 0.8 item 7):
@@ -3523,7 +3592,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
         )
         if not initialized_in_window:
             live_blockers.append(
-                _initialization_blocker(_initializer_diagnostics(writer.path("estimator.log")))
+                _initialization_blocker(
+                    _initializer_diagnostics(writer.path("estimator.log"))
+                )
             )
         else:
             log_lines.append("estimator initialized before arm (H5)")
@@ -3551,7 +3622,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     _capture_clock_ns(stats),
                     {"timeout_s": settings.step_timeout_s.flight},
                 )
-            control = platform.arm_and_guided(settings.step_timeout_s.flight, drain=drain)
+            control = platform.arm_and_guided(
+                settings.step_timeout_s.flight, drain=drain
+            )
             if control.refused:
                 live_blockers.append(
                     f"the autopilot refused Guided flight with GPS off: mode_reached="
@@ -3660,7 +3733,9 @@ def _run_sensor_derived_live(document: dict[str, Any], output_dir: Path) -> Comm
                     sample_disagreement(f"hold-{index}")
                 log_lines.append("route complete; commanding LAND")
                 if capture is not None:
-                    capture.command("land", _capture_clock_ns(stats), {"phase": "scored-route"})
+                    capture.command(
+                        "land", _capture_clock_ns(stats), {"phase": "scored-route"}
+                    )
                 session.set_mode("LAND")
                 # The FLIGHT ends here, at the LAND command. The freshness metrics --
                 # F1's publish gaps and F2's published-state age -- stop being recorded,
@@ -3921,6 +3996,7 @@ def _capture_clock_ns(stats: _FeedStats) -> int | None:
     newest = stats.sim_clock.newest_s
     return None if newest is None else sim_time_ns(newest)
 
+
 def _simulator_pacing_document(
     settings: PlatformSettings,
     controller_pacing: Any,
@@ -4117,7 +4193,11 @@ def _run_ordered_bring_up(
         drain()
         link.drain()
         echoed = next(
-            (reply for reply in link.replies if reply.get("mavpackettype") == "GPS_GLOBAL_ORIGIN"),
+            (
+                reply
+                for reply in link.replies
+                if reply.get("mavpackettype") == "GPS_GLOBAL_ORIGIN"
+            ),
             None,
         )
         time.sleep(0.05)
@@ -4165,7 +4245,10 @@ def _run_ordered_bring_up(
                         "values": snapshot,
                     }
                 )
-            if all(_vehicle_parameter_matches(reported.get(name), expected[name]) for name in names):
+            if all(
+                _vehicle_parameter_matches(reported.get(name), expected[name])
+                for name in names
+            ):
                 break
             if time.monotonic() >= deadline:
                 break
@@ -4232,7 +4315,11 @@ def _run_ordered_bring_up(
             return
         now = stats.sim_clock.newest_s
         last = override["last_refresh_simulator_s"]
-        if now is not None and last is not None and now - last < BRING_UP_OVERRIDE_REFRESH_S:
+        if (
+            now is not None
+            and last is not None
+            and now - last < BRING_UP_OVERRIDE_REFRESH_S
+        ):
             return
         # With no simulator reading yet the cadence cannot be measured, and the vehicle
         # lapses an unrefreshed override on its own clock, which is stalled with the
@@ -4259,8 +4346,13 @@ def _run_ordered_bring_up(
                 override["observed_during_window"] = observed
         return observed
 
-    window_values = {name: window_value for name, window_value, _r, _w in BRING_UP_WINDOW_PARAMETERS}
-    restore_values = {name: restore_value for name, _w, restore_value, _r in BRING_UP_WINDOW_PARAMETERS}
+    window_values = {
+        name: window_value for name, window_value, _r, _w in BRING_UP_WINDOW_PARAMETERS
+    }
+    restore_values = {
+        name: restore_value
+        for name, _w, restore_value, _r in BRING_UP_WINDOW_PARAMETERS
+    }
 
     # 2. The window's own parameter writes, read back from the vehicle itself.
     if not blockers:
@@ -4269,7 +4361,9 @@ def _run_ordered_bring_up(
         )
         write_parameters(window_values)
         window_readback, observations = readback(names, window_values)
-        record["readbacks"]["window"] = {name: window_readback.get(name) for name in names}
+        record["readbacks"]["window"] = {
+            name: window_readback.get(name) for name in names
+        }
         record["readback_observations"] = {"window": observations}
         for name, window_value, _restore, _why in BRING_UP_WINDOW_PARAMETERS:
             if not _vehicle_parameter_matches(window_readback.get(name), window_value):
@@ -4429,7 +4523,9 @@ def _run_ordered_bring_up(
                 max_altitude_m = max(max_altitude_m, -sample.local_position_ned[2])
             if sample.servo_outputs is not None:
                 motors["samples"] += 1
-                motors["max_pwm"] = max(motors["max_pwm"], max(sample.servo_outputs[:4]))
+                motors["max_pwm"] = max(
+                    motors["max_pwm"], max(sample.servo_outputs[:4])
+                )
 
         # The airtime budget the declaration bounds ("<= 5.0 s from the arm readback to
         # the LAND command") and the wall clock's reading of the same interval. The bound
@@ -4440,7 +4536,9 @@ def _run_ordered_bring_up(
             "the excitation's declared airtime, arm readback to LAND",
         )
         arm_monotonic = time.monotonic()
-        flight["armed_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        flight["armed_at_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
         flight["simulator_time_at_arm_s"] = stats.sim_clock.newest_s
         flight["mode"] = sample.mode_name
         flight["pairs_fed_at_arm"] = stats.pairs
@@ -4613,9 +4711,9 @@ def _run_ordered_bring_up(
                     {"altitude_m": EXCITATION_TAKEOFF_ALTITUDE_M, "attempt": attempt},
                 )
             if attempt == 1:
-                flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
-                    timespec="milliseconds"
-                )
+                flight["takeoff_commanded_at_utc"] = datetime.now(
+                    timezone.utc
+                ).isoformat(timespec="milliseconds")
                 flight["takeoff_commanded_after_arm_simulator_s"] = (
                     None
                     if stats.sim_clock.newest_s is None or arm_simulator_s is None
@@ -4637,7 +4735,10 @@ def _run_ordered_bring_up(
                 else:
                     time.sleep(0.05)
             takeoff_acks.append(
-                {"attempt": attempt, "result": None if ack is None else ack.get("result")}
+                {
+                    "attempt": attempt,
+                    "result": None if ack is None else ack.get("result"),
+                }
             )
             if ack is not None and ack.get("result") == 0:
                 break
@@ -4751,7 +4852,9 @@ def _run_ordered_bring_up(
         # closure gate refuses the scored window while that answer is still the
         # override's value.
         if override["sent"]:
-            record["sent"].append(link.send_rc_channels_override(RC_THROTTLE_RELEASE_PWM))
+            record["sent"].append(
+                link.send_rc_channels_override(RC_THROTTLE_RELEASE_PWM)
+            )
             if capture is not None:
                 capture.command(
                     "rc_override_release",
@@ -4796,7 +4899,10 @@ def _run_ordered_bring_up(
             published_attitude(),
             writer.path("mavlink.jsonl"),
         )
-        if override["sent"] and override["observed_during_window"] != override["sent_pwm"]:
+        if (
+            override["sent"]
+            and override["observed_during_window"] != override["sent_pwm"]
+        ):
             blockers.append(
                 "the window's throttle override never took effect: the vehicle's own RC "
                 f"report read {override['observed_during_window']} us on channel "
@@ -4829,7 +4935,9 @@ def _run_ordered_bring_up(
         write_parameters(restore_values)
         restore_readback, observations = readback(names, restore_values)
         record["readback_observations"]["restored"] = observations
-        record["readbacks"]["restored"] = {name: restore_readback.get(name) for name in names}
+        record["readbacks"]["restored"] = {
+            name: restore_readback.get(name) for name in names
+        }
         closure = _bring_up_closure_blockers(restore_readback, override)
         record["closure_blockers"] = closure
         blockers.extend(closure)
@@ -4875,7 +4983,9 @@ def _run_ordered_bring_up(
             for name, expected, _source in SEAM_REQUIREMENTS
             if name in BRING_UP_SEAM_READBACK
         }
-        seam_readback, seam_observations = readback(BRING_UP_SEAM_READBACK, seam_expected)
+        seam_readback, seam_observations = readback(
+            BRING_UP_SEAM_READBACK, seam_expected
+        )
         record["readback_observations"]["seam_after_window"] = seam_observations
         record["readbacks"]["seam_after_window"] = {
             name: seam_readback.get(name) for name in BRING_UP_SEAM_READBACK
@@ -4949,12 +5059,20 @@ def _bring_up_manifest(record: dict[str, Any]) -> dict[str, Any]:
         "attempted": True,
         "completed": record["completed"],
         "window_parameters": {
-            row["name"]: {"window": row["window_value"], "restore": row["restore_value"]}
+            row["name"]: {
+                "window": row["window_value"],
+                "restore": row["restore_value"],
+            }
             for row in record["declaration"]["parameter_window"]
         },
         "origin_datum": {
             key: record["declaration"]["origin_datum"][key]
-            for key in ("latitude_deg", "longitude_deg", "altitude_msl_m", "is_a_pose_feed")
+            for key in (
+                "latitude_deg",
+                "longitude_deg",
+                "altitude_msl_m",
+                "is_a_pose_feed",
+            )
         },
         "excitation": record["declaration"]["window"],
         # The units the declared windows were spent in, and what each one cost. A budget
@@ -4978,6 +5096,7 @@ def _bring_up_manifest(record: dict[str, Any]) -> dict[str, Any]:
         "window_parameters_in_force": record.get("window_parameters_in_force", {}),
         "blockers": list(record["blockers"]),
     }
+
 
 # ---------------------------------------------------------------------------
 # E1-DIAG: the live pose-assisted diagnostic (plan sections 0.6 item 7, 0.7, 0.8)
@@ -5048,7 +5167,9 @@ def _diagnostic_preflight(
     )
     satisfied = satisfied and scene_ok
     for check in check_prerequisites(settings, output_dir):
-        rows.append({"name": check.name, "satisfied": check.satisfied, "detail": check.detail})
+        rows.append(
+            {"name": check.name, "satisfied": check.satisfied, "detail": check.detail}
+        )
         satisfied = satisfied and check.satisfied
     mavlink_port = _parse_mavlink_port(settings.mavlink_endpoint)
     port_free = mavlink_port is not None and _port_is_free(mavlink_port)
@@ -5057,7 +5178,11 @@ def _diagnostic_preflight(
             "name": "port_mavlink",
             "satisfied": port_free,
             "detail": f"tcp {settings.mavlink_endpoint} is "
-            + ("free" if port_free else "already in use; kill orphaned SITL processes first"),
+            + (
+                "free"
+                if port_free
+                else "already in use; kill orphaned SITL processes first"
+            ),
         }
     )
     satisfied = satisfied and port_free
@@ -5081,7 +5206,9 @@ def _diagnostic_preflight(
     return rows, satisfied
 
 
-def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) -> CommandOutcome:
+def _run_pose_assisted_diagnostic(
+    document: dict[str, Any], output_dir: Path
+) -> CommandOutcome:
     """E1-DIAG: fly the bounded excitation on truth, observe the pinned estimator.
 
     The question is one fact (plan sections 0.6 item 7, 0.8 item 1): does
@@ -5122,7 +5249,9 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
         json.dumps(preflight, indent=2) + "\n", encoding="utf-8"
     )
     if not satisfied:
-        blockers = tuple(f"{row['name']}: {row['detail']}" for row in rows if not row["satisfied"])
+        blockers = tuple(
+            f"{row['name']}: {row['detail']}" for row in rows if not row["satisfied"]
+        )
         return _pose_assisted_outcome(
             blockers,
             {"preflight": rows, "estimator_pin": estimator},
@@ -5249,7 +5378,9 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
 
     def feed_pair(record: Any) -> None:
         pair = record.pair
-        left = loc.grayscale_rgb8(pair.left_bytes, settings.stereo.width, settings.stereo.height)
+        left = loc.grayscale_rgb8(
+            pair.left_bytes, settings.stereo.width, settings.stereo.height
+        )
         right = loc.grayscale_rgb8(
             pair.right_bytes, settings.stereo.width, settings.stereo.height
         )
@@ -5263,13 +5394,13 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
             )
         )
         stats.pairs += 1
+
     ordered_pairs = OrderedPairFeed(
         pending_pairs,
         sim_time_ns_of=lambda held: sim_time_ns(held.sim_time_s),
         feed_one=feed_pair,
         stats=stats,
     )
-
 
     def observe_state(state: loc.EstimatorState) -> None:
         observer["states_received"] += 1
@@ -5334,7 +5465,10 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
                     return
                 if state is not None:
                     observe_state(state)
-                if time.monotonic() - last_telemetry_sample >= TELEMETRY_SAMPLE_PERIOD_S:
+                if (
+                    time.monotonic() - last_telemetry_sample
+                    >= TELEMETRY_SAMPLE_PERIOD_S
+                ):
                     last_telemetry_sample = time.monotonic()
                     try:
                         sample = platform.telemetry()
@@ -5394,7 +5528,9 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
         settings,
         runner=LowPrioritySubprocessRunner(),
         session=session,
-        gateway=TcpSensorGateway(stamp=lambda: settings.capture_stamp(time.monotonic_ns())),
+        gateway=TcpSensorGateway(
+            stamp=lambda: settings.capture_stamp(time.monotonic_ns())
+        ),
         evidence=writer,
         label="run-a",
         extra_params=carrier_params,
@@ -5447,7 +5583,9 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
         platform.request_telemetry_streams()
         for message_id in (MSG_ID_SYS_STATUS, MSG_ID_GPS_RAW_INT):
             session.request_message_interval(message_id, GPS_AIDING_SAMPLE_HZ)
-        control, _attempt_at = platform.request_control(settings.pre_arm_wait_s, drain=drain)
+        control, _attempt_at = platform.request_control(
+            settings.pre_arm_wait_s, drain=drain
+        )
         log_lines.append(
             f"control: mode_reached={control.mode_reached}, armed={control.armed}, "
             f"attempts={control.control_attempts}, refusals={list(control.refusals)}"
@@ -5493,7 +5631,9 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
             flight["takeoff_commanded_at_utc"] = datetime.now(timezone.utc).isoformat(
                 timespec="milliseconds"
             )
-            climb_window = window(EXCITATION_CLIMB_DRAIN_S, "the diagnostic's climb drain")
+            climb_window = window(
+                EXCITATION_CLIMB_DRAIN_S, "the diagnostic's climb drain"
+            )
             while not climb_window.expired():
                 drain()
                 if observer["max_altitude_m"] >= (
@@ -5547,8 +5687,14 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
         phase["name"] = "stopped"
 
     if observer["feed_error"] is not None:
-        blockers.append(f"the estimator's feed failed mid-run: {observer['feed_error']}")
-    if control is not None and not control.refused and observer["max_altitude_m"] < 0.10:
+        blockers.append(
+            f"the estimator's feed failed mid-run: {observer['feed_error']}"
+        )
+    if (
+        control is not None
+        and not control.refused
+        and observer["max_altitude_m"] < 0.10
+    ):
         # The arm succeeded but the airframe never measurably left the ground, so
         # the reading rule has no motion to read: named rather than silently
         # answered (a takeoff the autopilot refused in flight is exactly this).
@@ -5599,7 +5745,9 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
     )
     writer.write_json("motion-window.json", motion_window)
     writer.write_json("initializer-diagnostics.json", diagnostics)
-    writer.write_json("gps-aiding.json", _gps_aiding_verdict(writer.path("mavlink.jsonl")))
+    writer.write_json(
+        "gps-aiding.json", _gps_aiding_verdict(writer.path("mavlink.jsonl"))
+    )
     log_lines.extend(
         [
             f"pairs fed: {stats.pairs}, imu samples fed: {stats.imu_samples}, "
@@ -5644,7 +5792,6 @@ def _run_pose_assisted_diagnostic(document: dict[str, Any], output_dir: Path) ->
         },
         (*writer.artifacts, "preflight.json"),
     )
-
 
 
 def _wait_initialized(
@@ -5720,6 +5867,7 @@ def _wait_for_thrust_path(
     motors["floor_pwm"] = floor
     return None
 
+
 def _scene_capture_gate(
     writer: EvidenceWriter,
     settings: PlatformSettings,
@@ -5741,7 +5889,10 @@ def _scene_capture_gate(
     count is not evidence about it.
     """
     deadline = time.monotonic() + SCENE_CAPTURE_TIMEOUT_S
-    while scene_capture["count"] < SCENE_CAPTURE_MAX_FRAMES and time.monotonic() < deadline:
+    while (
+        scene_capture["count"] < SCENE_CAPTURE_MAX_FRAMES
+        and time.monotonic() < deadline
+    ):
         drain()
         time.sleep(0.05)
     pairs_dir = writer.directory / "pairs"
@@ -5802,8 +5953,11 @@ def _scene_capture_gate(
         "stream this front end is given cannot initialize, so the arm is refused"
     )
 
+
 def _wrap_angle(radius: float) -> float:
     return (radius + math.pi) % (2.0 * math.pi) - math.pi
+
+
 def _attitude_gate(
     writer: EvidenceWriter,
     aligned: dict[str, object] | None,
@@ -5881,7 +6035,9 @@ def _attitude_gate(
     composition_deg = [
         math.degrees(_wrap_angle(p - d)) for p, d in zip(published, declared)
     ]
-    declaration_deg = [math.degrees(_wrap_angle(d - t)) for d, t in zip(declared, truth_rpy)]
+    declaration_deg = [
+        math.degrees(_wrap_angle(d - t)) for d, t in zip(declared, truth_rpy)
+    ]
     odom_up_down_component = float(alignment.epoch_rotation[2][2])
     level_error_deg = math.degrees(
         math.acos(max(-1.0, min(1.0, -odom_up_down_component)))
@@ -5947,6 +6103,37 @@ def _crash_disarm_statustexts(mavlink_log: Path) -> list[str]:
                 if text.startswith(CRASH_DISARM_STATUSTEXT_PREFIX):
                     texts.append(text)
     return texts
+
+
+def _last_heartbeat_armed(mavlink_log: Path) -> bool | None:
+    """The armed state the run's own recorded HEARTBEATs ended in.
+
+    The same convention ``decode_telemetry`` applies to ``base_mode``: the
+    safety-armed bit (128). The last heartbeat in the file is the last one the
+    vehicle sent, so when the log was drained to its end this is the state the
+    aircraft finished in — read from the vehicle's own words rather than from a
+    telemetry sample taken at one instant.
+
+    ``None`` when the log is missing or carries no heartbeat with a base mode:
+    an unmeasured state is returned as unmeasured, never as either answer.
+    """
+    armed: bool | None = None
+    if not mavlink_log.is_file():
+        return armed
+    with mavlink_log.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(document, dict):
+                continue
+            if document.get("mavpackettype") != "HEARTBEAT":
+                continue
+            base_mode = document.get("base_mode")
+            if base_mode is not None:
+                armed = bool(base_mode & 128)
+    return armed
 
 
 def _end_state_record(
@@ -6025,9 +6212,7 @@ def _end_state_blocker(record: dict[str, Any]) -> str | None:
         return None
     if record["state"] == "unmeasured":
         return f"the {record['phase']}'s end state is unmeasured: {record['reason']}"
-    return (
-        f"the {record['phase']}'s end state failed: " + "; ".join(record["failures"])
-    )
+    return f"the {record['phase']}'s end state failed: " + "; ".join(record["failures"])
 
 
 def _end_state_check_row(record: dict[str, Any]) -> dict[str, str]:
@@ -6137,7 +6322,9 @@ def _truth_error_statistics(
             unjoined += 1
             continue
         horizontal.append(
-            math.hypot(estimate[0] - nearest_position[0], estimate[1] - nearest_position[1])
+            math.hypot(
+                estimate[0] - nearest_position[0], estimate[1] - nearest_position[1]
+            )
         )
         vertical.append(abs(estimate[2] - nearest_position[2]))
         samples.append(
@@ -6273,7 +6460,9 @@ def _score(
             }
         )
     else:
-        checks.append({"name": "E1", "status": "fail", "detail": truth_comparison["reason"]})
+        checks.append(
+            {"name": "E1", "status": "fail", "detail": truth_comparison["reason"]}
+        )
     gaps = machine.publish_gaps_s
     checks.append(
         {
@@ -6329,7 +6518,9 @@ def _score(
             }
         )
     else:
-        checks.append({"name": "H3", "status": "fail", "detail": disagreement_summary["reason"]})
+        checks.append(
+            {"name": "H3", "status": "fail", "detail": disagreement_summary["reason"]}
+        )
     # H2/H4 is the machine's state at the END OF THE SCORED WINDOW, which is where the
     # window's declared end (arm to disarm) puts it. Reading the process's final state
     # instead makes the declared 300 ms silence stop -- the correct behaviour once the
