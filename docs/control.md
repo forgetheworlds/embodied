@@ -55,6 +55,9 @@ Per-layer convention: `src/embodied/<layer>/`, `tests/test_<layer>.py`,
 4. Doorway residual for the layer proof is **0.10 m**.
 5. Always load `compat_ekf.parm`. Waypoints in the yaml are absolute local-NED;
    the proof converts them to odom ENU before building `Motion`.
+6. After a ±π yaw-rate pair: brief yaw-ignored settle, then inbound with
+   `yaw=0`. Leaving yaw ignored for the whole return lets heading drift and
+   tip-strike at the next doorway.
 
 ## Done bar
 

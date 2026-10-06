@@ -304,8 +304,9 @@ def fly_control_route(
     if return_waypoints:
         yaw_turn(-spin_rad, "reface")
 
-    # Settle with yaw ignored so return does not couple a heading snap into
-    # the first translation (tip-strike AngErr≈90 after ±π on this scene).
+    # Settle with yaw ignored so the post-reface heading is not slammed, then
+    # lock yaw=0 on inbound. Leaving yaw ignored for the whole return lets
+    # heading drift (~π by return[3]) and tip-strike at the vestibule door.
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
     ):
@@ -340,7 +341,7 @@ def fly_control_route(
             stream = _stream(
                 vehicle,
                 platform,
-                build_motion=lambda t=target: hold_motion(t, yaw=None),
+                build_motion=lambda t=target: hold_motion(t, yaw=0.0),
                 duration_s=hold_s,
                 drain=drain,
             )
