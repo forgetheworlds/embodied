@@ -304,6 +304,33 @@ def fly_control_route(
     if return_waypoints:
         yaw_turn(-spin_rad, "reface")
 
+    # Settle with yaw ignored so return does not couple a heading snap into
+    # the first translation (tip-strike AngErr≈90 after ±π on this scene).
+    if return_waypoints and not any(
+        "guided flight lost" in reason for reason in reasons
+    ):
+        state = vehicle.state()
+        if state.position is not None:
+            settle_pos = state.position
+            stream = _stream(
+                vehicle,
+                platform,
+                build_motion=lambda p=settle_pos: Motion(
+                    position=p, velocity=ZERO, yaw=None
+                ),
+                duration_s=min(hold_s, 3.0),
+                drain=drain,
+            )
+            _score_hold(
+                steps,
+                reasons,
+                label="settle",
+                target_odom=settle_pos,
+                vehicle=vehicle,
+                stream=stream,
+                residual_max_m=residual_max_m,
+            )
+
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
     ):
@@ -313,7 +340,7 @@ def fly_control_route(
             stream = _stream(
                 vehicle,
                 platform,
-                build_motion=lambda t=target: hold_motion(t, yaw=0.0),
+                build_motion=lambda t=target: hold_motion(t, yaw=None),
                 duration_s=hold_s,
                 drain=drain,
             )
