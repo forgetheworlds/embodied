@@ -76,7 +76,9 @@ publication. Settle/align are explicit hold Motions when used — not silence.
 7. Prefer native Webots movie (`EMBODIED_WEBOTS_MOVIE`) over desktop
    screen capture — ffmpeg x11grab starves SITL/EKF and tip-strikes.
    Delay past PreArm with `EMBODIED_WEBOTS_MOVIE_DELAY_S` (default 90).
-   Do not pin CPUs for recording.
+   Cap length with `EMBODIED_WEBOTS_MOVIE_DURATION_S` (default 180) and
+   finalize while the world is still alive (parent SIGKILL drops in-flight
+   encodes). Do not pin CPUs for recording.
 
 ## Done bar
 

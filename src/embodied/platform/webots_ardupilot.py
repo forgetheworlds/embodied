@@ -1282,7 +1282,7 @@ class PlatformSettings:
         if self.sim_wall_clamp:
             environment["EMBODIED_SIM_WALL_CLAMP"] = "1"
         # Forward optional native-movie policy into the Webots controller.
-        for key in ("EMBODIED_WEBOTS_MOVIE", "EMBODIED_WEBOTS_MOVIE_DELAY_S"):
+        for key in ("EMBODIED_WEBOTS_MOVIE", "EMBODIED_WEBOTS_MOVIE_DELAY_S", "EMBODIED_WEBOTS_MOVIE_DURATION_S"):
             value = os.environ.get(key)
             if value:
                 environment[key] = value

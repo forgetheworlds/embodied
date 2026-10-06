@@ -104,36 +104,53 @@ def _movie_delay_s() -> float:
         return 90.0
 
 
-def _maybe_stop_movie(robot, path: str | None, *, started: bool) -> None:
-    if not path or not started:
-        return
+def _movie_duration_s() -> float:
+    """Wall seconds to record after start; finish before the parent SIGKILLs Webots."""
+    raw = os.environ.get("EMBODIED_WEBOTS_MOVIE_DURATION_S", "180").strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 180.0
+
+
+def _request_movie_stop(robot) -> None:
     stop = getattr(robot, "movieStopRecording", None)
-    if stop is None:
-        return
-    stop()
-    # Webots encodes asynchronously after stop; exiting before movieIsReady
-    # drops the file (observed: gate pass, no mp4, controller crash on teardown).
-    ready = getattr(robot, "movieIsReady", None)
-    deadline = time.monotonic() + 120.0
-    while ready is not None and not ready() and time.monotonic() < deadline:
-        # Keep stepping so the supervisor can finish the encode pipeline.
-        if hasattr(robot, "step"):
-            if robot.step(int(robot.getBasicTimeStep())) == -1:
-                break
-        else:
-            time.sleep(0.05)
+    if stop is not None:
+        stop()
+        print("Controller: native movie stop requested", flush=True)
+
+
+def _movie_status_line(robot, path: str) -> str:
     failed = getattr(robot, "movieFailed", None)
+    ready = getattr(robot, "movieIsReady", None)
     if failed is not None and failed():
-        print(f"Controller: native movie FAILED → {path}", flush=True)
-    elif ready is not None and not ready():
-        print(f"Controller: native movie NOT READY (timeout) → {path}", flush=True)
-    elif os.path.isfile(path):
-        print(
-            f"Controller: native movie stopped → {path} ({os.path.getsize(path)} bytes)",
-            flush=True,
-        )
-    else:
-        print(f"Controller: native movie stopped but file missing → {path}", flush=True)
+        return f"Controller: native movie FAILED → {path}"
+    if ready is not None and not ready():
+        return f"Controller: native movie NOT READY → {path}"
+    if os.path.isfile(path):
+        return f"Controller: native movie stopped → {path} ({os.path.getsize(path)} bytes)"
+    return f"Controller: native movie stopped but file missing → {path}"
+
+
+def _finalize_movie(robot, path: str) -> None:
+    """Stop recording and wait until Webots finishes writing the file.
+
+    Nested ``robot.step`` here would starve the FDM loop. Prefer stopping from
+    ``run_loop`` and polling ``movieIsReady`` on the normal step path; this
+    helper is only the finally fallback when the parent has not SIGKILLed yet.
+    """
+    _request_movie_stop(robot)
+    ready = getattr(robot, "movieIsReady", None)
+    deadline = time.monotonic() + 30.0
+    while ready is not None and not ready() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    print(_movie_status_line(robot, path), flush=True)
+
+
+def _maybe_stop_movie(robot, path: str | None, *, started: bool, finalized: bool) -> None:
+    if not path or not started or finalized:
+        return
+    _finalize_movie(robot, path)
 
 
 def parse_args():
@@ -421,7 +438,7 @@ def main():
             movie_path = None
     else:
         robot = Robot()
-    movie_state = {"started": False}
+    movie_state = {"started": False, "finalized": False}
     # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
     # "F2's denominator"): the bridge sets EMBODIED_SIM_WALL_CLAMP=1 in this
     # process's environment only when the run's configuration asked for it, and the
@@ -439,7 +456,12 @@ def main():
     first_controls = link.wait_for_sitl()
     if first_controls is None:
         print("Controller: SITL never sent a control packet; stopping", flush=True)
-        _maybe_stop_movie(robot, movie_path, started=movie_state["started"])
+        _maybe_stop_movie(
+            robot,
+            movie_path,
+            started=movie_state["started"],
+            finalized=movie_state["finalized"],
+        )
         devices.stop_motors()
         channel.close()
         link.close()
@@ -472,7 +494,12 @@ def main():
         )
         raise
     finally:
-        _maybe_stop_movie(robot, movie_path, started=movie_state["started"])
+        _maybe_stop_movie(
+            robot,
+            movie_path,
+            started=movie_state["started"],
+            finalized=movie_state["finalized"],
+        )
         devices.stop_motors()
         channel.close()
         link.close()
@@ -504,17 +531,43 @@ def run_loop(
     pair_counter = 0
     last_flight_state = None
     if movie_state is None:
-        movie_state = {"started": False}
+        movie_state = {"started": False, "finalized": False}
     movie_after_wall = time.monotonic() + _movie_delay_s()
+    movie_until_wall = None
+    movie_stop_requested = False
     while True:
+        now = time.monotonic()
         if (
             movie_path
             and not movie_state["started"]
             and robot is not None
-            and time.monotonic() >= movie_after_wall
+            and now >= movie_after_wall
         ):
             _start_movie(robot, movie_path)
             movie_state["started"] = True
+            movie_until_wall = now + _movie_duration_s()
+        if (
+            movie_path
+            and movie_state["started"]
+            and not movie_stop_requested
+            and robot is not None
+            and movie_until_wall is not None
+            and now >= movie_until_wall
+        ):
+            # Request stop while the world is still alive — parent teardown
+            # SIGKILLs Webots before finally can wait for movieIsReady.
+            _request_movie_stop(robot)
+            movie_stop_requested = True
+        if (
+            movie_path
+            and movie_stop_requested
+            and not movie_state["finalized"]
+            and robot is not None
+        ):
+            ready = getattr(robot, "movieIsReady", None)
+            if ready is None or ready():
+                print(_movie_status_line(robot, movie_path), flush=True)
+                movie_state["finalized"] = True
         if not devices.step():
             print(
                 f"Controller: the simulation closed at {devices.simulator_time_s():.3f}s",
