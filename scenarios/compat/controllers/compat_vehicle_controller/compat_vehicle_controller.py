@@ -69,6 +69,52 @@ from controller import Robot  # noqa: E402  (Webots puts this on the controller'
 
 from sensors import VehicleDevices  # noqa: E402
 
+# MPEG-4 FOURCC used by Webots Supervisor.movieStartRecording.
+_WEBOTS_MOVIE_CODEC_MPEG4 = 1337
+
+
+def _maybe_movie_path() -> str | None:
+    """Return ``EMBODIED_WEBOTS_MOVIE`` path when set (recording starts later).
+
+    Encoding during PreArm starves the gyro loop, so the path is prepared here
+    and ``_start_movie`` runs only after ``EMBODIED_WEBOTS_MOVIE_DELAY_S``.
+    """
+    path = os.environ.get("EMBODIED_WEBOTS_MOVIE", "").strip()
+    if not path:
+        return None
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
+
+def _start_movie(robot, path: str) -> None:
+    # Modest resolution / quality; cheaper than 60fps desktop x11grab.
+    robot.movieStartRecording(path, 1280, 720, _WEBOTS_MOVIE_CODEC_MPEG4, 80, 1, False)
+    print(f"Controller: native movie recording → {path}", flush=True)
+
+
+def _movie_delay_s() -> float:
+    raw = os.environ.get("EMBODIED_WEBOTS_MOVIE_DELAY_S", "90").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 90.0
+
+
+def _maybe_stop_movie(robot, path: str | None, *, started: bool) -> None:
+    if not path or not started:
+        return
+    stop = getattr(robot, "movieStopRecording", None)
+    if stop is None:
+        return
+    stop()
+    failed = getattr(robot, "movieFailed", None)
+    if failed is not None and failed():
+        print(f"Controller: native movie FAILED → {path}", flush=True)
+    else:
+        print(f"Controller: native movie stopped → {path}", flush=True)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -339,7 +385,24 @@ def send_status(channel, status, sim_time_s, devices):
 
 def main():
     args = parse_args()
-    robot = Robot()
+    movie_path = _maybe_movie_path()
+    # Supervisor only when a native movie was requested — always-on
+    # Supervisor() previously crashed this controller under load on first_indoor.
+    if movie_path:
+        from controller import Supervisor
+
+        robot = Supervisor()
+        if getattr(robot, "movieStartRecording", None) is None:
+            print(
+                "Controller: EMBODIED_WEBOTS_MOVIE set but robot has no Supervisor "
+                "movie API (is supervisor TRUE?)",
+                flush=True,
+            )
+            movie_path = None
+    else:
+        robot = Robot()
+    movie_started = False
+    movie_state = {"started": False}
     # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
     # "F2's denominator"): the bridge sets EMBODIED_SIM_WALL_CLAMP=1 in this
     # process's environment only when the run's configuration asked for it, and the
@@ -357,6 +420,7 @@ def main():
     first_controls = link.wait_for_sitl()
     if first_controls is None:
         print("Controller: SITL never sent a control packet; stopping", flush=True)
+        _maybe_stop_movie(robot, movie_path, started=movie_state["started"])
         devices.stop_motors()
         channel.close()
         link.close()
@@ -366,7 +430,19 @@ def main():
     controls = first_controls
 
     try:
-        run_loop(devices, link, channel, injections, status, args, controls, first_controls)
+        run_loop(
+            devices,
+            link,
+            channel,
+            injections,
+            status,
+            args,
+            controls,
+            first_controls,
+            robot=robot,
+            movie_path=movie_path,
+            movie_state=movie_state,
+        )
     except Exception:
         # A controller that dies silently looks exactly like a simulator that never
         # started, so the reason is printed where the platform probe can read it.
@@ -377,6 +453,7 @@ def main():
         )
         raise
     finally:
+        _maybe_stop_movie(robot, movie_path, started=movie_state["started"])
         devices.stop_motors()
         channel.close()
         link.close()
@@ -384,7 +461,20 @@ def main():
     return 0
 
 
-def run_loop(devices, link, channel, injections, status, args, controls, first_controls):
+def run_loop(
+    devices,
+    link,
+    channel,
+    injections,
+    status,
+    args,
+    controls,
+    first_controls,
+    *,
+    robot=None,
+    movie_path=None,
+    movie_state=None,
+):
     """The simulation loop: flight state out, motor commands in, records beside."""
     camera_period_ms = max(int(args.camera_period_ms), devices.timestep_ms)
     imu_period_ms = max(int(args.imu_period_ms), devices.timestep_ms)
@@ -394,7 +484,18 @@ def run_loop(devices, link, channel, injections, status, args, controls, first_c
     next_pose_ms = 0
     pair_counter = 0
     last_flight_state = None
+    if movie_state is None:
+        movie_state = {"started": False}
+    movie_after_wall = time.monotonic() + _movie_delay_s()
     while True:
+        if (
+            movie_path
+            and not movie_state["started"]
+            and robot is not None
+            and time.monotonic() >= movie_after_wall
+        ):
+            _start_movie(robot, movie_path)
+            movie_state["started"] = True
         if not devices.step():
             print(
                 f"Controller: the simulation closed at {devices.simulator_time_s():.3f}s",

@@ -26,7 +26,16 @@ export DISPLAY="${DISPLAY:-:1}"
 export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 
 rm -rf "$OUTPUT"
-mkdir -p "$(dirname "$OUTPUT")"
+mkdir -p "$OUTPUT"
+
+# Native Webots Supervisor movie (optional). Delayed past PreArm by default
+# (EMBODIED_WEBOTS_MOVIE_DELAY_S=90) so encoding does not starve gyro bring-up.
+# Example: EMBODIED_WEBOTS_MOVIE="$OUTPUT/control-doorway.mp4" ./configs/layers/control
+# No CPU affinity / EMBODIED_SIM_CPUS — that previously destabilized the controller.
+if [[ -n "${EMBODIED_WEBOTS_MOVIE:-}" ]]; then
+  export EMBODIED_WEBOTS_MOVIE
+  export EMBODIED_WEBOTS_MOVIE_DELAY_S="${EMBODIED_WEBOTS_MOVIE_DELAY_S:-90}"
+fi
 
 python -u -m embodied motion-proof --config "$CONFIG" --output "$OUTPUT"
 status=$?

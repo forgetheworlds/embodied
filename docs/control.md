@@ -73,6 +73,10 @@ publication. Settle/align are explicit hold Motions when used — not silence.
 6. SITL Webots-Python must not integrate multi-second FDM timestamp gaps
    (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`); a `time_boot_ms`
    jump kills VisOdom and tips the aircraft.
+7. Prefer native Webots movie (`EMBODIED_WEBOTS_MOVIE`) over desktop
+   screen capture — ffmpeg x11grab starves SITL/EKF and tip-strikes.
+   Delay past PreArm with `EMBODIED_WEBOTS_MOVIE_DELAY_S` (default 90).
+   Do not pin CPUs for recording.
 
 ## Done bar
 
@@ -85,6 +89,8 @@ publication. Settle/align are explicit hold Motions when used — not silence.
 ```sh
 .venv/bin/python -m pytest tests/test_control.py -q
 ./configs/layers/control
+# with native movie (starts after ~90s wall, past PreArm):
+EMBODIED_WEBOTS_MOVIE=work/runs/layers/control/control-doorway.mp4 ./configs/layers/control
 ```
 
 ## Does not own
