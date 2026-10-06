@@ -297,8 +297,7 @@ def _build_phases(
             )
         )
         # Yaw-ignored settle first: locking yaw=0 immediately after ±π
-        # reverse-spin has tip-struck (Crash AngErr) under load. Return/align
-        # still command yaw=0 once rates have died.
+        # reverse-spin has tip-struck (Crash AngErr) under load.
         phases.append(
             Phase(
                 name="settle",
@@ -306,6 +305,17 @@ def _build_phases(
                 duration_s=hold_s,
                 target=None,
                 yaw=None,
+            )
+        )
+        # Lock yaw=0 at the settled XY before any lateral move — combining a
+        # heading snap with translation tip-struck on align.
+        phases.append(
+            Phase(
+                name="heading",
+                kind="hold",
+                duration_s=max(2.0, 0.5 * hold_s),
+                target=None,
+                yaw=0.0,
             )
         )
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
