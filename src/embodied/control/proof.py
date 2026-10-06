@@ -531,10 +531,13 @@ def fly_control_route(
 
         if phase.kind == "heading_slew" and not phase_done:
             now = vehicle.state()
+            # Require a real settle after the slew claims north — a 5-tick
+            # early-complete then slamming lateral accel tip-struck on align.
+            min_lock_pubs = _phase_min_publications(max(3.0, 0.5 * hold_s), platform)
             if (
                 now.yaw is not None
                 and abs(wrap_angle_rad(now.yaw)) <= HEADING_LOCK_TOL_RAD
-                and phase.publications >= _phase_min_publications(2.0, platform)
+                and phase.publications >= min_lock_pubs
             ):
                 phase_done = True
 
