@@ -78,6 +78,10 @@ while SITL FDM continues on UDP. See `flight-critical-timing.json` on each run.
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
 6. Do not wall-sleep the flight loop or block it on camera/estimator reads —
    Webots/SITL can keep advancing and external-nav goes stale.
+7. SITL must not integrate multi-second FDM timestamp gaps in one update
+   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`). A +45 s
+   `time_boot_ms` jump kills VisOdom / tips the aircraft. Phase timing prefers
+   Webots pose stamps over autopilot boot time for the same reason.
 
 ## Done bar
 

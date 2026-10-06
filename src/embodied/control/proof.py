@@ -124,10 +124,40 @@ def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sim_time_s(platform: WebotsArduPilot) -> float | None:
+    """Simulation clock for pacing: prefer Webots pose time over autopilot boot.
+
+    Autopilot ``time_boot_ms`` can jump by tens of seconds in one ATTITUDE when
+    SITL coalesces a UDP FDM backlog (see patches/ardupilot-sitl-webots-fdm-time-clamp.patch).
+    Pose stamps come from Webots ``robot.getTime()`` and do not have that jump.
+    """
+    pose = getattr(platform, "_latest_pose", None)
+    if pose is not None:
+        return float(pose[0])
     sample = platform.latest_telemetry
     if sample is None or sample.boot_time_ms is None:
         return None
     return sample.boot_time_ms / 1000.0
+
+
+def _phase_done(
+    phase: "Phase",
+    sim: float | None,
+    *,
+    envelope_min: float,
+) -> bool:
+    """True when the phase's sim duration has elapsed without a clock jump."""
+    if phase.start_sim is not None and sim is not None:
+        elapsed = sim - phase.start_sim
+        # A multi-second jump is a clock fault, not a completed hold.
+        if elapsed < 0 or elapsed > phase.duration_s + 1.0:
+            return False
+        return elapsed >= phase.duration_s
+    if phase.start_sim is None and sim is not None:
+        phase.start_sim = sim
+        return False
+    if phase.publications * REFRESH_S >= phase.duration_s / envelope_min:
+        return True
+    return False
 
 
 def _wall_backstop_s(platform: WebotsArduPilot, sim_duration_s: float) -> float:
@@ -454,16 +484,11 @@ def fly_control_route(
             break
 
         sim = _sim_time_s(platform)
-        phase_done = False
-        if phase.start_sim is not None and sim is not None:
-            phase_done = (sim - phase.start_sim) >= phase.duration_s
-        elif phase.start_sim is None and sim is not None:
-            phase.start_sim = sim
-        elif phase.publications * REFRESH_S >= phase.duration_s / min(
-            platform.settings.realtime_ratio_envelope
-        ):
-            # Wall-clock fallback if sim time is unavailable.
-            phase_done = True
+        phase_done = _phase_done(
+            phase,
+            sim,
+            envelope_min=min(platform.settings.realtime_ratio_envelope),
+        )
 
         _wait_sim_refresh(platform, timing)
 
