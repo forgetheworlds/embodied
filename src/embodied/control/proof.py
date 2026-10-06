@@ -372,22 +372,14 @@ def _build_phases(
                 requested_rad=0.0,
             )
         )
-        # Yaw-ignored settle, then slow heading slew to 0 at frozen XY.
-        # Absolute yaw=0 right after ±π tip-struck (Crash AngErr).
+        # Yaw-ignored settle and inbound. Absolute yaw lock after ±π tip-struck;
+        # a heading-slew then lateral align also tip-struck. Reface scores the
+        # unwind; keep XY holds yaw-ignored through the return doors.
         phases.append(
             Phase(
                 name="settle",
                 kind="hold",
                 duration_s=hold_s,
-                target=None,
-                yaw=None,
-            )
-        )
-        phases.append(
-            Phase(
-                name="heading",
-                kind="heading_slew",
-                duration_s=max(hold_s, math.pi / HEADING_SLEW_RATE_RAD_S + 2.0),
                 target=None,
                 yaw=None,
             )
@@ -405,8 +397,6 @@ def _build_phases(
                         target=_ned_waypoint_to_odom(
                             far_north, first_east, far_z, hover_m=hover_m
                         ),
-                        # Yaw ignored while translating: yaw=0 + lateral move
-                        # tip-struck even after a successful heading lock.
                         yaw=None,
                     )
                 )
