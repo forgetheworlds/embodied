@@ -366,7 +366,7 @@ def _build_phases(
                         target=_ned_waypoint_to_odom(
                             far_north, first_east, far_z, hover_m=hover_m
                         ),
-                        yaw=0.0,
+                        yaw=None,
                     )
                 )
         for index, waypoint in enumerate(inbound):
@@ -376,7 +376,7 @@ def _build_phases(
                     kind="hold",
                     duration_s=hold_s,
                     target=_ned_waypoint_to_odom(*waypoint, hover_m=hover_m),
-                    yaw=0.0,
+                    yaw=None,
                 )
             )
     return phases
