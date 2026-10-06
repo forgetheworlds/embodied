@@ -304,9 +304,9 @@ def fly_control_route(
     if return_waypoints:
         yaw_turn(-spin_rad, "reface")
 
-    # Settle with yaw ignored so the post-reface heading is not slammed, then
-    # lock yaw=0 on inbound. Leaving yaw ignored for the whole return lets
-    # heading drift (~π by return[3]) and tip-strike at the vestibule door.
+    # After ±π: settle in place with yaw=0 (small heading fix, no translate),
+    # then align east with the first inbound hold before moving north—diagonal
+    # 7.5/-0.5 → 5.5/-1.2 after the spin pair tip-struck even with yaw≈0.
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
     ):
@@ -316,10 +316,8 @@ def fly_control_route(
             stream = _stream(
                 vehicle,
                 platform,
-                build_motion=lambda p=settle_pos: Motion(
-                    position=p, velocity=ZERO, yaw=None
-                ),
-                duration_s=min(hold_s, 3.0),
+                build_motion=lambda p=settle_pos: hold_motion(p, yaw=0.0),
+                duration_s=hold_s,
                 drain=drain,
             )
             _score_hold(
@@ -336,7 +334,32 @@ def fly_control_route(
         "guided flight lost" in reason for reason in reasons
     ):
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
+        if inbound and waypoints:
+            far_north, _far_east, far_z = waypoints[-1]
+            first_north, first_east, first_z = inbound[0]
+            if abs(first_east - _far_east) > 1e-6:
+                align = _ned_waypoint_to_odom(
+                    far_north, first_east, far_z, hover_m=hover_m
+                )
+                stream = _stream(
+                    vehicle,
+                    platform,
+                    build_motion=lambda t=align: hold_motion(t, yaw=0.0),
+                    duration_s=hold_s,
+                    drain=drain,
+                )
+                _score_hold(
+                    steps,
+                    reasons,
+                    label="align",
+                    target_odom=align,
+                    vehicle=vehicle,
+                    stream=stream,
+                    residual_max_m=residual_max_m,
+                )
         for index, waypoint in enumerate(inbound):
+            if any("guided flight lost" in reason for reason in reasons):
+                break
             target = _ned_waypoint_to_odom(*waypoint, hover_m=hover_m)
             stream = _stream(
                 vehicle,
