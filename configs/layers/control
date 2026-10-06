@@ -33,8 +33,13 @@ mkdir -p "$OUTPUT"
 # Example: EMBODIED_WEBOTS_MOVIE="$OUTPUT/control-doorway.mp4" ./configs/layers/control
 # No CPU affinity / EMBODIED_SIM_CPUS — that previously destabilized the controller.
 if [[ -n "${EMBODIED_WEBOTS_MOVIE:-}" ]]; then
+  # Absolute path: Webots controller cwd is not the repo root.
+  if [[ "${EMBODIED_WEBOTS_MOVIE}" != /* ]]; then
+    EMBODIED_WEBOTS_MOVIE="$ROOT/${EMBODIED_WEBOTS_MOVIE}"
+  fi
   export EMBODIED_WEBOTS_MOVIE
   export EMBODIED_WEBOTS_MOVIE_DELAY_S="${EMBODIED_WEBOTS_MOVIE_DELAY_S:-90}"
+  mkdir -p "$(dirname "$EMBODIED_WEBOTS_MOVIE")"
 fi
 
 python -u -m embodied motion-proof --config "$CONFIG" --output "$OUTPUT"

@@ -74,14 +74,16 @@ _WEBOTS_MOVIE_CODEC_MPEG4 = 1337
 
 
 def _maybe_movie_path() -> str | None:
-    """Return ``EMBODIED_WEBOTS_MOVIE`` path when set (recording starts later).
+    """Return absolute ``EMBODIED_WEBOTS_MOVIE`` path when set (recording starts later).
 
     Encoding during PreArm starves the gyro loop, so the path is prepared here
     and ``_start_movie`` runs only after ``EMBODIED_WEBOTS_MOVIE_DELAY_S``.
+    Absolute paths matter: the controller's cwd is the Webots controller dir.
     """
     path = os.environ.get("EMBODIED_WEBOTS_MOVIE", "").strip()
     if not path:
         return None
+    path = os.path.abspath(path)
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -90,7 +92,7 @@ def _maybe_movie_path() -> str | None:
 
 def _start_movie(robot, path: str) -> None:
     # Modest resolution / quality; cheaper than 60fps desktop x11grab.
-    robot.movieStartRecording(path, 1280, 720, _WEBOTS_MOVIE_CODEC_MPEG4, 80, 1, False)
+    robot.movieStartRecording(path, 854, 480, _WEBOTS_MOVIE_CODEC_MPEG4, 70, 1, False)
     print(f"Controller: native movie recording → {path}", flush=True)
 
 
@@ -109,11 +111,29 @@ def _maybe_stop_movie(robot, path: str | None, *, started: bool) -> None:
     if stop is None:
         return
     stop()
+    # Webots encodes asynchronously after stop; exiting before movieIsReady
+    # drops the file (observed: gate pass, no mp4, controller crash on teardown).
+    ready = getattr(robot, "movieIsReady", None)
+    deadline = time.monotonic() + 120.0
+    while ready is not None and not ready() and time.monotonic() < deadline:
+        # Keep stepping so the supervisor can finish the encode pipeline.
+        if hasattr(robot, "step"):
+            if robot.step(int(robot.getBasicTimeStep())) == -1:
+                break
+        else:
+            time.sleep(0.05)
     failed = getattr(robot, "movieFailed", None)
     if failed is not None and failed():
         print(f"Controller: native movie FAILED → {path}", flush=True)
+    elif ready is not None and not ready():
+        print(f"Controller: native movie NOT READY (timeout) → {path}", flush=True)
+    elif os.path.isfile(path):
+        print(
+            f"Controller: native movie stopped → {path} ({os.path.getsize(path)} bytes)",
+            flush=True,
+        )
     else:
-        print(f"Controller: native movie stopped → {path}", flush=True)
+        print(f"Controller: native movie stopped but file missing → {path}", flush=True)
 
 
 def parse_args():
