@@ -172,13 +172,12 @@ class ObservationChannel:
     def send(self, kind, sim_time_s, payload):
         """Frame one message and queue it, in the order it was produced.
 
-        Status, injection acknowledgements, and pose samples are queued as control
-        frames: they answer the analysis process or feed the autopilot's external-nav
-        path, so a backlog of camera frames must not discard them. Camera pairs stay
-        bulk and are dropped from the newest end when the reader falls behind. IMU
-        stays bulk — it is large-rate and the FDM UDP path already carries inertial
-        truth to SITL. Control frames may jump ahead of waiting bulk frames at flush
-        time (see OutboundStream), but never split a frame that has begun to send.
+        Status and injection acknowledgements are queued as control frames: they answer
+        the analysis process, so a backlog of camera frames defers them but never
+        discards them. Everything else is bulk and is dropped from the newest end when
+        the reader falls behind. Both kinds leave in the order they were queued, because
+        the reader resynchronises on frame boundaries and a reordered frame is a stream
+        it cannot parse.
         """
         if self.client is None:
             return
@@ -186,11 +185,7 @@ class ObservationChannel:
         framed = SHARED.pack_message(
             kind, sim_time_s=sim_time_s, sequence=self.sequence, payload=payload
         )
-        control = kind in (
-            SHARED.Kind.STATUS,
-            SHARED.Kind.FAULT_ACK,
-            SHARED.Kind.POSE,
-        )
+        control = kind in (SHARED.Kind.STATUS, SHARED.Kind.FAULT_ACK)
         queued = (
             self.outgoing.queue_control(framed) if control else self.outgoing.queue(framed)
         )

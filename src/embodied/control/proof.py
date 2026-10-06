@@ -6,15 +6,11 @@ One publication loop while armed GUIDED::
         choose current phase
         produce one Motion
         Vehicle.command(Motion)
-        wait ~50 ms of *simulation* time
+        ~50 ms
 
 Phase changes (outbound / hold / spin / reface / settle / align / return)
 replace the current Motion without stopping publication. Scoring happens on
 transition ticks; the next Motion is commanded in the same loop cadence.
-
-The refresh is sim-paced on purpose: a wall-clock sleep while Webots/SITL keep
-advancing opens setpoint gaps that look like guided loss under host load. Sensor
-drains in this loop are non-blocking so camera backlog cannot stall commands.
 
 Run::
 
@@ -56,12 +52,7 @@ from embodied.platform.webots_ardupilot import (
 DEFAULT_SPIN_RAD = math.pi
 DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
-# Command refresh period in *simulation* seconds (Guided setpoint lifetime).
 REFRESH_S = 0.05
-# Short wall poll while waiting for sim time to advance — must not define cadence.
-REFRESH_POLL_S = 0.005
-# If sim time is unavailable, do not spin forever on the wall.
-REFRESH_WALL_FALLBACK_S = 0.05
 SPIN_RATE_RAD_S = 0.6
 ZERO = Vec3(0.0, 0.0, 0.0)
 
@@ -71,43 +62,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _drain(platform: WebotsArduPilot) -> None:
-    """Non-blocking sensor drain: never wait on camera/estimator output mid-flight.
-
-    A blocking read here would stall Vehicle.command() while Webots/SITL continue,
-    which is exactly how external-nav and setpoints go stale under host load.
-    """
-    record = platform.sensor_record(0.0)
+    record = platform.sensor_record(0.02)
     while record is not None:
         record = platform.sensor_record(0.0)
-
-
-def _wait_sim_refresh(platform: WebotsArduPilot, timing: dict[str, Any]) -> None:
-    """Hold until ~REFRESH_S of simulation time has passed (or wall fallback)."""
-    # Fold MAVLink so boot_time_ms (sim clock) can advance; latest_telemetry alone
-    # is a cache and will freeze this wait into perpetual stall-fallback.
-    platform.telemetry()
-    start_sim = _sim_time_s(platform)
-    start_wall = platform._monotonic()
-    if start_sim is None:
-        _drain(platform)
-        platform._sleep(REFRESH_WALL_FALLBACK_S)
-        timing["wall_fallback_waits"] += 1
-        return
-    while True:
-        _drain(platform)
-        platform.telemetry()
-        sim = _sim_time_s(platform)
-        if sim is not None and (sim - start_sim) >= REFRESH_S:
-            gap = sim - start_sim
-            timing["sim_waits"] += 1
-            timing["max_sim_refresh_s"] = max(timing["max_sim_refresh_s"], gap)
-            return
-        # Keep publishing inside Guided's setpoint lifetime (COMMAND_DEADLINE_S
-        # is 0.25 s). A long stall-fallback here re-opens wall gaps.
-        if platform._monotonic() - start_wall >= REFRESH_WALL_FALLBACK_S:
-            timing["sim_stall_fallbacks"] += 1
-            return
-        platform._sleep(REFRESH_POLL_S)
 
 
 def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
@@ -124,40 +81,10 @@ def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sim_time_s(platform: WebotsArduPilot) -> float | None:
-    """Simulation clock for pacing: prefer Webots pose time over autopilot boot.
-
-    Autopilot ``time_boot_ms`` can jump by tens of seconds in one ATTITUDE when
-    SITL coalesces a UDP FDM backlog (see patches/ardupilot-sitl-webots-fdm-time-clamp.patch).
-    Pose stamps come from Webots ``robot.getTime()`` and do not have that jump.
-    """
-    pose = getattr(platform, "_latest_pose", None)
-    if pose is not None:
-        return float(pose[0])
     sample = platform.latest_telemetry
     if sample is None or sample.boot_time_ms is None:
         return None
     return sample.boot_time_ms / 1000.0
-
-
-def _phase_done(
-    phase: "Phase",
-    sim: float | None,
-    *,
-    envelope_min: float,
-) -> bool:
-    """True when the phase's sim duration has elapsed without a clock jump."""
-    if phase.start_sim is not None and sim is not None:
-        elapsed = sim - phase.start_sim
-        # A multi-second jump is a clock fault, not a completed hold.
-        if elapsed < 0 or elapsed > phase.duration_s + 1.0:
-            return False
-        return elapsed >= phase.duration_s
-    if phase.start_sim is None and sim is not None:
-        phase.start_sim = sim
-        return False
-    if phase.publications * REFRESH_S >= phase.duration_s / envelope_min:
-        return True
-    return False
 
 
 def _wall_backstop_s(platform: WebotsArduPilot, sim_duration_s: float) -> float:
@@ -341,16 +268,14 @@ def _build_phases(
                 requested_rad=-spin_rad,
             )
         )
-        # Explicit hold at entry pose after reface. Leave yaw alone: snapping
-        # yaw=0 immediately after a ±π yaw-rate unwind tip-strikes (roll→π,
-        # AngErr disarm) even when the reface yaw score itself passed.
+        # Explicit hold Motion at entry pose with yaw=0 — still published every tick.
         phases.append(
             Phase(
                 name="settle",
                 kind="hold",
                 duration_s=hold_s,
                 target=None,
-                yaw=None,
+                yaw=0.0,
             )
         )
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
@@ -366,7 +291,7 @@ def _build_phases(
                         target=_ned_waypoint_to_odom(
                             far_north, first_east, far_z, hover_m=hover_m
                         ),
-                        yaw=None,
+                        yaw=0.0,
                     )
                 )
         for index, waypoint in enumerate(inbound):
@@ -376,7 +301,7 @@ def _build_phases(
                     kind="hold",
                     duration_s=hold_s,
                     target=_ned_waypoint_to_odom(*waypoint, hover_m=hover_m),
-                    yaw=None,
+                    yaw=0.0,
                 )
             )
     return phases
@@ -428,17 +353,6 @@ def fly_control_route(
     wall_budget = sum(phase.duration_s for phase in phases) + hold_s
     wall_until = platform._monotonic() + _wall_backstop_s(platform, wall_budget)
     guided_lost = False
-    timing: dict[str, Any] = {
-        "command_refresh_pacing": "simulation",
-        "refresh_s": REFRESH_S,
-        "publications": 0,
-        "sim_waits": 0,
-        "wall_fallback_waits": 0,
-        "sim_stall_fallbacks": 0,
-        "max_sim_refresh_s": 0.0,
-        "guided_lost_at_sim_s": None,
-        "vision_feed": None,
-    }
 
     while index < len(phases) and platform._monotonic() < wall_until:
         phase = phases[index]
@@ -463,10 +377,8 @@ def fly_control_route(
         motion = _phase_motion(phase)
         result = vehicle.command(motion)
         phase.publications += 1
-        timing["publications"] += 1
         if not result.accepted:
             guided_lost = True
-            timing["guided_lost_at_sim_s"] = _sim_time_s(platform)
             if phase.kind == "yaw_rate":
                 _score_yaw_phase(
                     log,
@@ -486,13 +398,19 @@ def fly_control_route(
             break
 
         sim = _sim_time_s(platform)
-        phase_done = _phase_done(
-            phase,
-            sim,
-            envelope_min=min(platform.settings.realtime_ratio_envelope),
-        )
+        phase_done = False
+        if phase.start_sim is not None and sim is not None:
+            phase_done = (sim - phase.start_sim) >= phase.duration_s
+        elif phase.start_sim is None and sim is not None:
+            phase.start_sim = sim
+        elif phase.publications * REFRESH_S >= phase.duration_s / min(
+            platform.settings.realtime_ratio_envelope
+        ):
+            # Wall-clock fallback if sim time is unavailable.
+            phase_done = True
 
-        _wait_sim_refresh(platform, timing)
+        drain()
+        platform._sleep(REFRESH_S)
 
         if not phase_done:
             continue
@@ -526,15 +444,11 @@ def fly_control_route(
         drain()
         time.sleep(0.05)
 
-    timing["vision_feed"] = dict(getattr(platform, "_vision_feed_timing", {}) or {})
-    platform.evidence.write_json("flight-critical-timing.json", timing)
-
     return {
         "status": "pass" if not log.reasons else "fail",
         "reasons": log.reasons,
         "steps": log.steps,
         "residual_max_m": residual_max_m,
-        "timing": timing,
     }
 
 

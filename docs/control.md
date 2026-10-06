@@ -46,18 +46,12 @@ while flying:
     choose current phase
     produce one Motion
     Vehicle.command(Motion)
-    wait ~50 ms of simulation time
+    ~50 ms
 ```
 
 Phase changes (outbound, hold, spin, reface, settle, align, return) only replace
 the current Motion. Scoring happens on transition ticks without stopping
 publication. Settle/align are explicit hold Motions when used — not silence.
-
-Flight-critical pacing (pose → VISION_POSITION_ESTIMATE, and this command loop)
-tracks **simulation time**, not wall sleep, so host slowdown slows the sim rather
-than opening artificial VisOdom / setpoint gaps. Pose frames ride the controller's
-control lane ahead of stereo bulk so camera backlog cannot starve external-nav
-while SITL FDM continues on UDP. See `flight-critical-timing.json` on each run.
 
 ## Layout
 
@@ -71,17 +65,14 @@ while SITL FDM continues on UDP. See `flight-critical-timing.json` on each run.
 
 ## Hard-won constraints
 
-1. Never stop publishing while armed GUIDED (~50 ms **sim** cadence).
+1. Never stop publishing while armed GUIDED (~50 ms cadence).
 2. Refuse `command()` when not armed GUIDED.
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
 4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
-6. Do not wall-sleep the flight loop or block it on camera/estimator reads —
-   Webots/SITL can keep advancing and external-nav goes stale.
-7. SITL must not integrate multi-second FDM timestamp gaps in one update
-   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`). A +45 s
-   `time_boot_ms` jump kills VisOdom / tips the aircraft. Phase timing prefers
-   Webots pose stamps over autopilot boot time for the same reason.
+6. SITL Webots-Python must not integrate multi-second FDM timestamp gaps
+   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`); a `time_boot_ms`
+   jump kills VisOdom and tips the aircraft.
 
 ## Done bar
 

@@ -341,21 +341,21 @@ class OutboundStream:
     the cameras, and a socket that is not ready raises rather than waiting, because
     waiting would stall the simulation itself.
 
-    Three rules keep the reader's view honest. A frame that has already begun to go
-    out is never discarded: half a frame — or a frame whose second half was overtaken
-    by another frame — leaves the reader with bytes it cannot resynchronise, which is
+    Three rules keep the reader's view honest. Frames leave in the order they were
+    queued, whatever kind they are, and a frame that has already begun to go out is
+    never discarded: half a frame — or a frame whose second half was overtaken by
+    another frame — leaves the reader with bytes it cannot resynchronise, which is
     worse than a frame it never sees. Because of that, admission is the only place a
     frame can be lost.
 
     Bulk frames and control frames are admitted differently. A bulk frame is refused
     when the queue is over its bound, and the refusal is counted, so a slow reader
     receives whole frames at a lower rate and the run can report what was lost. A
-    control frame — status, injection acknowledgement, or pose — is not refused for
+    control frame — the status, or the answer to an injection — is not refused for
     being preceded by pixels: it evicts the newest frames that have not begun to go
-    out, and is inserted ahead of waiting bulk so external-nav / command answers are
-    not trapped behind megabyte stereo pairs while SITL's UDP FDM path continues.
-    The control frames have a bound of their own, and exceeding either bound is
-    counted, so nothing is dropped in silence.
+    out, because a lost acknowledgement cannot be told apart from a command that was
+    never applied. The control frames have a bound of their own, and exceeding either
+    bound is counted, so nothing is dropped in silence.
     """
 
     def __init__(
@@ -403,12 +403,6 @@ class OutboundStream:
         False means even an empty bulk queue could not carry it, or the control frames
         already queued fill their own bound: both are counted, because a control frame
         that was discarded is a fact about the run rather than something to hide.
-
-        Control frames are inserted ahead of waiting bulk frames (never ahead of a
-        frame that has already begun to send, and never ahead of earlier control).
-        That keeps STATUS / FAULT_ACK / POSE from sitting behind megabyte stereo
-        pairs while SITL's UDP FDM path continues — the failure mode that starves
-        external-nav under host load.
         """
         if len(frame) > self.max_queued_bytes:
             raise FramingError(
@@ -423,7 +417,7 @@ class OutboundStream:
             if not self._evict(self._newest_bulk_index):
                 self.dropped_control_frames += 1
                 return False
-        self._insert_control(frame)
+        self._append(frame, droppable=False)
         return True
 
     def flush(self, sock: socket.socket) -> None:
@@ -480,16 +474,6 @@ class OutboundStream:
         self._queued_bytes += len(frame)
         if not droppable:
             self._control_bytes += len(frame)
-
-    def _insert_control(self, frame: bytes) -> None:
-        """Place a control frame after in-flight/earlier control, before bulk."""
-        insert_at = 1 if self._frames and self._sent_from_head else 0
-        while insert_at < len(self._frames) and not self._droppable[insert_at]:
-            insert_at += 1
-        self._frames.insert(insert_at, frame)
-        self._droppable.insert(insert_at, False)
-        self._queued_bytes += len(frame)
-        self._control_bytes += len(frame)
 
     @property
     def _oldest_control_index(self) -> int | None:
@@ -2269,20 +2253,15 @@ MSG_ID_RC_CHANNELS = 65
 RC_CHANNELS_THROTTLE_FIELD = "chan3_raw"
 
 
-# How often the vision feed republishes the latest simulator pose, in *simulation*
-# time. EKF3 rejects external-navigation measurements closer together than 20 ms
+# How often the vision feed republishes the latest simulator pose. EKF3 rejects
+# external-navigation measurements closer together than 20 ms
 # (AP_NavEKF3.h:516, extNavIntervalMin_ms = 20, pinned commit af85259), so the
-# feed runs at 25 ms of sim — comfortably inside what the filter accepts, and at
-# the controller's own 20 ms pose cadence (the controller's --pose-period-ms
-# default). Pacing on wall time was wrong: under host load the adapter could
-# keep firing (or starve) while Webots/SITL advanced on another clock, creating
-# artificial VisOdom gaps. The feed now wakes on each new pose and only sends
-# when simulation time has advanced by this period.
+# feed runs at 25 ms — comfortably inside what the filter accepts, and at the
+# controller's own 20 ms pose cadence (the controller's --pose-period-ms default)
+# the stream carries one small pose record beside every 25 inertial samples
+# instead of one per inertial sample, which starved the stereo pairs in the
+# readiness handoff (measured, extnav-it2 run-a: pair=no at the 90 s deadline).
 VISION_POSE_PERIOD_S = 0.025
-# Wall poll when no pose has arrived yet — must not define the publish cadence.
-VISION_FEED_IDLE_POLL_S = 0.05
-# Sim-time gap that counts as a missed external-nav deadline (VisOdom health).
-VISION_FEED_GAP_WARN_S = 0.20
 
 
 # ---------------------------------------------------------------------------
@@ -3464,29 +3443,17 @@ class WebotsArduPilot:
         self.navigation_epoch = "nav-1"
         # The simulator-interface pose feed. The reader stores the latest pose
         # sample it reads; a dedicated thread republishes it to the autopilot's
-        # external-navigation path on a *simulation-time* cadence
-        # (VISION_POSE_PERIOD_S). The slot is a plain tuple reference — the
-        # reader replaces it atomically and wakes the feed; the feed owns no
-        # state the checklist reads except the account stop() records.
+        # external-navigation path at VISION_POSE_PERIOD_S. The slot is a plain
+        # tuple reference — the reader replaces it atomically and the feed reads
+        # whole tuples — and the feed owns no state the checklist reads except the
+        # account stop() records.
         self._latest_pose: (
             tuple[float, tuple[float, float, float], tuple[float, float, float]] | None
         ) = None
-        self._vision_pose_wake = threading.Event()
         self._vision_feed_thread: threading.Thread | None = None
         self._vision_feed_stop = threading.Event()
         self._vision_feed_error: BaseException | None = None
         self._vision_feed_published = 0
-        self._vision_feed_timing: dict[str, Any] = {
-            "pacing": "simulation",
-            "period_s": VISION_POSE_PERIOD_S,
-            "published": 0,
-            "duplicate_sim_skips": 0,
-            "period_skips": 0,
-            "max_sim_gap_s": 0.0,
-            "gap_warn_count": 0,
-            "last_published_sim_s": None,
-            "last_pose_sim_s": None,
-        }
         self._vehicle: vehicle_module.Vehicle | None = None
 
     @property
@@ -3609,7 +3576,6 @@ class WebotsArduPilot:
                     "enabled": False,
                     "published": 0,
                     "period_s": VISION_POSE_PERIOD_S,
-                    "pacing": "simulation",
                     "error": None,
                     "reason": "localization.mode is sensor-derived: this bridge republishes "
                     "no simulator pose, so the truth feed cannot reach the estimator's "
@@ -3721,8 +3687,6 @@ class WebotsArduPilot:
                 "enabled": self.settings.truth_republish,
                 "published": self._vision_feed_published,
                 "period_s": VISION_POSE_PERIOD_S,
-                "pacing": "simulation",
-                "timing": dict(self._vision_feed_timing),
                 "error": None
                 if self._vision_feed_error is None
                 else repr(self._vision_feed_error),
@@ -3885,76 +3849,45 @@ class WebotsArduPilot:
     def _stop_vision_feed(self) -> None:
         """Stop the feed before the session it sends on is closed."""
         self._vision_feed_stop.set()
-        self._vision_pose_wake.set()
         thread, self._vision_feed_thread = self._vision_feed_thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=READER_JOIN_TIMEOUT_S)
 
     def _vision_feed_loop(self) -> None:
-        """Republish the latest simulator pose on a simulation-time cadence.
+        """Republish the latest simulator pose at the external-navigation rate.
 
-        The controller streams pose samples beside the cameras; EKF3 accepts an
-        external-navigation measurement only every 20 ms of *filter* time
-        (AP_NavEKF3.h:516 at the pinned commit). This feed keeps the most recent
-        sample and sends it when simulation time has advanced by
-        VISION_POSE_PERIOD_S. It wakes when the reader installs a pose with a
-        newer sim stamp, so a stalled host slows publish rate with the sim
-        instead of opening wall-clock gaps while FDM continues. Duplicate sim
-        stamps are skipped; a failed send stops the loop — a dead link is the
-        reader's failure to raise, not this loop's to retry.
+        The controller streams pose samples beside the inertial ones; EKF3 accepts
+        an external-navigation measurement only every 20 ms (AP_NavEKF3.h:516 at
+        the pinned commit), so the feed keeps the most recent sample and sends it
+        at VISION_POSE_PERIOD_S. It sends nothing until a pose arrives, and a
+        failed send stops it — a dead link is the reader's failure to raise, not
+        this loop's to retry.
         """
-        last_published_sim: float | None = None
-        timing = self._vision_feed_timing
+        next_send = time.monotonic()
         while not self._vision_feed_stop.is_set():
+            now = time.monotonic()
+            if now < next_send:
+                if self._vision_feed_stop.wait(next_send - now):
+                    return
+                continue
+            next_send = now + VISION_POSE_PERIOD_S
             pose = self._latest_pose
             if pose is None:
-                if self._vision_feed_stop.wait(VISION_FEED_IDLE_POLL_S):
-                    return
                 continue
             sim_time_s, position, attitude = pose
-            timing["last_pose_sim_s"] = sim_time_s
-            ready = last_published_sim is None or (
-                sim_time_s - last_published_sim
-            ) >= VISION_POSE_PERIOD_S
-            if last_published_sim is not None:
-                gap = sim_time_s - last_published_sim
-                if gap > timing["max_sim_gap_s"]:
-                    timing["max_sim_gap_s"] = gap
-                if gap >= VISION_FEED_GAP_WARN_S:
-                    timing["gap_warn_count"] += 1
-                if gap <= 0.0:
-                    timing["duplicate_sim_skips"] += 1
-                    ready = False
-                elif gap < VISION_POSE_PERIOD_S:
-                    timing["period_skips"] += 1
-            if ready:
-                try:
-                    self._session.send_vision_position_estimate(
-                        usec=int(round(sim_time_s * 1_000_000)),
-                        x=position[0],
-                        y=position[1],
-                        z=position[2],
-                        roll=attitude[0],
-                        pitch=attitude[1],
-                        yaw=attitude[2],
-                    )
-                    self._vision_feed_published += 1
-                    timing["published"] = self._vision_feed_published
-                    timing["last_published_sim_s"] = sim_time_s
-                    last_published_sim = sim_time_s
-                except BaseException as error:  # noqa: BLE001 - recorded, not raised
-                    self._vision_feed_error = error
-                    return
-            # Clear then re-check so a pose that arrived during publish is not lost.
-            self._vision_pose_wake.clear()
-            newest = self._latest_pose
-            if newest is not None and (
-                last_published_sim is None
-                or (newest[0] - last_published_sim) >= VISION_POSE_PERIOD_S
-            ):
-                continue
-            self._vision_pose_wake.wait(VISION_FEED_IDLE_POLL_S)
-            if self._vision_feed_stop.is_set():
+            try:
+                self._session.send_vision_position_estimate(
+                    usec=int(round(sim_time_s * 1_000_000)),
+                    x=position[0],
+                    y=position[1],
+                    z=position[2],
+                    roll=attitude[0],
+                    pitch=attitude[1],
+                    yaw=attitude[2],
+                )
+                self._vision_feed_published += 1
+            except BaseException as error:  # noqa: BLE001 - recorded, not raised
+                self._vision_feed_error = error
                 return
 
     def _reader_loop(self) -> None:
@@ -4006,17 +3939,11 @@ class WebotsArduPilot:
         if record.pose is not None:
             # The vision feed's input: the latest simulator pose wins, because the
             # autopilot wants the most recent truth, not a queue of past truth.
-            incoming = (
+            self._latest_pose = (
                 record.sim_time_s,
                 record.pose.position_xyz,
                 record.pose.attitude_rpy,
             )
-            previous = self._latest_pose
-            self._latest_pose = incoming
-            # Wake only when simulation time advances. Same-stamp replacements
-            # (reader faster than the sim clock) must not busy-spin the feed.
-            if previous is None or incoming[0] > previous[0]:
-                self._vision_pose_wake.set()
         sink = self.record_sink
         if sink is not None:
             sink(record)
