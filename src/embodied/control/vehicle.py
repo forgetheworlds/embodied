@@ -203,7 +203,15 @@ class Vehicle:
         evidence = self._bring_up(altitude_m)
         self._last_takeoff = evidence
         if evidence.refused:
-            reason = evidence.refusals[0] if evidence.refusals else "takeoff refused"
+            if evidence.altitude_m is not None and evidence.armed:
+                reason = (
+                    f"takeoff climb incomplete (alt {evidence.altitude_m:.2f} m "
+                    f"< {0.5 * altitude_m:.2f} m)"
+                )
+            elif evidence.refusals:
+                reason = evidence.refusals[-1]
+            else:
+                reason = "takeoff refused"
             return Result(accepted=False, reason=reason)
         return Result(accepted=True)
 
@@ -427,9 +435,15 @@ class Vehicle:
                 and adapter._monotonic() < climb_wall_until
             ):
                 sim = _sim_time_s(adapter)
+                # Keep external-nav streaming; gaps make EKF "stop aiding".
+                self._pump()
+                position_ready = (
+                    sample.home_position is not None
+                    and sample.local_position_ned is not None
+                )
                 if (
                     takeoff_attempts < TAKEOFF_ATTEMPTS
-                    and sample.home_position is not None
+                    and position_ready
                     and (
                         next_takeoff_sim is None
                         or (sim is not None and sim >= next_takeoff_sim)
@@ -453,8 +467,7 @@ class Vehicle:
                     and sim - climb_start_sim >= climb_timeout
                 ):
                     break
-                self._pump()
-                adapter._sleep(0.2)
+                adapter._sleep(0.1)
             evidence = replace(
                 evidence,
                 takeoff_commanded_m=altitude_m,
