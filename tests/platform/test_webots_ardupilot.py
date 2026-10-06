@@ -616,6 +616,12 @@ class ScriptedMavlinkSession:
                 "vz": 0.0,
             },
             {
+                "mavpackettype": "HOME_POSITION",
+                "latitude": -353632610,
+                "longitude": 1491652300,
+                "altitude": 584000,
+            },
+            {
                 "mavpackettype": "SERVO_OUTPUT_RAW",
                 **{f"servo{index}_raw": servo for index in range(1, 9)},
             },
@@ -632,6 +638,10 @@ class ScriptedMavlinkSession:
                 "flight_custom_version": bytes([1, 2, 3, 4, 5, 6, 7, 8]),
                 "vendor_id": 3,
                 "product_id": 1,
+            },
+            {
+                "mavpackettype": "STATUSTEXT",
+                "text": "EKF3 IMU0 is using external nav data",
             },
             {"mavpackettype": "STATUSTEXT", "text": statustext},
         ]
@@ -1353,6 +1363,22 @@ def test_a_full_queue_drops_pixels_to_carry_a_control_frame():
     assert stream.queued_bytes == 3
 
 
+def test_a_control_frame_jumps_ahead_of_waiting_bulk():
+    """Pose/status must not sit behind megabyte pairs while FDM keeps advancing.
+
+    When no frame is mid-send, a control admission is inserted before waiting bulk
+    so external-nav samples are not delayed by camera backlog on the shared TCP
+    stream.
+    """
+    stream = W.OutboundStream(max_queued_bytes=100)
+    assert stream.queue(b"bulk-frame!!") is True  # 12 bytes
+    assert stream.queue_control(b"pose") is True
+    assert stream._frames[0] == b"pose"
+    assert stream._droppable[0] is False
+    assert stream._frames[1] == b"bulk-frame!!"
+    assert stream._droppable[1] is True
+
+
 def test_a_control_frame_never_overtakes_a_frame_that_is_half_sent():
     """A reordered frame is a stream the reader cannot parse.
 
@@ -1745,7 +1771,8 @@ def test_the_vision_feed_publishes_the_simulator_pose_to_the_autopilot(tmp_path)
 
     The feed republishes what the controller put on the stream, in the NED values
     that arrived, with the message time taken from the simulation clock — it adds
-    no opinion of its own.
+    no opinion of its own. Publish cadence follows simulation time between poses,
+    not a wall-clock sleep.
     """
     clock = FakeClock()
     session = ScriptedMavlinkSession(clock)
@@ -1770,10 +1797,10 @@ def test_the_vision_feed_publishes_the_simulator_pose_to_the_autopilot(tmp_path)
         clock.sleep(0.5)
         adapter.start()
         deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline and not session.vision_poses:
-            # The feed runs on real time; the stream runs on the test clock, so
-            # both must advance for a pose to travel from gateway to autopilot.
-            clock.sleep(0.02)
+        while time.monotonic() < deadline and len(session.vision_poses) < 2:
+            # Advance sim time enough for the feed's VISION_POSE_PERIOD_S gate,
+            # and yield the wall so the reader/feed threads can run.
+            clock.sleep(0.03)
             time.sleep(0.02)
     finally:
         adapter.stop()
@@ -1784,10 +1811,15 @@ def test_the_vision_feed_publishes_the_simulator_pose_to_the_autopilot(tmp_path)
     assert (sample["roll"], sample["pitch"], sample["yaw"]) == (0.01, -0.02, 0.3)
     # The message time is the simulation time of the pose, in microseconds.
     assert 0 < sample["usec"] < 1_000_000_000
+    # Simulation stamps are non-decreasing across publishes.
+    usecs = [item["usec"] for item in published]
+    assert usecs == sorted(usecs)
     # The feed's own account is recorded beside the run's other evidence.
     feed = json.loads((tmp_path / "run-x" / "vision-pose-feed.json").read_text())
     assert feed["published"] == len(published)
+    assert feed["pacing"] == "simulation"
     assert feed["error"] is None
+    assert feed["timing"]["published"] == len(published)
 
 
 def test_a_probe_run_tolerates_a_stream_that_carries_pose_records(tmp_path):

@@ -6,11 +6,15 @@ One publication loop while armed GUIDED::
         choose current phase
         produce one Motion
         Vehicle.command(Motion)
-        ~50 ms
+        wait ~50 ms of *simulation* time
 
 Phase changes (outbound / hold / spin / reface / settle / align / return)
 replace the current Motion without stopping publication. Scoring happens on
 transition ticks; the next Motion is commanded in the same loop cadence.
+
+The refresh is sim-paced on purpose: a wall-clock sleep while Webots/SITL keep
+advancing opens setpoint gaps that look like guided loss under host load. Sensor
+drains in this loop are non-blocking so camera backlog cannot stall commands.
 
 Run::
 
@@ -52,7 +56,12 @@ from embodied.platform.webots_ardupilot import (
 DEFAULT_SPIN_RAD = math.pi
 DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
+# Command refresh period in *simulation* seconds (Guided setpoint lifetime).
 REFRESH_S = 0.05
+# Short wall poll while waiting for sim time to advance — must not define cadence.
+REFRESH_POLL_S = 0.005
+# If sim time is unavailable, do not spin forever on the wall.
+REFRESH_WALL_FALLBACK_S = 0.05
 SPIN_RATE_RAD_S = 0.6
 ZERO = Vec3(0.0, 0.0, 0.0)
 
@@ -62,9 +71,39 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _drain(platform: WebotsArduPilot) -> None:
-    record = platform.sensor_record(0.02)
+    """Non-blocking sensor drain: never wait on camera/estimator output mid-flight.
+
+    A blocking read here would stall Vehicle.command() while Webots/SITL continue,
+    which is exactly how external-nav and setpoints go stale under host load.
+    """
+    record = platform.sensor_record(0.0)
     while record is not None:
         record = platform.sensor_record(0.0)
+
+
+def _wait_sim_refresh(platform: WebotsArduPilot, timing: dict[str, Any]) -> None:
+    """Hold until ~REFRESH_S of simulation time has passed (or wall fallback)."""
+    start_sim = _sim_time_s(platform)
+    start_wall = platform._monotonic()
+    if start_sim is None:
+        _drain(platform)
+        platform._sleep(REFRESH_WALL_FALLBACK_S)
+        timing["wall_fallback_waits"] += 1
+        return
+    while True:
+        _drain(platform)
+        sim = _sim_time_s(platform)
+        if sim is not None and (sim - start_sim) >= REFRESH_S:
+            gap = sim - start_sim
+            timing["sim_waits"] += 1
+            timing["max_sim_refresh_s"] = max(timing["max_sim_refresh_s"], gap)
+            return
+        if platform._monotonic() - start_wall >= REFRESH_WALL_FALLBACK_S * 4:
+            # Sim appears frozen from this process's view; keep publishing rather
+            # than silent-gap guided flight. Attribute the miss.
+            timing["sim_stall_fallbacks"] += 1
+            return
+        platform._sleep(REFRESH_POLL_S)
 
 
 def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +392,17 @@ def fly_control_route(
     wall_budget = sum(phase.duration_s for phase in phases) + hold_s
     wall_until = platform._monotonic() + _wall_backstop_s(platform, wall_budget)
     guided_lost = False
+    timing: dict[str, Any] = {
+        "command_refresh_pacing": "simulation",
+        "refresh_s": REFRESH_S,
+        "publications": 0,
+        "sim_waits": 0,
+        "wall_fallback_waits": 0,
+        "sim_stall_fallbacks": 0,
+        "max_sim_refresh_s": 0.0,
+        "guided_lost_at_sim_s": None,
+        "vision_feed": None,
+    }
 
     while index < len(phases) and platform._monotonic() < wall_until:
         phase = phases[index]
@@ -377,8 +427,10 @@ def fly_control_route(
         motion = _phase_motion(phase)
         result = vehicle.command(motion)
         phase.publications += 1
+        timing["publications"] += 1
         if not result.accepted:
             guided_lost = True
+            timing["guided_lost_at_sim_s"] = _sim_time_s(platform)
             if phase.kind == "yaw_rate":
                 _score_yaw_phase(
                     log,
@@ -409,8 +461,7 @@ def fly_control_route(
             # Wall-clock fallback if sim time is unavailable.
             phase_done = True
 
-        drain()
-        platform._sleep(REFRESH_S)
+        _wait_sim_refresh(platform, timing)
 
         if not phase_done:
             continue
@@ -444,11 +495,15 @@ def fly_control_route(
         drain()
         time.sleep(0.05)
 
+    timing["vision_feed"] = dict(getattr(platform, "_vision_feed_timing", {}) or {})
+    platform.evidence.write_json("flight-critical-timing.json", timing)
+
     return {
         "status": "pass" if not log.reasons else "fail",
         "reasons": log.reasons,
         "steps": log.steps,
         "residual_max_m": residual_max_m,
+        "timing": timing,
     }
 
 
