@@ -1,8 +1,7 @@
 # Control-layer live sim verification (not pytest).
 #
-# Canonical entry: configs/layers/control
-# Exercises every Vehicle primitive through first_indoor doorways:
-# takeoff → outbound gotos → hold → spin → reverse-spin reface → return → land.
+# Canonical entry: ./configs/layers/control
+# Exercises Vehicle API v1 (takeoff / command loop / land) through first_indoor.
 #
 # Waypoints are absolute local-NED (EKF origin = world ENU origin). Iris spawn
 # is ENU (-1,0,*) → NED (-1,0,*); do NOT treat these as spawn-relative offsets.

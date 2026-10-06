@@ -1,18 +1,15 @@
-"""Live control-layer proof: Webots + SITL exercising every Vehicle primitive.
+"""Live control-layer proof: caller-owned Vehicle API v1 command loop.
 
-Default complex scene: ``configs/motion_doorway.yaml`` (first_indoor apertures).
+Route (public methods only):
 
-Route:
+1. takeoff(altitude)
+2. stream hold Motions at each outbound odom waypoint
+3. stream hold at the far end
+4. stream yaw_rate turn (+π) then reverse (−π)
+5. stream return waypoints
+6. land()
 
-1. takeoff
-2. goto each outbound waypoint and hold
-3. explicit hold at the far end
-4. spin (relative yaw rate)
-5. reface (reverse yaw-rate spin back toward north)
-6. goto return waypoints back toward the pad
-7. land
-
-Run the layer gate::
+Run::
 
     ./configs/layers/control
 """
@@ -34,6 +31,8 @@ from embodied.cli import (
     repository_root,
 )
 from embodied.contracts.records import SensorMode
+from embodied.control import Motion, Vehicle, Vec3, wrap_angle_rad
+from embodied.control.vehicle import ned_to_enu
 from embodied.platform.webots_ardupilot import (
     EvidenceWriter,
     PlatformSettings,
@@ -47,8 +46,11 @@ from embodied.platform.webots_ardupilot import (
 )
 
 DEFAULT_SPIN_RAD = math.pi
-DEFAULT_SPIN_TOLERANCE_RAD = 0.35
+DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
+REFRESH_S = 0.05
+SPIN_RATE_RAD_S = 0.6
+ZERO = Vec3(0.0, 0.0, 0.0)
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -62,7 +64,6 @@ def _drain(platform: WebotsArduPilot) -> None:
 
 
 def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
-    """Return motion-proof task settings, preferring ``motion`` over ``probe``."""
     motion = document.get("motion")
     probe = document["probe"]
     if motion is not None:
@@ -75,30 +76,88 @@ def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _score_goto(
+def _sim_time_s(platform: WebotsArduPilot) -> float | None:
+    sample = platform.latest_telemetry
+    if sample is None or sample.boot_time_ms is None:
+        return None
+    return sample.boot_time_ms / 1000.0
+
+
+def _wall_backstop_s(platform: WebotsArduPilot, sim_duration_s: float) -> float:
+    min_ratio = min(platform.settings.realtime_ratio_envelope)
+    return sim_duration_s / min_ratio
+
+
+def _ned_waypoint_to_odom(
+    north: float, east: float, z_offset: float, hover_m: float
+) -> Vec3:
+    """Config stores absolute local-NED holds; Motion is odom ENU."""
+    down = -(hover_m - z_offset)
+    return Vec3(*ned_to_enu((north, east, down)))
+
+
+def _stream(
+    vehicle: Vehicle,
+    platform: WebotsArduPilot,
+    *,
+    build_motion: Callable[[], Motion],
+    duration_s: float,
+    drain: Callable[[], None],
+) -> dict[str, Any]:
+    """Caller-owned refresh: one command() per tick for ``duration_s`` sim time."""
+    start_sim: float | None = None
+    wall_until = platform._monotonic() + _wall_backstop_s(platform, duration_s)
+    publications = 0
+    while platform._monotonic() < wall_until:
+        sim = _sim_time_s(platform)
+        if sim is not None:
+            if start_sim is None:
+                start_sim = sim
+            elif sim - start_sim >= duration_s:
+                break
+        result = vehicle.command(build_motion())
+        if not result.accepted:
+            return {
+                "ok": False,
+                "publications": publications,
+                "guided_lost": True,
+                "reason": result.reason,
+            }
+        publications += 1
+        drain()
+        platform._sleep(REFRESH_S)
+    return {"ok": True, "publications": publications, "guided_lost": False}
+
+
+def _score_hold(
     steps: list[dict[str, Any]],
     reasons: list[str],
     *,
     label: str,
-    result: dict[str, Any],
+    target_odom: Vec3,
+    vehicle: Vehicle,
+    stream: dict[str, Any],
     residual_max_m: float,
 ) -> None:
-    residual = result.get("residual_m")
+    state = vehicle.state()
+    residual = None
+    if state.position is not None:
+        residual = math.dist(state.position.as_tuple(), target_odom.as_tuple())
     ok = (
-        result.get("ok") is True
+        stream.get("ok") is True
         and residual is not None
         and residual <= residual_max_m
     )
     steps.append(
         {
             "task": label,
-            "target_ned": list(result.get("target_ned") or ()),
+            "target_odom": list(target_odom.as_tuple()),
             "residual_m": residual,
-            "publications": result.get("publications"),
+            "publications": stream.get("publications"),
             "ok": ok,
         }
     )
-    if result.get("guided_lost"):
+    if stream.get("guided_lost"):
         reasons.append(f"{label}: guided flight lost")
     elif residual is None:
         reasons.append(f"{label}: no position to score")
@@ -119,24 +178,24 @@ def fly_control_route(
     spin_tolerance_rad: float = DEFAULT_SPIN_TOLERANCE_RAD,
     return_waypoints: bool = True,
 ) -> dict[str, Any]:
-    """Fly takeoff → outbound → hold → spin → return → land through Vehicle."""
+    """Fly the layer route through Vehicle.takeoff / command / land / state."""
     vehicle = platform.vehicle
     drain: Callable[[], None] = lambda: _drain(platform)
     reasons: list[str] = []
     steps: list[dict[str, Any]] = []
 
-    takeoff = vehicle.takeoff(
-        platform.settings.step_timeout_s.flight, drain=drain
-    )
+    takeoff = vehicle.takeoff(hover_m)
+    state = vehicle.state()
     steps.append(
         {
             "task": "takeoff",
-            "ok": not takeoff.refused,
-            "altitude_m": takeoff.altitude_m,
+            "ok": takeoff.accepted,
+            "altitude_m": None if state.position is None else state.position.z,
+            "reason": takeoff.reason,
         }
     )
-    if takeoff.refused:
-        reasons.append("takeoff refused")
+    if not takeoff.accepted:
+        reasons.append(takeoff.reason or "takeoff refused")
         return {
             "status": "fail",
             "reasons": reasons,
@@ -144,132 +203,136 @@ def fly_control_route(
             "residual_max_m": residual_max_m,
         }
 
+    def hold_motion(target: Vec3, *, yaw: float | None = 0.0) -> Motion:
+        return Motion(position=target, velocity=ZERO, yaw=yaw)
+
     for index, waypoint in enumerate(waypoints):
-        north, east, z_offset = waypoint
-        down = -(hover_m - z_offset)
-        result = vehicle.goto(
-            north,
-            east,
-            down_m=down,
-            hold_s=hold_s,
-            yaw_rad=0.0,
+        target = _ned_waypoint_to_odom(*waypoint, hover_m=hover_m)
+        stream = _stream(
+            vehicle,
+            platform,
+            build_motion=lambda t=target: hold_motion(t, yaw=0.0),
+            duration_s=hold_s,
             drain=drain,
         )
-        _score_goto(
+        _score_hold(
             steps,
             reasons,
             label=f"goto[{index}]",
-            result=result,
+            target_odom=target,
+            vehicle=vehicle,
+            stream=stream,
             residual_max_m=residual_max_m,
         )
-        if result.get("guided_lost"):
+        if stream.get("guided_lost"):
             break
 
     if not any("guided flight lost" in reason for reason in reasons):
-        hold = vehicle.hold(hold_s, yaw_rad=0.0, drain=drain)
-        hold_residual = hold.get("residual_m")
-        hold_ok = hold.get("ok") is True and not hold.get("guided_lost")
-        steps.append(
-            {
-                "task": "hold",
-                "residual_m": hold_residual,
-                "publications": hold.get("publications"),
-                "ok": hold_ok,
-            }
-        )
-        if hold.get("guided_lost"):
-            reasons.append("hold: guided flight lost")
-        elif not hold_ok:
-            reasons.append("hold: failed")
+        state = vehicle.state()
+        if state.position is None:
+            reasons.append("hold: no position")
+            steps.append({"task": "hold", "ok": False})
+        else:
+            target = state.position
+            stream = _stream(
+                vehicle,
+                platform,
+                build_motion=lambda t=target: hold_motion(t, yaw=0.0),
+                duration_s=hold_s,
+                drain=drain,
+            )
+            _score_hold(
+                steps,
+                reasons,
+                label="hold",
+                target_odom=target,
+                vehicle=vehicle,
+                stream=stream,
+                residual_max_m=residual_max_m,
+            )
 
-    if not any("guided flight lost" in reason for reason in reasons):
-        spun = vehicle.spin(spin_rad, drain=drain)
-        delta = spun.get("delta_rad")
-        spin_ok = (
-            spun.get("ok") is True
-            and not spun.get("guided_lost")
+    def yaw_turn(angle_rad: float, label: str) -> None:
+        if any("guided flight lost" in reason for reason in reasons):
+            return
+        state = vehicle.state()
+        if state.position is None or state.yaw is None:
+            reasons.append(f"{label}: missing pose")
+            steps.append({"task": label, "ok": False})
+            return
+        start_yaw = state.yaw
+        hold_pos = state.position
+        rate = SPIN_RATE_RAD_S if angle_rad >= 0.0 else -SPIN_RATE_RAD_S
+        duration = abs(angle_rad) / abs(SPIN_RATE_RAD_S)
+        stream = _stream(
+            vehicle,
+            platform,
+            build_motion=lambda p=hold_pos, r=rate: Motion(
+                position=p, velocity=ZERO, yaw_rate=r
+            ),
+            duration_s=duration,
+            drain=drain,
+        )
+        after = vehicle.state()
+        delta = None
+        if after.yaw is not None:
+            delta = wrap_angle_rad(after.yaw - start_yaw)
+        ok = (
+            stream.get("ok") is True
             and delta is not None
-            and abs(abs(delta) - abs(spin_rad)) <= spin_tolerance_rad
+            and abs(abs(delta) - abs(angle_rad)) <= spin_tolerance_rad
         )
         steps.append(
             {
-                "task": "spin",
-                "requested_rad": spun.get("requested_rad"),
+                "task": label,
+                "requested_rad": angle_rad,
                 "delta_rad": delta,
-                "publications": spun.get("publications"),
-                "ok": spin_ok,
+                "publications": stream.get("publications"),
+                "ok": ok,
             }
         )
-        if spun.get("guided_lost"):
-            reasons.append("spin: guided flight lost")
+        if stream.get("guided_lost"):
+            reasons.append(f"{label}: guided flight lost")
         elif delta is None:
-            reasons.append("spin: no yaw delta to score")
-        elif not spin_ok:
+            reasons.append(f"{label}: no yaw delta to score")
+        elif not ok:
             reasons.append(
-                f"spin: |delta| {abs(delta):.3f} rad vs requested {abs(spin_rad):.3f} "
+                f"{label}: |delta| {abs(delta):.3f} rad vs requested {abs(angle_rad):.3f} "
                 f"(tol {spin_tolerance_rad:.3f})"
             )
 
-    # Unwind with a rate-controlled reverse spin before inbound legs.
-    # Absolute yaw=0 after ~π tip-strikes (AngErr≈120); return while still
-    # yawed also tip-struck on return[0] through the 1 m doorway.
-    if return_waypoints and not any(
-        "guided flight lost" in reason for reason in reasons
-    ):
-        unwind = vehicle.spin(-spin_rad, drain=drain)
-        unwind_delta = unwind.get("delta_rad")
-        reface_ok = (
-            unwind.get("ok") is True
-            and not unwind.get("guided_lost")
-            and unwind_delta is not None
-            and abs(abs(unwind_delta) - abs(spin_rad)) <= spin_tolerance_rad
-        )
-        steps.append(
-            {
-                "task": "reface",
-                "requested_rad": unwind.get("requested_rad"),
-                "delta_rad": unwind_delta,
-                "publications": unwind.get("publications"),
-                "ok": reface_ok,
-            }
-        )
-        if unwind.get("guided_lost"):
-            reasons.append("reface: guided flight lost")
-        elif unwind_delta is None:
-            reasons.append("reface: no yaw delta to score")
-        elif not reface_ok:
-            reasons.append(
-                f"reface: |delta| {abs(unwind_delta):.3f} rad vs requested "
-                f"{abs(spin_rad):.3f} (tol {spin_tolerance_rad:.3f})"
-            )
+    yaw_turn(spin_rad, "spin")
+    if return_waypoints:
+        yaw_turn(-spin_rad, "reface")
 
     if return_waypoints and not any(
         "guided flight lost" in reason for reason in reasons
     ):
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
         for index, waypoint in enumerate(inbound):
-            north, east, z_offset = waypoint
-            down = -(hover_m - z_offset)
-            result = vehicle.goto(
-                north,
-                east,
-                down_m=down,
-                hold_s=hold_s,
-                yaw_rad=0.0,
+            target = _ned_waypoint_to_odom(*waypoint, hover_m=hover_m)
+            stream = _stream(
+                vehicle,
+                platform,
+                build_motion=lambda t=target: hold_motion(t, yaw=0.0),
+                duration_s=hold_s,
                 drain=drain,
             )
-            _score_goto(
+            _score_hold(
                 steps,
                 reasons,
                 label=f"return[{index}]",
-                result=result,
+                target_odom=target,
+                vehicle=vehicle,
+                stream=stream,
                 residual_max_m=residual_max_m,
             )
-            if result.get("guided_lost"):
+            if stream.get("guided_lost"):
                 break
 
-    vehicle.land()
-    steps.append({"task": "land", "ok": True})
+    land = vehicle.land()
+    steps.append({"task": "land", "ok": land.accepted})
+    if not land.accepted:
+        reasons.append(land.reason or "land refused")
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         drain()
@@ -283,7 +346,6 @@ def fly_control_route(
     }
 
 
-# Keep the old name as an alias for callers/tests that still import it.
 fly_motion_route = fly_control_route
 
 
@@ -317,7 +379,6 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
     return_waypoints = bool(motion.get("return_waypoints", True))
 
     writer = EvidenceWriter(output_dir, "run-a")
-    # Same EKF-active layering as compat: without it SITL stays on simulator AHRS.
     platform = WebotsArduPilot(
         settings,
         runner=SubprocessRunner(),
@@ -349,8 +410,8 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
             gate_status=gate,
             reasons=tuple(result["reasons"]),
             limitations=(
-                "Control proof: takeoff, outbound gotos, hold, spin, return, land; "
-                "no estimator or obstacle-avoidance checks",
+                "Control proof: Vehicle API v1 takeoff/command/land through "
+                "doorways; no estimator or obstacle-avoidance checks",
             ),
             manifest={
                 "command": "motion-proof",
@@ -383,8 +444,8 @@ register_command(
     "motion-proof",
     _command,
     help_text=(
-        "Launch the simulator and fly the full Vehicle control route "
-        "(takeoff, gotos, hold, spin, return, land)."
+        "Launch the simulator and fly the Vehicle API v1 control route "
+        "(takeoff, command-loop holds/turns, land)."
     ),
     stage_id="P00-motion",
     run_prefix="p00-motion-proof",

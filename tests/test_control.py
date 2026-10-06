@@ -1,8 +1,6 @@
-"""Deterministic control-layer contract tests (no Webots / SITL).
+"""Deterministic Vehicle API v1 contract tests (no Webots / SITL).
 
-Checks the Vehicle API behaviour we rely on: ENU↔NED, setpoint masks,
-yaw-rate spin with position held (not angle slam / open-loop XY), and
-refuse-publish when not armed Guided.
+Public surface only: takeoff, command(Motion), land, state.
 """
 
 from __future__ import annotations
@@ -13,21 +11,13 @@ from types import SimpleNamespace
 from embodied.contracts.records import (
     ClockStamp,
     Frame,
-    MotionTarget,
     TYPE_MASK_ACCELERATION_IGNORE,
     TYPE_MASK_POSITION_IGNORE,
     TYPE_MASK_YAW_IGNORE,
     TYPE_MASK_YAW_RATE_IGNORE,
 )
-from embodied.control.vehicle import (
-    REFRESH_S,
-    SPIN_RATE_RAD_S,
-    LocalNedTarget,
-    Vehicle,
-    enu_to_ned,
-    mask_for_target,
-    wrap_angle_rad,
-)
+from embodied.control import Motion, Result, Vehicle, VehicleState, Vec3
+from embodied.control.vehicle import enu_to_ned, mask_for_target, ned_to_enu, wrap_angle_rad
 
 
 class _FakeEvidence:
@@ -58,8 +48,6 @@ class _FakeSession:
 
 
 class _FakeAdapter:
-    """Minimal stand-in for WebotsArduPilot used only by Vehicle unit tests."""
-
     def __init__(self, *, armed: bool = True, guided: bool = True) -> None:
         self.settings = SimpleNamespace(
             hover_altitude_m=1.5,
@@ -77,13 +65,15 @@ class _FakeAdapter:
         self._session = _FakeSession()
         self._now = 0.0
         self._boot_ms = 0
+        self._statustexts: list[str] = []
         mode = "GUIDED" if guided else "LOITER"
         self._telemetry = SimpleNamespace(
             in_guided_mode=guided,
             armed=armed,
             mode_name=mode,
             local_position_ned=(0.0, 0.0, -1.5),
-            attitude_rpy=(0.0, 0.0, 0.0),
+            velocity_ned=(0.1, -0.2, 0.0),
+            attitude_rpy=(0.0, 0.0, 0.25),
             servo_outputs=(1100, 1100, 1100, 1100),
             home_position=(-353632610, 1491652300, 584000),
             boot_time_ms=self._boot_ms,
@@ -121,76 +111,128 @@ class _FakeAdapter:
         )
 
 
-def test_enu_to_ned_axes() -> None:
-    assert enu_to_ned((1.0, 0.0, 0.0)) == (1.0, 0.0, 0.0)
-    assert enu_to_ned((0.0, 1.0, 0.0)) == (0.0, -1.0, 0.0)
-    assert enu_to_ned((0.0, 0.0, 1.0)) == (0.0, 0.0, -1.0)
+def test_enu_ned_round_trip() -> None:
+    assert enu_to_ned((1.0, 2.0, 3.0)) == (1.0, -2.0, -3.0)
+    assert ned_to_enu((1.0, -2.0, -3.0)) == (1.0, 2.0, 3.0)
 
 
-def test_goto_mask_keeps_position_velocity_and_yaw() -> None:
-    motion = MotionTarget(
-        position_ned=(1.0, 2.0, -1.5),
+def test_command_is_one_shot_odom_to_ned() -> None:
+    adapter = _FakeAdapter()
+    vehicle = Vehicle(adapter)
+    motion = Motion(
+        position=Vec3(2.5, 0.4, 1.5),
+        velocity=Vec3(0.0, 0.0, 0.0),
+        yaw=0.0,
+    )
+    result = vehicle.command(motion)
+    assert result == Result(accepted=True)
+    assert len(adapter._session.setpoints) == 1
+    last = adapter._session.setpoints[-1]
+    assert last.frame is Frame.ODOM
+    assert last.target.position_ned == enu_to_ned((2.5, 0.4, 1.5))
+    assert last.target.velocity_ned == (0.0, 0.0, 0.0)
+    assert last.target.yaw_rad == 0.0
+    assert last.target.yaw_rate_rad_s is None
+    assert not (last.type_mask & TYPE_MASK_POSITION_IGNORE)
+    assert last.type_mask & TYPE_MASK_YAW_RATE_IGNORE
+    assert last.type_mask & TYPE_MASK_ACCELERATION_IGNORE
+
+
+def test_command_yaw_rate_turn_keeps_position() -> None:
+    adapter = _FakeAdapter()
+    vehicle = Vehicle(adapter)
+    motion = Motion(
+        position=Vec3(7.5, 0.5, 1.5),
+        velocity=Vec3(0.0, 0.0, 0.0),
+        yaw_rate=0.6,
+    )
+    assert vehicle.command(motion).accepted is True
+    last = adapter._session.setpoints[-1]
+    assert last.target.yaw_rad is None
+    assert last.target.yaw_rate_rad_s == 0.6
+    assert last.target.position_ned == enu_to_ned((7.5, 0.5, 1.5))
+    assert last.type_mask & TYPE_MASK_YAW_IGNORE
+    assert not (last.type_mask & TYPE_MASK_YAW_RATE_IGNORE)
+
+
+def test_command_refuses_when_not_guided() -> None:
+    adapter = _FakeAdapter(armed=False, guided=True)
+    vehicle = Vehicle(adapter)
+    result = vehicle.command(
+        Motion(position=Vec3(1.0, 0.0, 1.5), velocity=Vec3(0.0, 0.0, 0.0))
+    )
+    assert result.accepted is False
+    assert result.reason == "not in armed Guided flight"
+    assert adapter._session.setpoints == []
+    assert adapter.refusals
+
+
+def test_command_refuses_yaw_and_yaw_rate_together() -> None:
+    adapter = _FakeAdapter()
+    vehicle = Vehicle(adapter)
+    result = vehicle.command(
+        Motion(
+            position=Vec3(0.0, 0.0, 1.5),
+            velocity=Vec3(0.0, 0.0, 0.0),
+            yaw=0.0,
+            yaw_rate=0.5,
+        )
+    )
+    assert result.accepted is False
+    assert "heading" in (result.reason or "")
+    assert adapter._session.setpoints == []
+
+
+def test_command_refuses_non_finite() -> None:
+    adapter = _FakeAdapter()
+    vehicle = Vehicle(adapter)
+    result = vehicle.command(
+        Motion(position=Vec3(math.nan, 0.0, 1.5), velocity=Vec3(0.0, 0.0, 0.0))
+    )
+    assert result.accepted is False
+    assert adapter._session.setpoints == []
+
+
+def test_takeoff_rejects_bad_altitude() -> None:
+    vehicle = Vehicle(_FakeAdapter())
+    assert vehicle.takeoff(0.0).accepted is False
+    assert vehicle.takeoff(-1.0).accepted is False
+
+
+def test_land_sets_land_mode() -> None:
+    adapter = _FakeAdapter()
+    vehicle = Vehicle(adapter)
+    assert vehicle.land().accepted is True
+    assert adapter._session.modes == ["LAND"]
+
+
+def test_state_reports_odom_pose() -> None:
+    adapter = _FakeAdapter()
+    state = Vehicle(adapter).state()
+    assert isinstance(state, VehicleState)
+    assert state.armed is True
+    assert state.guided is True
+    assert state.position == Vec3(*ned_to_enu((0.0, 0.0, -1.5)))
+    assert state.velocity == Vec3(*ned_to_enu((0.1, -0.2, 0.0)))
+    assert state.yaw == 0.25
+
+
+def test_wrap_angle_rad() -> None:
+    assert abs(wrap_angle_rad(math.pi + 0.1) + (math.pi - 0.1)) < 1e-9
+
+
+def test_mask_for_hold_motion() -> None:
+    from embodied.contracts.records import MotionTarget
+
+    target = MotionTarget(
+        position_ned=(1.0, 0.0, -1.5),
         velocity_ned=(0.0, 0.0, 0.0),
         acceleration_ned=None,
         yaw_rad=0.0,
         yaw_rate_rad_s=None,
     )
-    mask = mask_for_target(motion)
+    mask = mask_for_target(target)
     assert mask & TYPE_MASK_ACCELERATION_IGNORE
     assert mask & TYPE_MASK_YAW_RATE_IGNORE
     assert not (mask & TYPE_MASK_POSITION_IGNORE)
     assert not (mask & TYPE_MASK_YAW_IGNORE)
-
-
-def test_spin_uses_yaw_rate_not_angle() -> None:
-    adapter = _FakeAdapter()
-    vehicle = Vehicle(adapter)
-    result = vehicle.spin(math.pi / 2)
-    assert result["ok"] is True
-    assert adapter._session.setpoints
-    last = adapter._session.setpoints[-1]
-    assert last.frame is Frame.ODOM
-    assert last.target.yaw_rad is None
-    assert last.target.yaw_rate_rad_s == SPIN_RATE_RAD_S
-    # Position is held during spin so XY control stays closed-loop.
-    assert last.target.position_ned == (0.0, 0.0, -1.5)
-    assert not (last.type_mask & TYPE_MASK_POSITION_IGNORE)
-    assert last.type_mask & TYPE_MASK_YAW_IGNORE
-    assert not (last.type_mask & TYPE_MASK_YAW_RATE_IGNORE)
-
-
-def test_reverse_spin_uses_negative_yaw_rate() -> None:
-    """Reface after +π must unwind via rate, not absolute yaw=0 (tip-strike)."""
-    adapter = _FakeAdapter()
-    vehicle = Vehicle(adapter)
-    result = vehicle.spin(-math.pi)
-    assert result["ok"] is True
-    last = adapter._session.setpoints[-1]
-    assert last.target.yaw_rad is None
-    assert last.target.yaw_rate_rad_s == -SPIN_RATE_RAD_S
-    assert last.target.position_ned == (0.0, 0.0, -1.5)
-
-
-def test_publish_refused_when_not_guided() -> None:
-    adapter = _FakeAdapter(armed=False, guided=True)
-    vehicle = Vehicle(adapter)
-    published = vehicle.publish(
-        LocalNedTarget(
-            position_ned=(1.0, 0.0, -1.5),
-            velocity_ned=(0.0, 0.0, 0.0),
-            yaw_rad=0.0,
-            deadline_s=1.0,
-            certificate_ref=None,
-        )
-    )
-    assert published is None
-    assert adapter.refusals
-    assert adapter._session.setpoints == []
-
-
-def test_refresh_period_is_named_const() -> None:
-    assert REFRESH_S == 0.05
-
-
-def test_wrap_angle_rad() -> None:
-    assert abs(wrap_angle_rad(math.pi + 0.1) + (math.pi - 0.1)) < 1e-9

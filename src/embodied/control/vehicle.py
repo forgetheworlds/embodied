@@ -1,16 +1,21 @@
-"""Bottom layer: ArduPilot GUIDED motion on a live MAVLink link.
+"""Control layer: Vehicle API v1 (GUIDED motion on a live MAVLink link).
 
-One module owns frame conversion, setpoint records, publishing, arming, takeoff,
-goto, hold, spin, and land. The platform adapter starts processes and sensor I/O;
-everything that moves the aircraft goes through :class:`Vehicle`.
+Public surface::
+
+    Vehicle.takeoff(altitude_m) -> Result
+    Vehicle.command(Motion) -> Result
+    Vehicle.land() -> Result
+    Vehicle.state() -> VehicleState
+
+``Motion`` is odom-only (ENU: x north, y west, z up). Vehicle converts
+odom→NED→MAVLink. Each ``command()`` is one shot — the caller owns refresh.
 """
 
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from embodied.contracts.records import (
     ClockStamp,
@@ -30,7 +35,48 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Frames
+# Public types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Vec3:
+    x: float
+    y: float
+    z: float
+
+    def as_tuple(self) -> tuple[float, float, float]:
+        return (float(self.x), float(self.y), float(self.z))
+
+
+@dataclass(frozen=True)
+class Motion:
+    """One odom motion sample. Hold = zero velocity; turns add ``yaw_rate``."""
+
+    position: Vec3
+    velocity: Vec3
+    yaw: float | None = None
+    yaw_rate: float | None = None
+
+
+@dataclass(frozen=True)
+class Result:
+    accepted: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class VehicleState:
+    armed: bool
+    guided: bool
+    position: Vec3 | None
+    velocity: Vec3 | None
+    yaw: float | None
+    landed: bool | None = None
+
+
+# ---------------------------------------------------------------------------
+# Frames / masks (Vehicle-owned odom↔NED)
 # ---------------------------------------------------------------------------
 
 
@@ -44,12 +90,41 @@ def enu_to_ned(values: Sequence[float]) -> tuple[float, float, float]:
     return (float(values[0]), -float(values[1]), -float(values[2]))
 
 
+def ned_to_enu(values: Sequence[float]) -> tuple[float, float, float]:
+    if len(values) != 3:
+        raise FrameError("a frame conversion takes three components")
+    return (float(values[0]), -float(values[1]), -float(values[2]))
+
+
 def wrap_angle_rad(angle: float) -> float:
     return math.remainder(angle, math.tau)
 
 
+def _finite3(values: Sequence[float], label: str) -> None:
+    if len(values) != 3:
+        raise FrameError(f"{label} needs three components")
+    for value in values:
+        if not math.isfinite(float(value)):
+            raise FrameError(f"{label} has a non-finite component")
+
+
+def mask_for_target(target: MotionTarget) -> int:
+    mask = 0
+    if target.position_ned is None:
+        mask |= TYPE_MASK_POSITION_IGNORE
+    if target.velocity_ned is None:
+        mask |= TYPE_MASK_VELOCITY_IGNORE
+    if target.acceleration_ned is None:
+        mask |= TYPE_MASK_ACCELERATION_IGNORE
+    if target.yaw_rad is None:
+        mask |= TYPE_MASK_YAW_IGNORE
+    if target.yaw_rate_rad_s is None:
+        mask |= TYPE_MASK_YAW_RATE_IGNORE
+    return mask
+
+
 # ---------------------------------------------------------------------------
-# Wire types
+# Adapter glue kept for platform probes (not Vehicle API v1)
 # ---------------------------------------------------------------------------
 
 
@@ -83,36 +158,16 @@ class AutopilotControlEvidence:
     refusals: tuple[str, ...]
 
 
-def mask_for_target(target: MotionTarget) -> int:
-    mask = 0
-    if target.position_ned is None:
-        mask |= TYPE_MASK_POSITION_IGNORE
-    if target.velocity_ned is None:
-        mask |= TYPE_MASK_VELOCITY_IGNORE
-    if target.acceleration_ned is None:
-        mask |= TYPE_MASK_ACCELERATION_IGNORE
-    if target.yaw_rad is None:
-        mask |= TYPE_MASK_YAW_IGNORE
-    if target.yaw_rate_rad_s is None:
-        mask |= TYPE_MASK_YAW_RATE_IGNORE
-    return mask
-
-
-# ---------------------------------------------------------------------------
-# Vehicle
-# ---------------------------------------------------------------------------
-
 ARM_SETTLE_S = 1.0
 CONTROL_RETRY_S = 5.0
 CONTROL_GRANT_GRACE_S = 3.0
-REFRESH_S = 0.05
-SPIN_RATE_RAD_S = 0.6
+# Validity of one command() sample on the wire. Caller must refresh sooner.
+COMMAND_DEADLINE_S = 0.25
 TAKEOFF_ATTEMPTS = 5
 TAKEOFF_RETRY_SIM_S = 1.5
 
 
 def _sim_time_s(adapter: WebotsArduPilot) -> float | None:
-    """Autopilot sim clock from MAVLink ``time_boot_ms``."""
     sample = adapter.latest_telemetry
     if sample is None or sample.boot_time_ms is None:
         return None
@@ -120,16 +175,94 @@ def _sim_time_s(adapter: WebotsArduPilot) -> float | None:
 
 
 def _wall_backstop_s(adapter: WebotsArduPilot, sim_duration_s: float) -> float:
-    """Wall-clock ceiling when sim time must advance but the host runs slow."""
     min_ratio = min(adapter.settings.realtime_ratio_envelope)
     return sim_duration_s / min_ratio
 
 
+# ---------------------------------------------------------------------------
+# Vehicle
+# ---------------------------------------------------------------------------
+
+
 class Vehicle:
-    """Move the aircraft: the only layer that commands ArduPilot guided motion."""
+    """Public GUIDED motion API. Caller owns the command refresh loop."""
 
     def __init__(self, adapter: WebotsArduPilot) -> None:
         self._adapter = adapter
+        self._last_takeoff: AutopilotControlEvidence | None = None
+
+    # -- public ------------------------------------------------------------
+
+    def takeoff(self, altitude_m: float) -> Result:
+        """Arm, enter GUIDED, wait for EKF origin, climb to ``altitude_m``."""
+        if not math.isfinite(altitude_m) or altitude_m <= 0.0:
+            return Result(
+                accepted=False,
+                reason="takeoff altitude must be a positive finite metres",
+            )
+        evidence = self._bring_up(altitude_m)
+        self._last_takeoff = evidence
+        if evidence.refused:
+            reason = evidence.refusals[0] if evidence.refusals else "takeoff refused"
+            return Result(accepted=False, reason=reason)
+        return Result(accepted=True)
+
+    def command(self, motion: Motion) -> Result:
+        """Publish one odom motion sample. Does not republish or auto-hold."""
+        try:
+            self._validate_motion(motion)
+        except FrameError as error:
+            return Result(accepted=False, reason=str(error))
+        if motion.yaw is not None and motion.yaw_rate is not None:
+            return Result(
+                accepted=False,
+                reason="request either a heading or a heading rate, not both",
+            )
+        publication = self.publish(
+            LocalNedTarget(
+                position_ned=enu_to_ned(motion.position.as_tuple()),
+                velocity_ned=enu_to_ned(motion.velocity.as_tuple()),
+                yaw_rad=motion.yaw,
+                yaw_rate_rad_s=motion.yaw_rate,
+                deadline_s=COMMAND_DEADLINE_S,
+                certificate_ref=None,
+            )
+        )
+        if publication is None:
+            return Result(accepted=False, reason="not in armed Guided flight")
+        return Result(accepted=True)
+
+    def land(self) -> Result:
+        self._adapter._session.set_mode("LAND")
+        return Result(accepted=True)
+
+    def state(self) -> VehicleState:
+        sample = self._adapter.telemetry()
+        position = None
+        velocity = None
+        yaw = None
+        landed: bool | None = None
+        if sample is not None:
+            if sample.local_position_ned is not None:
+                position = Vec3(*ned_to_enu(sample.local_position_ned))
+            if sample.velocity_ned is not None:
+                velocity = Vec3(*ned_to_enu(sample.velocity_ned))
+            if sample.attitude_rpy is not None:
+                yaw = float(sample.attitude_rpy[2])
+            if position is not None and not sample.armed:
+                landed = position.z < 0.35
+            elif sample.mode_name == "LAND" and position is not None:
+                landed = position.z < 0.35
+        return VehicleState(
+            armed=bool(sample.armed) if sample is not None else False,
+            guided=bool(sample.in_guided_mode) if sample is not None else False,
+            position=position,
+            velocity=velocity,
+            yaw=yaw,
+            landed=landed,
+        )
+
+    # -- adapter glue (platform probes; not public API v1) -----------------
 
     def request_control(
         self,
@@ -150,8 +283,7 @@ class Vehicle:
             adapter._session.arm()
             settle_until = adapter._monotonic() + ARM_SETTLE_S
             while adapter._monotonic() < settle_until:
-                if drain is not None:
-                    drain()
+                self._pump(drain)
                 adapter._sleep(0.1)
             sample = adapter.telemetry()
             for text in sample.statustexts:
@@ -161,8 +293,7 @@ class Vehicle:
                 break
             retry_until = adapter._monotonic() + CONTROL_RETRY_S
             while adapter._monotonic() < retry_until and adapter._monotonic() < deadline:
-                if drain is not None:
-                    drain()
+                self._pump(drain)
                 adapter._sleep(0.5)
         evidence = AutopilotControlEvidence(
             commanded_mode="GUIDED",
@@ -181,113 +312,6 @@ class Vehicle:
             monotonic_ns=int(attempt_at * 1e9),
         )
         return evidence, stamp
-
-    def takeoff(
-        self,
-        timeout_s: float,
-        *,
-        drain: Callable[[], None] | None = None,
-    ) -> AutopilotControlEvidence:
-        adapter = self._adapter
-        evidence, attempt_at = self.request_control(
-            adapter.settings.pre_arm_wait_s, drain=drain
-        )
-        altitude = None
-        sample = adapter.latest_telemetry
-        if evidence.armed:
-            # GUIDED NAV_TAKEOFF needs EKF origin (HOME_POSITION). Wait in sim
-            # time so a slow realtime host does not fire the command too early.
-            origin_start_sim: float | None = None
-            origin_wall_until = adapter._monotonic() + _wall_backstop_s(
-                adapter, adapter.settings.pre_arm_wait_s
-            )
-            while (
-                sample.in_guided_mode
-                and sample.armed
-                and adapter._monotonic() < origin_wall_until
-            ):
-                sample = adapter.telemetry()
-                if sample.home_position is not None:
-                    break
-                sim = _sim_time_s(adapter)
-                if sim is not None:
-                    if origin_start_sim is None:
-                        origin_start_sim = sim
-                    elif sim - origin_start_sim >= adapter.settings.pre_arm_wait_s:
-                        break
-                if drain is not None:
-                    drain()
-                adapter._sleep(0.1)
-            climb_start_sim: float | None = None
-            next_takeoff_sim: float | None = None
-            takeoff_attempts = 0
-            climb_wall_until = adapter._monotonic() + _wall_backstop_s(
-                adapter, timeout_s
-            )
-            while (
-                sample.in_guided_mode
-                and sample.armed
-                and adapter._monotonic() < climb_wall_until
-            ):
-                sim = _sim_time_s(adapter)
-                if (
-                    takeoff_attempts < TAKEOFF_ATTEMPTS
-                    and sample.home_position is not None
-                    and (
-                        next_takeoff_sim is None
-                        or (sim is not None and sim >= next_takeoff_sim)
-                    )
-                ):
-                    adapter._session.takeoff(adapter.settings.hover_altitude_m)
-                    takeoff_attempts += 1
-                    if sim is not None:
-                        if climb_start_sim is None:
-                            climb_start_sim = sim
-                        next_takeoff_sim = sim + TAKEOFF_RETRY_SIM_S
-                sample = adapter.telemetry()
-                position = sample.local_position_ned
-                if position is not None:
-                    altitude = -position[2]
-                    if altitude >= 0.5 * adapter.settings.hover_altitude_m:
-                        break
-                if (
-                    climb_start_sim is not None
-                    and sim is not None
-                    and sim - climb_start_sim >= timeout_s
-                ):
-                    break
-                if drain is not None:
-                    drain()
-                adapter._sleep(0.2)
-            evidence = replace(
-                evidence,
-                mode_reached=sample.in_guided_mode,
-                armed=bool(sample.armed),
-                altitude_m=altitude,
-                refused=not (
-                    sample.in_guided_mode
-                    and sample.armed
-                    and altitude is not None
-                    and altitude >= 0.5 * adapter.settings.hover_altitude_m
-                ),
-            )
-        adapter.evidence.write_json(
-            "flight-state.json",
-            {
-                "commanded_mode": evidence.commanded_mode,
-                "mode_reached": evidence.mode_reached,
-                "armed": evidence.armed,
-                "takeoff_commanded_m": evidence.takeoff_commanded_m,
-                "altitude_m": evidence.altitude_m,
-                "control_attempts": evidence.control_attempts,
-                "refusals": list(evidence.refusals),
-                "pre_arm_wait_s": adapter.settings.pre_arm_wait_s,
-                "control_requested_at_monotonic_ns": attempt_at.monotonic_ns,
-                "statustexts": list(evidence.statustexts),
-                "refused": evidence.refused,
-            },
-        )
-        return evidence
 
     def publish(self, target: LocalNedTarget) -> SetpointPublication | None:
         adapter = self._adapter
@@ -340,125 +364,124 @@ class Vehicle:
         adapter._publications.append(publication)
         return publication
 
-    def _refresh(
-        self,
-        target: LocalNedTarget,
-        duration_s: float,
-        *,
-        drain: Callable[[], None] | None = None,
-        refresh_s: float = REFRESH_S,
-    ) -> dict[str, Any]:
+    # -- internals ---------------------------------------------------------
+
+    def _validate_motion(self, motion: Motion) -> None:
+        if not isinstance(motion, Motion):
+            raise FrameError("command expects a Motion")
+        _finite3(motion.position.as_tuple(), "position")
+        _finite3(motion.velocity.as_tuple(), "velocity")
+        if motion.yaw is not None and not math.isfinite(motion.yaw):
+            raise FrameError("yaw is not finite")
+        if motion.yaw_rate is not None and not math.isfinite(motion.yaw_rate):
+            raise FrameError("yaw_rate is not finite")
+
+    def _pump(self, drain: Callable[[], None] | None = None) -> None:
+        if drain is not None:
+            drain()
+            return
         adapter = self._adapter
-        start_sim: float | None = None
-        wall_until = adapter._monotonic() + _wall_backstop_s(adapter, duration_s)
-        publications = 0
-        while adapter._monotonic() < wall_until:
-            sample = adapter.telemetry()
-            sim = _sim_time_s(adapter)
-            if sim is not None:
-                if start_sim is None:
-                    start_sim = sim
-                elif sim - start_sim >= duration_s:
-                    break
-            if self.publish(target) is None:
-                return {"ok": False, "publications": publications, "guided_lost": True}
-            publications += 1
-            if drain is not None:
-                drain()
-            adapter._sleep(refresh_s)
+        sensor_record = getattr(adapter, "sensor_record", None)
+        if sensor_record is None:
+            return
+        record = sensor_record(0.02)
+        while record is not None:
+            record = sensor_record(0.0)
+
+    def _bring_up(self, altitude_m: float) -> AutopilotControlEvidence:
+        adapter = self._adapter
+        evidence, attempt_at = self.request_control(adapter.settings.pre_arm_wait_s)
+        altitude = None
         sample = adapter.latest_telemetry
-        after = None if sample is None else sample.local_position_ned
-        residual = None
-        if target.position_ned is not None and after is not None:
-            residual = math.dist(after, target.position_ned)
-        return {
-            "ok": True,
-            "publications": publications,
-            "guided_lost": False,
-            "residual_m": residual,
-            "position_after_ned": after,
-        }
-
-    def goto(
-        self,
-        north_m: float,
-        east_m: float,
-        *,
-        down_m: float | None = None,
-        hold_s: float = 8.0,
-        yaw_rad: float = 0.0,
-        drain: Callable[[], None] | None = None,
-    ) -> dict[str, Any]:
-        hover = self._adapter.settings.hover_altitude_m
-        if down_m is None:
-            down_m = -hover
-        target = LocalNedTarget(
-            position_ned=(north_m, east_m, down_m),
-            velocity_ned=(0.0, 0.0, 0.0),
-            yaw_rad=yaw_rad,
-            deadline_s=hold_s,
-            certificate_ref=None,
+        if evidence.armed:
+            origin_start_sim: float | None = None
+            origin_wall_until = adapter._monotonic() + _wall_backstop_s(
+                adapter, adapter.settings.pre_arm_wait_s
+            )
+            while (
+                sample.in_guided_mode
+                and sample.armed
+                and adapter._monotonic() < origin_wall_until
+            ):
+                sample = adapter.telemetry()
+                if sample.home_position is not None:
+                    break
+                sim = _sim_time_s(adapter)
+                if sim is not None:
+                    if origin_start_sim is None:
+                        origin_start_sim = sim
+                    elif sim - origin_start_sim >= adapter.settings.pre_arm_wait_s:
+                        break
+                self._pump()
+                adapter._sleep(0.1)
+            climb_start_sim: float | None = None
+            next_takeoff_sim: float | None = None
+            takeoff_attempts = 0
+            climb_timeout = adapter.settings.step_timeout_s.flight
+            climb_wall_until = adapter._monotonic() + _wall_backstop_s(
+                adapter, climb_timeout
+            )
+            while (
+                sample.in_guided_mode
+                and sample.armed
+                and adapter._monotonic() < climb_wall_until
+            ):
+                sim = _sim_time_s(adapter)
+                if (
+                    takeoff_attempts < TAKEOFF_ATTEMPTS
+                    and sample.home_position is not None
+                    and (
+                        next_takeoff_sim is None
+                        or (sim is not None and sim >= next_takeoff_sim)
+                    )
+                ):
+                    adapter._session.takeoff(altitude_m)
+                    takeoff_attempts += 1
+                    if sim is not None:
+                        if climb_start_sim is None:
+                            climb_start_sim = sim
+                        next_takeoff_sim = sim + TAKEOFF_RETRY_SIM_S
+                sample = adapter.telemetry()
+                position = sample.local_position_ned
+                if position is not None:
+                    altitude = -position[2]
+                    if altitude >= 0.5 * altitude_m:
+                        break
+                if (
+                    climb_start_sim is not None
+                    and sim is not None
+                    and sim - climb_start_sim >= climb_timeout
+                ):
+                    break
+                self._pump()
+                adapter._sleep(0.2)
+            evidence = replace(
+                evidence,
+                takeoff_commanded_m=altitude_m,
+                mode_reached=sample.in_guided_mode,
+                armed=bool(sample.armed),
+                altitude_m=altitude,
+                refused=not (
+                    sample.in_guided_mode
+                    and sample.armed
+                    and altitude is not None
+                    and altitude >= 0.5 * altitude_m
+                ),
+            )
+        adapter.evidence.write_json(
+            "flight-state.json",
+            {
+                "commanded_mode": evidence.commanded_mode,
+                "mode_reached": evidence.mode_reached,
+                "armed": evidence.armed,
+                "takeoff_commanded_m": evidence.takeoff_commanded_m,
+                "altitude_m": evidence.altitude_m,
+                "control_attempts": evidence.control_attempts,
+                "refusals": list(evidence.refusals),
+                "pre_arm_wait_s": adapter.settings.pre_arm_wait_s,
+                "control_requested_at_monotonic_ns": attempt_at.monotonic_ns,
+                "statustexts": list(evidence.statustexts),
+                "refused": evidence.refused,
+            },
         )
-        result = self._refresh(target, hold_s, drain=drain)
-        result["target_ned"] = target.position_ned
-        return result
-
-    def hold(
-        self,
-        duration_s: float,
-        *,
-        yaw_rad: float = 0.0,
-        drain: Callable[[], None] | None = None,
-    ) -> dict[str, Any]:
-        sample = self._adapter.latest_telemetry
-        position = None if sample is None else sample.local_position_ned
-        if position is None:
-            position = (0.0, 0.0, -self._adapter.settings.hover_altitude_m)
-        target = LocalNedTarget(
-            position_ned=position,
-            velocity_ned=(0.0, 0.0, 0.0),
-            yaw_rad=yaw_rad,
-            deadline_s=duration_s,
-            certificate_ref=None,
-        )
-        return self._refresh(target, duration_s, drain=drain)
-
-    def spin(
-        self,
-        angle_rad: float,
-        *,
-        rate_rad_s: float = SPIN_RATE_RAD_S,
-        drain: Callable[[], None] | None = None,
-    ) -> dict[str, Any]:
-        if rate_rad_s == 0.0:
-            raise ValueError("spin rate must be non-zero")
-        sample = self._adapter.latest_telemetry
-        start_yaw = None if sample is None or sample.attitude_rpy is None else sample.attitude_rpy[2]
-        # Hold XY/Z while yawing. Ignoring position during spin lets the
-        # horizontal controller go open-loop; re-engaging it on the next goto
-        # tip-struck on return[0] (AngErr≈90) after a clean ±π pair.
-        position = None if sample is None else sample.local_position_ned
-        if position is None:
-            position = (0.0, 0.0, -self._adapter.settings.hover_altitude_m)
-        duration = abs(angle_rad) / abs(rate_rad_s)
-        signed_rate = rate_rad_s if angle_rad >= 0.0 else -rate_rad_s
-        target = LocalNedTarget(
-            position_ned=position,
-            velocity_ned=(0.0, 0.0, 0.0),
-            yaw_rad=None,
-            yaw_rate_rad_s=signed_rate,
-            deadline_s=duration,
-            certificate_ref=None,
-        )
-        result = self._refresh(target, duration, drain=drain)
-        sample = self._adapter.latest_telemetry
-        end_yaw = None if sample is None or sample.attitude_rpy is None else sample.attitude_rpy[2]
-        delta = None
-        if start_yaw is not None and end_yaw is not None:
-            delta = wrap_angle_rad(end_yaw - start_yaw)
-        result["requested_rad"] = angle_rad
-        result["delta_rad"] = delta
-        return result
-
-    def land(self) -> None:
-        self._adapter._session.set_mode("LAND")
+        return evidence
