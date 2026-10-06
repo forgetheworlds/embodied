@@ -73,9 +73,9 @@ boot-time jump cannot skip an 8 s hold in one fold.
 4. Doorway residual **0.10 m**. Load `compat_ekf.parm` and
    `compat_control.parm` (slower Guided WPNAV for indoor frames).
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
-6. After ±π reverse-spin: coast (`yaw_rate=0`), yaw-ignored settle, then a
-   slow heading slew to north before align/return with `yaw=0` (absolute yaw
-   snap right after the unwind tip-struck under host load).
+6. After ±π reverse-spin: coast, yaw-ignored settle, slow heading slew to
+   north at frozen XY, then align/return with yaw ignored while translating
+   (yaw=0 + lateral move tip-struck even after a successful heading lock).
 
 ## Done bar
 
