@@ -83,6 +83,9 @@ def _drain(platform: WebotsArduPilot) -> None:
 
 def _wait_sim_refresh(platform: WebotsArduPilot, timing: dict[str, Any]) -> None:
     """Hold until ~REFRESH_S of simulation time has passed (or wall fallback)."""
+    # Fold MAVLink so boot_time_ms (sim clock) can advance; latest_telemetry alone
+    # is a cache and will freeze this wait into perpetual stall-fallback.
+    platform.telemetry()
     start_sim = _sim_time_s(platform)
     start_wall = platform._monotonic()
     if start_sim is None:
@@ -92,15 +95,16 @@ def _wait_sim_refresh(platform: WebotsArduPilot, timing: dict[str, Any]) -> None
         return
     while True:
         _drain(platform)
+        platform.telemetry()
         sim = _sim_time_s(platform)
         if sim is not None and (sim - start_sim) >= REFRESH_S:
             gap = sim - start_sim
             timing["sim_waits"] += 1
             timing["max_sim_refresh_s"] = max(timing["max_sim_refresh_s"], gap)
             return
-        if platform._monotonic() - start_wall >= REFRESH_WALL_FALLBACK_S * 4:
-            # Sim appears frozen from this process's view; keep publishing rather
-            # than silent-gap guided flight. Attribute the miss.
+        # Keep publishing inside Guided's setpoint lifetime (COMMAND_DEADLINE_S
+        # is 0.25 s). A long stall-fallback here re-opens wall gaps.
+        if platform._monotonic() - start_wall >= REFRESH_WALL_FALLBACK_S:
             timing["sim_stall_fallbacks"] += 1
             return
         platform._sleep(REFRESH_POLL_S)
