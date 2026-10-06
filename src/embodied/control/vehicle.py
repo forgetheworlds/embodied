@@ -402,26 +402,8 @@ class Vehicle:
         altitude = None
         sample = adapter.latest_telemetry
         if evidence.armed:
-            origin_start_sim: float | None = None
-            origin_wall_until = adapter._monotonic() + _wall_backstop_s(
-                adapter, adapter.settings.pre_arm_wait_s
-            )
-            while (
-                sample.in_guided_mode
-                and sample.armed
-                and adapter._monotonic() < origin_wall_until
-            ):
-                sample = adapter.telemetry()
-                if sample.home_position is not None:
-                    break
-                sim = _sim_time_s(adapter)
-                if sim is not None:
-                    if origin_start_sim is None:
-                        origin_start_sim = sim
-                    elif sim - origin_start_sim >= adapter.settings.pre_arm_wait_s:
-                        break
-                self._pump()
-                adapter._sleep(0.1)
+            # Climb immediately: separate origin-wait after arm burned the
+            # auto-disarm window before NAV_TAKEOFF could fire.
             climb_start_sim: float | None = None
             next_takeoff_sim: float | None = None
             takeoff_attempts = 0
@@ -434,16 +416,12 @@ class Vehicle:
                 and sample.armed
                 and adapter._monotonic() < climb_wall_until
             ):
-                sim = _sim_time_s(adapter)
-                # Keep external-nav streaming; gaps make EKF "stop aiding".
                 self._pump()
-                position_ready = (
-                    sample.home_position is not None
-                    and sample.local_position_ned is not None
-                )
+                sample = adapter.telemetry()
+                sim = _sim_time_s(adapter)
                 if (
                     takeoff_attempts < TAKEOFF_ATTEMPTS
-                    and position_ready
+                    and sample.home_position is not None
                     and (
                         next_takeoff_sim is None
                         or (sim is not None and sim >= next_takeoff_sim)
@@ -455,7 +433,6 @@ class Vehicle:
                         if climb_start_sim is None:
                             climb_start_sim = sim
                         next_takeoff_sim = sim + TAKEOFF_RETRY_SIM_S
-                sample = adapter.telemetry()
                 position = sample.local_position_ned
                 if position is not None:
                     altitude = -position[2]
