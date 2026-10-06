@@ -54,6 +54,10 @@ DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
 REFRESH_S = 0.05
 SPIN_RATE_RAD_S = 0.6
+# Under host load (screen capture, etc.) MAVLink can starve and boot_time can
+# jump by many seconds in one telemetry fold. Require enough publications before
+# a phase may complete so holds cannot skip on a single clock jump.
+PHASE_MIN_PUB_FRACTION = 0.25
 ZERO = Vec3(0.0, 0.0, 0.0)
 
 
@@ -90,6 +94,30 @@ def _sim_time_s(platform: WebotsArduPilot) -> float | None:
 def _wall_backstop_s(platform: WebotsArduPilot, sim_duration_s: float) -> float:
     min_ratio = min(platform.settings.realtime_ratio_envelope)
     return sim_duration_s / min_ratio
+
+
+def _phase_min_publications(duration_s: float, platform: WebotsArduPilot) -> int:
+    """Lower bound on publications before a timed phase may complete."""
+    min_ratio = min(platform.settings.realtime_ratio_envelope)
+    expected = duration_s / max(REFRESH_S, 1e-3)
+    return max(1, int(expected * min_ratio * PHASE_MIN_PUB_FRACTION))
+
+
+def _phase_time_done(
+    phase: Phase,
+    *,
+    sim: float | None,
+    platform: WebotsArduPilot,
+) -> bool:
+    min_pubs = _phase_min_publications(phase.duration_s, platform)
+    if phase.publications < min_pubs:
+        return False
+    if phase.start_sim is not None and sim is not None:
+        return (sim - phase.start_sim) >= phase.duration_s
+    # Wall-clock fallback if sim time is unavailable.
+    return phase.publications * REFRESH_S >= phase.duration_s / min(
+        platform.settings.realtime_ratio_envelope
+    )
 
 
 def _ned_waypoint_to_odom(
@@ -398,16 +426,9 @@ def fly_control_route(
             break
 
         sim = _sim_time_s(platform)
-        phase_done = False
-        if phase.start_sim is not None and sim is not None:
-            phase_done = (sim - phase.start_sim) >= phase.duration_s
-        elif phase.start_sim is None and sim is not None:
+        if phase.start_sim is None and sim is not None:
             phase.start_sim = sim
-        elif phase.publications * REFRESH_S >= phase.duration_s / min(
-            platform.settings.realtime_ratio_envelope
-        ):
-            # Wall-clock fallback if sim time is unavailable.
-            phase_done = True
+        phase_done = _phase_time_done(phase, sim=sim, platform=platform)
 
         drain()
         platform._sleep(REFRESH_S)

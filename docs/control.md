@@ -52,6 +52,8 @@ while flying:
 Phase changes (outbound, hold, spin, reface, settle, align, return) only replace
 the current Motion. Scoring happens on transition ticks without stopping
 publication. Settle/align are explicit hold Motions when used — not silence.
+Timed phases also require a minimum publication count so a starved MAVLink
+boot-time jump cannot skip an 8 s hold in one fold.
 
 ## Layout
 
