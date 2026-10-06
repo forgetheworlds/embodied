@@ -27,7 +27,11 @@ class Motion:
   auto-hold-on-cease inside Vehicle.
 - Hold = position + zero velocity (+ optional yaw).
 - Turns = held position + `yaw_rate` (unwind with opposite rate after a large turn).
-- `takeoff` owns arm / GUIDED / EKF-origin bring-up.
+- `takeoff` owns arm / GUIDED / EKF-origin bring-up. It prefetches until the
+  local estimate is healthy (pose + home, EKF still aiding), skips arm spam
+  while PreArm is flapping, keeps pumping sensors between attempts, and
+  extends the wait when refusals are still recoverable (vis-odom / gyro rate /
+  need-position). Permanent sensor death still fails closed.
 - Typed `Result` for accept/refuse. `VehicleState`: armed, guided, position,
   velocity, yaw (+ landed when known).
 

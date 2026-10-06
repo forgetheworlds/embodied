@@ -165,6 +165,74 @@ CONTROL_GRANT_GRACE_S = 3.0
 COMMAND_DEADLINE_S = 0.25
 TAKEOFF_ATTEMPTS = 5
 TAKEOFF_RETRY_SIM_S = 1.5
+# Extra wall time when PreArm is still clearly recoverable (vis-odom / gyro rate /
+# position estimate). Permanent sensor death still fails closed at the cap.
+BRINGUP_EXTEND_S = 120.0
+BRINGUP_PREFETCH_S = 45.0
+# Keep pumping until the estimate stays healthy this long before the first arm.
+BRINGUP_HEALTHY_HOLD_S = 2.0
+ARM_RETRY_GAP_S = 3.0
+
+_RECOVERABLE_ARM_MARKERS = (
+    "Need Position Estimate",
+    "Need Alt Estimate",
+    "VisOdom",
+    "Gyro 1 rate",
+    "EKF3 still initialising",
+    "waiting for home",
+    "Accels inconsistent",
+    "EKF attitude is bad",
+    "still initialising",
+)
+
+_UNHEALTHY_ARM_MARKERS = (
+    "Need Position Estimate",
+    "Need Alt Estimate",
+    "VisOdom",
+    "Gyro 1 rate",
+    "waiting for home",
+    "Accels inconsistent",
+    "EKF attitude is bad",
+    "still initialising",
+)
+
+
+def _arm_refusal_recoverable(text: str) -> bool:
+    return any(marker in text for marker in _RECOVERABLE_ARM_MARKERS)
+
+
+def _recent_texts(adapter: WebotsArduPilot, sample) -> tuple[str, ...]:
+    stored = getattr(adapter, "_statustexts", None)
+    if stored:
+        return tuple(stored)
+    return tuple(sample.statustexts)
+
+
+def _ekf_aiding(texts: Sequence[str]) -> bool | None:
+    """True when the newest EKF aid line is 'using external nav', else False/None."""
+    last: bool | None = None
+    for text in texts:
+        if "using external nav" in text:
+            last = True
+        elif "stopped aiding" in text:
+            last = False
+    return last
+
+
+def _estimate_ready(adapter: WebotsArduPilot, sample) -> bool:
+    """Local pose + home, EKF still aiding, and no fresh PreArm health flaps."""
+    if sample.local_position_ned is None or sample.home_position is None:
+        return False
+    texts = _recent_texts(adapter, sample)
+    aiding = _ekf_aiding(texts)
+    if aiding is False:
+        return False
+    for text in sample.statustexts:
+        if not (text.startswith("PreArm:") or text.startswith("Arm:")):
+            continue
+        if any(marker in text for marker in _UNHEALTHY_ARM_MARKERS):
+            return False
+    return True
 
 
 def _sim_time_s(adapter: WebotsArduPilot) -> float | None:
@@ -209,7 +277,14 @@ class Vehicle:
                     f"< {0.5 * altitude_m:.2f} m)"
                 )
             elif evidence.refusals:
-                reason = evidence.refusals[-1]
+                latest = evidence.refusals[-1]
+                if all(_arm_refusal_recoverable(text) for text in evidence.refusals):
+                    reason = (
+                        "bring-up timed out waiting for a healthy position estimate "
+                        f"({latest})"
+                    )
+                else:
+                    reason = latest
             else:
                 reason = "takeoff refused"
             return Result(accepted=False, reason=reason)
@@ -279,12 +354,65 @@ class Vehicle:
         drain: Callable[[], None] | None = None,
     ) -> tuple[AutopilotControlEvidence, ClockStamp]:
         adapter = self._adapter
-        deadline = adapter._monotonic() + timeout_s
+        started = adapter._monotonic()
+        deadline = started + timeout_s
+        hard_deadline = started + timeout_s + BRINGUP_EXTEND_S
         refusals: dict[str, str] = {}
         attempts = 0
-        attempt_at = adapter._monotonic()
+        attempt_at = started
         sample = adapter.telemetry()
+        healthy_since: float | None = None
+        extended = False
+
+        # Prefetch: keep the sensor/vis-odom path alive until the estimate is
+        # ready (or the prefetch budget expires). Arming into a flapping EKF
+        # just burns PreArm retries under load.
+        prefetch_until = started + min(BRINGUP_PREFETCH_S, timeout_s)
+        while adapter._monotonic() < prefetch_until:
+            self._pump(drain)
+            sample = adapter.telemetry()
+            if sample.armed:
+                break
+            if _estimate_ready(adapter, sample):
+                if healthy_since is None:
+                    healthy_since = adapter._monotonic()
+                if adapter._monotonic() - healthy_since >= BRINGUP_HEALTHY_HOLD_S:
+                    break
+            else:
+                healthy_since = None
+            adapter._sleep(0.05)
+
         while True:
+            self._pump(drain)
+            sample = adapter.telemetry()
+            for text in sample.statustexts:
+                if text.startswith("PreArm:") or text.startswith("Arm:"):
+                    refusals[text] = text
+            if sample.armed:
+                break
+
+            now = adapter._monotonic()
+            if now >= deadline:
+                # Only extend when every refusal so far looks recoverable.
+                if (
+                    not extended
+                    and now < hard_deadline
+                    and refusals
+                    and all(_arm_refusal_recoverable(text) for text in refusals)
+                ):
+                    deadline = hard_deadline
+                    extended = True
+                else:
+                    break
+
+            ready = _estimate_ready(adapter, sample)
+            if not ready:
+                healthy_since = None
+                # Skip arm spam while the estimate is still flapping; keep
+                # pumping so gyro / vis-odom can catch up under load.
+                adapter._sleep(0.05)
+                continue
+
             attempts += 1
             attempt_at = adapter._monotonic()
             adapter._session.set_mode("GUIDED")
@@ -292,17 +420,33 @@ class Vehicle:
             settle_until = adapter._monotonic() + ARM_SETTLE_S
             while adapter._monotonic() < settle_until:
                 self._pump(drain)
-                adapter._sleep(0.1)
+                adapter._sleep(0.05)
             sample = adapter.telemetry()
             for text in sample.statustexts:
                 if text.startswith("PreArm:") or text.startswith("Arm:"):
                     refusals[text] = text
-            if sample.armed or adapter._monotonic() >= deadline:
+            if sample.armed:
                 break
-            retry_until = adapter._monotonic() + CONTROL_RETRY_S
+
+            retry_until = adapter._monotonic() + ARM_RETRY_GAP_S
             while adapter._monotonic() < retry_until and adapter._monotonic() < deadline:
                 self._pump(drain)
-                adapter._sleep(0.5)
+                sample = adapter.telemetry()
+                for text in sample.statustexts:
+                    if text.startswith("PreArm:") or text.startswith("Arm:"):
+                        refusals[text] = text
+                if sample.armed:
+                    break
+                if not _estimate_ready(adapter, sample):
+                    # Drop out of the post-arm gap early so we resume pumping
+                    # without waiting out the full retry delay while unhealthy.
+                    break
+                adapter._sleep(0.05)
+            if sample.armed:
+                break
+
+        # Preserve chronological order (dict insertion); do not alphabetize —
+        # callers surface refusals[-1] as the latest reason.
         evidence = AutopilotControlEvidence(
             commanded_mode="GUIDED",
             mode_reached=sample.in_guided_mode,
@@ -312,7 +456,7 @@ class Vehicle:
             statustexts=tuple(adapter._statustexts),
             refused=not (sample.in_guided_mode and sample.armed),
             control_attempts=attempts,
-            refusals=tuple(sorted(refusals)),
+            refusals=tuple(refusals),
         )
         stamp = ClockStamp(
             host_id=adapter.settings.host_id,

@@ -17,7 +17,14 @@ from embodied.contracts.records import (
     TYPE_MASK_YAW_RATE_IGNORE,
 )
 from embodied.control import Motion, Result, Vehicle, VehicleState, Vec3
-from embodied.control.vehicle import enu_to_ned, mask_for_target, ned_to_enu, wrap_angle_rad
+from embodied.control.vehicle import (
+    _arm_refusal_recoverable,
+    _estimate_ready,
+    enu_to_ned,
+    mask_for_target,
+    ned_to_enu,
+    wrap_angle_rad,
+)
 
 
 class _FakeEvidence:
@@ -197,6 +204,31 @@ def test_takeoff_rejects_bad_altitude() -> None:
     vehicle = Vehicle(_FakeAdapter())
     assert vehicle.takeoff(0.0).accepted is False
     assert vehicle.takeoff(-1.0).accepted is False
+
+
+def test_takeoff_accepts_when_already_guided() -> None:
+    adapter = _FakeAdapter(armed=True, guided=True)
+    result = Vehicle(adapter).takeoff(1.5)
+    assert result.accepted is True
+    assert adapter._session.takeoffs == [1.5]
+
+
+def test_arm_refusal_recoverable_markers() -> None:
+    assert _arm_refusal_recoverable("PreArm: Need Position Estimate")
+    assert _arm_refusal_recoverable("Arm: Gyro 1 rate 440Hz < loop rate*1.8 450Hz")
+    assert _arm_refusal_recoverable("Arm: VisOdom: not healthy")
+    assert not _arm_refusal_recoverable("PreArm: 3D Accel calibration needed")
+
+
+def test_estimate_ready_requires_pose_home_and_aiding() -> None:
+    adapter = _FakeAdapter()
+    sample = adapter.telemetry()
+    assert _estimate_ready(adapter, sample) is True
+    adapter._statustexts = ["EKF3 IMU0 stopped aiding"]
+    assert _estimate_ready(adapter, sample) is False
+    adapter._statustexts = ["EKF3 IMU0 is using external nav data"]
+    sample.statustexts = ("PreArm: Need Position Estimate",)
+    assert _estimate_ready(adapter, sample) is False
 
 
 def test_land_sets_land_mode() -> None:
