@@ -25,8 +25,17 @@ source .venv/bin/activate
 export DISPLAY="${DISPLAY:-:1}"
 export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 
+# Reserve host cores for Webots + SITL (and the in-Webots controller). On a
+# 4-core cloud VM this keeps one core free for the agent/desktop so capture
+# load cannot starve the flight stack. Override with EMBODIED_SIM_CPUS=.
+export EMBODIED_SIM_CPUS="${EMBODIED_SIM_CPUS:-0,1,2}"
+
 rm -rf "$OUTPUT"
-mkdir -p "$(dirname "$OUTPUT")"
+mkdir -p "$OUTPUT"
+
+# Native Webots Supervisor movie (not desktop ffmpeg). Disable with
+# EMBODIED_WEBOTS_MOVIE= ./configs/layers/control
+export EMBODIED_WEBOTS_MOVIE="${EMBODIED_WEBOTS_MOVIE:-$OUTPUT/control-doorway.mp4}"
 
 python -u -m embodied motion-proof --config "$CONFIG" --output "$OUTPUT"
 status=$?

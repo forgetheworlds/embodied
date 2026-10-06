@@ -69,6 +69,68 @@ from controller import Robot  # noqa: E402  (Webots puts this on the controller'
 
 from sensors import VehicleDevices  # noqa: E402
 
+# MPEG-4 FOURCC used by Webots Supervisor.movieStartRecording.
+_WEBOTS_MOVIE_CODEC_MPEG4 = 1337
+
+
+def _apply_sim_cpu_affinity() -> None:
+    """Pin this controller to ``EMBODIED_SIM_CPUS`` when the host reserved cores."""
+    raw = os.environ.get("EMBODIED_SIM_CPUS", "").strip()
+    if not raw:
+        return
+    try:
+        cpus = {int(part.strip()) for part in raw.split(",") if part.strip()}
+    except ValueError:
+        print(f"Controller: ignoring bad EMBODIED_SIM_CPUS={raw!r}", flush=True)
+        return
+    if not cpus:
+        return
+    try:
+        os.sched_setaffinity(0, cpus)
+        print(f"Controller: CPU affinity {sorted(cpus)}", flush=True)
+    except OSError as error:
+        print(f"Controller: CPU affinity failed ({error})", flush=True)
+
+
+def _maybe_start_movie(robot) -> str | None:
+    """Start a native Webots movie when ``EMBODIED_WEBOTS_MOVIE`` is set.
+
+    Requires ``supervisor TRUE`` on the robot. Prefer this over desktop
+    ffmpeg capture: recording stays inside Webots on the reserved sim CPUs.
+    """
+    path = os.environ.get("EMBODIED_WEBOTS_MOVIE", "").strip()
+    if not path:
+        return None
+    start = getattr(robot, "movieStartRecording", None)
+    if start is None:
+        print(
+            "Controller: EMBODIED_WEBOTS_MOVIE set but robot has no Supervisor "
+            "movie API (is supervisor TRUE?)",
+            flush=True,
+        )
+        return None
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    # Modest resolution / quality keeps encoding cheaper than 60fps x11grab.
+    start(path, 1280, 720, _WEBOTS_MOVIE_CODEC_MPEG4, 80, 1, False)
+    print(f"Controller: native movie recording → {path}", flush=True)
+    return path
+
+
+def _maybe_stop_movie(robot, path: str | None) -> None:
+    if not path:
+        return
+    stop = getattr(robot, "movieStopRecording", None)
+    if stop is None:
+        return
+    stop()
+    failed = getattr(robot, "movieFailed", None)
+    if failed is not None and failed():
+        print(f"Controller: native movie FAILED → {path}", flush=True)
+    else:
+        print(f"Controller: native movie stopped → {path}", flush=True)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -338,8 +400,17 @@ def send_status(channel, status, sim_time_s, devices):
 
 
 def main():
+    _apply_sim_cpu_affinity()
     args = parse_args()
-    robot = Robot()
+    # Supervisor when the world sets supervisor TRUE (first_indoor control proof).
+    # Falls back to Robot for worlds that leave supervisor FALSE.
+    try:
+        from controller import Supervisor
+
+        robot = Supervisor()
+    except Exception:  # noqa: BLE001 - worlds without supervisor stay on Robot
+        robot = Robot()
+    movie_path = _maybe_start_movie(robot)
     # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
     # "F2's denominator"): the bridge sets EMBODIED_SIM_WALL_CLAMP=1 in this
     # process's environment only when the run's configuration asked for it, and the
@@ -357,6 +428,7 @@ def main():
     first_controls = link.wait_for_sitl()
     if first_controls is None:
         print("Controller: SITL never sent a control packet; stopping", flush=True)
+        _maybe_stop_movie(robot, movie_path)
         devices.stop_motors()
         channel.close()
         link.close()
@@ -377,6 +449,7 @@ def main():
         )
         raise
     finally:
+        _maybe_stop_movie(robot, movie_path)
         devices.stop_motors()
         channel.close()
         link.close()
