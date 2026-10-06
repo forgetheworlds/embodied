@@ -296,14 +296,16 @@ def _build_phases(
                 requested_rad=-spin_rad,
             )
         )
-        # Explicit hold Motion at entry pose with yaw=0 — still published every tick.
+        # Yaw-ignored settle first: locking yaw=0 immediately after ±π
+        # reverse-spin has tip-struck (Crash AngErr) under load. Return/align
+        # still command yaw=0 once rates have died.
         phases.append(
             Phase(
                 name="settle",
                 kind="hold",
                 duration_s=hold_s,
                 target=None,
-                yaw=0.0,
+                yaw=None,
             )
         )
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
