@@ -1281,6 +1281,11 @@ class PlatformSettings:
         environment = {"PYTHONPATH": merged, "EMBODIED_SRC": source_root}
         if self.sim_wall_clamp:
             environment["EMBODIED_SIM_WALL_CLAMP"] = "1"
+        # Forward optional native-movie policy into the Webots controller.
+        for key in ("EMBODIED_WEBOTS_MOVIE", "EMBODIED_WEBOTS_MOVIE_DELAY_S", "EMBODIED_WEBOTS_MOVIE_DURATION_S"):
+            value = os.environ.get(key)
+            if value:
+                environment[key] = value
         return environment
 
 
@@ -4004,7 +4009,25 @@ class WebotsArduPilot:
     def arm_and_guided(
         self, timeout_s: float, *, drain: Callable[[], None] | None = None
     ) -> AutopilotControlEvidence:
-        return self.vehicle.takeoff(timeout_s, drain=drain)
+        # Platform probe still wants AutopilotControlEvidence; Vehicle API v1
+        # returns Result from takeoff(altitude_m). Bring-up writes flight-state
+        # and stores evidence on the vehicle for this shim.
+        del timeout_s  # climb budget comes from settings.step_timeout_s.flight
+        result = self.vehicle.takeoff(self.settings.hover_altitude_m)
+        evidence = self.vehicle._last_takeoff
+        if evidence is not None:
+            return evidence
+        return AutopilotControlEvidence(
+            commanded_mode="GUIDED",
+            mode_reached=False,
+            armed=False,
+            takeoff_commanded_m=self.settings.hover_altitude_m,
+            altitude_m=None,
+            statustexts=(),
+            refused=not result.accepted,
+            control_attempts=0,
+            refusals=(result.reason,) if result.reason else (),
+        )
 
     def send_local_ned(self, target: LocalNedTarget) -> SetpointPublication | None:
         return self.vehicle.publish(target)
