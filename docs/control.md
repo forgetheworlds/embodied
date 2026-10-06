@@ -72,8 +72,9 @@ boot-time jump cannot skip an 8 s hold in one fold.
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
 4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
-6. After ±π reverse-spin: settle yaw-ignored, then stationary heading lock
-   (`yaw=0`), then align/return with yaw=0 (avoid tip-strike AngErr).
+6. After ±π reverse-spin: coast (`yaw_rate=0`), settle/align/return
+   yaw-ignored. Absolute yaw=0 after the unwind tip-struck (Crash AngErr)
+   under host load; reface already scores the heading unwind.
 
 ## Done bar
 

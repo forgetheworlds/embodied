@@ -53,7 +53,7 @@ DEFAULT_SPIN_RAD = math.pi
 DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
 REFRESH_S = 0.05
-SPIN_RATE_RAD_S = 0.6
+SPIN_RATE_RAD_S = 0.4
 # Under host load (screen capture, etc.) MAVLink can starve and boot_time can
 # jump by many seconds in one telemetry fold. Require enough publications before
 # a phase may complete so holds cannot skip on a single clock jump.
@@ -296,8 +296,21 @@ def _build_phases(
                 requested_rad=-spin_rad,
             )
         )
-        # Yaw-ignored settle first: locking yaw=0 immediately after ±π
-        # reverse-spin has tip-struck (Crash AngErr) under load.
+        # Coast: explicitly zero yaw_rate at the spin XY before settle so the
+        # airframe is not still twisting when we stop commanding rate.
+        phases.append(
+            Phase(
+                name="coast",
+                kind="yaw_rate",
+                duration_s=2.0,
+                yaw=None,
+                yaw_rate=0.0,
+                requested_rad=0.0,
+            )
+        )
+        # After ±π reverse-spin, keep yaw ignored on settle/align/return.
+        # Absolute yaw=0 here tip-struck (Crash AngErr) under this host load;
+        # reface already scored the unwind.
         phases.append(
             Phase(
                 name="settle",
@@ -305,17 +318,6 @@ def _build_phases(
                 duration_s=hold_s,
                 target=None,
                 yaw=None,
-            )
-        )
-        # Lock yaw=0 at the settled XY before any lateral move — combining a
-        # heading snap with translation tip-struck on align.
-        phases.append(
-            Phase(
-                name="heading",
-                kind="hold",
-                duration_s=max(2.0, 0.5 * hold_s),
-                target=None,
-                yaw=0.0,
             )
         )
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
@@ -331,7 +333,7 @@ def _build_phases(
                         target=_ned_waypoint_to_odom(
                             far_north, first_east, far_z, hover_m=hover_m
                         ),
-                        yaw=0.0,
+                        yaw=None,
                     )
                 )
         for index, waypoint in enumerate(inbound):
@@ -341,7 +343,7 @@ def _build_phases(
                     kind="hold",
                     duration_s=hold_s,
                     target=_ned_waypoint_to_odom(*waypoint, hover_m=hover_m),
-                    yaw=0.0,
+                    yaw=None,
                 )
             )
     return phases
