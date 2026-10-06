@@ -1,13 +1,16 @@
-"""Live control-layer proof: caller-owned Vehicle API v1 command loop.
+"""Live control-layer proof: gapless caller-owned Vehicle API v1 loop.
 
-Route (public methods only):
+One publication loop while armed GUIDED::
 
-1. takeoff(altitude)
-2. stream hold Motions at each outbound odom waypoint
-3. stream hold at the far end
-4. stream yaw_rate turn (+π) then reverse (−π)
-5. stream return waypoints
-6. land()
+    while flying:
+        choose current phase
+        produce one Motion
+        Vehicle.command(Motion)
+        ~50 ms
+
+Phase changes (outbound / hold / spin / reface / settle / align / return)
+replace the current Motion without stopping publication. Scoring happens on
+transition ticks; the next Motion is commanded in the same loop cadence.
 
 Run::
 
@@ -19,6 +22,7 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -96,75 +100,211 @@ def _ned_waypoint_to_odom(
     return Vec3(*ned_to_enu((north, east, down)))
 
 
-def _stream(
-    vehicle: Vehicle,
-    platform: WebotsArduPilot,
-    *,
-    build_motion: Callable[[], Motion],
-    duration_s: float,
-    drain: Callable[[], None],
-) -> dict[str, Any]:
-    """Caller-owned refresh: one command() per tick for ``duration_s`` sim time."""
+@dataclass
+class Phase:
+    """One route segment. Kind selects how Motion is built each tick."""
+
+    name: str
+    kind: str  # hold | yaw_rate
+    duration_s: float
+    target: Vec3 | None = None
+    yaw: float | None = 0.0
+    yaw_rate: float | None = None
+    requested_rad: float | None = None
+    # Filled on phase entry (first tick); never stop publishing to capture these.
+    frozen_position: Vec3 | None = None
+    start_yaw: float | None = None
     start_sim: float | None = None
-    wall_until = platform._monotonic() + _wall_backstop_s(platform, duration_s)
-    publications = 0
-    while platform._monotonic() < wall_until:
-        sim = _sim_time_s(platform)
-        if sim is not None:
-            if start_sim is None:
-                start_sim = sim
-            elif sim - start_sim >= duration_s:
-                break
-        result = vehicle.command(build_motion())
-        if not result.accepted:
-            return {
-                "ok": False,
-                "publications": publications,
-                "guided_lost": True,
-                "reason": result.reason,
-            }
-        publications += 1
-        drain()
-        platform._sleep(REFRESH_S)
-    return {"ok": True, "publications": publications, "guided_lost": False}
+    publications: int = 0
+    entered: bool = False
 
 
-def _score_hold(
-    steps: list[dict[str, Any]],
-    reasons: list[str],
-    *,
-    label: str,
-    target_odom: Vec3,
+@dataclass
+class FlightLog:
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+
+
+def _hold_motion(target: Vec3, *, yaw: float | None) -> Motion:
+    return Motion(position=target, velocity=ZERO, yaw=yaw)
+
+
+def _phase_motion(phase: Phase) -> Motion:
+    if phase.kind == "yaw_rate":
+        assert phase.frozen_position is not None
+        assert phase.yaw_rate is not None
+        return Motion(
+            position=phase.frozen_position,
+            velocity=ZERO,
+            yaw_rate=phase.yaw_rate,
+        )
+    assert phase.target is not None or phase.frozen_position is not None
+    position = phase.target if phase.target is not None else phase.frozen_position
+    assert position is not None
+    return _hold_motion(position, yaw=phase.yaw)
+
+
+def _score_hold_phase(
+    log: FlightLog,
+    phase: Phase,
     vehicle: Vehicle,
-    stream: dict[str, Any],
+    *,
     residual_max_m: float,
+    guided_lost: bool,
 ) -> None:
     state = vehicle.state()
+    target = phase.target if phase.target is not None else phase.frozen_position
     residual = None
-    if state.position is not None:
-        residual = math.dist(state.position.as_tuple(), target_odom.as_tuple())
+    if state.position is not None and target is not None:
+        residual = math.dist(state.position.as_tuple(), target.as_tuple())
     ok = (
-        stream.get("ok") is True
+        not guided_lost
         and residual is not None
         and residual <= residual_max_m
     )
-    steps.append(
+    log.steps.append(
         {
-            "task": label,
-            "target_odom": list(target_odom.as_tuple()),
+            "task": phase.name,
+            "target_odom": None if target is None else list(target.as_tuple()),
             "residual_m": residual,
-            "publications": stream.get("publications"),
+            "publications": phase.publications,
             "ok": ok,
         }
     )
-    if stream.get("guided_lost"):
-        reasons.append(f"{label}: guided flight lost")
+    if guided_lost:
+        log.reasons.append(f"{phase.name}: guided flight lost")
     elif residual is None:
-        reasons.append(f"{label}: no position to score")
+        log.reasons.append(f"{phase.name}: no position to score")
     elif residual > residual_max_m:
-        reasons.append(
-            f"{label}: residual {residual:.3f} m > {residual_max_m:.3f} m"
+        log.reasons.append(
+            f"{phase.name}: residual {residual:.3f} m > {residual_max_m:.3f} m"
         )
+
+
+def _score_yaw_phase(
+    log: FlightLog,
+    phase: Phase,
+    vehicle: Vehicle,
+    *,
+    spin_tolerance_rad: float,
+    guided_lost: bool,
+) -> None:
+    state = vehicle.state()
+    delta = None
+    if phase.start_yaw is not None and state.yaw is not None:
+        delta = wrap_angle_rad(state.yaw - phase.start_yaw)
+    requested = phase.requested_rad or 0.0
+    ok = (
+        not guided_lost
+        and delta is not None
+        and abs(abs(delta) - abs(requested)) <= spin_tolerance_rad
+    )
+    log.steps.append(
+        {
+            "task": phase.name,
+            "requested_rad": requested,
+            "delta_rad": delta,
+            "publications": phase.publications,
+            "ok": ok,
+        }
+    )
+    if guided_lost:
+        log.reasons.append(f"{phase.name}: guided flight lost")
+    elif delta is None:
+        log.reasons.append(f"{phase.name}: no yaw delta to score")
+    elif not ok:
+        log.reasons.append(
+            f"{phase.name}: |delta| {abs(delta):.3f} rad vs requested "
+            f"{abs(requested):.3f} (tol {spin_tolerance_rad:.3f})"
+        )
+
+
+def _build_phases(
+    *,
+    waypoints: tuple[tuple[float, float, float], ...],
+    hold_s: float,
+    hover_m: float,
+    spin_rad: float,
+    return_waypoints: bool,
+) -> list[Phase]:
+    phases: list[Phase] = []
+    for index, waypoint in enumerate(waypoints):
+        phases.append(
+            Phase(
+                name=f"goto[{index}]",
+                kind="hold",
+                duration_s=hold_s,
+                target=_ned_waypoint_to_odom(*waypoint, hover_m=hover_m),
+                yaw=0.0,
+            )
+        )
+    phases.append(
+        Phase(
+            name="hold",
+            kind="hold",
+            duration_s=hold_s,
+            target=None,  # freeze XY on entry
+            yaw=0.0,
+        )
+    )
+    phases.append(
+        Phase(
+            name="spin",
+            kind="yaw_rate",
+            duration_s=abs(spin_rad) / SPIN_RATE_RAD_S,
+            yaw=None,
+            yaw_rate=SPIN_RATE_RAD_S if spin_rad >= 0.0 else -SPIN_RATE_RAD_S,
+            requested_rad=spin_rad,
+        )
+    )
+    if return_waypoints:
+        phases.append(
+            Phase(
+                name="reface",
+                kind="yaw_rate",
+                duration_s=abs(spin_rad) / SPIN_RATE_RAD_S,
+                yaw=None,
+                yaw_rate=-SPIN_RATE_RAD_S if spin_rad >= 0.0 else SPIN_RATE_RAD_S,
+                requested_rad=-spin_rad,
+            )
+        )
+        # Explicit hold Motion at entry pose with yaw=0 — still published every tick.
+        phases.append(
+            Phase(
+                name="settle",
+                kind="hold",
+                duration_s=hold_s,
+                target=None,
+                yaw=0.0,
+            )
+        )
+        inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
+        if inbound and waypoints:
+            far_north, far_east, far_z = waypoints[-1]
+            _first_north, first_east, _first_z = inbound[0]
+            if abs(first_east - far_east) > 1e-6:
+                phases.append(
+                    Phase(
+                        name="align",
+                        kind="hold",
+                        duration_s=hold_s,
+                        target=_ned_waypoint_to_odom(
+                            far_north, first_east, far_z, hover_m=hover_m
+                        ),
+                        yaw=0.0,
+                    )
+                )
+        for index, waypoint in enumerate(inbound):
+            phases.append(
+                Phase(
+                    name=f"return[{index}]",
+                    kind="hold",
+                    duration_s=hold_s,
+                    target=_ned_waypoint_to_odom(*waypoint, hover_m=hover_m),
+                    yaw=0.0,
+                )
+            )
+    return phases
 
 
 def fly_control_route(
@@ -178,15 +318,14 @@ def fly_control_route(
     spin_tolerance_rad: float = DEFAULT_SPIN_TOLERANCE_RAD,
     return_waypoints: bool = True,
 ) -> dict[str, Any]:
-    """Fly the layer route through Vehicle.takeoff / command / land / state."""
+    """Fly the layer route with one gapless Vehicle.command() loop."""
     vehicle = platform.vehicle
     drain: Callable[[], None] = lambda: _drain(platform)
-    reasons: list[str] = []
-    steps: list[dict[str, Any]] = []
+    log = FlightLog()
 
     takeoff = vehicle.takeoff(hover_m)
     state = vehicle.state()
-    steps.append(
+    log.steps.append(
         {
             "task": "takeoff",
             "ok": takeoff.accepted,
@@ -195,204 +334,120 @@ def fly_control_route(
         }
     )
     if not takeoff.accepted:
-        reasons.append(takeoff.reason or "takeoff refused")
+        log.reasons.append(takeoff.reason or "takeoff refused")
         return {
             "status": "fail",
-            "reasons": reasons,
-            "steps": steps,
+            "reasons": log.reasons,
+            "steps": log.steps,
             "residual_max_m": residual_max_m,
         }
 
-    def hold_motion(target: Vec3, *, yaw: float | None = 0.0) -> Motion:
-        return Motion(position=target, velocity=ZERO, yaw=yaw)
+    phases = _build_phases(
+        waypoints=waypoints,
+        hold_s=hold_s,
+        hover_m=hover_m,
+        spin_rad=spin_rad,
+        return_waypoints=return_waypoints,
+    )
+    index = 0
+    wall_budget = sum(phase.duration_s for phase in phases) + hold_s
+    wall_until = platform._monotonic() + _wall_backstop_s(platform, wall_budget)
+    guided_lost = False
 
-    for index, waypoint in enumerate(waypoints):
-        target = _ned_waypoint_to_odom(*waypoint, hover_m=hover_m)
-        stream = _stream(
-            vehicle,
-            platform,
-            build_motion=lambda t=target: hold_motion(t, yaw=0.0),
-            duration_s=hold_s,
-            drain=drain,
-        )
-        _score_hold(
-            steps,
-            reasons,
-            label=f"goto[{index}]",
-            target_odom=target,
-            vehicle=vehicle,
-            stream=stream,
-            residual_max_m=residual_max_m,
-        )
-        if stream.get("guided_lost"):
+    while index < len(phases) and platform._monotonic() < wall_until:
+        phase = phases[index]
+        state = vehicle.state()
+
+        if not phase.entered:
+            # Capture freezes on the same tick we still publish — no silent gap.
+            if phase.target is None:
+                if state.position is None:
+                    log.reasons.append(f"{phase.name}: no position at entry")
+                    break
+                phase.frozen_position = state.position
+                phase.target = state.position
+            if phase.kind == "yaw_rate":
+                phase.frozen_position = (
+                    state.position if state.position is not None else phase.target
+                )
+                phase.start_yaw = state.yaw
+            phase.entered = True
+            phase.start_sim = _sim_time_s(platform)
+
+        motion = _phase_motion(phase)
+        result = vehicle.command(motion)
+        phase.publications += 1
+        if not result.accepted:
+            guided_lost = True
+            if phase.kind == "yaw_rate":
+                _score_yaw_phase(
+                    log,
+                    phase,
+                    vehicle,
+                    spin_tolerance_rad=spin_tolerance_rad,
+                    guided_lost=True,
+                )
+            else:
+                _score_hold_phase(
+                    log,
+                    phase,
+                    vehicle,
+                    residual_max_m=residual_max_m,
+                    guided_lost=True,
+                )
             break
 
-    if not any("guided flight lost" in reason for reason in reasons):
-        state = vehicle.state()
-        if state.position is None:
-            reasons.append("hold: no position")
-            steps.append({"task": "hold", "ok": False})
+        sim = _sim_time_s(platform)
+        phase_done = False
+        if phase.start_sim is not None and sim is not None:
+            phase_done = (sim - phase.start_sim) >= phase.duration_s
+        elif phase.start_sim is None and sim is not None:
+            phase.start_sim = sim
+        elif phase.publications * REFRESH_S >= phase.duration_s / min(
+            platform.settings.realtime_ratio_envelope
+        ):
+            # Wall-clock fallback if sim time is unavailable.
+            phase_done = True
+
+        drain()
+        platform._sleep(REFRESH_S)
+
+        if not phase_done:
+            continue
+
+        # Score then immediately advance — next loop iteration publishes the
+        # next phase Motion without an inter-phase silence.
+        if phase.kind == "yaw_rate":
+            _score_yaw_phase(
+                log,
+                phase,
+                vehicle,
+                spin_tolerance_rad=spin_tolerance_rad,
+                guided_lost=False,
+            )
         else:
-            target = state.position
-            stream = _stream(
+            _score_hold_phase(
+                log,
+                phase,
                 vehicle,
-                platform,
-                build_motion=lambda t=target: hold_motion(t, yaw=0.0),
-                duration_s=hold_s,
-                drain=drain,
-            )
-            _score_hold(
-                steps,
-                reasons,
-                label="hold",
-                target_odom=target,
-                vehicle=vehicle,
-                stream=stream,
                 residual_max_m=residual_max_m,
+                guided_lost=False,
             )
-
-    def yaw_turn(angle_rad: float, label: str) -> None:
-        if any("guided flight lost" in reason for reason in reasons):
-            return
-        state = vehicle.state()
-        if state.position is None or state.yaw is None:
-            reasons.append(f"{label}: missing pose")
-            steps.append({"task": label, "ok": False})
-            return
-        start_yaw = state.yaw
-        hold_pos = state.position
-        rate = SPIN_RATE_RAD_S if angle_rad >= 0.0 else -SPIN_RATE_RAD_S
-        duration = abs(angle_rad) / abs(SPIN_RATE_RAD_S)
-        stream = _stream(
-            vehicle,
-            platform,
-            build_motion=lambda p=hold_pos, r=rate: Motion(
-                position=p, velocity=ZERO, yaw_rate=r
-            ),
-            duration_s=duration,
-            drain=drain,
-        )
-        after = vehicle.state()
-        delta = None
-        if after.yaw is not None:
-            delta = wrap_angle_rad(after.yaw - start_yaw)
-        ok = (
-            stream.get("ok") is True
-            and delta is not None
-            and abs(abs(delta) - abs(angle_rad)) <= spin_tolerance_rad
-        )
-        steps.append(
-            {
-                "task": label,
-                "requested_rad": angle_rad,
-                "delta_rad": delta,
-                "publications": stream.get("publications"),
-                "ok": ok,
-            }
-        )
-        if stream.get("guided_lost"):
-            reasons.append(f"{label}: guided flight lost")
-        elif delta is None:
-            reasons.append(f"{label}: no yaw delta to score")
-        elif not ok:
-            reasons.append(
-                f"{label}: |delta| {abs(delta):.3f} rad vs requested {abs(angle_rad):.3f} "
-                f"(tol {spin_tolerance_rad:.3f})"
-            )
-
-    yaw_turn(spin_rad, "spin")
-    if return_waypoints:
-        yaw_turn(-spin_rad, "reface")
-
-    # After ±π: settle in place with yaw=0 (small heading fix, no translate),
-    # then align east with the first inbound hold before moving north—diagonal
-    # 7.5/-0.5 → 5.5/-1.2 after the spin pair tip-struck even with yaw≈0.
-    if return_waypoints and not any(
-        "guided flight lost" in reason for reason in reasons
-    ):
-        state = vehicle.state()
-        if state.position is not None:
-            settle_pos = state.position
-            stream = _stream(
-                vehicle,
-                platform,
-                build_motion=lambda p=settle_pos: hold_motion(p, yaw=0.0),
-                duration_s=hold_s,
-                drain=drain,
-            )
-            _score_hold(
-                steps,
-                reasons,
-                label="settle",
-                target_odom=settle_pos,
-                vehicle=vehicle,
-                stream=stream,
-                residual_max_m=residual_max_m,
-            )
-
-    if return_waypoints and not any(
-        "guided flight lost" in reason for reason in reasons
-    ):
-        inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
-        if inbound and waypoints:
-            far_north, _far_east, far_z = waypoints[-1]
-            first_north, first_east, first_z = inbound[0]
-            if abs(first_east - _far_east) > 1e-6:
-                align = _ned_waypoint_to_odom(
-                    far_north, first_east, far_z, hover_m=hover_m
-                )
-                stream = _stream(
-                    vehicle,
-                    platform,
-                    build_motion=lambda t=align: hold_motion(t, yaw=0.0),
-                    duration_s=hold_s,
-                    drain=drain,
-                )
-                _score_hold(
-                    steps,
-                    reasons,
-                    label="align",
-                    target_odom=align,
-                    vehicle=vehicle,
-                    stream=stream,
-                    residual_max_m=residual_max_m,
-                )
-        for index, waypoint in enumerate(inbound):
-            if any("guided flight lost" in reason for reason in reasons):
-                break
-            target = _ned_waypoint_to_odom(*waypoint, hover_m=hover_m)
-            stream = _stream(
-                vehicle,
-                platform,
-                build_motion=lambda t=target: hold_motion(t, yaw=0.0),
-                duration_s=hold_s,
-                drain=drain,
-            )
-            _score_hold(
-                steps,
-                reasons,
-                label=f"return[{index}]",
-                target_odom=target,
-                vehicle=vehicle,
-                stream=stream,
-                residual_max_m=residual_max_m,
-            )
-            if stream.get("guided_lost"):
-                break
+        index += 1
 
     land = vehicle.land()
-    steps.append({"task": "land", "ok": land.accepted})
+    log.steps.append({"task": "land", "ok": land.accepted})
     if not land.accepted:
-        reasons.append(land.reason or "land refused")
+        log.reasons.append(land.reason or "land refused")
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         drain()
         time.sleep(0.05)
 
     return {
-        "status": "pass" if not reasons else "fail",
-        "reasons": reasons,
-        "steps": steps,
+        "status": "pass" if not log.reasons else "fail",
+        "reasons": log.reasons,
+        "steps": log.steps,
         "residual_max_m": residual_max_m,
     }
 
@@ -461,8 +516,8 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
             gate_status=gate,
             reasons=tuple(result["reasons"]),
             limitations=(
-                "Control proof: Vehicle API v1 takeoff/command/land through "
-                "doorways; no estimator or obstacle-avoidance checks",
+                "Control proof: gapless Vehicle.command() loop through doorways; "
+                "no estimator or obstacle-avoidance checks",
             ),
             manifest={
                 "command": "motion-proof",
@@ -496,7 +551,7 @@ register_command(
     _command,
     help_text=(
         "Launch the simulator and fly the Vehicle API v1 control route "
-        "(takeoff, command-loop holds/turns, land)."
+        "with a gapless caller-owned command() loop."
     ),
     stage_id="P00-motion",
     run_prefix="p00-motion-proof",

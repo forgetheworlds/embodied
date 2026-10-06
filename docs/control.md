@@ -24,15 +24,30 @@ class Motion:
 - **Odom only** — no frame field on `Motion`. Vehicle owns odom→NED→MAVLink.
 - **Caller-owned refresh** — each `command()` is one shot. If the caller stops
   publishing, Guided times out / fails closed. No last-motion republish and no
-  auto-hold-on-cease.
-- Hold = current/target position + zero velocity (+ optional yaw).
-- Turns = hold position + `yaw_rate` (never absolute yaw slam after a large
-  heading change; unwind with opposite rate).
+  auto-hold-on-cease inside Vehicle.
+- Hold = position + zero velocity (+ optional yaw).
+- Turns = held position + `yaw_rate` (unwind with opposite rate after a large turn).
 - `takeoff` owns arm / GUIDED / EKF-origin bring-up.
-- Typed `Result` for accept/refuse (not Guided, bad numbers, yaw+yaw_rate, …).
-- `VehicleState`: armed, guided, position, velocity, yaw (+ landed when known).
+- Typed `Result` for accept/refuse. `VehicleState`: armed, guided, position,
+  velocity, yaw (+ landed when known).
 
 There is **no** public `goto` / `hold` / `spin` helper surface.
+
+## Live proof contract
+
+`configs/layers/control` runs **one gapless caller loop** while GUIDED:
+
+```text
+while flying:
+    choose current phase
+    produce one Motion
+    Vehicle.command(Motion)
+    ~50 ms
+```
+
+Phase changes (outbound, hold, spin, reface, settle, align, return) only replace
+the current Motion. Scoring happens on transition ticks without stopping
+publication. Settle/align are explicit hold Motions when used — not silence.
 
 ## Layout
 
@@ -44,25 +59,18 @@ There is **no** public `goto` / `hold` / `spin` helper surface.
 | `configs/layers/control.yaml` | Doorway route |
 | `docs/control.md` | This note |
 
-Per-layer convention: `src/embodied/<layer>/`, `tests/test_<layer>.py`,
-`configs/layers/<layer>`, `docs/<layer>.md`.
-
 ## Hard-won constraints
 
-1. Refresh GUIDED setpoints from the **caller** (~50 ms). Stopping fails closed.
-2. Refuse `command()` when not armed GUIDED — never publish blind.
-3. Keep XY closed-loop during yaw-rate turns (position held in `Motion`).
-4. Doorway residual for the layer proof is **0.10 m**.
-5. Always load `compat_ekf.parm`. Waypoints in the yaml are absolute local-NED;
-   the proof converts them to odom ENU before building `Motion`.
-6. After a ±π yaw-rate pair: settle in place with `yaw=0`, align east with the
-   first inbound hold, then return with `yaw=0`. A diagonal cut across R2 right
-   after the spin pair tip-strikes; unconstrained yaw on the whole return drifts.
+1. Never stop publishing while armed GUIDED (~50 ms cadence).
+2. Refuse `command()` when not armed GUIDED.
+3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
+4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
+5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
 
 ## Done bar
 
 1. `pytest tests/test_control.py`
-2. `./configs/layers/control` → receipt `gate_status: pass`
+2. `./configs/layers/control` → `gate_status: pass`
 3. This doc stays accurate
 
 ## How to run
@@ -71,8 +79,6 @@ Per-layer convention: `src/embodied/<layer>/`, `tests/test_<layer>.py`,
 .venv/bin/python -m pytest tests/test_control.py -q
 ./configs/layers/control
 ```
-
-Evidence: `work/runs/layers/control/` (`receipt.json`, `run-a/motion-proof.json`).
 
 ## Does not own
 
