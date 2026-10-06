@@ -412,16 +412,23 @@ def send_status(channel, status, sim_time_s, devices):
 def main():
     _apply_sim_cpu_affinity()
     args = parse_args()
-    # Supervisor when the world sets supervisor TRUE (first_indoor control proof).
-    # Falls back to Robot for worlds that leave supervisor FALSE.
-    try:
+    movie_path = _maybe_start_movie(None)  # path only; needs Supervisor to record
+    # Use Supervisor only when a native movie was requested — always-on
+    # Supervisor() crashed this controller under load on first_indoor.
+    if movie_path:
         from controller import Supervisor
 
         robot = Supervisor()
-    except Exception:  # noqa: BLE001 - worlds without supervisor stay on Robot
+    else:
         robot = Robot()
-    movie_path = _maybe_start_movie(robot)
     movie_started = False
+    if movie_path and getattr(robot, "movieStartRecording", None) is None:
+        print(
+            "Controller: EMBODIED_WEBOTS_MOVIE set but robot has no Supervisor "
+            "movie API (is supervisor TRUE?)",
+            flush=True,
+        )
+        movie_path = None
     # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
     # "F2's denominator"): the bridge sets EMBODIED_SIM_WALL_CLAMP=1 in this
     # process's environment only when the run's configuration asked for it, and the
