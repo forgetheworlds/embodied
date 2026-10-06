@@ -523,17 +523,18 @@ def fly_control_route(
         if phase.start_sim is None and sim is not None:
             phase.start_sim = sim
         phase_done = _phase_time_done(phase, sim=sim, platform=platform)
-        if (
-            phase.kind == "heading_slew"
-            and state.yaw is not None
-            and abs(wrap_angle_rad(state.yaw)) <= HEADING_LOCK_TOL_RAD
-            and phase.publications >= _phase_min_publications(2.0, platform)
-        ):
-            # Early-complete once north is locked and XY has been held briefly.
-            phase_done = True
 
         drain()
         platform._sleep(REFRESH_S)
+
+        if phase.kind == "heading_slew" and not phase_done:
+            now = vehicle.state()
+            if (
+                now.yaw is not None
+                and abs(wrap_angle_rad(now.yaw)) <= HEADING_LOCK_TOL_RAD
+                and phase.publications >= _phase_min_publications(2.0, platform)
+            ):
+                phase_done = True
 
         if not phase_done:
             continue
