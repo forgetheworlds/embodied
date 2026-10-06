@@ -52,8 +52,6 @@ while flying:
 Phase changes (outbound, hold, spin, reface, settle, align, return) only replace
 the current Motion. Scoring happens on transition ticks without stopping
 publication. Settle/align are explicit hold Motions when used — not silence.
-Timed phases also require a minimum publication count so a starved MAVLink
-boot-time jump cannot skip an 8 s hold in one fold.
 
 ## Layout
 
@@ -70,12 +68,8 @@ boot-time jump cannot skip an 8 s hold in one fold.
 1. Never stop publishing while armed GUIDED (~50 ms cadence).
 2. Refuse `command()` when not armed GUIDED.
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
-4. Doorway residual **0.10 m**. Load `compat_ekf.parm` and
-   `compat_control.parm` (slower Guided WPNAV for indoor frames).
+4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
-6. After ±π reverse-spin: coast (`yaw_rate=0`), then settle/align/return
-   yaw-ignored. Absolute yaw lock (and heading-slew then translate) tip-struck
-   under host load; reface still scores the unwind.
 
 ## Done bar
 

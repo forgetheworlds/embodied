@@ -53,13 +53,7 @@ DEFAULT_SPIN_RAD = math.pi
 DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
 REFRESH_S = 0.05
-SPIN_RATE_RAD_S = 0.4
-HEADING_SLEW_RATE_RAD_S = 0.25
-HEADING_LOCK_TOL_RAD = 0.15
-# Under host load (screen capture, etc.) MAVLink can starve and boot_time can
-# jump by many seconds in one telemetry fold. Require enough publications before
-# a phase may complete so holds cannot skip on a single clock jump.
-PHASE_MIN_PUB_FRACTION = 0.25
+SPIN_RATE_RAD_S = 0.6
 ZERO = Vec3(0.0, 0.0, 0.0)
 
 
@@ -98,30 +92,6 @@ def _wall_backstop_s(platform: WebotsArduPilot, sim_duration_s: float) -> float:
     return sim_duration_s / min_ratio
 
 
-def _phase_min_publications(duration_s: float, platform: WebotsArduPilot) -> int:
-    """Lower bound on publications before a timed phase may complete."""
-    min_ratio = min(platform.settings.realtime_ratio_envelope)
-    expected = duration_s / max(REFRESH_S, 1e-3)
-    return max(1, int(expected * min_ratio * PHASE_MIN_PUB_FRACTION))
-
-
-def _phase_time_done(
-    phase: Phase,
-    *,
-    sim: float | None,
-    platform: WebotsArduPilot,
-) -> bool:
-    min_pubs = _phase_min_publications(phase.duration_s, platform)
-    if phase.publications < min_pubs:
-        return False
-    if phase.start_sim is not None and sim is not None:
-        return (sim - phase.start_sim) >= phase.duration_s
-    # Wall-clock fallback if sim time is unavailable.
-    return phase.publications * REFRESH_S >= phase.duration_s / min(
-        platform.settings.realtime_ratio_envelope
-    )
-
-
 def _ned_waypoint_to_odom(
     north: float, east: float, z_offset: float, hover_m: float
 ) -> Vec3:
@@ -135,7 +105,7 @@ class Phase:
     """One route segment. Kind selects how Motion is built each tick."""
 
     name: str
-    kind: str  # hold | yaw_rate | heading_slew
+    kind: str  # hold | yaw_rate
     duration_s: float
     target: Vec3 | None = None
     yaw: float | None = 0.0
@@ -159,21 +129,7 @@ def _hold_motion(target: Vec3, *, yaw: float | None) -> Motion:
     return Motion(position=target, velocity=ZERO, yaw=yaw)
 
 
-def _heading_slew_motion(position: Vec3, yaw: float | None) -> Motion:
-    """Hold XY while slewing yaw toward 0 with a capped rate (no absolute snap)."""
-    if yaw is None:
-        return Motion(position=position, velocity=ZERO)
-    error = wrap_angle_rad(0.0 - yaw)
-    if abs(error) <= HEADING_LOCK_TOL_RAD:
-        return Motion(position=position, velocity=ZERO, yaw=0.0)
-    rate = max(
-        -HEADING_SLEW_RATE_RAD_S,
-        min(HEADING_SLEW_RATE_RAD_S, 1.2 * error),
-    )
-    return Motion(position=position, velocity=ZERO, yaw_rate=rate)
-
-
-def _phase_motion(phase: Phase, *, yaw: float | None = None) -> Motion:
+def _phase_motion(phase: Phase) -> Motion:
     if phase.kind == "yaw_rate":
         assert phase.frozen_position is not None
         assert phase.yaw_rate is not None
@@ -185,8 +141,6 @@ def _phase_motion(phase: Phase, *, yaw: float | None = None) -> Motion:
     assert phase.target is not None or phase.frozen_position is not None
     position = phase.target if phase.target is not None else phase.frozen_position
     assert position is not None
-    if phase.kind == "heading_slew":
-        return _heading_slew_motion(position, yaw)
     return _hold_motion(position, yaw=phase.yaw)
 
 
@@ -224,52 +178,6 @@ def _score_hold_phase(
     elif residual > residual_max_m:
         log.reasons.append(
             f"{phase.name}: residual {residual:.3f} m > {residual_max_m:.3f} m"
-        )
-
-
-def _score_heading_phase(
-    log: FlightLog,
-    phase: Phase,
-    vehicle: Vehicle,
-    *,
-    residual_max_m: float,
-    guided_lost: bool,
-) -> None:
-    state = vehicle.state()
-    target = phase.target if phase.target is not None else phase.frozen_position
-    residual = None
-    if state.position is not None and target is not None:
-        residual = math.dist(state.position.as_tuple(), target.as_tuple())
-    yaw = state.yaw
-    yaw_err = None if yaw is None else abs(wrap_angle_rad(yaw))
-    ok = (
-        not guided_lost
-        and residual is not None
-        and residual <= residual_max_m
-        and yaw_err is not None
-        and yaw_err <= HEADING_LOCK_TOL_RAD
-    )
-    log.steps.append(
-        {
-            "task": phase.name,
-            "target_odom": None if target is None else list(target.as_tuple()),
-            "residual_m": residual,
-            "yaw_err_rad": yaw_err,
-            "publications": phase.publications,
-            "ok": ok,
-        }
-    )
-    if guided_lost:
-        log.reasons.append(f"{phase.name}: guided flight lost")
-    elif residual is None or yaw_err is None:
-        log.reasons.append(f"{phase.name}: no pose to score")
-    elif residual > residual_max_m:
-        log.reasons.append(
-            f"{phase.name}: residual {residual:.3f} m > {residual_max_m:.3f} m"
-        )
-    elif yaw_err > HEADING_LOCK_TOL_RAD:
-        log.reasons.append(
-            f"{phase.name}: |yaw| {yaw_err:.3f} rad > {HEADING_LOCK_TOL_RAD:.3f}"
         )
 
 
@@ -360,28 +268,14 @@ def _build_phases(
                 requested_rad=-spin_rad,
             )
         )
-        # Coast: explicitly zero yaw_rate at the spin XY before settle so the
-        # airframe is not still twisting when we stop commanding rate.
-        phases.append(
-            Phase(
-                name="coast",
-                kind="yaw_rate",
-                duration_s=2.0,
-                yaw=None,
-                yaw_rate=0.0,
-                requested_rad=0.0,
-            )
-        )
-        # Yaw-ignored settle and inbound. Absolute yaw lock after ±π tip-struck;
-        # a heading-slew then lateral align also tip-struck. Reface scores the
-        # unwind; keep XY holds yaw-ignored through the return doors.
+        # Explicit hold Motion at entry pose with yaw=0 — still published every tick.
         phases.append(
             Phase(
                 name="settle",
                 kind="hold",
                 duration_s=hold_s,
                 target=None,
-                yaw=None,
+                yaw=0.0,
             )
         )
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
@@ -397,7 +291,7 @@ def _build_phases(
                         target=_ned_waypoint_to_odom(
                             far_north, first_east, far_z, hover_m=hover_m
                         ),
-                        yaw=None,
+                        yaw=0.0,
                     )
                 )
         for index, waypoint in enumerate(inbound):
@@ -407,7 +301,7 @@ def _build_phases(
                     kind="hold",
                     duration_s=hold_s,
                     target=_ned_waypoint_to_odom(*waypoint, hover_m=hover_m),
-                    yaw=None,
+                    yaw=0.0,
                 )
             )
     return phases
@@ -472,7 +366,7 @@ def fly_control_route(
                     break
                 phase.frozen_position = state.position
                 phase.target = state.position
-            if phase.kind in ("yaw_rate", "heading_slew"):
+            if phase.kind == "yaw_rate":
                 phase.frozen_position = (
                     state.position if state.position is not None else phase.target
                 )
@@ -480,7 +374,7 @@ def fly_control_route(
             phase.entered = True
             phase.start_sim = _sim_time_s(platform)
 
-        motion = _phase_motion(phase, yaw=state.yaw)
+        motion = _phase_motion(phase)
         result = vehicle.command(motion)
         phase.publications += 1
         if not result.accepted:
@@ -491,14 +385,6 @@ def fly_control_route(
                     phase,
                     vehicle,
                     spin_tolerance_rad=spin_tolerance_rad,
-                    guided_lost=True,
-                )
-            elif phase.kind == "heading_slew":
-                _score_heading_phase(
-                    log,
-                    phase,
-                    vehicle,
-                    residual_max_m=residual_max_m,
                     guided_lost=True,
                 )
             else:
@@ -512,24 +398,19 @@ def fly_control_route(
             break
 
         sim = _sim_time_s(platform)
-        if phase.start_sim is None and sim is not None:
+        phase_done = False
+        if phase.start_sim is not None and sim is not None:
+            phase_done = (sim - phase.start_sim) >= phase.duration_s
+        elif phase.start_sim is None and sim is not None:
             phase.start_sim = sim
-        phase_done = _phase_time_done(phase, sim=sim, platform=platform)
+        elif phase.publications * REFRESH_S >= phase.duration_s / min(
+            platform.settings.realtime_ratio_envelope
+        ):
+            # Wall-clock fallback if sim time is unavailable.
+            phase_done = True
 
         drain()
         platform._sleep(REFRESH_S)
-
-        if phase.kind == "heading_slew" and not phase_done:
-            now = vehicle.state()
-            # Require a real settle after the slew claims north — a 5-tick
-            # early-complete then slamming lateral accel tip-struck on align.
-            min_lock_pubs = _phase_min_publications(max(3.0, 0.5 * hold_s), platform)
-            if (
-                now.yaw is not None
-                and abs(wrap_angle_rad(now.yaw)) <= HEADING_LOCK_TOL_RAD
-                and phase.publications >= min_lock_pubs
-            ):
-                phase_done = True
 
         if not phase_done:
             continue
@@ -542,14 +423,6 @@ def fly_control_route(
                 phase,
                 vehicle,
                 spin_tolerance_rad=spin_tolerance_rad,
-                guided_lost=False,
-            )
-        elif phase.kind == "heading_slew":
-            _score_heading_phase(
-                log,
-                phase,
-                vehicle,
-                residual_max_m=residual_max_m,
                 guided_lost=False,
             )
         else:
