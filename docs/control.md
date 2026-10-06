@@ -73,8 +73,9 @@ publication. Settle/align are explicit hold Motions when used — not silence.
 6. Prefer native Webots movie (`EMBODIED_WEBOTS_MOVIE`) over desktop
    screen capture — ffmpeg x11grab starves SITL/EKF and tip-strikes.
    Delay past PreArm with `EMBODIED_WEBOTS_MOVIE_DELAY_S` (default 90).
-7. Pin Webots/SITL to reserved cores with `EMBODIED_SIM_CPUS` (default
-   `0,1,2` from `./configs/layers/control`) so host load yields to the sim.
+7. Pin **SITL** to reserved cores with `EMBODIED_SIM_CPUS` (default
+   `0,1,2` from `./configs/layers/control`; `none` disables) so the
+   autopilot loop keeps CPU under host load. Webots stays unpinned.
 
 ## Done bar
 

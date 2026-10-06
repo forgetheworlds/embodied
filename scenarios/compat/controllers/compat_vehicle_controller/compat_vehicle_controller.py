@@ -73,40 +73,15 @@ from sensors import VehicleDevices  # noqa: E402
 _WEBOTS_MOVIE_CODEC_MPEG4 = 1337
 
 
-def _apply_sim_cpu_affinity() -> None:
-    """Pin this controller to ``EMBODIED_SIM_CPUS`` when the host reserved cores."""
-    raw = os.environ.get("EMBODIED_SIM_CPUS", "").strip()
-    if not raw:
-        return
-    try:
-        cpus = {int(part.strip()) for part in raw.split(",") if part.strip()}
-    except ValueError:
-        print(f"Controller: ignoring bad EMBODIED_SIM_CPUS={raw!r}", flush=True)
-        return
-    if not cpus:
-        return
-    try:
-        os.sched_setaffinity(0, cpus)
-        print(f"Controller: CPU affinity {sorted(cpus)}", flush=True)
-    except OSError as error:
-        print(f"Controller: CPU affinity failed ({error})", flush=True)
-
-
 def _maybe_start_movie(robot) -> str | None:
-    """Prepare a native Webots movie path when ``EMBODIED_WEBOTS_MOVIE`` is set.
+    """Return the native movie path when ``EMBODIED_WEBOTS_MOVIE`` is set.
 
-    Recording is not started here: encoding on the sim CPUs during PreArm
-    starves the gyro loop. Call ``_start_movie`` after bring-up is past.
+    ``robot`` may be None: this only resolves/creates the path. Recording is
+    started later via ``_start_movie`` after the PreArm delay so encoding does
+    not starve the gyro loop.
     """
     path = os.environ.get("EMBODIED_WEBOTS_MOVIE", "").strip()
     if not path:
-        return None
-    if getattr(robot, "movieStartRecording", None) is None:
-        print(
-            "Controller: EMBODIED_WEBOTS_MOVIE set but robot has no Supervisor "
-            "movie API (is supervisor TRUE?)",
-            flush=True,
-        )
         return None
     parent = os.path.dirname(path)
     if parent:
@@ -410,7 +385,6 @@ def send_status(channel, status, sim_time_s, devices):
 
 
 def main():
-    _apply_sim_cpu_affinity()
     args = parse_args()
     movie_path = _maybe_start_movie(None)  # path only; needs Supervisor to record
     # Use Supervisor only when a native movie was requested — always-on

@@ -2347,14 +2347,17 @@ class SubprocessRunner:
         freshness bounds are measured on: the pinned estimator process and this
         process's feed and publisher threads.
 
-        When ``EMBODIED_SIM_CPUS`` is set, the child is pinned to that CPU set
-        (best-effort) so the flight stack keeps reserved cores under host load.
+        When ``EMBODIED_SIM_CPUS`` is set, **SITL** is pinned to that CPU set
+        (best-effort) so the autopilot loop keeps reserved cores under host load.
+        Webots is left unpinned so its controller child is not affinity-trapped
+        with the physics thread (that pairing crashed under load on this host).
         """
         log_path.parent.mkdir(parents=True, exist_ok=True)
         merged = dict(os.environ)
         if env:
             merged.update(env)
-        affinity = self._cpu_affinity_from_env()
+        # Only pin SITL — Webots+controller stay free to schedule.
+        affinity = self._cpu_affinity_from_env() if name == "sitl" else None
         preexec = None
         if low_priority or affinity is not None:
             preexec = self._child_preexec(

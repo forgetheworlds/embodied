@@ -27,8 +27,12 @@ export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 
 # Reserve host cores for Webots + SITL (and the in-Webots controller). On a
 # 4-core cloud VM this keeps one core free for the agent/desktop so capture
-# load cannot starve the flight stack. Override with EMBODIED_SIM_CPUS=.
-export EMBODIED_SIM_CPUS="${EMBODIED_SIM_CPUS:-0,1,2}"
+# load cannot starve the flight stack. Set EMBODIED_SIM_CPUS=none to disable.
+if [[ -z "${EMBODIED_SIM_CPUS+x}" ]]; then
+  export EMBODIED_SIM_CPUS="0,1,2"
+elif [[ "${EMBODIED_SIM_CPUS}" == "none" || "${EMBODIED_SIM_CPUS}" == "off" ]]; then
+  unset EMBODIED_SIM_CPUS
+fi
 
 rm -rf "$OUTPUT"
 mkdir -p "$OUTPUT"
