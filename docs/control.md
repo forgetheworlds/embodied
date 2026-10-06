@@ -3,13 +3,18 @@
 Bottom API: anything that physically moves or rotates the aircraft under
 ArduPilot GUIDED. Higher layers call this surface; they do not dig under it.
 
-## One doc · one test · one proof
+## One doc · one test · one proof · one package
 
 | Path | Role |
 |---|---|
 | `docs/control.md` | This note |
 | `tests/test_control.py` | No-sim contract of the public API |
 | `configs/layers/control` | Live Webots + SITL proof (`control.yaml` route) |
+| `src/embodied/control/vehicle.py` | Public API (`Vehicle`, `Motion`, …) |
+| `src/embodied/control/proof.py` | Doorway phases driven by the proof script |
+
+Platform support (not a second API): SITL FDM clamp patch; optional native
+movie in `compat_vehicle_controller` via `EMBODIED_WEBOTS_MOVIE`.
 
 ```sh
 .venv/bin/python -m pytest tests/test_control.py -q
