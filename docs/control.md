@@ -3,6 +3,25 @@
 Bottom API: anything that physically moves or rotates the aircraft under
 ArduPilot GUIDED. Higher layers call this surface; they do not dig under it.
 
+## One doc · one test · one proof
+
+| Path | Role |
+|---|---|
+| `docs/control.md` | This note |
+| `tests/test_control.py` | No-sim contract of the public API |
+| `configs/layers/control` | Live Webots + SITL proof (`control.yaml` route) |
+
+```sh
+.venv/bin/python -m pytest tests/test_control.py -q
+./configs/layers/control          # exit 0 iff receipt gate_status is pass
+```
+
+Optional movie (native Webots, not desktop ffmpeg):
+
+```sh
+EMBODIED_WEBOTS_MOVIE=work/runs/layers/control/control-doorway.mp4 ./configs/layers/control
+```
+
 ## Public API
 
 ```python
@@ -21,79 +40,42 @@ class Motion:
     yaw_rate: float | None = None
 ```
 
-- **Odom only** — no frame field on `Motion`. Vehicle owns odom→NED→MAVLink.
-- **Caller-owned refresh** — each `command()` is one shot. If the caller stops
-  publishing, Guided times out / fails closed. No last-motion republish and no
-  auto-hold-on-cease inside Vehicle.
+- **Odom only** — Vehicle owns odom→NED→MAVLink.
+- **Caller-owned refresh** — each `command()` is one shot; stop publishing and
+  Guided fails closed. No last-motion republish inside Vehicle.
 - Hold = position + zero velocity (+ optional yaw).
 - Turns = held position + `yaw_rate` (unwind with opposite rate after a large turn).
-- `takeoff` owns arm / GUIDED / EKF-origin bring-up. It prefetches until the
-  local estimate is healthy (pose + home, EKF still aiding), skips arm spam
-  while PreArm is flapping, keeps pumping sensors between attempts, and
-  extends the wait when refusals are still recoverable (vis-odom / gyro rate /
-  need-position). Permanent sensor death still fails closed.
-- Typed `Result` for accept/refuse. `VehicleState`: armed, guided, position,
-  velocity, yaw (+ landed when known).
+- `takeoff` owns arm / GUIDED / EKF-origin bring-up (prefetch, recoverable PreArm).
+- No public `goto` / `hold` / `spin` helpers — compose `Motion` instead.
 
-There is **no** public `goto` / `hold` / `spin` helper surface.
+## Live proof
 
-## Live proof contract
-
-`configs/layers/control` runs **one gapless caller loop** while GUIDED:
+One gapless caller loop while GUIDED:
 
 ```text
 while flying:
-    choose current phase
-    produce one Motion
+    choose current phase Motion
     Vehicle.command(Motion)
     ~50 ms
 ```
 
-Phase changes (outbound, hold, spin, reface, settle, align, return) only replace
-the current Motion. Scoring happens on transition ticks without stopping
-publication. Settle/align are explicit hold Motions when used — not silence.
+Phases (outbound, hold, spin, reface, settle, align, return) only replace the
+current Motion. Settle/align are explicit holds — not silence. Doorway residual
+gate: **0.10 m**. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
 
-## Layout
+## Constraints that matter
 
-| Path | Role |
-|---|---|
-| `src/embodied/control/` | Layer package |
-| `tests/test_control.py` | No-sim contract of the public API |
-| `configs/layers/control` | Live sim verification script |
-| `configs/layers/control.yaml` | Doorway route |
-| `docs/control.md` | This note |
-
-## Hard-won constraints
-
-1. Never stop publishing while armed GUIDED (~50 ms cadence).
+1. Never stop publishing while armed GUIDED (~50 ms).
 2. Refuse `command()` when not armed GUIDED.
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
-4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
-5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
-6. SITL Webots-Python must not integrate multi-second FDM timestamp gaps
-   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`); a `time_boot_ms`
-   jump kills VisOdom and tips the aircraft.
-7. Prefer native Webots movie (`EMBODIED_WEBOTS_MOVIE`) over desktop
-   screen capture — ffmpeg x11grab starves SITL/EKF and tip-strikes.
-   Delay past PreArm with `EMBODIED_WEBOTS_MOVIE_DELAY_S` (default 90).
-   Cap length with `EMBODIED_WEBOTS_MOVIE_DURATION_S` (default 180) and
-   finalize while the world is still alive (parent SIGKILL drops in-flight
-   encodes). Do not pin CPUs for recording.
-
-## Done bar
-
-1. `pytest tests/test_control.py`
-2. `./configs/layers/control` → `gate_status: pass`
-3. This doc stays accurate
-
-## How to run
-
-```sh
-.venv/bin/python -m pytest tests/test_control.py -q
-./configs/layers/control
-# with native movie (starts after ~90s wall, past PreArm):
-EMBODIED_WEBOTS_MOVIE=work/runs/layers/control/control-doorway.mp4 ./configs/layers/control
-```
+4. Load `compat_ekf.parm`.
+5. SITL must clamp Webots FDM time jumps
+   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`) — otherwise
+   `time_boot_ms` leaps and VisOdom dies.
+6. Prefer `EMBODIED_WEBOTS_MOVIE` over desktop capture. Delay past PreArm
+   (`EMBODIED_WEBOTS_MOVIE_DELAY_S`, default 90), finish mid-run
+   (`EMBODIED_WEBOTS_MOVIE_DURATION_S`, default 180). No CPU pinning.
+   Software-GL movie may look stuttery; that is capture, not the flight.
 
 ## Does not own
 
