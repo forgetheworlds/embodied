@@ -1,12 +1,14 @@
-# Doorway Vehicle scene (first_indoor apertures).
+# Control-layer live sim verification (not pytest).
 #
-# Canonical control-layer live verification is configs/layers/control
-# (config: configs/layers/control.yaml). Keep this file for older commands
-# and open-field/doorway A/B checks; prefer the layers/ entry for the gate.
+# Canonical entry: ./configs/layers/control
+# Exercises Vehicle API v1 (takeoff / command loop / land) through first_indoor.
+#
+# Waypoints are absolute local-NED (EKF origin = world ENU origin). Iris spawn
+# is ENU (-1,0,*) → NED (-1,0,*); do NOT treat these as spawn-relative offsets.
 
 project:
-  stage: P00-motion
-  name: motion-doorway
+  stage: P00-control
+  name: layer-control
 
 platform:
   ardupilot_root: work/ardupilot
@@ -51,8 +53,6 @@ sensors:
   calibration: scenarios/compat/calibration.json
 
 # PlatformSettings still reads probe.*; values mirror motion.* for this scene.
-# Waypoints are absolute local-NED (EKF origin = world ENU origin). Iris spawn
-# is ENU (-1,0,*) → NED (-1,0,*); do NOT treat these as spawn-relative offsets.
 probe:
   hover_altitude_m: 1.5
   waypoints_local_ned:
@@ -66,7 +66,7 @@ probe:
   stream_loss_window_s: 6
   settle_s: 1.5
   at_rest_window_s: 2.0
-  pre_arm_wait_s: 60
+  pre_arm_wait_s: 120
   estimator_fault:
     kind: position_step
     magnitude_m: 30.0
@@ -81,9 +81,6 @@ probe:
     flight: 240
   budget_wall_clock_s: 1200
 
-# Absolute local-NED holds (world ENU x north, east = -y). Matches proposal
-# world ENU chain; residual 0.10 m; 8 s sim holds. Full control proof also
-# spins in place at the far end, then returns through the same holds.
 motion:
   hover_altitude_m: 1.5
   hold_per_waypoint_s: 8
@@ -99,4 +96,4 @@ motion:
     - [5.50, -1.20, 0.0]
     - [7.50, -0.50, 0.0]
 
-output: work/runs/p00-motion-doorway
+output: work/runs/layers/control

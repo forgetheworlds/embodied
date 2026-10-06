@@ -1,0 +1,123 @@
+diff --git a/libraries/SITL/SIM_Webots_Python.cpp b/libraries/SITL/SIM_Webots_Python.cpp
+index 19771ea21d..6bfae755ee 100644
+--- a/libraries/SITL/SIM_Webots_Python.cpp
++++ b/libraries/SITL/SIM_Webots_Python.cpp
+@@ -75,20 +75,37 @@ void WebotsPython::send_servos(const struct sitl_input &input)
+ 
+ /*
+   Receive sensor data from Webots (the Flight Dynamics Model)
++
++  Always consume to the *latest* queued FDM packet (older ones are stale).
++  Advance SITL time by at most one physics frame's worth of deltat: if the
++  UDP buffer held many seconds of Webots time while this process lagged,
++  applying the full timestamp gap in one update injects a multi-second
++  `time_boot_ms` jump (observed: +45 s in one ATTITUDE), which blows up
++  EKF external-nav and tips the aircraft. Sensor state still comes from the
++  latest packet; only the integrated clock is clamped.
+ */
+ void WebotsPython::recv_fdm(const struct sitl_input &input)
+ {
+-    fdm_packet pkt;
++    fdm_packet pkt{};
++    bool got = false;
+ 
+     /*
+-      we re-send the servo packet every 0.1 seconds until we get a
+-      reply. This allows us to cope with some packet loss to the FDM
++      Wait for at least one packet, re-sending servos while idle (copes with
++      some packet loss). Once one arrives, non-blocking-drain to the newest
++      complete packet so we never sit on a stale sample behind a backlog.
+      */
+-    while (socket_sitl.recv(&pkt, sizeof(pkt), 100) != sizeof(pkt)) {
+-        send_servos(input);
+-        // Reset the timestamp after a long disconnection, also catch webots reset
+-        if (get_wall_time_us() > last_wall_time_us + WEBOTS_TIMEOUT_US) {
+-            last_timestamp = 0;
++    while (!got) {
++        while (socket_sitl.recv(&pkt, sizeof(pkt), 100) != sizeof(pkt)) {
++            send_servos(input);
++            // Reset the timestamp after a long disconnection, also catch webots reset
++            if (get_wall_time_us() > last_wall_time_us + WEBOTS_TIMEOUT_US) {
++                last_timestamp = 0;
++            }
++        }
++        got = true;
++        fdm_packet newer{};
++        while (socket_sitl.recv(&newer, sizeof(newer), 0) == sizeof(newer)) {
++            pkt = newer;
+         }
+     }
+ 
+@@ -120,39 +137,20 @@ void WebotsPython::recv_fdm(const struct sitl_input &input)
+                         pkt.position_xyz[2]);
+     position.xy() += origin.get_distance_NE_double(home);
+ 
+-    // auto-adjust to simulation frame rate
+-    time_now_us += static_cast<uint64_t>(deltat * 1.0e6);
++    // Cap the integrated step. Webots basicTimeStep is 2 ms; allow a few
++    // coalesced steps, never a multi-second catch-up into one EKF iterate.
++    static constexpr double kMaxFrameS = 0.02;
++    const double dt = deltat > kMaxFrameS ? kMaxFrameS : deltat;
++    time_now_us += static_cast<uint64_t>(dt * 1.0e6);
+ 
+-    if (deltat < 0.01 && deltat > 0) {
+-        adjust_frame_time(static_cast<float>(1.0/deltat));
++    if (dt > 0 && dt < 0.01) {
++        adjust_frame_time(static_cast<float>(1.0/dt));
+     }
++    // Track Webots' clock (not the clamped dt) so the next deltat is honest.
+     last_timestamp = pkt.timestamp;
+ 
+ }
+ 
+-/*
+-  Drain remaining data on the socket to prevent phase lag
+- */
+-void WebotsPython::drain_sockets()
+-{
+-    const uint16_t buflen = 1024;
+-    char buf[buflen];
+-    ssize_t received;
+-    errno = 0;
+-    do {
+-        received = socket_sitl.recv(buf, buflen, 0);
+-        if (received < 0) {
+-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != 0) {
+-                fprintf(stderr, "error recv on socket in: %s \n",
+-                        strerror(errno));
+-            }
+-        } else {
+-            // fprintf(stderr, "received from control socket: %s\n", buf);
+-        }
+-    } while (received > 0);
+-
+-}
+-
+ /*
+   Update the Webots simulation by one time step
+  */
+@@ -166,7 +164,9 @@ void WebotsPython::update(const struct sitl_input &input)
+     time_advance();
+     // update magnetic field
+     update_mag_field_bf();
+-    drain_sockets();
++    // Do not discard further FDM packets here: recv_fdm already took the
++    // latest. A post-drain that throws away timestamps was the old phase-lag
++    // helper, and it is what produced multi-second time_boot jumps.
+ }
+ 
+ }  // namespace SITL
+diff --git a/libraries/SITL/SIM_Webots_Python.h b/libraries/SITL/SIM_Webots_Python.h
+index b7b04532c4..bf572baa78 100644
+--- a/libraries/SITL/SIM_Webots_Python.h
++++ b/libraries/SITL/SIM_Webots_Python.h
+@@ -69,9 +69,6 @@ private:
+     /// @brief send servo packet to Webots
+     void send_servos(const struct sitl_input &input);
+ 
+-    /// @brief drain all pending packets from Webots
+-    void drain_sockets();
+-
+     double last_timestamp;
+ 
+     SocketAPM_native socket_sitl;

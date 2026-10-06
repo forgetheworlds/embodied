@@ -38,27 +38,52 @@ echo "== installing the pinned Python dependencies into .venv"
 .venv/bin/pip install -q -e '.[dev]'
 
 # 2. ArduPilot SITL at the pinned commit, with submodules, built via waf.
-if [ -x "$ARDUPILOT_DIR/build/sitl/bin/arducopter" ]; then
-    echo "== $ARDUPILOT_DIR/build/sitl/bin/arducopter already built, skipping"
-else
-    if [ ! -d "$ARDUPILOT_DIR" ]; then
-        echo "== cloning ArduPilot into $ARDUPILOT_DIR (large, with submodules)"
-        git clone --recurse-submodules https://github.com/ArduPilot/ardupilot.git "$ARDUPILOT_DIR"
+#    Apply the Webots-Python FDM time-clamp patch (skips multi-second
+#    time_boot jumps when SITL drains a UDP FDM backlog).
+FDM_PATCH="patches/ardupilot-sitl-webots-fdm-time-clamp.patch"
+FDM_SRC="$ARDUPILOT_DIR/libraries/SITL/SIM_Webots_Python.cpp"
+FDM_BIN="$ARDUPILOT_DIR/build/sitl/bin/arducopter"
+
+apply_fdm_patch() {
+    if [ ! -f "$FDM_PATCH" ] || [ ! -f "$FDM_SRC" ]; then
+        return 0
     fi
+    if grep -q 'kMaxFrameS' "$FDM_SRC"; then
+        echo "== ArduPilot FDM time-clamp patch already present in tree"
+        return 0
+    fi
+    echo "== applying $FDM_PATCH"
+    git -C "$ARDUPILOT_DIR" apply "$(pwd)/$FDM_PATCH"
+}
+
+build_sitl() {
+    echo "== building ArduPilot SITL (a few minutes)"
     (
         cd "$ARDUPILOT_DIR"
-        current=$(git rev-parse HEAD)
-        if [ "$current" != "$ARDUPILOT_COMMIT" ]; then
-            echo "== checking out the pinned ArduPilot commit $ARDUPILOT_COMMIT"
-            git checkout "$ARDUPILOT_COMMIT"
-            git submodule update --init --recursive
-        fi
-        echo "== building ArduPilot SITL (a few minutes)"
         ./waf configure --board sitl
         ./waf copter
     )
-    [ -x "$ARDUPILOT_DIR/build/sitl/bin/arducopter" ] \
-        || fail "the waf build finished but $ARDUPILOT_DIR/build/sitl/bin/arducopter is missing"
+    [ -x "$FDM_BIN" ] || fail "the waf build finished but $FDM_BIN is missing"
+}
+
+if [ ! -d "$ARDUPILOT_DIR" ]; then
+    echo "== cloning ArduPilot into $ARDUPILOT_DIR (large, with submodules)"
+    git clone --recurse-submodules https://github.com/ArduPilot/ardupilot.git "$ARDUPILOT_DIR"
+fi
+(
+    cd "$ARDUPILOT_DIR"
+    current=$(git rev-parse HEAD)
+    if [ "$current" != "$ARDUPILOT_COMMIT" ]; then
+        echo "== checking out the pinned ArduPilot commit $ARDUPILOT_COMMIT"
+        git checkout "$ARDUPILOT_COMMIT"
+        git submodule update --init --recursive
+    fi
+)
+apply_fdm_patch
+if [ ! -x "$FDM_BIN" ] || [ "$FDM_SRC" -nt "$FDM_BIN" ]; then
+    build_sitl
+else
+    echo "== $FDM_BIN already built and up to date, skipping"
 fi
 
 # 3. Webots. The download is manual (license click-through), so the script
