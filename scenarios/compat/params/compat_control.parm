@@ -1,0 +1,7 @@
+# Indoor doorway Guided speeds for the control-layer proof.
+# Default WPNAV_SPEED (~500 cm/s) tip-strikes / clips frames on return.
+WPNAV_SPEED      120
+WPNAV_SPEED_UP   100
+WPNAV_SPEED_DN   80
+WPNAV_ACCEL      60
+WPNAV_ACCEL_Z    80

@@ -70,7 +70,8 @@ boot-time jump cannot skip an 8 s hold in one fold.
 1. Never stop publishing while armed GUIDED (~50 ms cadence).
 2. Refuse `command()` when not armed GUIDED.
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
-4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
+4. Doorway residual **0.10 m**. Load `compat_ekf.parm` and
+   `compat_control.parm` (slower Guided WPNAV for indoor frames).
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
 6. After ±π reverse-spin: coast (`yaw_rate=0`), settle/align/return
    yaw-ignored. Absolute yaw=0 after the unwind tip-struck (Crash AngErr)
