@@ -1282,7 +1282,7 @@ class PlatformSettings:
         if self.sim_wall_clamp:
             environment["EMBODIED_SIM_WALL_CLAMP"] = "1"
         # Forward optional sim-host policy into the Webots controller process.
-        for key in ("EMBODIED_SIM_CPUS", "EMBODIED_WEBOTS_MOVIE"):
+        for key in ("EMBODIED_SIM_CPUS", "EMBODIED_WEBOTS_MOVIE", "EMBODIED_WEBOTS_MOVIE_DELAY_S"):
             value = os.environ.get(key)
             if value:
                 environment[key] = value

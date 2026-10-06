@@ -33,9 +33,13 @@ export EMBODIED_SIM_CPUS="${EMBODIED_SIM_CPUS:-0,1,2}"
 rm -rf "$OUTPUT"
 mkdir -p "$OUTPUT"
 
-# Native Webots Supervisor movie (not desktop ffmpeg). Disable with
-# EMBODIED_WEBOTS_MOVIE= ./configs/layers/control
-export EMBODIED_WEBOTS_MOVIE="${EMBODIED_WEBOTS_MOVIE:-$OUTPUT/control-doorway.mp4}"
+# Native Webots Supervisor movie (optional). Delayed past PreArm by default
+# (EMBODIED_WEBOTS_MOVIE_DELAY_S=90) so encoding does not starve gyro bring-up.
+# Example: EMBODIED_WEBOTS_MOVIE="$OUTPUT/control-doorway.mp4" ./configs/layers/control
+if [[ -n "${EMBODIED_WEBOTS_MOVIE:-}" ]]; then
+  export EMBODIED_WEBOTS_MOVIE
+  export EMBODIED_WEBOTS_MOVIE_DELAY_S="${EMBODIED_WEBOTS_MOVIE_DELAY_S:-90}"
+fi
 
 python -u -m embodied motion-proof --config "$CONFIG" --output "$OUTPUT"
 status=$?
