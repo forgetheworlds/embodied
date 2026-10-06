@@ -401,7 +401,6 @@ def main():
             movie_path = None
     else:
         robot = Robot()
-    movie_started = False
     movie_state = {"started": False}
     # The scored path's sim/wall clamp (owner ruling 2026-09-30, APPROVAL-RECORD
     # "F2's denominator"): the bridge sets EMBODIED_SIM_WALL_CLAMP=1 in this
