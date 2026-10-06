@@ -341,14 +341,16 @@ def _build_phases(
                 requested_rad=-spin_rad,
             )
         )
-        # Explicit hold Motion at entry pose with yaw=0 — still published every tick.
+        # Explicit hold at entry pose after reface. Leave yaw alone: snapping
+        # yaw=0 immediately after a ±π yaw-rate unwind tip-strikes (roll→π,
+        # AngErr disarm) even when the reface yaw score itself passed.
         phases.append(
             Phase(
                 name="settle",
                 kind="hold",
                 duration_s=hold_s,
                 target=None,
-                yaw=0.0,
+                yaw=None,
             )
         )
         inbound = tuple(reversed(waypoints[:-1])) if len(waypoints) > 1 else ()
