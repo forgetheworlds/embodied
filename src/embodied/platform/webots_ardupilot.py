@@ -1281,11 +1281,6 @@ class PlatformSettings:
         environment = {"PYTHONPATH": merged, "EMBODIED_SRC": source_root}
         if self.sim_wall_clamp:
             environment["EMBODIED_SIM_WALL_CLAMP"] = "1"
-        # Forward optional sim-host policy into the Webots controller process.
-        for key in ("EMBODIED_SIM_CPUS", "EMBODIED_WEBOTS_MOVIE", "EMBODIED_WEBOTS_MOVIE_DELAY_S"):
-            value = os.environ.get(key)
-            if value:
-                environment[key] = value
         return environment
 
 
@@ -2294,40 +2289,6 @@ class SubprocessRunner:
     def __init__(self) -> None:
         self._processes: dict[str, subprocess.Popen] = {}
 
-    @staticmethod
-    def _cpu_affinity_from_env() -> frozenset[int] | None:
-        """Optional host CPU set for sim children (``EMBODIED_SIM_CPUS=0,1,2``).
-
-        Used to reserve cores for Webots/SITL so desktop capture / agent load
-        cannot starve the flight stack. Empty / unset means no affinity pin.
-        """
-        raw = os.environ.get("EMBODIED_SIM_CPUS", "").strip()
-        if not raw:
-            return None
-        try:
-            cpus = frozenset(int(part.strip()) for part in raw.split(",") if part.strip())
-        except ValueError:
-            return None
-        return cpus or None
-
-    @staticmethod
-    def _child_preexec(
-        *,
-        low_priority: bool,
-        cpu_affinity: frozenset[int] | None,
-    ):
-        def _apply() -> None:
-            if low_priority:
-                os.nice(10)
-            if cpu_affinity is not None:
-                try:
-                    os.sched_setaffinity(0, set(cpu_affinity))
-                except OSError:
-                    # Affinity is best-effort: a rejected mask must not kill spawn.
-                    pass
-
-        return _apply
-
     def spawn(
         self,
         name: str,
@@ -2346,23 +2307,11 @@ class SubprocessRunner:
         contention burst they yield the CPU to the wall-clocked pair this rig's
         freshness bounds are measured on: the pinned estimator process and this
         process's feed and publisher threads.
-
-        When ``EMBODIED_SIM_CPUS`` is set, **SITL** is pinned to that CPU set
-        (best-effort) so the autopilot loop keeps reserved cores under host load.
-        Webots is left unpinned so its controller child is not affinity-trapped
-        with the physics thread (that pairing crashed under load on this host).
         """
         log_path.parent.mkdir(parents=True, exist_ok=True)
         merged = dict(os.environ)
         if env:
             merged.update(env)
-        # Only pin SITL — Webots+controller stay free to schedule.
-        affinity = self._cpu_affinity_from_env() if name == "sitl" else None
-        preexec = None
-        if low_priority or affinity is not None:
-            preexec = self._child_preexec(
-                low_priority=low_priority, cpu_affinity=affinity
-            )
         with log_path.open("wb") as log:
             process = subprocess.Popen(
                 list(argv),
@@ -2372,7 +2321,7 @@ class SubprocessRunner:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
-                preexec_fn=preexec,
+                preexec_fn=(lambda: os.nice(10)) if low_priority else None,
             )
         self._processes[name] = process
         return ChildProcess(

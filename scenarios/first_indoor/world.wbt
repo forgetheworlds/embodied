@@ -303,7 +303,6 @@ Solid {
 }
 Iris {
   translation -1 0 0.09
-  supervisor TRUE
   controller "compat_vehicle_controller"
   controllerArgs [
     "--sitl-address"

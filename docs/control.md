@@ -70,12 +70,6 @@ publication. Settle/align are explicit hold Motions when used — not silence.
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
 4. Doorway residual **0.10 m**. Load `compat_ekf.parm`.
 5. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
-6. Prefer native Webots movie (`EMBODIED_WEBOTS_MOVIE`) over desktop
-   screen capture — ffmpeg x11grab starves SITL/EKF and tip-strikes.
-   Delay past PreArm with `EMBODIED_WEBOTS_MOVIE_DELAY_S` (default 90).
-7. Pin **SITL** to reserved cores with `EMBODIED_SIM_CPUS` (default
-   `0,1,2` from `./configs/layers/control`; `none` disables) so the
-   autopilot loop keeps CPU under host load. Webots stays unpinned.
 
 ## Done bar
 
@@ -88,9 +82,8 @@ publication. Settle/align are explicit hold Motions when used — not silence.
 ```sh
 .venv/bin/python -m pytest tests/test_control.py -q
 ./configs/layers/control
-# with native movie (starts after ~90s wall, past PreArm):
-EMBODIED_WEBOTS_MOVIE=work/runs/layers/control/control-doorway.mp4 ./configs/layers/control
 ```
+
 ## Does not own
 
 Path planning, mission budgets, perception, estimators, obstacle avoidance, or
