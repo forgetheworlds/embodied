@@ -13,6 +13,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import queue
 import time
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from embodied.platform.webots_ardupilot import (
     PlatformUnavailable,
     ProbeFailure,
     PymavlinkSession,
+    SensorRecord,
     SubprocessRunner,
     TcpSensorGateway,
     WebotsArduPilot,
@@ -64,8 +66,35 @@ def _stamp() -> ClockStamp:
     )
 
 
-def _drain_into_pipeline(platform: WebotsArduPilot, pipeline: PerceptionPipeline) -> dict[str, Any]:
-    """Consume pending sensor records; integrate stereo pairs."""
+def _install_pair_sink(platform: WebotsArduPilot) -> queue.Queue[SensorRecord]:
+    """Pixels only arrive through record_sink; sensor_record strips pair payloads."""
+    pair_q: queue.Queue[SensorRecord] = queue.Queue(maxsize=8)
+
+    def _sink(record: SensorRecord) -> None:
+        if record.kind is not Kind.PAIR or record.pair is None:
+            return
+        try:
+            pair_q.put_nowait(record)
+        except queue.Full:
+            try:
+                pair_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                pair_q.put_nowait(record)
+            except queue.Full:
+                pass
+
+    platform.record_sink = _sink
+    return pair_q
+
+
+def _drain_into_pipeline(
+    platform: WebotsArduPilot,
+    pipeline: PerceptionPipeline,
+    pair_q: queue.Queue[SensorRecord],
+) -> dict[str, Any]:
+    """Consume IMU from sensor_record and stereo pixels from the pair sink."""
     last_verdict = None
     pairs = 0
     imus = 0
@@ -84,27 +113,35 @@ def _drain_into_pipeline(platform: WebotsArduPilot, pipeline: PerceptionPipeline
                 sim_time_s=sim,
                 stamp=stamp,
             )
-        elif record.kind is Kind.PAIR and record.pair is not None:
-            pair = record.pair
-            left, right = decode_pair_rgb(
-                pair.left_bytes,
-                pair.right_bytes,
-                width=pair.width,
-                height=pair.height,
-                encoding=pair.encoding,
-            )
-            pairs += 1
-            verdict = pipeline.on_pair(
-                left_rgb=left,
-                right_rgb=right,
-                pair_id=pair.pair_id,
-                capture_host_ns=pair.capture_host_ns,
-                sim_time_s=sim,
-                stamp=stamp,
-            )
-            if verdict is not None:
-                last_verdict = verdict
-        # POSE / STATUS ignored for Perception evidence (truth / transport only).
+        # POSE / STATUS / PAIR-without-pixels ignored for Perception evidence.
+    while True:
+        try:
+            record = pair_q.get_nowait()
+        except queue.Empty:
+            break
+        if record.pair is None:
+            continue
+        pair = record.pair
+        stamp = _stamp()
+        sim = record.sim_time_s if record.sim_time_s is not None and record.sim_time_s >= 0.0 else None
+        left, right = decode_pair_rgb(
+            pair.left_bytes,
+            pair.right_bytes,
+            width=pair.width,
+            height=pair.height,
+            encoding=pair.encoding,
+        )
+        pairs += 1
+        verdict = pipeline.on_pair(
+            left_rgb=left,
+            right_rgb=right,
+            pair_id=pair.pair_id,
+            capture_host_ns=pair.capture_host_ns,
+            sim_time_s=sim,
+            stamp=stamp,
+        )
+        if verdict is not None:
+            last_verdict = verdict
     return {"pairs": pairs, "imus": imus, "last_verdict": last_verdict}
 
 
@@ -113,6 +150,7 @@ def fly_perception_route(
     *,
     hover_m: float,
     ap_ext_nav_mode: str,
+    pair_q: queue.Queue[SensorRecord],
 ) -> dict[str, Any]:
     reasons: list[str] = []
     steps: list[dict[str, Any]] = []
@@ -128,7 +166,7 @@ def fly_perception_route(
 
     deadline = time.monotonic() + HOVER_SETTLE_S
     while time.monotonic() < deadline:
-        _drain_into_pipeline(platform, pipeline)
+        _drain_into_pipeline(platform, pipeline, pair_q)
         hold = vehicle.state().position or Vec3(0.0, 0.0, hover_m)
         vehicle.command(Motion(position=hold, velocity=ZERO))
         time.sleep(REFRESH_S)
@@ -136,7 +174,7 @@ def fly_perception_route(
     collect_until = time.monotonic() + COLLECT_S
     free_hits = 0
     while time.monotonic() < collect_until:
-        drained = _drain_into_pipeline(platform, pipeline)
+        drained = _drain_into_pipeline(platform, pipeline, pair_q)
         hold = vehicle.state().position or Vec3(0.0, 0.0, hover_m)
         vehicle.command(Motion(position=hold, velocity=ZERO))
         verdict = drained["last_verdict"] or pipeline.query_forward_volume(_stamp())
@@ -271,6 +309,8 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
         label="perception-proof",
         extra_params=settings.compat_estimator_params,
     )
+    # Must install before start(): reader strips pair pixels after the sink runs.
+    pair_q = _install_pair_sink(platform)
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.ready)
@@ -278,6 +318,7 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
             platform,
             hover_m=hover_m,
             ap_ext_nav_mode=settings.sensor_mode.value,
+            pair_q=pair_q,
         )
         writer.write_json("perception-proof.json", result)
         gate = GateStatus.PASS if result["status"] == "pass" else GateStatus.FAIL
