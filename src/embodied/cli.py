@@ -124,6 +124,7 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {}
 COMMAND_MODULES = (
     "embodied.platform.webots_ardupilot",
     "embodied.control.proof",
+    "embodied.perception.proof",
     "embodied.execution.proof",
     "embodied.bench.cli",
     "embodied.platform.localization_check",

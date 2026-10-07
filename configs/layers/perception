@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Perception live sim verification (Webots + SITL).
+# Exit 0 only when receipt gate_status is pass and live sensor_derived FREE is proven.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+CONFIG="${CONFIG:-configs/layers/perception.yaml}"
+OUTPUT="${OUTPUT:-work/runs/layers/perception}"
+
+if [[ ! -x .venv/bin/python ]]; then
+  echo "perception: missing .venv; run scripts/bootstrap.sh first" >&2
+  exit 2
+fi
+
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+export DISPLAY="${DISPLAY:-:1}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+
+rm -rf "$OUTPUT"
+mkdir -p "$(dirname "$OUTPUT")"
+
+python -u -m embodied perception-proof --config "$CONFIG" --output "$OUTPUT"
+status=$?
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
+fi
+
+RECEIPT="$OUTPUT/receipt.json"
+PROOF="$OUTPUT/run-a/perception-proof.json"
+if [[ ! -f "$RECEIPT" ]]; then
+  echo "perception: missing receipt at $RECEIPT" >&2
+  exit 1
+fi
+
+python - "$RECEIPT" "$PROOF" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipt = json.loads(Path(sys.argv[1]).read_text())
+gate = receipt.get("gate_status")
+reasons = receipt.get("reasons") or []
+print(f"perception: status={receipt.get('status')} gate={gate}")
+for reason in reasons:
+    print(f"  reason: {reason}")
+if gate != "pass":
+    raise SystemExit(1)
+proof_path = Path(sys.argv[2])
+if not proof_path.is_file():
+    print(f"perception: missing proof at {proof_path}", file=sys.stderr)
+    raise SystemExit(1)
+proof = json.loads(proof_path.read_text())
+if not proof.get("live_sensor_derived_free"):
+    print("perception: proof missing live_sensor_derived_free", file=sys.stderr)
+    raise SystemExit(1)
+if proof.get("perception_nav_evidence_class") != "sensor_derived":
+    print(
+        f"perception: nav evidence_class={proof.get('perception_nav_evidence_class')!r} "
+        "want sensor_derived",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(
+    f"perception: live FREE ok free_hits={proof.get('free_hits')} "
+    f"map={proof.get('perception_map_evidence_class')}"
+)
+PY
