@@ -524,6 +524,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
             },
         }
     ),
+    # P00 Execution joint proof knobs. Optional so other layer configs load.
+    "execution_proof": _Optional(
+        {
+            "require_geometry_clear": _Optional(bool),
+        }
+    ),
     "output": str,
 }
 
