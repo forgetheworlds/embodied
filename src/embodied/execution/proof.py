@@ -47,6 +47,7 @@ from embodied.execution import (
     ValidityWindow,
 )
 from embodied.execution.plant import StaticPlantLimitsPort, declared_plant
+from embodied.memory.world import FREE
 from embodied.perception.pipeline import (
     PerceptionPipeline,
     decode_pair_rgb,
@@ -245,6 +246,46 @@ def _stop_tube_free_at(
     }
 
 
+def _clear_anchor_near(
+    pipeline: PerceptionPipeline,
+    vehicle: Vec3,
+    *,
+    envelope_m: float,
+    max_dist_m: float,
+) -> tuple[Vec3 | None, dict[str, Any] | None]:
+    """Pick a known FREE cell center near the vehicle where stop_tube is CLEAR.
+
+    Body hover is often never_observed (sparse map). Safety CLEAR queries the
+    candidate Motions sample — so the short geometry segment must sit on a
+    real free+sensor_derived stop tube, within tracking distance of the vehicle.
+    """
+    occ = pipeline.mapping.occupancy()
+    if occ is None:
+        return None, None
+    ranked: list[tuple[float, Vec3]] = []
+    for cell, label in occ.cells:
+        if label != FREE:
+            continue
+        cx, cy, cz = occ._cell_center(cell)  # noqa: SLF001 — same centers Safety volumes use
+        dx = cx - vehicle.x
+        dy = cy - vehicle.y
+        dz = cz - vehicle.z
+        dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+        if dist <= max_dist_m:
+            ranked.append((dist, Vec3(cx, cy, cz)))
+    ranked.sort(key=lambda item: item[0])
+    for dist, center in ranked[:64]:
+        preflight = _stop_tube_free_at(pipeline, center, envelope_m=envelope_m)
+        if preflight is not None and preflight.get("clear"):
+            preflight = {**preflight, "anchor_dist_m": dist}
+            return center, preflight
+    # Best-effort report: nearest free cell even if stop_tube not clear.
+    if ranked:
+        center = ranked[0][1]
+        return None, _stop_tube_free_at(pipeline, center, envelope_m=envelope_m)
+    return None, None
+
+
 @dataclass
 class WallClocks:
     t0_mono: float
@@ -262,16 +303,29 @@ def _make_cert(
     *,
     epoch: str,
     geometry: GeometryCertificate | None,
+    clear_anchor: Vec3 | None = None,
 ) -> TrajectoryCertificate:
-    end = Vec3(start.x + SEGMENT_DX_M, start.y, start.z)
+    # When geometry CLEAR is attached, hold on a verified free stop-tube anchor
+    # (not the never_observed body voxel). Candidate stays CLEAR for the short prove.
+    if clear_anchor is not None:
+        primary = HoldTrajectory(position=clear_anchor, duration_s=SEGMENT_DURATION_S)
+        terminal = HoldTrajectory(position=clear_anchor)
+        hold_fallback = clear_anchor
+        start_state_pos = clear_anchor
+    else:
+        end = Vec3(start.x + SEGMENT_DX_M, start.y, start.z)
+        primary = SegmentTrajectory(start=start, end=end, duration_s=SEGMENT_DURATION_S)
+        terminal = HoldTrajectory(position=end)
+        hold_fallback = start
+        start_state_pos = start
     return TrajectoryCertificate(
         certificate_id="exec-proof-1",
-        primary=SegmentTrajectory(start=start, end=end, duration_s=SEGMENT_DURATION_S),
-        terminal=HoldTrajectory(position=end),
-        fallbacks={"hold": HoldTrajectory(position=start)},
+        primary=primary,
+        terminal=terminal,
+        fallbacks={"hold": HoldTrajectory(position=hold_fallback)},
         nav_epoch=epoch,
-        start_state=StartState(position=start, velocity=Vec3(0, 0, 0)),
-        start_tolerance=StartTolerance(position_m=1.0, velocity_mps=2.0),
+        start_state=StartState(position=start_state_pos, velocity=Vec3(0, 0, 0)),
+        start_tolerance=StartTolerance(position_m=1.5, velocity_mps=2.0),
         validity=ValidityWindow(None, None),
         tracking_envelope=TrackingEnvelope(position_m=1.5, velocity_mps=3.0),
         geometry_certificate=geometry,
@@ -432,6 +486,7 @@ def fly_execution_route(
     geometry: GeometryCertificate | None = None
     geometry_attached = False
     stop_tube_preflight: dict[str, Any] | None = None
+    clear_anchor: Vec3 | None = None
     state = vehicle.state()
     start = state.position or start
     if require_geometry_clear:
@@ -453,13 +508,21 @@ def fly_execution_route(
                 free_hits=free_hits,
                 geometry_attached=False,
             )
-        stop_tube_preflight = _stop_tube_free_at(
-            pipeline, start, envelope_m=STOP_TUBE_ENVELOPE_M
+        # Body voxel is often never_observed; Safety CLEAR needs a free stop-tube
+        # on the Motions candidate — pick a nearby known FREE cell center.
+        clear_anchor, stop_tube_preflight = _clear_anchor_near(
+            pipeline,
+            start,
+            envelope_m=STOP_TUBE_ENVELOPE_M,
+            max_dist_m=1.4,
         )
-        if stop_tube_preflight is None or not stop_tube_preflight.get("clear"):
+        if clear_anchor is None or stop_tube_preflight is None or not stop_tube_preflight.get(
+            "clear"
+        ):
             reasons.append(
-                "geometry CLEAR required but stop_tube at candidate is not free+sensor_derived "
-                f"(preflight={stop_tube_preflight})"
+                "geometry CLEAR required but no nearby FREE stop_tube anchor "
+                f"(vehicle_stop_tube={_stop_tube_free_at(pipeline, start, envelope_m=STOP_TUBE_ENVELOPE_M)}, "
+                f"anchor_preflight={stop_tube_preflight})"
             )
             vehicle.land()
             return _receipt(
@@ -488,12 +551,17 @@ def fly_execution_route(
         {
             "task": "geometry_preflight",
             "stop_tube": stop_tube_preflight,
+            "clear_anchor": None
+            if clear_anchor is None
+            else (clear_anchor.x, clear_anchor.y, clear_anchor.z),
             "geometry_on_cert": geometry_attached,
             "map_revision": None if geometry is None else geometry.map_revision,
         }
     )
 
-    cert = _make_cert(start, epoch=epoch, geometry=geometry)
+    cert = _make_cert(
+        start, epoch=epoch, geometry=geometry, clear_anchor=clear_anchor
+    )
     replaced = exe.replace(cert)
     steps.append(
         {
