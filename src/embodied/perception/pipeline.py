@@ -106,10 +106,38 @@ class PerceptionPipeline:
     def store(self) -> MapStore:
         return self._store
 
+    def align_odom_position(self, position_m: tuple[float, float, float]) -> bool:
+        """One-shot odom↔Vehicle frame glue before map integrate (joint prove)."""
+        return self._estimator.align_odom_position(position_m)
+
+    def refresh_nav(self, stamp: ClockStamp) -> None:
+        """Re-publish EstimationPort from latest IMU/pair ages at ``stamp``."""
+        nav = self._estimator.latest(stamp=stamp, now_host_ns=stamp.monotonic_ns)
+        self._estimation.set(nav)
+        if nav is not None:
+            self._mapping._sim_time_s = nav.sim_time_s  # noqa: SLF001
+            self._mapping._stamp = stamp  # noqa: SLF001
+            self._mapping._age_s = nav.age_s  # noqa: SLF001
+            self._mapping._age_domain = (
+                AgeDomain.SIM_CONTROL if nav.sim_time_s is not None else AgeDomain.MONOTONIC
+            )
+
+    def mark_pair_for_nav(
+        self,
+        *,
+        capture_host_ns: int,
+        sim_time_s: float | None,
+        stamp: ClockStamp,
+    ) -> None:
+        """Advance visual age without map integrate (frozen-revision segment)."""
+        self._estimator.ingest_pair(capture_host_ns=capture_host_ns, sim_time_s=sim_time_s)
+        self.refresh_nav(stamp)
+
     def stats(self) -> dict[str, Any]:
         return {
             "imu_count": self._estimator.imu_count,
             "pair_count": self._estimator.pair_count,
+            "odom_aligned": self._estimator.odom_aligned,
             "integrates": self._integrates,
             "valid_depth_frames": self._valid_depth_frames,
             "last_depth_valid_fraction": self._last_depth_valid_fraction,

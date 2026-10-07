@@ -29,6 +29,7 @@ from embodied.cli import (
 from embodied.contracts.perception_ports import (
     EvidenceClass,
     OccupancySupport,
+    StopTubeQuery,
 )
 from embodied.contracts.records import ClockStamp, SensorMode
 from embodied.control import Vehicle, Vec3
@@ -66,10 +67,12 @@ from embodied.platform.webots_ardupilot import (
 )
 
 REFRESH_S = 0.05
-SEGMENT_DURATION_S = 4.0
-SEGMENT_DX_M = 0.8
+SEGMENT_DURATION_S = 3.0
+SEGMENT_DX_M = 0.4
 HOVER_SETTLE_S = 2.0
 COLLECT_S = 12.0
+ALIGN_WAIT_S = 2.0
+STOP_TUBE_ENVELOPE_M = 0.35
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -125,35 +128,52 @@ def _install_pair_sink(platform: WebotsArduPilot) -> queue.Queue[SensorRecord]:
     return pair_q
 
 
-def _drain_into_pipeline(
-    platform: WebotsArduPilot,
-    pipeline: PerceptionPipeline,
-    pair_q: queue.Queue[SensorRecord],
-) -> dict[str, Any]:
-    """Consume IMU from sensor_record and stereo pixels from the pair sink."""
-    last_verdict = None
-    pairs = 0
+def _feed_imu_burst(
+    platform: WebotsArduPilot, pipeline: PerceptionPipeline
+) -> int:
+    """Drain pending IMU (and ignore non-IMU) so nav age stays honest mid-pair."""
     imus = 0
     while True:
         record = platform.sensor_record(0.0)
         if record is None:
             break
+        if record.kind is not Kind.IMU or record.imu is None:
+            continue
         stamp = _stamp()
         sim = (
             record.sim_time_s
             if record.sim_time_s is not None and record.sim_time_s >= 0.0
             else None
         )
-        if record.kind is Kind.IMU and record.imu is not None:
-            imus += 1
-            pipeline.on_imu(
-                accelerometer=record.imu.accelerometer,
-                gyro=record.imu.gyro,
-                capture_host_ns=record.imu.capture_host_ns,
-                sim_time_s=sim,
-                stamp=stamp,
-            )
-    while True:
+        imus += 1
+        pipeline.on_imu(
+            accelerometer=record.imu.accelerometer,
+            gyro=record.imu.gyro,
+            capture_host_ns=record.imu.capture_host_ns,
+            sim_time_s=sim,
+            stamp=stamp,
+        )
+    return imus
+
+
+def _drain_into_pipeline(
+    platform: WebotsArduPilot,
+    pipeline: PerceptionPipeline,
+    pair_q: queue.Queue[SensorRecord],
+    *,
+    integrate_map: bool = True,
+) -> dict[str, Any]:
+    """Consume IMU + stereo. Interleave IMU around pairs so SGBM cannot starve nav.
+
+    When ``integrate_map`` is False (geometry segment with pinned revision), pairs
+    only refresh visual age — no MapStore integrate.
+    """
+    last_verdict = None
+    pairs = 0
+    imus = _feed_imu_burst(platform, pipeline)
+    # Cap pairs per tick so one drain cannot burn >stall_after wall time.
+    max_pairs = 2 if integrate_map else 4
+    while pairs < max_pairs:
         try:
             record = pair_q.get_nowait()
         except queue.Empty:
@@ -167,25 +187,62 @@ def _drain_into_pipeline(
             if record.sim_time_s is not None and record.sim_time_s >= 0.0
             else None
         )
-        left, right = decode_pair_rgb(
-            pair.left_bytes,
-            pair.right_bytes,
-            width=pair.width,
-            height=pair.height,
-            encoding=pair.encoding,
-        )
         pairs += 1
-        verdict = pipeline.on_pair(
-            left_rgb=left,
-            right_rgb=right,
-            pair_id=pair.pair_id,
-            capture_host_ns=pair.capture_host_ns,
-            sim_time_s=sim,
-            stamp=stamp,
-        )
-        if verdict is not None:
-            last_verdict = verdict
+        if integrate_map:
+            left, right = decode_pair_rgb(
+                pair.left_bytes,
+                pair.right_bytes,
+                width=pair.width,
+                height=pair.height,
+                encoding=pair.encoding,
+            )
+            verdict = pipeline.on_pair(
+                left_rgb=left,
+                right_rgb=right,
+                pair_id=pair.pair_id,
+                capture_host_ns=pair.capture_host_ns,
+                sim_time_s=sim,
+                stamp=stamp,
+            )
+            if verdict is not None:
+                last_verdict = verdict
+        else:
+            pipeline.mark_pair_for_nav(
+                capture_host_ns=pair.capture_host_ns,
+                sim_time_s=sim,
+                stamp=stamp,
+            )
+        # SGBM can take hundreds of ms — refresh IMU before age trips stall.
+        imus += _feed_imu_burst(platform, pipeline)
+    imus += _feed_imu_burst(platform, pipeline)
+    pipeline.refresh_nav(_stamp())
     return {"pairs": pairs, "imus": imus, "last_verdict": last_verdict}
+
+
+def _stop_tube_free_at(
+    pipeline: PerceptionPipeline, position: Vec3, *, envelope_m: float
+) -> dict[str, Any] | None:
+    """Preflight Safety's stop-tube query at a candidate (no invented FREE)."""
+    occ = pipeline.mapping.occupancy()
+    if occ is None:
+        return None
+    verdict = occ.query_stop_tube(
+        StopTubeQuery(
+            samples_odom_m=((position.x, position.y, position.z),),
+            envelope_radius_m=envelope_m,
+            include_brake_region=False,
+            brake_region=None,
+        ),
+        now=occ.stamp,
+    )
+    return {
+        "support": verdict.support.value,
+        "evidence_class": verdict.evidence_class.value,
+        "reason": verdict.reason,
+        "map_revision": verdict.map_revision,
+        "free_fraction": verdict.free_fraction,
+        "clear": is_sensor_derived_free(verdict),
+    }
 
 
 @dataclass
@@ -295,7 +352,9 @@ def fly_execution_route(
     start = state.position
     hold_cert = TrajectoryCertificate(
         certificate_id="exec-proof-hold",
-        primary=HoldTrajectory(position=start, duration_s=HOVER_SETTLE_S + COLLECT_S),
+        primary=HoldTrajectory(
+            position=start, duration_s=ALIGN_WAIT_S + HOVER_SETTLE_S + COLLECT_S
+        ),
         terminal=HoldTrajectory(position=start),
         fallbacks={"hold": HoldTrajectory(position=start)},
         nav_epoch=epoch,
@@ -321,12 +380,29 @@ def fly_execution_route(
             mapping_source=mapping_source,
         )
 
-    # Settle + collect: feed Perception until free+sensor_derived (or timeout).
+    # Align stereo_imu odom to Vehicle once before map integrate (frame glue).
+    aligned = False
+    align_deadline = time.monotonic() + ALIGN_WAIT_S
+    while time.monotonic() < align_deadline and not aligned:
+        _drain_into_pipeline(platform, pipeline, pair_q, integrate_map=False)
+        exe._tick()
+        pos = vehicle.state().position or start
+        aligned = pipeline.align_odom_position((pos.x, pos.y, pos.z))
+        time.sleep(REFRESH_S)
+    steps.append(
+        {
+            "task": "odom_align",
+            "ok": aligned,
+            "pipeline": pipeline.stats(),
+        }
+    )
+
+    # Settle + collect: integrate map until free+sensor_derived (or timeout).
     free_hits = 0
     settle_end = time.monotonic() + HOVER_SETTLE_S
     collect_end = settle_end + COLLECT_S
     while time.monotonic() < collect_end:
-        drained = _drain_into_pipeline(platform, pipeline, pair_q)
+        drained = _drain_into_pipeline(platform, pipeline, pair_q, integrate_map=True)
         exe._tick()
         verdict = drained["last_verdict"] or pipeline.query_sensor_derived_free(_stamp())
         if is_sensor_derived_free(verdict):
@@ -339,7 +415,6 @@ def fly_execution_route(
             if sample is not None:
                 occupancy_samples.append(sample)
         if free_hits > 0 and time.monotonic() >= settle_end:
-            # FREE available — leave collect early once we have evidence.
             break
         time.sleep(REFRESH_S)
 
@@ -352,15 +427,39 @@ def fly_execution_route(
         }
     )
 
-    # Geometry CLEAR only when required AND Perception actually delivered FREE.
-    # Do not attach a free-claim cert without live free+sensor_derived.
+    # Geometry CLEAR only when required AND stop-tube at candidate is FREE.
+    # Do not attach a free-claim cert without live free+sensor_derived evidence.
     geometry: GeometryCertificate | None = None
     geometry_attached = False
+    stop_tube_preflight: dict[str, Any] | None = None
+    state = vehicle.state()
+    start = state.position or start
     if require_geometry_clear:
         if free_hits < 1:
             reasons.append(
                 "geometry CLEAR required but Perception never returned free+sensor_derived "
                 f"(stats={pipeline.stats()})"
+            )
+            vehicle.land()
+            return _receipt(
+                reasons,
+                steps,
+                ap_ext_nav_mode,
+                exe,
+                pipeline,
+                occupancy_samples,
+                require_geometry_clear=require_geometry_clear,
+                mapping_source=mapping_source,
+                free_hits=free_hits,
+                geometry_attached=False,
+            )
+        stop_tube_preflight = _stop_tube_free_at(
+            pipeline, start, envelope_m=STOP_TUBE_ENVELOPE_M
+        )
+        if stop_tube_preflight is None or not stop_tube_preflight.get("clear"):
+            reasons.append(
+                "geometry CLEAR required but stop_tube at candidate is not free+sensor_derived "
+                f"(preflight={stop_tube_preflight})"
             )
             vehicle.land()
             return _receipt(
@@ -385,8 +484,15 @@ def fly_execution_route(
         )
         geometry_attached = True
 
-    state = vehicle.state()
-    start = state.position or start
+    steps.append(
+        {
+            "task": "geometry_preflight",
+            "stop_tube": stop_tube_preflight,
+            "geometry_on_cert": geometry_attached,
+            "map_revision": None if geometry is None else geometry.map_revision,
+        }
+    )
+
     cert = _make_cert(start, epoch=epoch, geometry=geometry)
     replaced = exe.replace(cert)
     steps.append(
@@ -416,15 +522,20 @@ def fly_execution_route(
             geometry_attached=geometry_attached,
         )
 
-    # Gapless Execution tick through primary + brief terminal
-    end_mono = time.monotonic() + SEGMENT_DURATION_S + 2.0
+    # Gapless tick: freeze map revision while geometry is attached (IMU+pair age only).
+    end_mono = time.monotonic() + SEGMENT_DURATION_S + 1.5
     geometry_allow_seen = False
+    decision_counts: dict[str, int] = {}
     while time.monotonic() < end_mono:
-        _drain_into_pipeline(platform, pipeline, pair_q)
+        _drain_into_pipeline(
+            platform,
+            pipeline,
+            pair_q,
+            integrate_map=not geometry_attached,
+        )
         sample = _sample_occupancy(pipeline)
         if sample is not None:
             occupancy_samples.append(sample)
-            # Fail closed: FREE without sensor_derived is dishonest
             if (
                 sample["support"] == OccupancySupport.FREE.value
                 and sample["evidence_class"] != EvidenceClass.SENSOR_DERIVED.value
@@ -439,6 +550,10 @@ def fly_execution_route(
                 free_hits += 1
         exe._tick()
         status = exe.status()
+        key = status.last_decision or "none"
+        if status.last_reason:
+            key = f"{key}:{status.last_reason}"
+        decision_counts[key] = decision_counts.get(key, 0) + 1
         if geometry_attached and status.last_decision == "allow":
             geometry_allow_seen = True
         if status.code is ExecutionStatusCode.FAILED:
@@ -462,6 +577,8 @@ def fly_execution_route(
             "occupancy_summary": occ_summary,
             "occupancy_samples": occupancy_samples[-5:],
             "geometry_allow_seen": geometry_allow_seen,
+            "decision_counts": decision_counts,
+            "map_frozen": geometry_attached,
         }
     )
     if status.publish_sequence < 5:
@@ -478,6 +595,12 @@ def fly_execution_route(
         reasons.append(
             "geometry CLEAR required but live occupancy never returned free+sensor_derived "
             f"(supports={occ_summary['supports_seen']})"
+        )
+    if require_geometry_clear and not geometry_allow_seen:
+        reasons.append(
+            "geometry CLEAR required but Safety never ALLOW under free-claim cert "
+            f"(last_decision={status.last_decision}, last_reason={status.last_reason}, "
+            f"decision_counts={decision_counts})"
         )
 
     land = vehicle.land()

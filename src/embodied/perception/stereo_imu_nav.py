@@ -116,6 +116,7 @@ class StereoImuNav:
         self._last_pair_host_ns: int | None = None
         self._last_pair_sim_s: float | None = None
         self._initialized = False
+        self._aligned = False
         self._state_sequence = 0
         self._pair_count = 0
         self._imu_count = 0
@@ -131,6 +132,23 @@ class StereoImuNav:
     @property
     def initialized(self) -> bool:
         return self._initialized
+
+    @property
+    def odom_aligned(self) -> bool:
+        return self._aligned
+
+    def align_odom_position(self, position_m: tuple[float, float, float]) -> bool:
+        """One-shot odom origin for this epoch (joint prove frame glue).
+
+        Does not change evidence_class. Call once before map integrate so
+        occupancy and Vehicle Motions share a frame for Safety stop-tube CLEAR.
+        """
+        if self._aligned or not self._initialized:
+            return False
+        self._position_m = np.asarray(position_m, dtype=np.float64).copy()
+        self._velocity_mps[:] = 0.0
+        self._aligned = True
+        return True
 
     def ingest_imu(
         self,
