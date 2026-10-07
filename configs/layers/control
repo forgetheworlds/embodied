@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Control-layer live sim verification (Webots + SITL). Not pytest.
+#
+# Convention: configs/layers/<layer> is the one sim script that proves that
+# layer. Pair with docs/<layer>.md and tests/test_<layer>.py.
+#
+# Exit 0 only when receipt gate_status is pass.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+CONFIG="${CONFIG:-configs/layers/control.yaml}"
+OUTPUT="${OUTPUT:-work/runs/layers/control}"
+
+if [[ ! -x .venv/bin/python ]]; then
+  echo "control: missing .venv; run scripts/bootstrap.sh first" >&2
+  exit 2
+fi
+
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+export DISPLAY="${DISPLAY:-:1}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+
+rm -rf "$OUTPUT"
+mkdir -p "$(dirname "$OUTPUT")"
+
+python -u -m embodied motion-proof --config "$CONFIG" --output "$OUTPUT"
+status=$?
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
+fi
+
+RECEIPT="$OUTPUT/receipt.json"
+if [[ ! -f "$RECEIPT" ]]; then
+  echo "control: missing receipt at $RECEIPT" >&2
+  exit 1
+fi
+
+python - "$RECEIPT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipt = json.loads(Path(sys.argv[1]).read_text())
+gate = receipt.get("gate_status")
+reasons = receipt.get("reasons") or []
+print(f"control: status={receipt.get('status')} gate={gate}")
+for reason in reasons:
+    print(f"  reason: {reason}")
+if gate != "pass":
+    raise SystemExit(1)
+PY

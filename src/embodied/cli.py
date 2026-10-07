@@ -123,6 +123,9 @@ COMMAND_REGISTRY: dict[str, CommandSpec] = {}
 # creating a cycle.
 COMMAND_MODULES = (
     "embodied.platform.webots_ardupilot",
+    "embodied.control.proof",
+    "embodied.perception.proof",
+    "embodied.execution.proof",
     "embodied.bench.cli",
     "embodied.platform.localization_check",
     # Registered for P05 by the integrator (2026-10-01, R9 serialized
@@ -297,6 +300,19 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "step_timeout_s": {"startup": float, "ready": float, "flight": float},
         "budget_wall_clock_s": float,
     },
+    # P00 motion layer: open-field multi-waypoint proof tasks. Optional so the
+    # compatibility gate configuration keeps loading unchanged.
+    "motion": _Optional(
+        {
+            "hover_altitude_m": float,
+            "waypoints_local_ned": [[float]],
+            "hold_per_waypoint_s": float,
+            "residual_max_m": float,
+            "spin_rad": _Optional(float),
+            "spin_tolerance_rad": _Optional(float),
+            "return_waypoints": _Optional(bool),
+        }
+    ),
     # -------------------------------------------------------------------
     # R2 (2026-10-03): the values that decide whether a flight moves.
     #
@@ -506,6 +522,12 @@ CONFIG_SCHEMA: dict[str, Any] = {
                 "error_max_horizontal_m": float,
                 "error_max_vertical_m": float,
             },
+        }
+    ),
+    # P00 Execution joint proof knobs. Optional so other layer configs load.
+    "execution_proof": _Optional(
+        {
+            "require_geometry_clear": _Optional(bool),
         }
     ),
     "output": str,

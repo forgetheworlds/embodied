@@ -72,11 +72,15 @@ from embodied.contracts.records import (
     SensorMode,
     RecordError,
     SetpointSource,
-    TYPE_MASK_ACCELERATION_IGNORE,
-    TYPE_MASK_POSITION_IGNORE,
-    TYPE_MASK_VELOCITY_IGNORE,
-    TYPE_MASK_YAW_IGNORE,
-    TYPE_MASK_YAW_RATE_IGNORE,
+)
+from embodied.control import vehicle as vehicle_module
+from embodied.control.vehicle import (
+    AutopilotControlEvidence,
+    FrameError as _VehicleFrameError,
+    LocalNedTarget,
+    SetpointPublication,
+    enu_to_ned as _vehicle_enu_to_ned,
+    mask_for_target,
 )
 
 
@@ -128,14 +132,13 @@ class SimFdmState:
 def enu_to_ned(values: Sequence[float]) -> tuple[float, float, float]:
     """Convert a Webots ENU triple into ArduPilot's NED frame.
 
-    Webots measures east-north-up; ArduPilot's local frame is north-east-down. The
-    pinned bridge converts by keeping x and negating y and z, and this adapter
-    follows it exactly rather than inventing a second convention. The conversion is
-    its own inverse, so the same function converts back.
+    Implemented in :mod:`embodied.control.vehicle` and re-exported here for the
+    Webots controller and existing imports.
     """
-    if len(values) != 3:
-        raise FramingError("a frame conversion takes three components")
-    return (float(values[0]), -float(values[1]), -float(values[2]))
+    try:
+        return _vehicle_enu_to_ned(values)
+    except _VehicleFrameError as error:
+        raise FramingError(str(error)) from error
 
 
 def unpack_controls(packet: bytes) -> tuple[float, ...]:
@@ -1193,11 +1196,14 @@ class PlatformSettings:
         argv = [
             str(self.webots_binary),
             "--batch",
-            "--minimize",
             f"--mode={self.webots_mode}",
             "--stdout",
             "--stderr",
         ]
+        # Default keeps the window out of the way for headless proofs. Set
+        # EMBODIED_WEBOTS_VISIBLE=1 to leave the 3D view on screen for live watching.
+        if os.environ.get("EMBODIED_WEBOTS_VISIBLE", "") != "1":
+            argv.insert(2, "--minimize")
         if os.environ.get("EMBODIED_WEBOTS_NO_RENDERING", "") == "1":
             argv.append("--no-rendering")
         argv.append(str(self.world))
@@ -3250,37 +3256,6 @@ class EvidenceWriter:
 
 
 @dataclass(frozen=True)
-class LocalNedTarget:
-    """One requested motion target in the local NED frame."""
-
-    position_ned: tuple[float, float, float] | None
-    velocity_ned: tuple[float, float, float] | None
-    yaw_rad: float | None
-    deadline_s: float
-    certificate_ref: str | None
-    # The yaw command as a RATE, not an angle. A rate stream is step-free even
-    # at the sweep's measured burst cadence, and the two are mutually
-    # exclusive downstream (MotionTarget refuses both at once), so None means
-    # every existing target stays an angle-or-nothing target. The observation
-    # sweep's velocity hold is the one caller that sets it
-    # (work/runs/night/XY-ROTATION-CRASH.md §4).
-    yaw_rate_rad_s: float | None = None
-
-
-@dataclass(frozen=True)
-class SetpointPublication:
-    """One published setpoint, with the honest statement of what is known about it.
-
-    Publication is measurable locally. Adoption by the autopilot is not: it shows up
-    later as telemetry, so this record never claims it.
-    """
-
-    setpoint: MotionSetpoint
-    published_stamp: ClockStamp
-    adoption: str = "publication recorded; adoption is judged from telemetry, not here"
-
-
-@dataclass(frozen=True)
 class StartupEvidence:
     webots: ChildProcess
     sitl: ChildProcess
@@ -3296,23 +3271,6 @@ class ReadinessEvidence:
     waited_s: float
     pair_seen: bool
     imu_seen: bool
-
-
-@dataclass(frozen=True)
-class AutopilotControlEvidence:
-    """What the autopilot was doing when it was asked for control, as it reported it."""
-
-    commanded_mode: str
-    mode_reached: bool
-    armed: bool
-    takeoff_commanded_m: float
-    altitude_m: float | None
-    statustexts: tuple[str, ...]
-    refused: bool
-    # How many times control was requested, and every refusal the autopilot gave: the
-    # list of what it said was missing, kept verbatim.
-    control_attempts: int
-    refusals: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -3350,28 +3308,6 @@ class ControlEvent:
             "statustexts": list(self.statustexts),
             "guidance_held": self.guidance_held,
         }
-
-
-def mask_for_target(target: MotionTarget) -> int:
-    """The type mask that matches a target: a field the mask ignores must be absent.
-
-    A set bit means "ignore this field", and the bits are MAVLink's own, so this mask is
-    what the autopilot reads. Each ignored field contributes a whole group, because the
-    autopilot reads the groups whole: setting one position axis would throw away the
-    position target entirely rather than hold one axis. Force is never claimed.
-    """
-    mask = 0
-    if target.position_ned is None:
-        mask |= TYPE_MASK_POSITION_IGNORE
-    if target.velocity_ned is None:
-        mask |= TYPE_MASK_VELOCITY_IGNORE
-    if target.acceleration_ned is None:
-        mask |= TYPE_MASK_ACCELERATION_IGNORE
-    if target.yaw_rad is None:
-        mask |= TYPE_MASK_YAW_IGNORE
-    if target.yaw_rate_rad_s is None:
-        mask |= TYPE_MASK_YAW_RATE_IGNORE
-    return mask
 
 
 # How long an arming and mode request is given before the autopilot's answer is read.
@@ -3518,6 +3454,14 @@ class WebotsArduPilot:
         self._vision_feed_stop = threading.Event()
         self._vision_feed_error: BaseException | None = None
         self._vision_feed_published = 0
+        self._vehicle: vehicle_module.Vehicle | None = None
+
+    @property
+    def vehicle(self) -> vehicle_module.Vehicle:
+        """Bottom-layer guided motion (takeoff, goto, hold, spin, land)."""
+        if self._vehicle is None:
+            self._vehicle = vehicle_module.Vehicle(self)
+        return self._vehicle
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -3843,64 +3787,7 @@ class WebotsArduPilot:
         *,
         drain: Callable[[], None] | None = None,
     ) -> tuple[AutopilotControlEvidence, ClockStamp]:
-        """Ask for Guided mode and arming until the vehicle accepts or the wait ends.
-
-        A simulated vehicle needs tens of seconds of simulated time before ArduPilot's
-        pre-arm checks pass — a GPS fix, a home position, a quiet window for the IMU
-        consistency check — and its refusals cannot be read as a list of what is still
-        missing, because it repeats a failing check at its own rate and stops repeating
-        it whether it cleared or not. So the request is repeated and every answer is
-        kept: the refusal that finally explains the stop is evidence, and the attempt
-        count says how long the vehicle was given.
-
-        Returns what the autopilot reported about itself, and when the last request was
-        made.
-        """
-        deadline = self._monotonic() + timeout_s
-        refusals: dict[str, str] = {}
-        attempts = 0
-        attempt_at = self._monotonic()
-        sample = self.telemetry()
-        while True:
-            attempts += 1
-            attempt_at = self._monotonic()
-            self._session.set_mode("GUIDED")
-            self._session.arm()
-            # Give the autopilot a moment to answer, reading the sensor stream while it
-            # does: this wait is a second of frames the controller would otherwise queue
-            # and then drop.
-            settle_until = self._monotonic() + ARM_SETTLE_S
-            while self._monotonic() < settle_until:
-                if drain is not None:
-                    drain()
-                self._sleep(0.1)
-            sample = self.telemetry()
-            for text in sample.statustexts:
-                if text.startswith("PreArm:") or text.startswith("Arm:"):
-                    refusals[text] = text
-            if sample.armed or self._monotonic() >= deadline:
-                break
-            retry_until = self._monotonic() + CONTROL_RETRY_S
-            while self._monotonic() < retry_until and self._monotonic() < deadline:
-                if drain is not None:
-                    drain()
-                self._sleep(0.5)
-        evidence = AutopilotControlEvidence(
-            commanded_mode="GUIDED",
-            mode_reached=sample.in_guided_mode,
-            armed=bool(sample.armed),
-            takeoff_commanded_m=self.settings.hover_altitude_m,
-            altitude_m=None,
-            statustexts=tuple(self._statustexts),
-            refused=not (sample.in_guided_mode and sample.armed),
-            control_attempts=attempts,
-            refusals=tuple(sorted(refusals)),
-        )
-        return evidence, ClockStamp(
-            host_id=self.settings.host_id,
-            clock_id=self.settings.clock_id,
-            monotonic_ns=int(attempt_at * 1e9),
-        )
+        return self.vehicle.request_control(timeout_s, drain=drain)
 
     def sensor_record(self, timeout_s: float) -> SensorRecord | None:
         """The next sensor record, or None when the stream stays silent for the timeout.
@@ -4117,129 +4004,28 @@ class WebotsArduPilot:
     def arm_and_guided(
         self, timeout_s: float, *, drain: Callable[[], None] | None = None
     ) -> AutopilotControlEvidence:
-        """Ask for Guided flight, and take off once the autopilot grants it.
-
-        A refusal is evidence: the mode and the arming state are read back from
-        telemetry, and every refusal the autopilot gave is kept with them. Control is
-        requested repeatedly for the configured wait, because a simulated vehicle needs
-        simulated time before its pre-arm checks pass.
-
-        ``drain`` is the caller's loop over the sensor stream, which keeps producing
-        throughout this wait.
-        """
-        evidence, attempt_at = self.request_control(
-            self.settings.pre_arm_wait_s, drain=drain
+        # Platform probe still wants AutopilotControlEvidence; Vehicle API v1
+        # returns Result from takeoff(altitude_m). Bring-up writes flight-state
+        # and stores evidence on the vehicle for this shim.
+        del timeout_s  # climb budget comes from settings.step_timeout_s.flight
+        result = self.vehicle.takeoff(self.settings.hover_altitude_m)
+        evidence = self.vehicle._last_takeoff
+        if evidence is not None:
+            return evidence
+        return AutopilotControlEvidence(
+            commanded_mode="GUIDED",
+            mode_reached=False,
+            armed=False,
+            takeoff_commanded_m=self.settings.hover_altitude_m,
+            altitude_m=None,
+            statustexts=(),
+            refused=not result.accepted,
+            control_attempts=0,
+            refusals=(result.reason,) if result.reason else (),
         )
-        altitude = None
-        if evidence.armed:
-            self._session.takeoff(self.settings.hover_altitude_m)
-            takeoff_at = self._monotonic()
-            deadline = takeoff_at + timeout_s
-            while self._monotonic() < deadline:
-                sample = self.telemetry()
-                position = sample.local_position_ned
-                if position is not None:
-                    altitude = -position[2]
-                    if (
-                        sample.in_guided_mode
-                        and sample.armed
-                        and altitude >= 0.5 * self.settings.hover_altitude_m
-                    ):
-                        break
-                if self._monotonic() - takeoff_at >= CONTROL_GRANT_GRACE_S and not (
-                    sample.in_guided_mode and sample.armed
-                ):
-                    # A mode that has not become Guided will not become Guided by waiting.
-                    break
-                if drain is not None:
-                    drain()
-                self._sleep(0.2)
-            evidence = replace(
-                evidence,
-                mode_reached=sample.in_guided_mode,
-                armed=bool(sample.armed),
-                altitude_m=altitude,
-                refused=not (sample.in_guided_mode and sample.armed),
-            )
-        self.evidence.write_json(
-            "flight-state.json",
-            {
-                "commanded_mode": evidence.commanded_mode,
-                "mode_reached": evidence.mode_reached,
-                "armed": evidence.armed,
-                "takeoff_commanded_m": evidence.takeoff_commanded_m,
-                "altitude_m": evidence.altitude_m,
-                "control_attempts": evidence.control_attempts,
-                "refusals": list(evidence.refusals),
-                "pre_arm_wait_s": self.settings.pre_arm_wait_s,
-                "control_requested_at_monotonic_ns": attempt_at.monotonic_ns,
-                "statustexts": list(evidence.statustexts),
-                "refused": evidence.refused,
-            },
-        )
-        return evidence
 
     def send_local_ned(self, target: LocalNedTarget) -> SetpointPublication | None:
-        """Publish one guided local-NED setpoint, and record that it was published.
-
-        Returns None when the last telemetry did not show the autopilot in Guided
-        flight. A setpoint sent in any other mode is a target nothing is following,
-        so it is not sent: the refusal is recorded with the mode and status that
-        caused it, and the caller reports what the aircraft was actually doing
-        instead of what it was told to do.
-
-        The fold is brought current first: with the reader thread delivering on
-        its own clock, a mode change that has already arrived may sit one sweep
-        ahead of the last sample, and a publication decided here must see it.
-        """
-        self.telemetry()
-        if not self.guidance_held:
-            sample = self._telemetry
-            refusal = {
-                "at_monotonic_ns": int(self._monotonic_ns()),
-                "requested_target_ned": list(target.position_ned)
-                if target.position_ned is not None
-                else None,
-                "observed_mode": None if sample is None else sample.mode_name,
-                "observed_armed": None if sample is None else sample.armed,
-                "reason": (
-                    "no telemetry has arrived, so the aircraft's mode is unknown and this "
-                    "adapter does not command blind"
-                    if sample is None
-                    else "the autopilot is not in armed Guided flight"
-                ),
-            }
-            self.refusals.append(refusal)
-            self.evidence.append_jsonl("refused-publications.jsonl", refusal)
-            return None
-        motion = MotionTarget(
-            position_ned=target.position_ned,
-            velocity_ned=target.velocity_ned,
-            acceleration_ned=None,
-            yaw_rad=target.yaw_rad,
-            yaw_rate_rad_s=target.yaw_rate_rad_s,
-        )
-        self._sequence += 1
-        setpoint = MotionSetpoint(
-            command_sequence=self._sequence,
-            mission_revision=0,
-            goal_revision=0,
-            nav_epoch=self.navigation_epoch,
-            frame=Frame.ODOM,
-            type_mask=mask_for_target(motion),
-            target=motion,
-            issue_stamp=self._stamp(),
-            deadline_s=target.deadline_s,
-            certificate_ref=target.certificate_ref,
-            sample_ref=None,
-            source=SetpointSource.NORMAL,
-        )
-        self._session.send_setpoint(setpoint)
-        publication = SetpointPublication(
-            setpoint=setpoint, published_stamp=self._stamp()
-        )
-        self._publications.append(publication)
-        return publication
+        return self.vehicle.publish(target)
 
     def inject(self, fault: Injection) -> InjectionReceipt:
         """Send one injection and wait for the controller to confirm it was applied.
