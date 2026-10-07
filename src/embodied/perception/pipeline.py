@@ -113,9 +113,8 @@ class PerceptionPipeline:
         return self._estimator.align_odom_position(position_m)
 
     def refresh_nav(self, stamp: ClockStamp) -> None:
-        """Re-publish EstimationPort from latest IMU/pair ages at ``stamp``."""
+        """Refresh mapping handle ages; EstimationPort is live (no snapshot set)."""
         nav = self._estimator.latest(stamp=stamp, now_host_ns=stamp.monotonic_ns)
-        self._estimation.set(nav)
         if nav is not None:
             self._mapping._sim_time_s = nav.sim_time_s  # noqa: SLF001
             self._mapping._stamp = stamp  # noqa: SLF001
