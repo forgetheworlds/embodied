@@ -1,7 +1,8 @@
 """Throwaway continuous smooth flight through the doorway polyline.
 
-Not the layer gate. Sliding yaw=0 hold setpoint along the route polyline
-(no per-waypoint pauses, no spin). Throwaway — delete when done exploring.
+Not the layer gate. Complex command probe: sliding position + path velocity
+feedforward + limited yaw_rate toward the path heading (not discrete
+left/right/hold steps). Throwaway — delete when done exploring.
 
 Run::
 
@@ -27,7 +28,7 @@ from embodied.cli import (
     repository_root,
 )
 from embodied.contracts.records import SensorMode
-from embodied.control import Motion, Vehicle, Vec3
+from embodied.control import Motion, Vehicle, Vec3, wrap_angle_rad
 from embodied.control.vehicle import ned_to_enu
 from embodied.platform.webots_ardupilot import (
     EvidenceWriter,
@@ -43,10 +44,25 @@ from embodied.platform.webots_ardupilot import (
 
 ROUTE_PATH = Path(__file__).with_name("route.yaml")
 REFRESH_S = 0.05
-# Slow sliding setpoint; yaw fixed at 0 (path-heading + vel FF tipped AngErr=84).
-CRUISE_SPEED_M_S = 0.25
+# Gentler than the AngErr=84 tip (was 0.35 m/s + snapped path yaw).
+CRUISE_SPEED_M_S = 0.20
+MAX_YAW_RATE_RAD_S = 0.25
+YAW_RATE_GAIN = 1.0
 END_HOLD_S = 2.0
 ZERO = Vec3(0.0, 0.0, 0.0)
+
+
+def _path_yaw_rad(tangent: Vec3) -> float:
+    """NED yaw from an ENU unit tangent (x north, y west)."""
+    return math.atan2(-tangent.y, tangent.x)
+
+
+def _limited_yaw_rate(current_yaw: float | None, desired_yaw: float) -> float:
+    if current_yaw is None:
+        return 0.0
+    error = wrap_angle_rad(desired_yaw - current_yaw)
+    rate = YAW_RATE_GAIN * error
+    return max(-MAX_YAW_RATE_RAD_S, min(MAX_YAW_RATE_RAD_S, rate))
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -116,7 +132,7 @@ def fly_smooth_route(
     hover_m: float,
     speed_m_s: float = CRUISE_SPEED_M_S,
 ) -> dict[str, Any]:
-    """Cruise the polyline once with a continuously advancing hold setpoint."""
+    """Cruise with position + velocity FF + capped yaw_rate toward path heading."""
     vehicle: Vehicle = platform.vehicle
     steps: list[dict[str, Any]] = []
     reasons: list[str] = []
@@ -140,11 +156,23 @@ def fly_smooth_route(
     distance = 0.0
     publications = 0
     guided_lost = False
+    max_abs_yaw_rate = 0.0
 
     while distance < path_m and not guided_lost:
-        pos, _tangent = _sample_polyline(points, distance)
-        # Sliding hold setpoint along the polyline (continuous, no per-wp pause).
-        result = vehicle.command(Motion(position=pos, velocity=ZERO, yaw=0.0))
+        pos, tangent = _sample_polyline(points, distance)
+        state = vehicle.state()
+        desired_yaw = _path_yaw_rad(tangent)
+        yaw_rate = _limited_yaw_rate(state.yaw, desired_yaw)
+        max_abs_yaw_rate = max(max_abs_yaw_rate, abs(yaw_rate))
+        velocity = Vec3(
+            tangent.x * speed_m_s,
+            tangent.y * speed_m_s,
+            tangent.z * speed_m_s,
+        )
+        # Complex Motion: no yaw snap — rate-limited turn while translating.
+        result = vehicle.command(
+            Motion(position=pos, velocity=velocity, yaw_rate=yaw_rate)
+        )
         publications += 1
         if not result.accepted:
             guided_lost = True
@@ -173,6 +201,8 @@ def fly_smooth_route(
             "task": "smooth_cruise",
             "path_m": path_m,
             "speed_m_s": speed_m_s,
+            "max_yaw_rate_rad_s": MAX_YAW_RATE_RAD_S,
+            "peak_commanded_yaw_rate": max_abs_yaw_rate,
             "publications": publications,
             "ok": not guided_lost and distance >= path_m * 0.95,
         }
