@@ -98,9 +98,8 @@ motion:
 
 output: work/runs/layers/execution
 
-# Execution joint proof knobs (Execution layer). Flip require_geometry_clear
-# when Perception lands live sensor_derived FREE on this branch.
+# Execution joint proof knobs (Execution layer).
+# require_geometry_clear: attach GeometryCertificate only after live
+# free+sensor_derived from PerceptionPipeline; fail closed if missing.
 execution_proof:
-  require_geometry_clear: false
-  nav_evidence_class: pose_assisted
-  map_evidence_class: pose_assisted
+  require_geometry_clear: true

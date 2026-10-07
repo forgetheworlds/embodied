@@ -12,7 +12,7 @@ If ``require_geometry_clear`` is set and live occupancy never yields
 from __future__ import annotations
 
 import argparse
-import math
+import queue
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,13 +27,8 @@ from embodied.cli import (
     repository_root,
 )
 from embodied.contracts.perception_ports import (
-    AgeDomain,
     EvidenceClass,
-    NavPose,
-    NavStatus,
-    NavigationState,
     OccupancySupport,
-    uncompared_disagreement,
 )
 from embodied.contracts.records import ClockStamp, SensorMode
 from embodied.control import Vehicle, Vec3
@@ -51,14 +46,19 @@ from embodied.execution import (
     ValidityWindow,
 )
 from embodied.execution.plant import StaticPlantLimitsPort, declared_plant
-from embodied.perception.estimation import StaticEstimationPort
-from embodied.perception.mapping_ports import StubMappingPort, StubOccupancyQuery
+from embodied.perception.pipeline import (
+    PerceptionPipeline,
+    decode_pair_rgb,
+    is_sensor_derived_free,
+)
 from embodied.platform.webots_ardupilot import (
     EvidenceWriter,
+    Kind,
     PlatformSettings,
     PlatformUnavailable,
     ProbeFailure,
     PymavlinkSession,
+    SensorRecord,
     SubprocessRunner,
     TcpSensorGateway,
     WebotsArduPilot,
@@ -69,6 +69,7 @@ REFRESH_S = 0.05
 SEGMENT_DURATION_S = 4.0
 SEGMENT_DX_M = 0.8
 HOVER_SETTLE_S = 2.0
+COLLECT_S = 12.0
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -101,10 +102,90 @@ def _stamp(ns: int | None = None) -> ClockStamp:
     )
 
 
-def _drain(platform: WebotsArduPilot) -> None:
-    record = platform.sensor_record(0.02)
-    while record is not None:
+def _install_pair_sink(platform: WebotsArduPilot) -> queue.Queue[SensorRecord]:
+    """Pixels only arrive through record_sink; sensor_record strips pair payloads."""
+    pair_q: queue.Queue[SensorRecord] = queue.Queue(maxsize=8)
+
+    def _sink(record: SensorRecord) -> None:
+        if record.kind is not Kind.PAIR or record.pair is None:
+            return
+        try:
+            pair_q.put_nowait(record)
+        except queue.Full:
+            try:
+                pair_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                pair_q.put_nowait(record)
+            except queue.Full:
+                pass
+
+    platform.record_sink = _sink
+    return pair_q
+
+
+def _drain_into_pipeline(
+    platform: WebotsArduPilot,
+    pipeline: PerceptionPipeline,
+    pair_q: queue.Queue[SensorRecord],
+) -> dict[str, Any]:
+    """Consume IMU from sensor_record and stereo pixels from the pair sink."""
+    last_verdict = None
+    pairs = 0
+    imus = 0
+    while True:
         record = platform.sensor_record(0.0)
+        if record is None:
+            break
+        stamp = _stamp()
+        sim = (
+            record.sim_time_s
+            if record.sim_time_s is not None and record.sim_time_s >= 0.0
+            else None
+        )
+        if record.kind is Kind.IMU and record.imu is not None:
+            imus += 1
+            pipeline.on_imu(
+                accelerometer=record.imu.accelerometer,
+                gyro=record.imu.gyro,
+                capture_host_ns=record.imu.capture_host_ns,
+                sim_time_s=sim,
+                stamp=stamp,
+            )
+    while True:
+        try:
+            record = pair_q.get_nowait()
+        except queue.Empty:
+            break
+        if record.pair is None:
+            continue
+        pair = record.pair
+        stamp = _stamp()
+        sim = (
+            record.sim_time_s
+            if record.sim_time_s is not None and record.sim_time_s >= 0.0
+            else None
+        )
+        left, right = decode_pair_rgb(
+            pair.left_bytes,
+            pair.right_bytes,
+            width=pair.width,
+            height=pair.height,
+            encoding=pair.encoding,
+        )
+        pairs += 1
+        verdict = pipeline.on_pair(
+            left_rgb=left,
+            right_rgb=right,
+            pair_id=pair.pair_id,
+            capture_host_ns=pair.capture_host_ns,
+            sim_time_s=sim,
+            stamp=stamp,
+        )
+        if verdict is not None:
+            last_verdict = verdict
+    return {"pairs": pairs, "imus": imus, "last_verdict": last_verdict}
 
 
 @dataclass
@@ -116,61 +197,7 @@ class WallClocks:
         return time.monotonic() - self.t0_mono
 
     def now_sim_s(self) -> float:
-        # Prefer Webots/sim time when available; fall back to wall delta.
         return time.monotonic() - self.t0_sim
-
-
-def _nav_from_vehicle(
-    vehicle: Vehicle,
-    *,
-    epoch: str,
-    evidence_class: EvidenceClass,
-) -> NavigationState | None:
-    state = vehicle.state()
-    if state.position is None:
-        return None
-    pos = state.position
-    vel = state.velocity or Vec3(0.0, 0.0, 0.0)
-    yaw = state.yaw or 0.0
-    # yaw → simple quaternion about z (ENU)
-    half = 0.5 * yaw
-    quat = (math.cos(half), 0.0, 0.0, math.sin(half))
-    stamp = _stamp()
-    pose = NavPose(
-        parent_frame="odom",
-        child_frame="body",
-        stamp=stamp,
-        position_m=(pos.x, pos.y, pos.z),
-        quaternion_wxyz=quat,
-        covariance=None,
-        nav_epoch=epoch,
-        source_ids=("vehicle_ekf",),
-        valid=True,
-    )
-    return NavigationState(
-        nav_epoch=epoch,
-        state_sequence=int(time.monotonic_ns() % 1_000_000),
-        controller_alignment_id="proof-align",
-        stamp=stamp,
-        sim_time_s=None,
-        age_s=0.0,
-        age_domain=AgeDomain.MONOTONIC,
-        monotonic_observed_at_s=time.monotonic(),
-        pose=pose,
-        velocity_mps=(vel.x, vel.y, vel.z),
-        covariance=None,
-        status=NavStatus.HEALTHY,
-        valid=True,
-        sigma_pos_m=None,
-        visual_source_ids=(),
-        imu_source_ids=(),
-        visual_age_s=None,
-        imu_age_s=None,
-        feed_stall=False,
-        ap_disagreement=uncompared_disagreement(),
-        evidence_class=evidence_class,
-        source_ids=("vehicle_ekf", "execution_proof"),
-    )
 
 
 def _make_cert(
@@ -196,27 +223,18 @@ def _make_cert(
     )
 
 
-def _compose_mapping_port(*, epoch: str, map_evidence_class: EvidenceClass):
-    """Prefer Perception composition if present; else stub (no MapStore glue)."""
-    try:
-        from embodied.perception import live as perception_live  # type: ignore
-
-        compose = getattr(perception_live, "compose_mapping_port", None)
-        if callable(compose):
-            return compose(nav_epoch=epoch, evidence_class=map_evidence_class), "perception.live"
-    except Exception:
-        pass
-    return (
-        StubMappingPort(
-            StubOccupancyQuery(
-                nav_epoch=epoch,
-                map_revision="stub-revision",
-                snapshot_id="stub-snapshot",
-                evidence_class=map_evidence_class,
-            )
-        ),
-        "stub_mapping_port",
-    )
+def _sample_occupancy(pipeline: PerceptionPipeline) -> dict[str, Any] | None:
+    verdict = pipeline.query_sensor_derived_free(_stamp())
+    if verdict is None:
+        return None
+    return {
+        "support": verdict.support.value,
+        "evidence_class": verdict.evidence_class.value,
+        "reason": verdict.reason,
+        "map_revision": verdict.map_revision,
+        "nav_epoch": verdict.nav_epoch,
+        "free_fraction": verdict.free_fraction,
+    }
 
 
 def fly_execution_route(
@@ -224,28 +242,25 @@ def fly_execution_route(
     *,
     hover_m: float,
     ap_ext_nav_mode: str,
+    pair_q: queue.Queue[SensorRecord],
     require_geometry_clear: bool = False,
-    nav_evidence_class: EvidenceClass = EvidenceClass.POSE_ASSISTED,
-    map_evidence_class: EvidenceClass = EvidenceClass.POSE_ASSISTED,
 ) -> dict[str, Any]:
     """Orchestrate joint flight. Safety.check is consumed, not reimplemented."""
     reasons: list[str] = []
     steps: list[dict[str, Any]] = []
+    occupancy_samples: list[dict[str, Any]] = []
     vehicle = Vehicle(platform)
     clocks = WallClocks(t0_mono=time.monotonic(), t0_sim=time.monotonic())
     epoch = "exec-proof-epoch"
 
-    # Clean rebuild: Vehicle + EstimationPort + MappingPort + Safety.check.
-    # No MissionRuntime / navigation dual-writer. MapStore only via Perception.
-    estimation = StaticEstimationPort(None)
-    mapping_port, mapping_source = _compose_mapping_port(
-        epoch=epoch, map_evidence_class=map_evidence_class
-    )
+    # Perception producer (not empty pose_assisted stub). No MissionRuntime.
+    pipeline = PerceptionPipeline(nav_epoch=epoch)
+    mapping_source = "perception.pipeline"
     steps.append({"task": "mapping_port_source", "source": mapping_source})
 
     ports = PortBundle(
-        estimation=estimation,
-        mapping=mapping_port,
+        estimation=pipeline.estimation,
+        mapping=pipeline.mapping,
         plant_limits=StaticPlantLimitsPort(declared_plant()),
     )
     exe = Execution(vehicle=vehicle, clocks=clocks, ports=ports, lease_s=0.3)
@@ -259,13 +274,11 @@ def fly_execution_route(
             steps,
             ap_ext_nav_mode,
             exe,
+            pipeline,
             require_geometry_clear=require_geometry_clear,
-            nav_evidence_class=nav_evidence_class,
-            map_evidence_class=map_evidence_class,
             mapping_source=mapping_source,
         )
 
-    # After takeoff: Execution is sole Vehicle.command writer (hold settle via replace).
     state = vehicle.state()
     if state.position is None:
         reasons.append("no vehicle position after takeoff")
@@ -274,19 +287,15 @@ def fly_execution_route(
             steps,
             ap_ext_nav_mode,
             exe,
+            pipeline,
             require_geometry_clear=require_geometry_clear,
-            nav_evidence_class=nav_evidence_class,
-            map_evidence_class=map_evidence_class,
             mapping_source=mapping_source,
         )
 
     start = state.position
-    estimation.set(
-        _nav_from_vehicle(vehicle, epoch=epoch, evidence_class=nav_evidence_class)
-    )
     hold_cert = TrajectoryCertificate(
         certificate_id="exec-proof-hold",
-        primary=HoldTrajectory(position=start, duration_s=HOVER_SETTLE_S),
+        primary=HoldTrajectory(position=start, duration_s=HOVER_SETTLE_S + COLLECT_S),
         terminal=HoldTrajectory(position=start),
         fallbacks={"hold": HoldTrajectory(position=start)},
         nav_epoch=epoch,
@@ -307,31 +316,66 @@ def fly_execution_route(
             steps,
             ap_ext_nav_mode,
             exe,
+            pipeline,
             require_geometry_clear=require_geometry_clear,
-            nav_evidence_class=nav_evidence_class,
-            map_evidence_class=map_evidence_class,
             mapping_source=mapping_source,
         )
+
+    # Settle + collect: feed Perception until free+sensor_derived (or timeout).
+    free_hits = 0
     settle_end = time.monotonic() + HOVER_SETTLE_S
-    while time.monotonic() < settle_end:
-        _drain(platform)
-        estimation.set(
-            _nav_from_vehicle(vehicle, epoch=epoch, evidence_class=nav_evidence_class)
-        )
+    collect_end = settle_end + COLLECT_S
+    while time.monotonic() < collect_end:
+        drained = _drain_into_pipeline(platform, pipeline, pair_q)
         exe._tick()
+        verdict = drained["last_verdict"] or pipeline.query_sensor_derived_free(_stamp())
+        if is_sensor_derived_free(verdict):
+            free_hits += 1
+            sample = _sample_occupancy(pipeline)
+            if sample is not None:
+                occupancy_samples.append(sample)
+        elif time.monotonic() >= settle_end:
+            sample = _sample_occupancy(pipeline)
+            if sample is not None:
+                occupancy_samples.append(sample)
+        if free_hits > 0 and time.monotonic() >= settle_end:
+            # FREE available — leave collect early once we have evidence.
+            break
         time.sleep(REFRESH_S)
 
-    state = vehicle.state()
-    start = state.position or start
-    estimation.set(
-        _nav_from_vehicle(vehicle, epoch=epoch, evidence_class=nav_evidence_class)
+    steps.append(
+        {
+            "task": "perception_collect",
+            "free_hits": free_hits,
+            "pipeline": pipeline.stats(),
+            "occupancy_samples_n": len(occupancy_samples),
+        }
     )
 
-    # Geometry CLEAR only when required AND Perception can underwrite it.
-    # Until then: geometry=None (fail closed — no CLEAR claim).
+    # Geometry CLEAR only when required AND Perception actually delivered FREE.
+    # Do not attach a free-claim cert without live free+sensor_derived.
     geometry: GeometryCertificate | None = None
+    geometry_attached = False
     if require_geometry_clear:
-        occ_now = mapping_port.occupancy()
+        if free_hits < 1:
+            reasons.append(
+                "geometry CLEAR required but Perception never returned free+sensor_derived "
+                f"(stats={pipeline.stats()})"
+            )
+            vehicle.land()
+            return _receipt(
+                reasons,
+                steps,
+                ap_ext_nav_mode,
+                exe,
+                pipeline,
+                occupancy_samples,
+                require_geometry_clear=require_geometry_clear,
+                mapping_source=mapping_source,
+                free_hits=free_hits,
+                geometry_attached=False,
+            )
+        occ_now = pipeline.mapping.occupancy()
         revision = "rev-0" if occ_now is None else occ_now.map_revision
         geometry = GeometryCertificate(
             nav_epoch=epoch,
@@ -339,15 +383,21 @@ def fly_execution_route(
             volume_refs=("stop_tube",),
             support_claim="free",
         )
+        geometry_attached = True
+
+    state = vehicle.state()
+    start = state.position or start
     cert = _make_cert(start, epoch=epoch, geometry=geometry)
     replaced = exe.replace(cert)
     steps.append(
         {
             "task": "replace",
             "ok": hasattr(replaced, "certificate_id"),
-            "detail": getattr(replaced, "certificate_id", None) or getattr(replaced, "reason", None),
+            "detail": getattr(replaced, "certificate_id", None)
+            or getattr(replaced, "reason", None),
             "geometry_required": require_geometry_clear,
-            "geometry_on_cert": geometry is not None,
+            "geometry_on_cert": geometry_attached,
+            "free_hits_before_replace": free_hits,
         }
     )
     if hasattr(replaced, "reason"):
@@ -358,52 +408,39 @@ def fly_execution_route(
             steps,
             ap_ext_nav_mode,
             exe,
+            pipeline,
+            occupancy_samples,
             require_geometry_clear=require_geometry_clear,
-            nav_evidence_class=nav_evidence_class,
-            map_evidence_class=map_evidence_class,
             mapping_source=mapping_source,
+            free_hits=free_hits,
+            geometry_attached=geometry_attached,
         )
 
     # Gapless Execution tick through primary + brief terminal
     end_mono = time.monotonic() + SEGMENT_DURATION_S + 2.0
-    occupancy_samples: list[dict[str, Any]] = []
+    geometry_allow_seen = False
     while time.monotonic() < end_mono:
-        _drain(platform)
-        estimation.set(
-            _nav_from_vehicle(vehicle, epoch=epoch, evidence_class=nav_evidence_class)
-        )
-        occ = mapping_port.occupancy()
-        if occ is not None:
-            from embodied.contracts.perception_ports import Aabb
-
-            sample = vehicle.state().position or start
-            verdict = occ.query_volume(
-                Aabb(
-                    min_m=(sample.x - 0.3, sample.y - 0.3, sample.z - 0.3),
-                    max_m=(sample.x + 0.3, sample.y + 0.3, sample.z + 0.3),
-                    frame="odom",
-                ),
-                now=_stamp(),
-            )
-            occupancy_samples.append(
-                {
-                    "support": verdict.support.value,
-                    "evidence_class": verdict.evidence_class.value,
-                    "reason": verdict.reason,
-                    "map_revision": verdict.map_revision,
-                    "nav_epoch": verdict.nav_epoch,
-                }
-            )
+        _drain_into_pipeline(platform, pipeline, pair_q)
+        sample = _sample_occupancy(pipeline)
+        if sample is not None:
+            occupancy_samples.append(sample)
             # Fail closed: FREE without sensor_derived is dishonest
             if (
-                verdict.support is OccupancySupport.FREE
-                and verdict.evidence_class is not EvidenceClass.SENSOR_DERIVED
+                sample["support"] == OccupancySupport.FREE.value
+                and sample["evidence_class"] != EvidenceClass.SENSOR_DERIVED.value
             ):
                 reasons.append(
-                    f"live map FREE with evidence_class={verdict.evidence_class.value} — forbidden"
+                    f"live map FREE with evidence_class={sample['evidence_class']} — forbidden"
                 )
+            if (
+                sample["support"] == OccupancySupport.FREE.value
+                and sample["evidence_class"] == EvidenceClass.SENSOR_DERIVED.value
+            ):
+                free_hits += 1
         exe._tick()
         status = exe.status()
+        if geometry_attached and status.last_decision == "allow":
+            geometry_allow_seen = True
         if status.code is ExecutionStatusCode.FAILED:
             reasons.append(status.last_reason or "execution failed")
             break
@@ -424,6 +461,7 @@ def fly_execution_route(
             "last_reason": status.last_reason,
             "occupancy_summary": occ_summary,
             "occupancy_samples": occupancy_samples[-5:],
+            "geometry_allow_seen": geometry_allow_seen,
         }
     )
     if status.publish_sequence < 5:
@@ -452,11 +490,13 @@ def fly_execution_route(
         steps,
         ap_ext_nav_mode,
         exe,
+        pipeline,
         occupancy_samples,
         require_geometry_clear=require_geometry_clear,
-        nav_evidence_class=nav_evidence_class,
-        map_evidence_class=map_evidence_class,
         mapping_source=mapping_source,
+        free_hits=free_hits,
+        geometry_attached=geometry_attached,
+        geometry_allow_seen=geometry_allow_seen,
     )
 
 
@@ -465,39 +505,54 @@ def _receipt(
     steps: list[dict[str, Any]],
     ap_ext_nav_mode: str,
     exe: Execution,
+    pipeline: PerceptionPipeline,
     occupancy_samples: list[dict[str, Any]] | None = None,
     *,
     require_geometry_clear: bool = False,
-    nav_evidence_class: EvidenceClass = EvidenceClass.POSE_ASSISTED,
-    map_evidence_class: EvidenceClass = EvidenceClass.POSE_ASSISTED,
-    mapping_source: str = "stub_mapping_port",
+    mapping_source: str = "perception.pipeline",
+    free_hits: int = 0,
+    geometry_attached: bool = False,
+    geometry_allow_seen: bool = False,
 ) -> dict[str, Any]:
     status = exe.status()
     samples = occupancy_samples or []
     occ_summary = _occupancy_summary(samples)
+    nav = pipeline.estimation.latest()
+    query = pipeline.mapping.occupancy()
     return {
         "status": "pass" if not reasons else "fail",
         "reasons": reasons,
         "steps": steps,
+        # AP airworthiness vs Perception evidence — keep separate.
         "ap_ext_nav_mode": ap_ext_nav_mode,
-        "perception_nav_evidence_class": nav_evidence_class.value,
-        "perception_map_evidence_class": map_evidence_class.value,
+        "perception_nav_evidence_class": None
+        if nav is None
+        else nav.evidence_class.value,
+        "perception_map_evidence_class": None
+        if query is None
+        else query.evidence_class.value,
         "mapping_port_source": mapping_source,
         "require_geometry_clear": require_geometry_clear,
-        "geometry_clear_claimed": require_geometry_clear,
+        "geometry_certificate_attached": geometry_attached,
+        # Only claim CLEAR when Safety actually allowed under a free-claim cert.
+        "geometry_clear_claimed": bool(geometry_attached and geometry_allow_seen),
+        "live_sensor_derived_free": free_hits > 0,
+        "free_hits": free_hits,
         "occupancy_summary": occ_summary,
+        "pipeline": pipeline.stats(),
         "execution": {
             "code": status.code.value,
             "publish_sequence": status.publish_sequence,
             "primary_completed": status.primary_completed,
             "last_decision": status.last_decision,
             "last_reason": status.last_reason,
-            "rebuild": "Vehicle + ports + Safety.check — no MissionRuntime",
+            "rebuild": "Vehicle + PerceptionPipeline ports + Safety.check — no MissionRuntime",
         },
         "occupancy_samples": samples[-10:],
         "note": (
-            "Clean Execution rebuild: sole Vehicle.command; consumes Safety + Perception ports; "
+            "Clean Execution rebuild: sole Vehicle.command; consumes Safety + PerceptionPipeline; "
             "no MissionRuntime/navigation dual-writer. "
+            "AP ext-nav (airworthiness) is orthogonal to Perception evidence_class. "
             "geometry CLEAR only when require_geometry_clear and live free+sensor_derived."
         ),
     }
@@ -523,8 +578,6 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
     hover_m = float(motion["hover_altitude_m"])
     proof_cfg = document.get("execution_proof") or {}
     require_geometry_clear = bool(proof_cfg.get("require_geometry_clear", False))
-    nav_ec = EvidenceClass(str(proof_cfg.get("nav_evidence_class", "pose_assisted")))
-    map_ec = EvidenceClass(str(proof_cfg.get("map_evidence_class", "pose_assisted")))
 
     writer = EvidenceWriter(output_dir, "run-a")
     platform = WebotsArduPilot(
@@ -538,6 +591,8 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
         label="execution-proof",
         extra_params=settings.compat_estimator_params,
     )
+    # Must install before start(): reader strips pair pixels after the sink runs.
+    pair_q = _install_pair_sink(platform)
     try:
         platform.start()
         platform.wait_ready(settings.step_timeout_s.ready)
@@ -545,9 +600,8 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
             platform,
             hover_m=hover_m,
             ap_ext_nav_mode=settings.sensor_mode.value,
+            pair_q=pair_q,
             require_geometry_clear=require_geometry_clear,
-            nav_evidence_class=nav_ec,
-            map_evidence_class=map_ec,
         )
         writer.write_json("execution-proof.json", result)
         gate = GateStatus.PASS if result["status"] == "pass" else GateStatus.FAIL
@@ -557,6 +611,7 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
             reasons=tuple(result["reasons"]),
             limitations=(
                 "Execution joint orchestration: sole Vehicle.command; consumes Safety.check; "
+                "PerceptionPipeline producer (sensor_derived); "
                 "geometry CLEAR only if require_geometry_clear and live free+sensor_derived; "
                 "AP ext-nav recorded separately from Perception evidence_class.",
             ),
@@ -567,8 +622,12 @@ def _command(args: argparse.Namespace, output_dir: Path) -> CommandOutcome:
                 "perception_nav_evidence_class": result["perception_nav_evidence_class"],
                 "perception_map_evidence_class": result["perception_map_evidence_class"],
                 "require_geometry_clear": result["require_geometry_clear"],
+                "geometry_certificate_attached": result["geometry_certificate_attached"],
                 "geometry_clear_claimed": result["geometry_clear_claimed"],
+                "live_sensor_derived_free": result["live_sensor_derived_free"],
+                "free_hits": result["free_hits"],
                 "occupancy_summary": result.get("occupancy_summary"),
+                "mapping_port_source": result["mapping_port_source"],
                 "steps": result["steps"],
             },
             artifacts=("run-a/execution-proof.json",),

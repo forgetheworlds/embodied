@@ -15,6 +15,6 @@ Frozen surface: project store `docs/execution-safety-frozen.md`. Safety honesty:
 ## Prove
 
 - Contract: `tests/test_execution.py`
-- Joint live: `./configs/layers/execution` — mapping via Perception `compose_mapping_port` if present, else stub (no MapStore in Execution)
-  - `require_geometry_clear: false` until Perception live FREE; then flip + re-prove
-  - FAIL if CLEAR required without live `free`+`sensor_derived`
+- Joint live: `./configs/layers/execution` — consumes `PerceptionPipeline` (stereo+IMU → MapStore); no stub pose_assisted map
+  - Receipt: `ap_ext_nav_mode` (AP airworthiness) separate from Perception `evidence_class`
+  - `require_geometry_clear: true` → GeometryCertificate only after live `free`+`sensor_derived`; FAIL if missing
