@@ -1,7 +1,7 @@
 """Throwaway continuous smooth flight through the doorway polyline.
 
-Not the layer gate. Uses Vehicle.command() with sliding position + velocity
-along the route (no per-waypoint holds, no spin). Delete when done exploring.
+Not the layer gate. Sliding yaw=0 hold setpoint along the route polyline
+(no per-waypoint pauses, no spin). Throwaway — delete when done exploring.
 
 Run::
 
@@ -116,7 +116,7 @@ def fly_smooth_route(
     hover_m: float,
     speed_m_s: float = CRUISE_SPEED_M_S,
 ) -> dict[str, Any]:
-    """Cruise the polyline once with continuous position+velocity Motions."""
+    """Cruise the polyline once with a continuously advancing hold setpoint."""
     vehicle: Vehicle = platform.vehicle
     steps: list[dict[str, Any]] = []
     reasons: list[str] = []
@@ -142,15 +142,9 @@ def fly_smooth_route(
     guided_lost = False
 
     while distance < path_m and not guided_lost:
-        pos, tangent = _sample_polyline(points, distance)
-        velocity = Vec3(
-            tangent.x * speed_m_s,
-            tangent.y * speed_m_s,
-            tangent.z * speed_m_s,
-        )
-        # Face travel direction (NED yaw = atan2(east, north); east = -y_enu).
-        yaw = math.atan2(-tangent.y, tangent.x)
-        result = vehicle.command(Motion(position=pos, velocity=velocity, yaw=yaw))
+        pos, _tangent = _sample_polyline(points, distance)
+        # Sliding hold setpoint along the polyline (continuous, no per-wp pause).
+        result = vehicle.command(Motion(position=pos, velocity=ZERO, yaw=0.0))
         publications += 1
         if not result.accepted:
             guided_lost = True
@@ -160,12 +154,12 @@ def fly_smooth_route(
         _drain(platform)
         platform._sleep(REFRESH_S)
 
-    # Brief zero-velocity hold at the tip so land isn't commanded mid-cruise.
+    # Brief hold at the tip so land isn't commanded mid-cruise.
     if not guided_lost:
         end, _ = _sample_polyline(points, path_m)
         hold_until = platform._monotonic() + END_HOLD_S
         while platform._monotonic() < hold_until:
-            result = vehicle.command(Motion(position=end, velocity=Vec3(0, 0, 0), yaw=0.0))
+            result = vehicle.command(Motion(position=end, velocity=ZERO, yaw=0.0))
             publications += 1
             if not result.accepted:
                 guided_lost = True
