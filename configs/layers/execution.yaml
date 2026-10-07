@@ -97,3 +97,10 @@ motion:
     - [7.50, -0.50, 0.0]
 
 output: work/runs/layers/execution
+
+# Execution joint proof knobs (Execution layer). Flip require_geometry_clear
+# when Perception lands live sensor_derived FREE on this branch.
+execution_proof:
+  require_geometry_clear: false
+  nav_evidence_class: pose_assisted
+  map_evidence_class: pose_assisted
