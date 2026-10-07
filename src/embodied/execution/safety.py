@@ -1,4 +1,9 @@
-"""Pure Safety.check — ALLOW / BACKUP / UNSUPPORTED leases. Never commands."""
+"""Pure Safety.check — ALLOW / BACKUP / UNSUPPORTED leases.
+
+Owns the Safety surface only. Never invents Motions, never commands Vehicle.
+Geometry CLEAR requires OccupancyVerdict FREE + sensor_derived + epoch match
+with active nav (Perception consumer rules).
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,7 @@ from embodied.contracts.perception_ports import (
     NavigationState,
     OccupancyQuery,
     OccupancySupport,
+    OccupancyVerdict,
     StopTubeQuery,
 )
 from embodied.control import Motion, VehicleState, Vec3
@@ -68,6 +74,13 @@ class UnsupportedDecision:
 
 SafetyDecision = AllowDecision | BackupDecision | UnsupportedDecision
 
+_BAD_NAV_STATUS = (
+    NavStatus.STALE,
+    NavStatus.LOST,
+    NavStatus.UNAVAILABLE,
+    NavStatus.INITIALIZING,
+)
+
 
 def _dist(a: Vec3, b: Vec3) -> float:
     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
@@ -95,6 +108,117 @@ def _backup_or_unsupported(
     )
 
 
+def _geometry_clear(
+    *,
+    occupancy: OccupancyQuery,
+    plant_limits: PlantLimits | None,
+    geometry_certificate: GeometryCertificate,
+    nav_state: NavigationState,
+    candidate: Motion,
+    refs: list[str],
+    predeclared_fallbacks: dict[str, Trajectory],
+    now_mono_s: float,
+    lease_s: float,
+) -> SafetyDecision | None:
+    """Return a fail decision, or None when geometry CLEAR is evidenced.
+
+    CLEAR only if verdict FREE + sensor_derived + epoch match with active nav.
+    Does not invent free space. Stop-capable credit needs PlantLimits.valid.
+    """
+    if nav_state.evidence_class is not EvidenceClass.SENSOR_DERIVED:
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason="nav_evidence_class",
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+    if geometry_certificate.nav_epoch != nav_state.nav_epoch:
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason="geometry_nav_epoch_mismatch",
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+    if not occupancy.healthy:
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason="occupancy_unhealthy",
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+    # Active nav epoch must match snapshot (Perception consumer rule).
+    if not occupancy.matches_epoch(nav_state.nav_epoch):
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason="occupancy_epoch_mismatch",
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+    if not occupancy.matches_revision(geometry_certificate.map_revision):
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason="occupancy_revision_mismatch",
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+
+    envelope = 0.35
+    plant_ok = plant_limits is not None and plant_limits.valid
+    if plant_ok:
+        assert plant_limits is not None
+        envelope = plant_limits.envelope_radius_m
+        refs.append("plant_limits")
+
+    sample = candidate.position
+    tube = StopTubeQuery(
+        samples_odom_m=((sample.x, sample.y, sample.z),),
+        envelope_radius_m=envelope,
+        include_brake_region=False,
+        brake_region=None,
+    )
+    # Re-query every check; use snapshot stamp as query `now` (freshness is on the handle).
+    verdict: OccupancyVerdict = occupancy.query_stop_tube(tube, now=occupancy.stamp)
+    refs.append(f"map_revision:{occupancy.map_revision}")
+    refs.append(f"occupancy:{verdict.support.value}")
+
+    if verdict.nav_epoch != nav_state.nav_epoch:
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason="verdict_epoch_mismatch",
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+    if (
+        verdict.support is not OccupancySupport.FREE
+        or verdict.evidence_class is not EvidenceClass.SENSOR_DERIVED
+    ):
+        if verdict.support is OccupancySupport.OCCUPIED:
+            reason = "geometry_occupied"
+        elif verdict.evidence_class is not EvidenceClass.SENSOR_DERIVED:
+            reason = "evidence_class"
+        else:
+            reason = "geometry_not_free"
+        return _backup_or_unsupported(
+            predeclared_fallbacks,
+            reason=reason,
+            checked_refs=tuple(refs),
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
+        )
+
+    refs.append("geometry_clear")
+    # Rule 7: stop-capable CLEAR needs PlantLimits.valid — never claim without it.
+    if plant_ok:
+        refs.append("stop_capable_clear")
+    return None
+
+
 def check(
     active_prefix: Trajectory,
     stop_continuation: Trajectory,
@@ -120,7 +244,7 @@ def check(
     telem_age_max_s: float = 1.0,
 ) -> SafetyDecision:
     """Certify the active prefix. Never invents Motions or free space."""
-    del active_prefix, stop_continuation, now_sim_s  # available for future motion-bound checks
+    del active_prefix, stop_continuation, now_sim_s  # traj correlation reserved for callers
     refs: list[str] = ["vehicle", *safety_evidence_refs]
 
     if not authority.armed or not authority.guided:
@@ -147,7 +271,6 @@ def check(
     if validity.not_after_mono_s is not None and now_mono_s > validity.not_after_mono_s:
         return UnsupportedDecision(reason="validity_expired", checked_refs=tuple(refs))
 
-    # Nav health / epoch
     if nav_state is None:
         return _backup_or_unsupported(
             predeclared_fallbacks,
@@ -162,7 +285,7 @@ def check(
     if (
         not nav_state.valid
         or nav_state.feed_stall
-        or nav_state.status in (NavStatus.STALE, NavStatus.LOST, NavStatus.UNAVAILABLE, NavStatus.INITIALIZING)
+        or nav_state.status in _BAD_NAV_STATUS
     ):
         return _backup_or_unsupported(
             predeclared_fallbacks,
@@ -199,7 +322,6 @@ def check(
             lease_s=lease_s,
         )
 
-    # Tracking envelope
     err = _dist(tracking_state.candidate.position, tracking_state.measured_position)
     if err > tracking_envelope.position_m:
         return _backup_or_unsupported(
@@ -219,9 +341,9 @@ def check(
             lease_s=lease_s,
         )
 
-    # Geometry CLEAR — only with real Perception FREE
+    # Geometry CLEAR — only with real Perception FREE (never invent).
     if geometry_certificate is not None and geometry_certificate.support_claim == "free":
-        if occupancy is None or not occupancy.healthy:
+        if occupancy is None:
             return _backup_or_unsupported(
                 predeclared_fallbacks,
                 reason="occupancy_missing",
@@ -229,53 +351,19 @@ def check(
                 now_mono_s=now_mono_s,
                 lease_s=lease_s,
             )
-        if not occupancy.matches_epoch(geometry_certificate.nav_epoch):
-            return _backup_or_unsupported(
-                predeclared_fallbacks,
-                reason="occupancy_epoch_mismatch",
-                checked_refs=tuple(refs),
-                now_mono_s=now_mono_s,
-                lease_s=lease_s,
-            )
-        if not occupancy.matches_revision(geometry_certificate.map_revision):
-            return _backup_or_unsupported(
-                predeclared_fallbacks,
-                reason="occupancy_revision_mismatch",
-                checked_refs=tuple(refs),
-                now_mono_s=now_mono_s,
-                lease_s=lease_s,
-            )
-        envelope = 0.35
-        if plant_limits is not None and plant_limits.valid:
-            envelope = plant_limits.envelope_radius_m
-            refs.append("plant_limits")
-        sample = tracking_state.candidate.position
-        tube = StopTubeQuery(
-            samples_odom_m=((sample.x, sample.y, sample.z),),
-            envelope_radius_m=envelope,
-            include_brake_region=False,
-            brake_region=None,
+        fail = _geometry_clear(
+            occupancy=occupancy,
+            plant_limits=plant_limits,
+            geometry_certificate=geometry_certificate,
+            nav_state=nav_state,
+            candidate=tracking_state.candidate,
+            refs=refs,
+            predeclared_fallbacks=predeclared_fallbacks,
+            now_mono_s=now_mono_s,
+            lease_s=lease_s,
         )
-        # Use OccupancyQuery stamp domain — pass a synthetic now stamp from age domain is N/A;
-        # consumers pass ClockStamp via query; we use occupancy.stamp as now for contract simplicity.
-        verdict = occupancy.query_stop_tube(tube, now=occupancy.stamp)
-        refs.append(f"map_revision:{occupancy.map_revision}")
-        refs.append(f"occupancy:{verdict.support.value}")
-        if (
-            verdict.support is not OccupancySupport.FREE
-            or verdict.evidence_class is not EvidenceClass.SENSOR_DERIVED
-        ):
-            reason = "geometry_not_free" if verdict.support is not OccupancySupport.FREE else "evidence_class"
-            if verdict.support is OccupancySupport.OCCUPIED:
-                reason = "geometry_occupied"
-            return _backup_or_unsupported(
-                predeclared_fallbacks,
-                reason=reason,
-                checked_refs=tuple(refs),
-                now_mono_s=now_mono_s,
-                lease_s=lease_s,
-            )
-        refs.append("geometry_clear")
+        if fail is not None:
+            return fail
     elif geometry_certificate is not None:
         refs.append("geometry_unknown_claim")
 
