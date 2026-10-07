@@ -3,6 +3,10 @@
 Owns the Safety surface only. Never invents Motions, never commands Vehicle.
 Geometry CLEAR requires OccupancyVerdict FREE + sensor_derived + epoch match
 with active nav (Perception consumer rules).
+
+Rebuild, not glue: this module does **not** wrap or call legacy
+``embodied.navigation.validator`` (or planner/geometry). It consumes frozen
+Perception ports + Execution certificate/plant types only.
 """
 
 from __future__ import annotations

@@ -285,3 +285,21 @@ def test_safety_module_has_no_vehicle_command():
     src = inspect.getsource(safety_mod)
     assert "Vehicle.command" not in src
     assert ".command(" not in src
+
+
+def test_safety_does_not_import_legacy_navigation():
+    """prefer-rebuild: Safety must not wrap navigation.validator / planner."""
+    import ast
+    from pathlib import Path
+
+    import embodied.execution.safety as safety_mod
+
+    tree = ast.parse(Path(safety_mod.__file__).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    assert not any(name == "embodied.navigation" or name.startswith("embodied.navigation.") for name in imported)
+    assert safety_mod.__name__ == "embodied.execution.safety"
