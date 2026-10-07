@@ -43,8 +43,10 @@ from embodied.platform.webots_ardupilot import (
 
 ROUTE_PATH = Path(__file__).with_name("route.yaml")
 REFRESH_S = 0.05
-CRUISE_SPEED_M_S = 0.35
+# Slow sliding setpoint; yaw fixed at 0 (path-heading + vel FF tipped AngErr=84).
+CRUISE_SPEED_M_S = 0.25
 END_HOLD_S = 2.0
+ZERO = Vec3(0.0, 0.0, 0.0)
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
