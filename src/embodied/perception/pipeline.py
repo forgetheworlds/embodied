@@ -19,7 +19,8 @@ from embodied.contracts.perception_ports import (
     OccupancyVerdict,
 )
 from embodied.contracts.records import Calibration, ClockStamp
-from embodied.memory.world import MapConfig, MapStore
+from embodied.control.vehicle import ned_to_enu
+from embodied.memory.world import FREE, MapConfig, MapStore
 from embodied.perception.camera import PoseProvenance, build_calibration, compute_validated_depth
 from embodied.perception.estimation import StaticEstimationPort, pose_estimate_from_nav
 from embodied.perception.mapping_ports import MapStoreMappingPort
@@ -113,6 +114,12 @@ class PerceptionPipeline:
             "valid_depth_frames": self._valid_depth_frames,
             "last_depth_valid_fraction": self._last_depth_valid_fraction,
             "known_cells": len(self._store.known_cells()),
+            "free_cells": sum(
+                1
+                for cell in self._store.known_cells()
+                if self._store.classify(cell, now_ns=self._store._newest_stamp_ns() or 0)  # noqa: SLF001
+                == FREE
+            ),
             "map_revision": self._store.revision,
             "rejections": list(self._rejections[-8:]),
             "store_rejections": list(self._store.rejections[-8:]),
@@ -127,9 +134,10 @@ class PerceptionPipeline:
         sim_time_s: float | None,
         stamp: ClockStamp,
     ) -> None:
+        # Controller ships IMU in ArduPilot NED; cameras/calib are body ENU/FLU.
         self._estimator.ingest_imu(
-            accelerometer=accelerometer,
-            gyro=gyro,
+            accelerometer=ned_to_enu(accelerometer),
+            gyro=ned_to_enu(gyro),
             capture_host_ns=capture_host_ns,
             sim_time_s=sim_time_s,
         )
@@ -195,30 +203,49 @@ class PerceptionPipeline:
         )
         if revision != before:
             self._integrates += 1
+        return self.query_sensor_derived_free(stamp)
+
+    def query_sensor_derived_free(self, stamp: ClockStamp) -> OccupancyVerdict | None:
+        """Prefer querying known FREE cells; else forward AABB; else known-cell AABB."""
         query = self._mapping.occupancy()
         if query is None:
             return None
-        # Default probe: volume ahead of body in odom (+x forward for identity yaw).
-        x, y, z = nav.pose.position_m
-        volume = Aabb(
-            min_m=(x + 0.6, y - 0.4, z - 0.4),
-            max_m=(x + 2.5, y + 0.4, z + 0.4),
-            frame="odom",
+        free_cells = tuple(cell for cell, label in query.cells if label == FREE)
+        if free_cells:
+            return query.query_cells(free_cells[:128], now=stamp)
+        nav = self._estimation.latest()
+        if nav is not None:
+            x, y, z = nav.pose.position_m
+            forward = Aabb(
+                min_m=(x + 0.4, y - 0.8, z - 0.8),
+                max_m=(x + 4.0, y + 0.8, z + 0.8),
+                frame="odom",
+            )
+            verdict = query.query_volume(forward, now=stamp)
+            if verdict.support is not OccupancySupport.UNSUPPORTED or verdict.reason != "never_observed":
+                return verdict
+        if not query.cells:
+            return query.query_volume(
+                Aabb(min_m=(0.0, -0.5, -0.5), max_m=(2.0, 0.5, 0.5), frame="odom"),
+                now=stamp,
+            )
+        # Expand to cover whatever the map actually wrote (attitude may differ).
+        centers = [query._cell_center(cell) for cell, _ in query.cells]  # noqa: SLF001
+        xs = [c[0] for c in centers]
+        ys = [c[1] for c in centers]
+        zs = [c[2] for c in centers]
+        pad = 0.15
+        return query.query_volume(
+            Aabb(
+                min_m=(min(xs) - pad, min(ys) - pad, min(zs) - pad),
+                max_m=(max(xs) + pad, max(ys) + pad, max(zs) + pad),
+                frame="odom",
+            ),
+            now=stamp,
         )
-        return query.query_volume(volume, now=stamp)
 
     def query_forward_volume(self, stamp: ClockStamp) -> OccupancyVerdict | None:
-        nav = self._estimation.latest()
-        query = self._mapping.occupancy()
-        if nav is None or query is None:
-            return None
-        x, y, z = nav.pose.position_m
-        volume = Aabb(
-            min_m=(x + 0.6, y - 0.4, z - 0.4),
-            max_m=(x + 2.5, y + 0.4, z + 0.4),
-            frame="odom",
-        )
-        return query.query_volume(volume, now=stamp)
+        return self.query_sensor_derived_free(stamp)
 
 
 def decode_pair_rgb(
