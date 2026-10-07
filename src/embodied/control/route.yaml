@@ -1,0 +1,19 @@
+# Doorway route for the control-layer live proof.
+# Loaded by embodied.control.proof (and the throwaway smooth flyer).
+#
+# Waypoints are absolute local-NED (EKF origin = world ENU origin).
+# Iris spawn is ENU (-1,0,*) → NED (-1,0,*).
+
+hover_altitude_m: 1.5
+hold_per_waypoint_s: 8
+residual_max_m: 0.10
+spin_rad: 3.141592653589793
+spin_tolerance_rad: 0.40
+return_waypoints: true
+waypoints_local_ned:
+  - [-0.40, 0.00, 0.0]
+  - [0.50, 0.00, 0.0]
+  - [2.50, -0.40, 0.0]
+  - [4.50, -1.20, 0.0]
+  - [5.50, -1.20, 0.0]
+  - [7.50, -0.50, 0.0]
