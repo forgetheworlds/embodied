@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+
 from embodied.cli import (
     CommandOutcome,
     CommandStatus,
@@ -49,12 +51,18 @@ from embodied.platform.webots_ardupilot import (
     check_prerequisites,
 )
 
+ROUTE_PATH = Path(__file__).with_name("route.yaml")
 DEFAULT_SPIN_RAD = math.pi
 DEFAULT_SPIN_TOLERANCE_RAD = 0.40
 DEFAULT_RESIDUAL_MAX_M = 0.15
 REFRESH_S = 0.05
 SPIN_RATE_RAD_S = 0.6
 ZERO = Vec3(0.0, 0.0, 0.0)
+
+
+def _load_package_route() -> dict[str, Any]:
+    """Doorway route lives beside this module (`route.yaml`)."""
+    return yaml.safe_load(ROUTE_PATH.read_text())
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -68,16 +76,23 @@ def _drain(platform: WebotsArduPilot) -> None:
 
 
 def _motion_section(document: dict[str, Any]) -> dict[str, Any]:
-    motion = document.get("motion")
-    probe = document["probe"]
-    if motion is not None:
-        return motion
-    return {
-        "hover_altitude_m": probe["hover_altitude_m"],
-        "hold_per_waypoint_s": probe["hold_per_waypoint_s"],
-        "residual_max_m": DEFAULT_RESIDUAL_MAX_M,
-        "waypoints_local_ned": probe["waypoints_local_ned"],
-    }
+    """Prefer package ``route.yaml``; config ``motion:`` / ``probe:`` may override keys."""
+    route = _load_package_route()
+    probe = document.get("probe") or {}
+    motion = document.get("motion") or {}
+    merged = dict(route)
+    # Legacy probe fields fill gaps only.
+    for key in (
+        "hover_altitude_m",
+        "hold_per_waypoint_s",
+        "residual_max_m",
+        "waypoints_local_ned",
+    ):
+        if key not in merged and key in probe:
+            merged[key] = probe[key]
+    merged.update(motion)
+    merged.setdefault("residual_max_m", DEFAULT_RESIDUAL_MAX_M)
+    return merged
 
 
 def _sim_time_s(platform: WebotsArduPilot) -> float | None:

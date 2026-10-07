@@ -3,22 +3,23 @@
 Bottom API: anything that physically moves or rotates the aircraft under
 ArduPilot GUIDED. Higher layers call this surface; they do not dig under it.
 
-## One doc · one test · one proof · one package
+## One package
 
 | Path | Role |
 |---|---|
-| `docs/control.md` | This note |
-| `tests/test_control.py` | No-sim contract of the public API |
-| `configs/layers/control` | Live Webots + SITL proof (`control.yaml` route) |
 | `src/embodied/control/vehicle.py` | Public API (`Vehicle`, `Motion`, …) |
-| `src/embodied/control/proof.py` | Doorway phases driven by the proof script |
-
-Platform support (not a second API): SITL FDM clamp patch; optional native
-movie in `compat_vehicle_controller` via `EMBODIED_WEBOTS_MOVIE`.
+| `src/embodied/control/proof.py` | Doorway gate flight (hold / spin / return) |
+| `src/embodied/control/route.yaml` | Doorway waypoints + gate numbers |
+| `src/embodied/control/smooth.py` | Throwaway continuous cruise (not the gate) |
+| `docs/control.md` | This note |
+| `tests/test_control.py` | No-sim contract |
+| `configs/layers/control` | Live gate script |
+| `configs/layers/control-smooth` | Throwaway smooth script |
 
 ```sh
 .venv/bin/python -m pytest tests/test_control.py -q
-./configs/layers/control          # exit 0 iff receipt gate_status is pass
+./configs/layers/control                 # gate: hold-at-waypoint route
+./configs/layers/control-smooth          # throwaway continuous cruise
 ```
 
 Optional movie (native Webots, not desktop ffmpeg):
@@ -53,9 +54,9 @@ class Motion:
 - `takeoff` owns arm / GUIDED / EKF-origin bring-up (prefetch, recoverable PreArm).
 - No public `goto` / `hold` / `spin` helpers — compose `Motion` instead.
 
-## Live proof
+## Live gate proof
 
-One gapless caller loop while GUIDED:
+One gapless caller loop while GUIDED (`proof.py` + `route.yaml`):
 
 ```text
 while flying:
@@ -66,7 +67,7 @@ while flying:
 
 Phases (outbound, hold, spin, reface, settle, align, return) only replace the
 current Motion. Settle/align are explicit holds — not silence. Doorway residual
-gate: **0.10 m**. Yaml waypoints are absolute local-NED; proof converts to odom ENU.
+gate: **0.10 m**.
 
 ## Constraints that matter
 
@@ -75,12 +76,10 @@ gate: **0.10 m**. Yaml waypoints are absolute local-NED; proof converts to odom 
 3. Keep XY closed-loop during yaw-rate turns (position in `Motion`).
 4. Load `compat_ekf.parm`.
 5. SITL must clamp Webots FDM time jumps
-   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`) — otherwise
-   `time_boot_ms` leaps and VisOdom dies.
-6. Prefer `EMBODIED_WEBOTS_MOVIE` over desktop capture. Delay past PreArm
-   (`EMBODIED_WEBOTS_MOVIE_DELAY_S`, default 90), finish mid-run
-   (`EMBODIED_WEBOTS_MOVIE_DURATION_S`, default 180). No CPU pinning.
-   Software-GL movie may look stuttery; that is capture, not the flight.
+   (`patches/ardupilot-sitl-webots-fdm-time-clamp.patch`).
+6. Prefer `EMBODIED_WEBOTS_MOVIE` over desktop capture. Delay past PreArm,
+   finish mid-run. No CPU pinning. Software-GL movie may look stuttery;
+   that is capture, not the flight.
 
 ## Does not own
 

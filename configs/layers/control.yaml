@@ -1,10 +1,7 @@
 # Control-layer live sim verification (not pytest).
 #
 # Canonical entry: ./configs/layers/control
-# Exercises Vehicle API v1 (takeoff / command loop / land) through first_indoor.
-#
-# Waypoints are absolute local-NED (EKF origin = world ENU origin). Iris spawn
-# is ENU (-1,0,*) → NED (-1,0,*); do NOT treat these as spawn-relative offsets.
+# Doorway route lives in src/embodied/control/route.yaml (not duplicated here).
 
 project:
   stage: P00-control
@@ -81,19 +78,7 @@ probe:
     flight: 240
   budget_wall_clock_s: 1200
 
-motion:
-  hover_altitude_m: 1.5
-  hold_per_waypoint_s: 8
-  residual_max_m: 0.10
-  spin_rad: 3.141592653589793
-  spin_tolerance_rad: 0.40
-  return_waypoints: true
-  waypoints_local_ned:
-    - [-0.40, 0.00, 0.0]
-    - [0.50, 0.00, 0.0]
-    - [2.50, -0.40, 0.0]
-    - [4.50, -1.20, 0.0]
-    - [5.50, -1.20, 0.0]
-    - [7.50, -0.50, 0.0]
+# Optional overrides for src/embodied/control/route.yaml — omit to use package route.
+# motion: {}
 
 output: work/runs/layers/control

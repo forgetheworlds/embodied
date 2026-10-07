@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Throwaway continuous smooth cruise (not the control-layer gate).
+# Route: src/embodied/control/route.yaml
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+CONFIG="${CONFIG:-configs/layers/control.yaml}"
+OUTPUT="${OUTPUT:-work/runs/layers/control-smooth}"
+
+if [[ ! -x .venv/bin/python ]]; then
+  echo "control-smooth: missing .venv; run scripts/bootstrap.sh first" >&2
+  exit 2
+fi
+
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+export DISPLAY="${DISPLAY:-:1}"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+
+rm -rf "$OUTPUT"
+mkdir -p "$OUTPUT"
+
+python -u -m embodied control-smooth --config "$CONFIG" --output "$OUTPUT"
+status=$?
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
+fi
+
+RECEIPT="$OUTPUT/receipt.json"
+if [[ ! -f "$RECEIPT" ]]; then
+  echo "control-smooth: missing receipt at $RECEIPT" >&2
+  exit 1
+fi
+
+python - "$RECEIPT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipt = json.loads(Path(sys.argv[1]).read_text())
+gate = receipt.get("gate_status")
+reasons = receipt.get("reasons") or []
+print(f"control-smooth: status={receipt.get('status')} gate={gate}")
+for reason in reasons:
+    print(f"  reason: {reason}")
+if gate != "pass":
+    raise SystemExit(1)
+PY
