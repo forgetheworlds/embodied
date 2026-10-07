@@ -51,12 +51,8 @@ from embodied.execution import (
     ValidityWindow,
 )
 from embodied.execution.plant import StaticPlantLimitsPort, declared_plant
-from embodied.memory.world import FREE, MapConfig, MapStore
 from embodied.perception.estimation import StaticEstimationPort
-from embodied.perception.mapping_ports import (
-    MapStoreMappingPort,
-    snapshot_from_cell_labels,
-)
+from embodied.perception.mapping_ports import StubMappingPort, StubOccupancyQuery
 from embodied.platform.webots_ardupilot import (
     EvidenceWriter,
     PlatformSettings,
@@ -200,49 +196,27 @@ def _make_cert(
     )
 
 
-def _ports_can_emit_sensor_derived_free() -> dict[str, Any]:
-    """In-process check: stacked ports emit FREE only under sensor_derived."""
-    config = MapConfig(
-        voxel_m=0.5,
-        bounds_odom_m={"x": (-1.0, 1.0), "y": (-1.0, 1.0), "z": (0.0, 2.0)},
-        surface_band_m=0.1,
-        log_odds_hit=0.7,
-        log_odds_pass=-0.4,
-        clamp=5.0,
-        free_threshold=0.5,
-        occupied_threshold=0.5,
-        min_clearing_rays=1,
-        freshness_s=5.0,
-        dynamic_speed_mps=None,
-        dynamic_reach_s=None,
+def _compose_mapping_port(*, epoch: str, map_evidence_class: EvidenceClass):
+    """Prefer Perception composition if present; else stub (no MapStore glue)."""
+    try:
+        from embodied.perception import live as perception_live  # type: ignore
+
+        compose = getattr(perception_live, "compose_mapping_port", None)
+        if callable(compose):
+            return compose(nav_epoch=epoch, evidence_class=map_evidence_class), "perception.live"
+    except Exception:
+        pass
+    return (
+        StubMappingPort(
+            StubOccupancyQuery(
+                nav_epoch=epoch,
+                map_revision="stub-revision",
+                snapshot_id="stub-snapshot",
+                evidence_class=map_evidence_class,
+            )
+        ),
+        "stub_mapping_port",
     )
-    sensor = snapshot_from_cell_labels(
-        labels={(2, 2, 2): FREE},
-        config=config,
-        nav_epoch="proof",
-        map_revision="r-free",
-        snapshot_id="s-free",
-        stamp=_stamp(),
-        evidence_class=EvidenceClass.SENSOR_DERIVED,
-    )
-    assisted = snapshot_from_cell_labels(
-        labels={(2, 2, 2): FREE},
-        config=config,
-        nav_epoch="proof",
-        map_revision="r-assist",
-        snapshot_id="s-assist",
-        stamp=_stamp(),
-        evidence_class=EvidenceClass.POSE_ASSISTED,
-    )
-    now = _stamp()
-    free = sensor.classify_cell((2, 2, 2), now=now)
-    blocked = assisted.classify_cell((2, 2, 2), now=now)
-    return {
-        "sensor_derived_support": free.support.value,
-        "pose_assisted_support": blocked.support.value,
-        "ok": free.support is OccupancySupport.FREE
-        and blocked.support is OccupancySupport.UNSUPPORTED,
-    }
 
 
 def fly_execution_route(
@@ -261,32 +235,13 @@ def fly_execution_route(
     clocks = WallClocks(t0_mono=time.monotonic(), t0_sim=time.monotonic())
     epoch = "exec-proof-epoch"
 
-    # Default: vehicle-backed nav/map are pose_assisted (AP truth VPE path).
-    # Perception agent flips these to sensor_derived + live FREE when ready.
+    # Clean rebuild: Vehicle + EstimationPort + MappingPort + Safety.check.
+    # No MissionRuntime / navigation dual-writer. MapStore only via Perception.
     estimation = StaticEstimationPort(None)
-    map_config = MapConfig(
-        voxel_m=0.25,
-        bounds_odom_m={"x": (-2.0, 4.0), "y": (-2.0, 2.0), "z": (0.0, 3.0)},
-        surface_band_m=0.15,
-        log_odds_hit=0.85,
-        log_odds_pass=-0.45,
-        clamp=5.0,
-        free_threshold=0.6,
-        occupied_threshold=0.6,
-        min_clearing_rays=2,
-        freshness_s=30.0,
-        dynamic_speed_mps=None,
-        dynamic_reach_s=None,
+    mapping_port, mapping_source = _compose_mapping_port(
+        epoch=epoch, map_evidence_class=map_evidence_class
     )
-    store = MapStore(config=map_config, submap_id="exec-proof", nav_epoch=epoch)
-    mapping = MapStoreMappingPort(
-        store,
-        nav_epoch=epoch,
-        evidence_class=map_evidence_class,
-        stamp=_stamp(),
-        limitations=("execution_proof_mapping_port",),
-    )
-    mapping_port = mapping
+    steps.append({"task": "mapping_port_source", "source": mapping_source})
 
     ports = PortBundle(
         estimation=estimation,
@@ -294,11 +249,6 @@ def fly_execution_route(
         plant_limits=StaticPlantLimitsPort(declared_plant()),
     )
     exe = Execution(vehicle=vehicle, clocks=clocks, ports=ports, lease_s=0.3)
-
-    free_check = _ports_can_emit_sensor_derived_free()
-    steps.append({"task": "ports_sensor_derived_free_check", **free_check})
-    if not free_check["ok"]:
-        reasons.append("ports failed sensor_derived FREE honesty check")
 
     takeoff = vehicle.takeoff(hover_m)
     steps.append({"task": "takeoff", "ok": takeoff.accepted, "reason": takeoff.reason})
@@ -308,11 +258,11 @@ def fly_execution_route(
             reasons,
             steps,
             ap_ext_nav_mode,
-            free_check,
             exe,
             require_geometry_clear=require_geometry_clear,
             nav_evidence_class=nav_evidence_class,
             map_evidence_class=map_evidence_class,
+            mapping_source=mapping_source,
         )
 
     # After takeoff: Execution is sole Vehicle.command writer (hold settle via replace).
@@ -323,11 +273,11 @@ def fly_execution_route(
             reasons,
             steps,
             ap_ext_nav_mode,
-            free_check,
             exe,
             require_geometry_clear=require_geometry_clear,
             nav_evidence_class=nav_evidence_class,
             map_evidence_class=map_evidence_class,
+            mapping_source=mapping_source,
         )
 
     start = state.position
@@ -356,11 +306,11 @@ def fly_execution_route(
             reasons,
             steps,
             ap_ext_nav_mode,
-            free_check,
             exe,
             require_geometry_clear=require_geometry_clear,
             nav_evidence_class=nav_evidence_class,
             map_evidence_class=map_evidence_class,
+            mapping_source=mapping_source,
         )
     settle_end = time.monotonic() + HOVER_SETTLE_S
     while time.monotonic() < settle_end:
@@ -407,11 +357,11 @@ def fly_execution_route(
             reasons,
             steps,
             ap_ext_nav_mode,
-            free_check,
             exe,
             require_geometry_clear=require_geometry_clear,
             nav_evidence_class=nav_evidence_class,
             map_evidence_class=map_evidence_class,
+            mapping_source=mapping_source,
         )
 
     # Gapless Execution tick through primary + brief terminal
@@ -501,12 +451,12 @@ def fly_execution_route(
         reasons,
         steps,
         ap_ext_nav_mode,
-        free_check,
         exe,
         occupancy_samples,
         require_geometry_clear=require_geometry_clear,
         nav_evidence_class=nav_evidence_class,
         map_evidence_class=map_evidence_class,
+        mapping_source=mapping_source,
     )
 
 
@@ -514,18 +464,17 @@ def _receipt(
     reasons: list[str],
     steps: list[dict[str, Any]],
     ap_ext_nav_mode: str,
-    free_check: dict[str, Any],
     exe: Execution,
     occupancy_samples: list[dict[str, Any]] | None = None,
     *,
     require_geometry_clear: bool = False,
     nav_evidence_class: EvidenceClass = EvidenceClass.POSE_ASSISTED,
     map_evidence_class: EvidenceClass = EvidenceClass.POSE_ASSISTED,
+    mapping_source: str = "stub_mapping_port",
 ) -> dict[str, Any]:
     status = exe.status()
     samples = occupancy_samples or []
     occ_summary = _occupancy_summary(samples)
-    geometry_clear_claimed = require_geometry_clear
     return {
         "status": "pass" if not reasons else "fail",
         "reasons": reasons,
@@ -533,9 +482,9 @@ def _receipt(
         "ap_ext_nav_mode": ap_ext_nav_mode,
         "perception_nav_evidence_class": nav_evidence_class.value,
         "perception_map_evidence_class": map_evidence_class.value,
-        "ports_sensor_derived_free_check": free_check,
+        "mapping_port_source": mapping_source,
         "require_geometry_clear": require_geometry_clear,
-        "geometry_clear_claimed": geometry_clear_claimed,
+        "geometry_clear_claimed": require_geometry_clear,
         "occupancy_summary": occ_summary,
         "execution": {
             "code": status.code.value,
@@ -543,13 +492,12 @@ def _receipt(
             "primary_completed": status.primary_completed,
             "last_decision": status.last_decision,
             "last_reason": status.last_reason,
-            "safety_owner": "safety layer (execution.safety.check consumed, not owned)",
+            "rebuild": "Vehicle + ports + Safety.check — no MissionRuntime",
         },
         "occupancy_samples": samples[-10:],
         "note": (
-            "Execution owns sole Vehicle.command + joint orchestration. "
-            "Safety.check is consumed from the Safety layer. "
-            "AP ext-nav is orthogonal to Perception evidence_class. "
+            "Clean Execution rebuild: sole Vehicle.command; consumes Safety + Perception ports; "
+            "no MissionRuntime/navigation dual-writer. "
             "geometry CLEAR only when require_geometry_clear and live free+sensor_derived."
         ),
     }

@@ -2,7 +2,9 @@
 
 **Owner:** Execution agent only. Consumes Safety.check + Perception ports; does not own those layers.
 
-Frozen surface: project store `docs/execution-safety-frozen.md` (joint contract). Safety honesty: CLEAR only FREE+`sensor_derived`+epoch match (`tests/test_safety.py`).
+**Rebuild rule:** clean sole-writer on Vehicle + new Safety + Perception ports. No `MissionRuntime` / old navigation dual-writer glue (`prefer-rebuild`).
+
+Frozen surface: project store `docs/execution-safety-frozen.md`. Safety honesty: CLEAR only FREE+`sensor_derived`+epoch match.
 
 ## Public API
 
@@ -12,8 +14,7 @@ Frozen surface: project store `docs/execution-safety-frozen.md` (joint contract)
 
 ## Prove
 
-- Contract: `tests/test_execution.py` (replace / terminal / sole-writer; not Safety.check)
-- Joint live entry: `./configs/layers/execution`
-  - `execution_proof.require_geometry_clear: false` until Perception live FREE
-  - When true: FAILS unless live occupancy returns `free`+`sensor_derived` (no invented FREE)
-  - Receipt: `ap_ext_nav_mode` vs Perception `evidence_class` + `occupancy_summary`
+- Contract: `tests/test_execution.py`
+- Joint live: `./configs/layers/execution` — mapping via Perception `compose_mapping_port` if present, else stub (no MapStore in Execution)
+  - `require_geometry_clear: false` until Perception live FREE; then flip + re-prove
+  - FAIL if CLEAR required without live `free`+`sensor_derived`
