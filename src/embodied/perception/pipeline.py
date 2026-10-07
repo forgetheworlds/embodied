@@ -14,6 +14,7 @@ import numpy as np
 from embodied.contracts.perception_ports import (
     Aabb,
     AgeDomain,
+    EstimationPort,
     EvidenceClass,
     OccupancySupport,
     OccupancyVerdict,
@@ -22,9 +23,9 @@ from embodied.contracts.records import Calibration, ClockStamp
 from embodied.control.vehicle import ned_to_enu
 from embodied.memory.world import FREE, MapConfig, MapStore
 from embodied.perception.camera import PoseProvenance, build_calibration, compute_validated_depth
-from embodied.perception.estimation import StaticEstimationPort, pose_estimate_from_nav
+from embodied.perception.estimation import pose_estimate_from_nav
 from embodied.perception.mapping_ports import MapStoreMappingPort
-from embodied.perception.stereo_imu_nav import StereoImuNav
+from embodied.perception.stereo_imu_nav import LiveStereoImuEstimationPort, StereoImuNav
 
 
 DEFAULT_DEPTH_SETTINGS: dict[str, Any] = {
@@ -71,8 +72,9 @@ class PerceptionPipeline:
     calibration: Calibration | None = None
 
     def __post_init__(self) -> None:
-        self._estimator = StereoImuNav(nav_epoch=self.nav_epoch)
-        self._estimation = StaticEstimationPort(None)
+        # stall_after_s covers host SGBM while a PAIR queue drains (IMU-only stall).
+        self._estimator = StereoImuNav(nav_epoch=self.nav_epoch, stall_after_s=2.5)
+        self._estimation: EstimationPort = LiveStereoImuEstimationPort(self._estimator)
         self._calibration = self.calibration or build_calibration()
         cfg = self.map_config or default_map_config()
         self._store = MapStore(config=cfg, submap_id="perception-live", nav_epoch=self.nav_epoch)
@@ -91,7 +93,7 @@ class PerceptionPipeline:
         self._rejections: list[str] = []
 
     @property
-    def estimation(self) -> StaticEstimationPort:
+    def estimation(self) -> EstimationPort:
         return self._estimation
 
     @property
@@ -169,8 +171,8 @@ class PerceptionPipeline:
             capture_host_ns=capture_host_ns,
             sim_time_s=sim_time_s,
         )
+        # Live EstimationPort recomputes on pull — do not freeze a snapshot here.
         nav = self._estimator.latest(stamp=stamp, now_host_ns=stamp.monotonic_ns)
-        self._estimation.set(nav)
         if nav is not None:
             self._mapping._sim_time_s = nav.sim_time_s  # noqa: SLF001 — freshness on handle
             self._mapping._stamp = stamp  # noqa: SLF001
@@ -190,8 +192,11 @@ class PerceptionPipeline:
         stamp: ClockStamp,
     ) -> OccupancyVerdict | None:
         self._estimator.ingest_pair(capture_host_ns=capture_host_ns, sim_time_s=sim_time_s)
-        nav = self._estimator.latest(stamp=stamp, now_host_ns=stamp.monotonic_ns)
-        self._estimation.set(nav)
+        # Capture-time nav (sensor clock) — do not mark EstimationPort STALE from
+        # wall-clock SGBM while a PAIR queue drains without new IMU samples.
+        nav = self._estimator.latest_at_capture(
+            stamp=stamp, capture_host_ns=capture_host_ns
+        )
         if nav is None or not nav.valid:
             self._rejections.append("pair skipped: nav not valid sensor_derived yet")
             return None

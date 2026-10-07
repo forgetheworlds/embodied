@@ -169,8 +169,6 @@ def test_integrate_pose_assisted_nav_refuses_free_path():
 
 def test_stereo_imu_nav_marks_sensor_derived_and_stalls():
     est = StereoImuNav(nav_epoch="e1", stall_after_s=0.05)
-    # Gravity along -z in body when level (specific force +z ≈ +g in NED-ish; Webots accel often +g up).
-    # Use +z accel ≈ +9.81 as specific force when body upright in ENU (accelerometer reads gravity).
     for i in range(20):
         est.ingest_imu(
             accelerometer=(0.0, 0.0, 9.81),
@@ -187,6 +185,42 @@ def test_stereo_imu_nav_marks_sensor_derived_and_stalls():
     assert stalled is not None
     assert stalled.feed_stall is True
     assert stalled.valid is False
+
+
+def test_visual_age_alone_does_not_stall_imu_nav():
+    """SGBM / pair gaps must not mark IMU-derived nav STALE."""
+    est = StereoImuNav(nav_epoch="e1", stall_after_s=1.0)
+    for i in range(10):
+        est.ingest_imu(
+            accelerometer=(0.0, 0.0, 9.81),
+            gyro=(0.0, 0.0, 0.0),
+            capture_host_ns=1_000_000_000 + i * 5_000_000,
+            sim_time_s=0.005 * i,
+        )
+    est.ingest_pair(capture_host_ns=1_000_050_000, sim_time_s=0.05)
+    # 0.5s after last IMU, 0.5s after last pair — under IMU stall, over old visual×2 rule.
+    nav = est.latest(stamp=_stamp(1_000_550_000), now_host_ns=1_000_550_000)
+    assert nav is not None
+    assert nav.valid is True
+    assert nav.feed_stall is False
+    assert nav.status is NavStatus.HEALTHY
+
+
+def test_latest_at_capture_uses_sensor_clock_not_wall_sgbm():
+    est = StereoImuNav(nav_epoch="e1", stall_after_s=1.0, capture_imu_slop_s=0.25)
+    est.ingest_imu(
+        accelerometer=(0.0, 0.0, 9.81),
+        gyro=(0.0, 0.0, 0.0),
+        capture_host_ns=1_000_000_000,
+        sim_time_s=1.0,
+    )
+    est.ingest_pair(capture_host_ns=1_000_050_000, sim_time_s=1.05)
+    # Wall "now" is 2s later (SGBM burst), but capture is near IMU on sensor clock.
+    later = 1_000_000_000 + 2_000_000_000
+    cap = est.latest_at_capture(stamp=_stamp(later), capture_host_ns=1_000_050_000)
+    assert cap is not None and cap.valid is True
+    live = est.latest(stamp=_stamp(later), now_host_ns=later)
+    assert live is not None and live.feed_stall is True
 
 
 def test_pipeline_on_pair_path_uses_ports():

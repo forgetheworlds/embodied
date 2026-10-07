@@ -7,6 +7,7 @@ never Webots POSE, never InertialUnit absolute RPY, never Vehicle EKF.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +15,7 @@ import numpy as np
 from embodied.contracts.perception_ports import (
     AgeDomain,
     EvidenceClass,
+    EstimationPort,
     NavEpoch,
     NavPose,
     NavStatus,
@@ -105,7 +107,11 @@ class StereoImuNav:
     accel_tilt_alpha: float = 0.02
     static_gyro_norm_max: float = 0.15
     static_accel_err_max: float = 1.5
-    stall_after_s: float = 1.0
+    # Host SGBM can burn >1s while a PAIR queue drains without new IMU ingest;
+    # stall is IMU-only (pose comes from accel+gyro). 2.5s covers a short burst.
+    stall_after_s: float = 2.5
+    # IMU must be this close to a stereo capture on the sensor clock for map bind.
+    capture_imu_slop_s: float = 0.25
 
     def __post_init__(self) -> None:
         self._quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
@@ -205,35 +211,17 @@ class StereoImuNav:
         if self._initialized:
             self._state_sequence += 1
 
-    def latest(
+    def _publish(
         self,
         *,
         stamp: ClockStamp,
-        now_host_ns: int | None = None,
-    ) -> NavigationState | None:
-        if not self._initialized:
-            return None
-        now_ns = now_host_ns if now_host_ns is not None else stamp.monotonic_ns
-        imu_age = None
-        if self._last_imu_host_ns is not None:
-            imu_age = max(0.0, (now_ns - self._last_imu_host_ns) * 1e-9)
-        visual_age = None
-        if self._last_pair_host_ns is not None:
-            visual_age = max(0.0, (now_ns - self._last_pair_host_ns) * 1e-9)
-        feed_stall = bool(
-            (imu_age is not None and imu_age > self.stall_after_s)
-            or (visual_age is not None and visual_age > self.stall_after_s * 2.0)
-            or self._pair_count == 0
-        )
-        age_s = float(imu_age if imu_age is not None else 0.0)
-        status = NavStatus.HEALTHY
-        valid = True
-        if feed_stall:
-            status = NavStatus.STALE
-            valid = False
-        elif self._pair_count < 1:
-            status = NavStatus.INITIALIZING
-            valid = False
+        now_ns: int,
+        imu_age_s: float | None,
+        visual_age_s: float | None,
+        feed_stall: bool,
+        status: NavStatus,
+        valid: bool,
+    ) -> NavigationState:
         pose = NavPose(
             parent_frame="odom",
             child_frame="body",
@@ -254,6 +242,7 @@ class StereoImuNav:
             source_ids=self.source_ids,
             valid=valid,
         )
+        age_s = float(imu_age_s if imu_age_s is not None else 0.0)
         return NavigationState(
             nav_epoch=self.nav_epoch,
             state_sequence=self._state_sequence,
@@ -275,10 +264,111 @@ class StereoImuNav:
             sigma_pos_m=None,
             visual_source_ids=self.visual_source_ids,
             imu_source_ids=self.imu_source_ids,
-            visual_age_s=visual_age,
-            imu_age_s=imu_age,
+            visual_age_s=visual_age_s,
+            imu_age_s=imu_age_s,
             feed_stall=feed_stall,
             ap_disagreement=uncompared_disagreement(),
             evidence_class=EvidenceClass.SENSOR_DERIVED,
             source_ids=self.source_ids,
         )
+
+    def latest(
+        self,
+        *,
+        stamp: ClockStamp,
+        now_host_ns: int | None = None,
+    ) -> NavigationState | None:
+        """Live Safety pull: ages vs wall/host now. IMU-only feed_stall."""
+        if not self._initialized:
+            return None
+        now_ns = now_host_ns if now_host_ns is not None else stamp.monotonic_ns
+        imu_age = None
+        if self._last_imu_host_ns is not None:
+            imu_age = max(0.0, (now_ns - self._last_imu_host_ns) * 1e-9)
+        visual_age = None
+        if self._last_pair_host_ns is not None:
+            visual_age = max(0.0, (now_ns - self._last_pair_host_ns) * 1e-9)
+        # Pose is IMU-derived: stereo latency alone must not mark nav STALE (map
+        # bind uses latest_at_capture). Missing IMU past stall_after_s does.
+        feed_stall = bool(imu_age is not None and imu_age > self.stall_after_s)
+        status = NavStatus.HEALTHY
+        valid = True
+        if feed_stall:
+            status = NavStatus.STALE
+            valid = False
+        elif self._pair_count < 1:
+            status = NavStatus.INITIALIZING
+            valid = False
+        return self._publish(
+            stamp=stamp,
+            now_ns=now_ns,
+            imu_age_s=imu_age,
+            visual_age_s=visual_age,
+            feed_stall=feed_stall,
+            status=status,
+            valid=valid,
+        )
+
+    def latest_at_capture(
+        self,
+        *,
+        stamp: ClockStamp,
+        capture_host_ns: int,
+    ) -> NavigationState | None:
+        """Capture-time nav for depth→map: IMU freshness vs pair stamp, not wall SGBM."""
+        if not self._initialized or self._last_imu_host_ns is None:
+            return None
+        imu_age = abs(capture_host_ns - self._last_imu_host_ns) * 1e-9
+        visual_age = 0.0
+        if self._last_pair_host_ns is not None:
+            visual_age = abs(capture_host_ns - self._last_pair_host_ns) * 1e-9
+        feed_stall = imu_age > self.capture_imu_slop_s
+        status = NavStatus.HEALTHY
+        valid = True
+        if feed_stall:
+            status = NavStatus.STALE
+            valid = False
+        elif self._pair_count < 1:
+            status = NavStatus.INITIALIZING
+            valid = False
+        return self._publish(
+            stamp=stamp,
+            now_ns=capture_host_ns,
+            imu_age_s=imu_age,
+            visual_age_s=visual_age,
+            feed_stall=feed_stall,
+            status=status,
+            valid=valid,
+        )
+
+
+class LiveStereoImuEstimationPort:
+    """EstimationPort that recomputes age/stall on every latest() pull."""
+
+    def __init__(self, estimator: StereoImuNav, *, host_id: str = "perception") -> None:
+        self._estimator = estimator
+        self._host_id = host_id
+
+    def latest(self) -> NavigationState | None:
+        now_ns = time.monotonic_ns()
+        stamp = ClockStamp(
+            host_id=self._host_id,
+            clock_id="host/monotonic",
+            monotonic_ns=now_ns,
+        )
+        return self._estimator.latest(stamp=stamp, now_host_ns=now_ns)
+
+    def current_epoch(self) -> NavEpoch | None:
+        state = self.latest()
+        return None if state is None else state.nav_epoch
+
+    def healthy(self) -> bool:
+        state = self.latest()
+        return (
+            state is not None
+            and state.valid
+            and state.status in (NavStatus.HEALTHY, NavStatus.DEGRADED)
+        )
+
+
+_: type[EstimationPort] = LiveStereoImuEstimationPort

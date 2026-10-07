@@ -206,16 +206,21 @@ def fly_perception_route(
             f"(stats={pipeline.stats()})"
         )
 
-    # Stall honesty: stop feeding; re-publish nav with wall now so age/stall updates.
+    # Stall honesty: stop feeding; LiveEstimationPort ages on pull (IMU stall_after_s).
+    stall_wait_s = pipeline.estimator.stall_after_s + 0.5
     stall_start = time.monotonic()
-    while time.monotonic() - stall_start < 1.2:
+    while time.monotonic() - stall_start < stall_wait_s:
         record = platform.sensor_record(0.0)
         while record is not None:
             record = platform.sensor_record(0.0)
+        try:
+            while True:
+                pair_q.get_nowait()
+        except queue.Empty:
+            pass
         hold = vehicle.state().position or Vec3(0.0, 0.0, hover_m)
         vehicle.command(Motion(position=hold, velocity=ZERO))
         time.sleep(REFRESH_S)
-    pipeline.estimation.set(pipeline.estimator.latest(stamp=_stamp()))
     nav_after = pipeline.estimation.latest()
     stall_ok = nav_after is None or (not pipeline.estimation.healthy())
     steps.append(
