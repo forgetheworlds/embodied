@@ -152,38 +152,9 @@ class SnapshotOccupancyQuery:
         )
 
     def _cells_in_volume(self, volume: Aabb | Sphere) -> list[CellIndex]:
+        """Sparse: only cells with evidence. Empty ⇒ caller gets never_observed/unsupported."""
         hits: list[CellIndex] = []
-        # Prefer known cells; also scan index ranges that intersect the volume.
-        candidates = set(self._cell_map())
-        bounds = {axis: (low, high) for axis, low, high in self.bounds_odom_m}
-        if isinstance(volume, Aabb):
-            mins = volume.min_m
-            maxs = volume.max_m
-        else:
-            r = volume.radius_m
-            mins = (
-                volume.center_m[0] - r,
-                volume.center_m[1] - r,
-                volume.center_m[2] - r,
-            )
-            maxs = (
-                volume.center_m[0] + r,
-                volume.center_m[1] + r,
-                volume.center_m[2] + r,
-            )
-        index_min = tuple(
-            int(math.floor((mins[i] - bounds[axis][0]) / self.voxel_m))
-            for i, axis in enumerate(("x", "y", "z"))
-        )
-        index_max = tuple(
-            int(math.floor((maxs[i] - bounds[axis][0]) / self.voxel_m))
-            for i, axis in enumerate(("x", "y", "z"))
-        )
-        for ix in range(index_min[0], index_max[0] + 1):
-            for iy in range(index_min[1], index_max[1] + 1):
-                for iz in range(index_min[2], index_max[2] + 1):
-                    candidates.add((ix, iy, iz))
-        for cell in candidates:
+        for cell in self._cell_map():
             center = self._cell_center(cell)
             if isinstance(volume, Aabb):
                 if _point_in_aabb(center, volume):
